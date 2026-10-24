@@ -2,7 +2,8 @@
 
 Each example runs in its own process, because examples call configure_jax with
 their own precision and that setting is global. The MIPLIB examples are not
-run: they need instances downloaded into data/.
+run: they need instances downloaded into data/. The RAG example is not run
+either: it downloads a dataset and embeds it with fastembed, which takes minutes.
 """
 
 import importlib.util

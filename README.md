@@ -105,6 +105,7 @@ can be combined, for example `pip install "jaddle[cuda12,examples]"`:
 |---|---|---|
 | `cuda12`, `cuda13` | CUDA-enabled JAX | GPU execution. Choose the extra that matches your CUDA driver; see the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for TPU and other platforms. |
 | `examples` | `matplotlib`, `scikit-learn` | The convex examples |
+| `rag_examples` | `fastembed`, `snowballstemmer`, and `examples` | The retrieval (RAG) examples |
 | `benchmarks` | `mpax` | The benchmarks |
 | `cvxpy` | `cvxpy` | [Modelling with CVXPY](#modelling-with-cvxpy) |
 | `test` | `pytest`, `cvxpy` | Running the test suite |
@@ -690,6 +691,9 @@ than a sparse one at that size.
 [`examples/cp/mpc_fleet.py`](examples/cp/mpc_fleet.py) controls a fleet of
 1000 systems this way. On a laptop GPU, each MPC solve took about 1/40 of the
 time of a warm-started SCS loop on the CPU.
+[`examples/cp/rag_reranker.py`](examples/cp/rag_reranker.py) uses it to solve
+a ranking SVM's whole regularisation path at once. It learns a reranker over
+keyword and dense-embedding features for retrieval on the SciFact benchmark.
 
 ## Modelling with CVXPY
 

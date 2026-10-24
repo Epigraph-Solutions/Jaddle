@@ -103,7 +103,34 @@ residuals (`≤ 0`), and box bounds. Jaddle differentiates them automatically.
 | [`cvxpy_channel_capacity.py`](cp/cvxpy_channel_capacity.py) | CVXPY's channel capacity example (Boyd & Vandenberghe, ex. 4.57): the mutual information `c @ x + Σ entr(P x) / log 2` maximised over input distributions on the simplex, solved with `jcv.solve`, which keeps `entr` smooth instead of using exponential cones. Recovers `1 − H₂(0.25)` for a binary symmetric channel, then checks a random 8 × 6 channel against Blahut–Arimoto and Clarabel, and reads the optimality conditions (equal divergences on the used inputs, the dual of `sum(x) == 1`) off the solution. | `cvxpy` |
 | [`cvxpy_robust_kalman.py`](cp/cvxpy_robust_kalman.py) | CVXPY's robust Kalman filtering example: smoothing a 1000-step trajectory of a damped vehicle from position measurements, a fifth of them outliers. The least-squares (Kalman) smoother is a QP and goes through `jcv.JaddleSolver`; the robust one, with `huber(norm(v[t]))` on the measurement noise, is compiled by `jcv.solve` into a smooth `JaddleCP` instead of second-order cones. Both are checked against Clarabel, and the plot shows the outliers pulling the least-squares estimate off the true path while the robust one stays on it. | `cvxpy`, `matplotlib` |
 | [`mpc_fleet.py`](cp/mpc_fleet.py) | Model predictive control of a fleet of 1000 oscillating-mass systems (Wang & Boyd's benchmark), 30 closed-loop steps. Each step is 1000 small QPs (105 variables, soft position limits) that share their matrices. `jc.make_qp_solver` scales the matrices once, and one `vmap`-ed solve handles the whole fleet, warm-started from the shifted previous plans. Benchmarked against warm-started SCS looping over the fleet, with a reference check of both solvers' accuracy and a sweep of time per QP from 1 to 10,000 systems on the GPU and the CPU. Writes `mpc_fleet.gif`, an animation of four systems' masses and actuators beside the whole fleet's positions. | `scs` (installed with `cvxpy`), `matplotlib` |
+| [`rag_reranker.py`](cp/rag_reranker.py) | A hybrid retrieval stack for SciFact: BM25 and dense embeddings (bge-small via `fastembed`, computed once and cached) merged by reciprocal rank fusion, then a linear ranking SVM that reranks the top 100 over 17 features per (query, document), including a cross-fitted learned term-weight score. Each regularisation path is one `vmap`-ed `jc.make_qp_solver` call, checked against Clarabel, with bootstrap intervals on the gains. A keyword-only reranker on the same candidates shows what the embeddings add. | `rag_examples` extra, the dataset download, and a ~130 MB model download |
 | [`kernel_svm.py`](cp/kernel_svm.py) | Train an RBF-kernel support vector machine on two interleaved half-moons. The SVM dual is a quadratic program, solved with `jc.quadratic_program`; the intercept is read off the equality constraint's dual. Plots the decision boundary, margins and support vectors. | `matplotlib` |
+
+### `rag_reranker.py`
+
+The reranker's QP, with `D`'s rows the feature differences `x⁺ₜ − x⁻ₜ` of the
+`T` training triplets:
+
+```
+minimise    ½‖v‖² + (C/T)·Σ ξ_t
+subject to  D v + ξ ≥ 1,   ξ ≥ 0
+```
+
+SciFact test nDCG@10:
+
+| | nDCG@10 |
+|---|---|
+| BM25 | 0.681 |
+| Learned term weights | 0.708 |
+| Dense (bge-small) | 0.720 |
+| RRF of BM25 and dense | 0.731 |
+| Keyword reranker (14 features) | 0.724 |
+| **Hybrid reranker (17 features)** | **0.770** |
+
+The hybrid reranker beats RRF by +0.040 (95% interval [+0.021, +0.060]) and
+the keyword reranker by +0.046 ([+0.023, +0.071]). Each 11-QP path solves in
+about 3 s on an RTX 5070 Ti laptop GPU. Embedding SciFact takes about
+4 minutes on the CPU the first time, and the run then takes about 35 s.
 
 The first two examples use `jc.solve(cp)` with its default settings, so they
 are a good starting template: replace the objective and constraint functions
