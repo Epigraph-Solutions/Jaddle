@@ -801,4 +801,3 @@ plt.show()
 # takes about 35 seconds once the embeddings are cached.
 
 # %%
-s
