@@ -1366,3 +1366,12 @@ def test_solve_concurrent_ipm_wins_when_pdlp_is_starved():
     assert not result["legs"]["jaddle"]["converged"]
     ref = reference_objective(lp)
     assert abs(result["objective"] - ref) / (1 + abs(ref)) < 1e-6
+
+
+@pytest.mark.parametrize("update_mode", ["pdhg", "halpern"])
+def test_no_averaging(update_mode):
+    # average=False carries no average buffer; the solve still certifies.
+    # ("alternating" needs the average to converge, so it is left out.)
+    lp = random_lp()
+    result = solve(lp, update_mode=update_mode, average=False, report_best=False)
+    assert_certified(lp, result, reference_objective(lp))

@@ -712,3 +712,15 @@ def test_diverged_solve_does_not_certify():
     assert not np.all(np.isfinite(result["solution"].primal))
     assert not result["converged"]
     assert result["stop_reason"] == "max_epochs"
+
+
+@pytest.mark.parametrize("update_mode", ["extragradient", "pdhg", "alternating"])
+@pytest.mark.parametrize("restarts", [True, False])
+def test_no_averaging(update_mode, restarts):
+    # average=False carries no average buffer; the solve still converges.
+    cp, expected = simplex_problem()
+    result = solve(
+        cp, update_mode=update_mode, average=False, restarts=restarts
+    )
+    assert result["converged"]
+    np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)

@@ -19,6 +19,12 @@
   and per-leg `"legs"`. It takes the same inputs as
   `jl.solve_with_presolve`.
 
+### Changed
+
+- `jl.solve` and `jc.solve` no longer keep a running-average copy of the
+  solution when `average=False`. This saves one solution-sized buffer
+  (primal and duals) in memory. Results are unchanged.
+
 ## 0.2.4
 
 ### Added

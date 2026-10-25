@@ -1436,7 +1436,9 @@ def _device_solver(
                 # Restart to whichever of {average, iterate} has the lower merit
                 # instead of always discarding a frequently-better average.
                 restart_used_avg = used_avg if average else jnp.asarray(False)
-                restart_point = _select(restart_used_avg, avg, state)
+                restart_point = (
+                    _select(restart_used_avg, avg, state) if average else state
+                )
                 restart_merit = merit
                 near_threshold = merit <= restart_decay * mal
                 if average and not report_best:
@@ -1590,7 +1592,8 @@ def _device_solver(
                         restarted, jax.tree.map(jnp.zeros_like, accum), accum
                     )
                 state = _select(restarted, restart_point, state)
-                avg = _select(restarted, restart_point, avg)
+                if average:
+                    avg = _select(restarted, restart_point, avg)
                 at_restart = _select(restarted, restart_point, at_restart)
                 total_weight = jnp.where(restarted, 0.0, total_weight)
                 restart_i_offset = jnp.where(restarted, i - 1, restart_i_offset)
@@ -1741,7 +1744,8 @@ def _device_solver(
 
     carry = dict(
         state=initial_solution,
-        avg=initial_solution,
+        # No average buffer when averaging is off (saves a state-sized copy).
+        avg=initial_solution if average else None,
         opt=opt_state,
         # diag_adapt: the diagonal metric (t, s), starting at the Ruiz+PC
         # baseline, and its per-cycle accumulators (H_x, H_y).

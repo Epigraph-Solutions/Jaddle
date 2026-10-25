@@ -1218,7 +1218,8 @@ def _device_solver(
                         restarted, jax.tree.map(jnp.zeros_like, accum), accum
                     )
                 state = _select(restarted, restart_point, state)
-                avg = _select(restarted, restart_point, avg)
+                if average:
+                    avg = _select(restarted, restart_point, avg)
                 at_restart = _select(restarted, restart_point, at_restart)
                 total_weight = jnp.where(restarted, 0.0, total_weight)
                 restart_i_offset = jnp.where(restarted, i - 1, restart_i_offset)
@@ -1295,7 +1296,8 @@ def _device_solver(
     carry = _strong(
         dict(
             state=initial_solution,
-            avg=initial_solution,
+            # No average buffer when averaging is off (saves a state-sized copy).
+            avg=initial_solution if average else None,
             used_avg=jnp.asarray(bool(average)),
             opt=opt_state,
             # diag_adapt: the diagonal metric (t, s), dual stacked [eq; ineq],
