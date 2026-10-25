@@ -12,6 +12,25 @@
   the fusion alone and 0.681 for BM25.
 - `rag_examples` extra (`fastembed`, `snowballstemmer`, and `examples`) for
   the retrieval examples.
+- `jc.save_cp` / `jc.load_cp`: write a `JaddleCP` to a single file with
+  `jax.export` and load it back without the code that built it. The file
+  holds the objective, the constraints and any `dual_bound` / `residuals`,
+  plus the bounds. A loaded CP solves with `jc.solve` as before, including
+  `gradient_scaling`, since the scales are exported too. Shapes, dtype and
+  target platforms are fixed when saving, and a loaded CP cannot be used
+  under `vmap`.
+- `jl.save_lp` / `jl.load_lp`: write a `JaddleLP` to a single `.npz` file
+  and read it back. The file keeps the numbers exactly (dtype, sparsity
+  pattern and entry order) and the cones. `load_lp(path, dtype=...)`
+  converts the numbers on loading, e.g. a float64 file to float32.
+- `jc.save_solver` / `jc.load_solver` and `jl.save_solver` /
+  `jl.load_solver`: the same for a family of problems. They save a function
+  built with `make_solver`, `make_optimal_value`, `make_solution` or (LPs)
+  `make_perturbed_solution`, with the solver settings fixed:
+  `save_solver(fn, path, *example_args)`. `batch=True` saves a batched
+  solver that takes any batch size. `vjp_order=1` saves gradients with
+  respect to the arguments. `jl.make_solution`'s gradient runs on the host,
+  so it saves without one.
 - `jl.solve_concurrent`: races Jaddle against HiGHS's interior-point method on
   the same LP and returns the first to converge. The loser is stopped through
   `cancelSolve()` (HiGHS) or a new `cancel` event on `jl.solve` (PDLP, with

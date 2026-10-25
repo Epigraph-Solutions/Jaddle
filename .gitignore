@@ -2,6 +2,7 @@
 /data
 /playpen
 /articles
+/results
 /jaddle.egg-info
 *.pyc
 /build

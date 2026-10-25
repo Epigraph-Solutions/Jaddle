@@ -7,6 +7,7 @@ from typing import NamedTuple
 import time
 from jaddle.jaddle_basic_types import JaddleCP, SaddleState
 import jaddle.jaddle_optimisers as jo
+from jaddle import jaddle_export as _export
 import numpy as np
 
 # Epoch budget for a chunk that should run until convergence: large enough never
@@ -128,7 +129,12 @@ def _gradient_scaled(cp, x0, probes):
     convergence test keeps the original problem's units."""
     x0 = projection_box(x0, cp.lower_bounds, cp.upper_bounds)
     m_eq = jax.eval_shape(cp.constraints_eq, x0).shape[0]
-    sigma, e = jax.jit(lambda x: _gradient_scales(cp, x, probes))(x0)
+    # A CP from ``load_cp`` carries its scales as an exported function: its
+    # own callables have no forward mode or batching, which the scales need.
+    scales_fn = getattr(cp, "gradient_scales", None)
+    if scales_fn is None:
+        scales_fn = lambda x: _gradient_scales(cp, x, probes)
+    sigma, e = jax.jit(scales_fn)(x0)
     e_eq, e_ineq = e[:m_eq], e[m_eq:]
 
     def from_scaled(state):
@@ -1941,6 +1947,143 @@ def make_solver(
         )
 
     return solve_fn
+
+
+_export.register(SolveCoreResult, "jaddle.convex.SolveCoreResult")
+
+
+def save_cp(cp, path, *, platforms=None, vjp_order=1, gradient_scaling_probes=16):
+    """
+    Write ``cp`` to ``path`` as a self-contained file that ``load_cp`` reads
+    back without the code that built it.
+
+    Each callable (objective, constraints, and ``dual_bound`` / ``residuals``
+    when set) is traced with ``jax.export`` and stored as StableHLO, with
+    reverse-mode derivatives up to ``vjp_order`` (the solver needs 1). Arrays
+    the callables close over are stored inside the file as constants. The
+    file is an ``.npz`` (written to ``path`` as given) that loads without
+    pickle.
+
+    Shapes and dtype are fixed when saving: the number of variables and
+    constraints, and the dtype of ``cp.lower_bounds``. The file runs on
+    ``platforms`` (default: the current backend), e.g. ``("cpu", "cuda")``
+    for both.
+
+    Exported functions have no forward-mode derivatives and no batching, so a
+    loaded CP cannot be used under ``vmap``. ``solve``'s
+    ``gradient_scaling`` needs both, so the scales are exported here too,
+    from the original callables, with ``gradient_scaling_probes`` fixed at
+    save time (the loaded CP ignores ``solve``'s value). To save a family of
+    problems ``build_cp(params)``, save a solver for it with ``save_solver``.
+    """
+    n = int(cp.num_variables)
+    dtype = jnp.result_type(float, jnp.asarray(cp.lower_bounds).dtype)
+    x = jax.ShapeDtypeStruct((n,), dtype)
+    m_eq = jax.eval_shape(cp.constraints_eq, x).shape[0]
+    m_ineq = jax.eval_shape(cp.constraints_ineq, x).shape[0]
+    d_eq = jax.ShapeDtypeStruct((m_eq,), dtype)
+    d_ineq = jax.ShapeDtypeStruct((m_ineq,), dtype)
+
+    def exported(fn, *args, order=vjp_order):
+        return _export.serialized(fn, args, platforms, order)
+
+    arrays = {
+        "fn_objective": exported(cp.objective, x),
+        "fn_constraints_eq": exported(cp.constraints_eq, x),
+        "fn_constraints_ineq": exported(cp.constraints_ineq, x),
+        # Only evaluated, never differentiated.
+        "fn_gradient_scales": exported(
+            lambda x0: _gradient_scales(cp, x0, gradient_scaling_probes), x, order=0
+        ),
+    }
+    if cp.dual_bound is not None:
+        arrays["fn_dual_bound"] = exported(cp.dual_bound, d_ineq, d_eq)
+    if getattr(cp, "residuals", None) is not None:
+        state = SaddleState(primal=x, dual_ineq=d_ineq, dual_eq=d_eq)
+        arrays["fn_residuals"] = exported(cp.residuals, state)
+
+    meta = dict(
+        num_variables=n,
+        num_eq_constraints=m_eq,
+        num_ineq_constraints=m_ineq,
+        dtype=jnp.dtype(dtype).name,
+        gradient_scaling_probes=gradient_scaling_probes,
+    )
+    arrays["lower_bounds"] = np.asarray(cp.lower_bounds, dtype=dtype)
+    arrays["upper_bounds"] = np.asarray(cp.upper_bounds, dtype=dtype)
+    _export.write(path, "cp", meta, arrays)
+
+
+def load_cp(path):
+    """
+    Read a ``JaddleCP`` written by ``save_cp``. It solves with ``solve`` like
+    the original, but its shapes are fixed, it cannot be used under ``vmap``,
+    and it runs only on the platforms it was saved for (see ``save_cp``).
+    Inputs are cast to the saved dtype, so a float32 file also runs under
+    x64; a float64 file needs ``jax_enable_x64``.
+    """
+    meta, arrays, fns = _export.read(path, "cp")
+    dtype = jnp.dtype(meta["dtype"])
+
+    def wrap(name):
+        if name not in fns:
+            return None
+        return lambda *args: _export.call_in_saved_dtypes(fns[name], args)
+
+    cp = JaddleCP(
+        num_variables=meta["num_variables"],
+        objective=wrap("objective"),
+        constraints_eq=wrap("constraints_eq"),
+        constraints_ineq=wrap("constraints_ineq"),
+        lower_bounds=jnp.asarray(arrays["lower_bounds"], dtype),
+        upper_bounds=jnp.asarray(arrays["upper_bounds"], dtype),
+        dual_bound=wrap("dual_bound"),
+        residuals=wrap("residuals"),
+    )
+    cp.gradient_scales = wrap("gradient_scales")
+    return cp
+
+
+def save_solver(fn, path, *args, batch=False, platforms=None, vjp_order=0):
+    """
+    Write a solver for a family of problems to ``path``, for ``load_solver``
+    to read back without the code that built it.
+
+    ``fn`` is a pure JAX function, typically from ``make_solver``,
+    ``make_optimal_value`` or ``make_solution``. ``args`` are example
+    arguments for it, usually one problem's params (arrays or
+    ``ShapeDtypeStruct``s): only their structure, shapes and dtypes are used,
+    and they are fixed in the file. So are the solver's settings
+    (tolerances, ``max_epochs``, ...) and anything ``build_cp`` closes over.
+    The loaded function takes the same arguments; optional ones not passed
+    here (``make_solver``'s ``initial_solution``) keep their defaults.
+
+    ``batch=True`` saves ``jax.vmap(fn)`` with a symbolic batch size: the
+    loaded function takes every argument with an extra leading axis, of any
+    length. A loaded function cannot be ``vmap``-ed itself, so save it
+    batched if you need batches.
+
+    ``vjp_order=1`` saves reverse-mode derivatives with respect to the
+    arguments, for ``make_optimal_value`` / ``make_solution`` (``jax.grad``
+    then works on the loaded function). ``make_solver``'s solve loop has no
+    derivative, so leave it at 0 there. The file runs on ``platforms``
+    (default: the current backend), e.g. ``("cpu", "cuda")`` for both.
+    """
+    _export.save_function(
+        fn, path, args, "cp_solver", batch=batch, platforms=platforms, vjp_order=vjp_order
+    )
+
+
+def load_solver(path):
+    """
+    Read a solver written by ``save_solver``, as a function of the arguments
+    it was saved with (each with a leading batch axis if saved with
+    ``batch=True``). It works under ``jit``, and under ``jax.grad`` if saved
+    with ``vjp_order=1``, but not under ``vmap`` or forward-mode autodiff.
+    Inputs are cast to the saved dtypes, so a float32 file also runs under
+    x64; a float64 file needs ``jax_enable_x64``.
+    """
+    return _export.load_function(path, "cp_solver")
 
 
 def make_optimal_value(build_cp, return_solution=False, **settings):

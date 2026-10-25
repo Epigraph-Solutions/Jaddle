@@ -1375,3 +1375,153 @@ def test_no_averaging(update_mode):
     lp = random_lp()
     result = solve(lp, update_mode=update_mode, average=False, report_best=False)
     assert_certified(lp, result, reference_objective(lp))
+
+
+SOLVER_TOLS = dict(
+    primal_feasibility_tolerance=TOL,
+    dual_feasibility_tolerance=TOL,
+    dual_gap_tolerance=TOL,
+)
+
+
+def jittered_values(lp, size, seed=0):
+    base = lp.values()
+    rng = np.random.default_rng(seed)
+    return jax.tree.map(
+        lambda v: jnp.asarray(v * (1 + 0.05 * rng.uniform(-1, 1, (size,) + v.shape))),
+        base,
+    )
+
+
+def test_save_load_solver(tmp_path):
+    lp = jl.to_jaddle_sparse(random_lp())
+    solve_fn = jl.make_solver(lp.with_values, **SOLVER_TOLS)
+    jl.save_solver(solve_fn, tmp_path / "lp.jls", lp.values())
+    loaded = jl.load_solver(tmp_path / "lp.jls")
+    result, expected = loaded(lp.values()), solve_fn(lp.values())
+    assert bool(result.converged)
+    np.testing.assert_allclose(result.solution.primal, expected.solution.primal, atol=1e-10)
+    assert int(result.epochs) == int(expected.epochs)
+
+
+def test_save_load_solver_batched(tmp_path):
+    lp = jl.to_jaddle_sparse(random_lp())
+    solve_fn = jl.make_solver(lp.with_values, **SOLVER_TOLS)
+    jl.save_solver(solve_fn, tmp_path / "batched.jls", lp.values(), batch=True)
+    loaded = jl.load_solver(tmp_path / "batched.jls")
+    for size in (1, 3):  # 1 is padded to the file's minimum batch of 2
+        batch = jittered_values(lp, size)
+        result, expected = loaded(batch), jax.vmap(solve_fn)(batch)
+        assert result.solution.primal.shape == (size, lp.c.shape[0])
+        np.testing.assert_allclose(
+            result.solution.primal, expected.solution.primal, atol=1e-10
+        )
+
+
+def test_save_load_optimal_value_gradient(tmp_path):
+    lp = jl.to_jaddle_sparse(random_lp())
+    value_fn = jl.make_optimal_value(lp.with_values, **SOLVER_TOLS)
+    jl.save_solver(value_fn, tmp_path / "value.jls", lp.values(), batch=True, vjp_order=1)
+    loaded = jl.load_solver(tmp_path / "value.jls")
+    batch = jittered_values(lp, 2)
+    np.testing.assert_allclose(loaded(batch), jax.vmap(value_fn)(batch), rtol=1e-10)
+    got = jax.grad(lambda b: loaded(b).sum())(batch)
+    want = jax.grad(lambda b: jax.vmap(value_fn)(b).sum())(batch)
+    for g, w in zip(got, want):
+        np.testing.assert_allclose(g, w, atol=1e-10)
+
+
+def test_save_load_perturbed_solution(tmp_path):
+    lp = jl.to_jaddle_sparse(small_lp([3, 2], A_eq=[[1, 1]], b_eq=[4]))
+    x_fn = jl.make_perturbed_solution(
+        lp.with_values, sigma=1.0, num_samples=8, max_epochs=200, **SOLVER_TOLS
+    )
+    key = jax.random.PRNGKey(0)
+    jl.save_solver(x_fn, tmp_path / "perturbed.jls", lp.values(), key, vjp_order=1)
+    loaded = jl.load_solver(tmp_path / "perturbed.jls")
+    np.testing.assert_allclose(loaded(lp.values(), key), x_fn(lp.values(), key), atol=1e-10)
+    # jax.grad of a scalar, not jacrev: a loaded function cannot be vmap-ed.
+    g = jnp.array([1.0, -2.0])
+    np.testing.assert_allclose(
+        jax.grad(lambda c: g @ loaded(lp.values()._replace(c=c), key))(lp.values().c),
+        jax.grad(lambda c: g @ x_fn(lp.values()._replace(c=c), key))(lp.values().c),
+        atol=1e-8,
+    )
+
+
+def test_save_solution_without_gradient(tmp_path):
+    lp = jl.to_jaddle_sparse(random_lp())
+    x_fn = jl.make_solution(lp.with_values, **SOLVER_TOLS)
+    jl.save_solver(x_fn, tmp_path / "x.jls", lp.values())
+    loaded = jl.load_solver(tmp_path / "x.jls")
+    np.testing.assert_allclose(loaded(lp.values()), x_fn(lp.values()), atol=1e-10)
+    # Its gradient runs scipy on the host, which cannot be exported.
+    with pytest.raises(Exception, match="vjp_order=0"):
+        jl.save_solver(x_fn, tmp_path / "x1.jls", lp.values(), vjp_order=1)
+
+
+def test_load_solver_checks_file_kind(tmp_path):
+    import jaddle.jaddle_convex as jc
+
+    cp = jc.JaddleCP(
+        2, lambda x: x @ x, lambda x: jnp.zeros(0), lambda x: jnp.zeros(0),
+        jnp.zeros(2), jnp.ones(2),
+    )
+    jc.save_cp(cp, tmp_path / "cp.jcp")
+    with pytest.raises(ValueError, match="jaddle_convex.load_cp"):
+        jl.load_solver(tmp_path / "cp.jcp")
+
+
+def assert_same_lp(got, want):
+    for name in ("c", "b_eq", "b_ineq", "lower_bounds", "upper_bounds", "b"):
+        np.testing.assert_array_equal(getattr(got, name), getattr(want, name))
+        assert getattr(got, name).dtype == getattr(want, name).dtype
+    for name in ("A_eq", "A_ineq", "A", "A_T"):
+        g, w = getattr(got, name), getattr(want, name)
+        assert g.shape == w.shape
+        np.testing.assert_array_equal(g.data, w.data)
+        np.testing.assert_array_equal(g.indices, w.indices)
+    assert got.cones == want.cones
+
+
+def test_save_load_lp(tmp_path):
+    lp = jl.to_jaddle_sparse(random_lp())
+    jl.save_lp(lp, tmp_path / "lp.jlp")
+    loaded = jl.load_lp(tmp_path / "lp.jlp")
+    assert_same_lp(loaded, lp)
+    got, want = jl.solve(loaded, **SOLVER_TOLS), jl.solve(lp, **SOLVER_TOLS)
+    assert got["converged"]
+    np.testing.assert_array_equal(got["solution"].primal, want["solution"].primal)
+
+
+def test_save_load_lp_with_cones(tmp_path):
+    from jaddle.cones import Cones
+
+    lp = jl.to_jaddle_sparse(random_lp())
+    n = lp.c.shape[0]
+    cones = Cones(soc=(3, 2), psd=(2,), exp=1)
+    lower = np.asarray(lp.lower_bounds).copy()
+    upper = np.asarray(lp.upper_bounds).copy()
+    lower[n - cones.size :], upper[n - cones.size :] = -np.inf, np.inf
+    conic = jl.JaddleLP(
+        lp.c, lp.A_eq, lp.b_eq, lp.A_ineq, lp.b_ineq,
+        jnp.asarray(lower), jnp.asarray(upper), cones=cones,
+    )
+    jl.save_lp(conic, tmp_path / "conic.jlp")
+    assert_same_lp(jl.load_lp(tmp_path / "conic.jlp"), conic)
+
+
+def test_load_lp_dtype(tmp_path):
+    lp = jl.to_jaddle_sparse(random_lp())
+    jl.save_lp(lp, tmp_path / "lp.jlp")
+    loaded = jl.load_lp(tmp_path / "lp.jlp", dtype=jnp.float32)
+    assert loaded.c.dtype == jnp.float32 and loaded.A.data.dtype == jnp.float32
+    np.testing.assert_allclose(loaded.A_eq.data, lp.A_eq.data, rtol=1e-6)
+
+
+def test_save_lp_rejects_scipy_lp(tmp_path):
+    with pytest.raises(TypeError, match="to_jaddle_sparse"):
+        jl.save_lp(random_lp(), tmp_path / "lp.jlp")
+    jl.save_lp(jl.to_jaddle_sparse(random_lp()), tmp_path / "lp.jlp")
+    with pytest.raises(ValueError, match="load_lp"):
+        jl.load_solver(tmp_path / "lp.jlp")

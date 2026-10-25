@@ -17,6 +17,7 @@ from jaddle.jaddle_basic_types import LP, JaddleLP, LPValues, SaddleState, scipy
 from scipy.sparse.linalg import gmres
 from jax.scipy.sparse.linalg import gmres
 import jaddle.jaddle_optimisers as jo
+from jaddle import jaddle_export as _export
 from jaddle.cones import Cones, project_primal
 
 np.set_printoptions(precision=2, suppress=True)
@@ -3295,6 +3296,142 @@ def make_solution(build_lp, active_tol=1e-6, **settings):
 
     x_fn.defvjp(forward, backward)
     return x_fn
+
+
+_export.register(SolveCoreResult, "jaddle.linear.SolveCoreResult")
+
+
+def save_solver(fn, path, *args, batch=False, platforms=None, vjp_order=0):
+    """
+    Write a solver for a family of LPs to ``path``, for ``load_solver`` to
+    read back without the code that built it.
+
+    ``fn`` is a pure JAX function, typically from ``make_solver``,
+    ``make_optimal_value``, ``make_solution`` or ``make_perturbed_solution``.
+    ``args`` are example arguments for it: one LP's params (e.g. an
+    ``LPValues`` for ``make_solver(lp.with_values)``), plus a
+    ``jax.random`` key for ``make_perturbed_solution``. Only their
+    structure, shapes and dtypes are used, and they are fixed in the file.
+    So are the solver's settings, the sparsity pattern, and anything
+    ``build_lp`` closes over. The loaded function takes the same arguments;
+    optional ones not passed here (``make_solver``'s ``initial_solution``)
+    keep their defaults.
+
+    ``batch=True`` saves ``jax.vmap(fn)`` with a symbolic batch size: the
+    loaded function takes every argument with an extra leading axis, of any
+    length. A loaded function cannot be ``vmap``-ed itself, so save it
+    batched if you need batches.
+
+    ``vjp_order=1`` saves reverse-mode derivatives with respect to the
+    arguments, for ``make_optimal_value`` and ``make_perturbed_solution``
+    (``jax.grad`` then works on the loaded function). Leave it at 0 for
+    ``make_solver`` (its solve loop has no derivative) and for
+    ``make_solution``, whose derivative runs on the host with scipy and
+    cannot be exported: a loaded ``make_solution`` gives ``x*`` but not its
+    gradient. The file runs on ``platforms`` (default: the current backend),
+    e.g. ``("cpu", "cuda")`` for both.
+    """
+    _export.save_function(
+        fn, path, args, "lp_solver", batch=batch, platforms=platforms, vjp_order=vjp_order
+    )
+
+
+def load_solver(path):
+    """
+    Read a solver written by ``save_solver``, as a function of the arguments
+    it was saved with (each with a leading batch axis if saved with
+    ``batch=True``). It works under ``jit``, and under ``jax.grad`` if saved
+    with ``vjp_order=1``, but not under ``vmap`` or forward-mode autodiff.
+    Inputs are cast to the saved dtypes, so a float32 file also runs under
+    x64; a float64 file needs ``jax_enable_x64``.
+    """
+    return _export.load_function(path, "lp_solver")
+
+
+_LP_VECTORS = ("c", "b_eq", "b_ineq", "lower_bounds", "upper_bounds")
+_LP_MATRICES = ("A_eq", "A_ineq")
+
+
+def save_lp(lp, path):
+    """
+    Write the ``JaddleLP`` ``lp`` to ``path``, for ``load_lp`` to read back.
+
+    The file holds the LP's numbers as they are (same dtype, same sparsity
+    pattern and entry order) and its cones. It is an ``.npz`` (written to
+    ``path`` as given) that loads without pickle. For a scipy ``LP``, save
+    ``to_jaddle_sparse(lp)``.
+    """
+    if not isinstance(lp, JaddleLP):
+        raise TypeError(
+            f"save_lp takes a JaddleLP, got {type(lp).__name__}; for a scipy LP "
+            "save jl.to_jaddle_sparse(lp)"
+        )
+    arrays = {name: np.asarray(getattr(lp, name)) for name in _LP_VECTORS}
+    matrices = {}
+    for name in _LP_MATRICES:
+        A = getattr(lp, name)
+        arrays[f"{name}_data"] = np.asarray(A.data)
+        arrays[f"{name}_indices"] = np.asarray(A.indices)
+        matrices[name] = dict(
+            shape=list(A.shape),
+            indices_sorted=bool(A.indices_sorted),
+            unique_indices=bool(A.unique_indices),
+        )
+    cones = lp.cones
+    meta = dict(
+        dtype=np.asarray(lp.c).dtype.name,
+        matrices=matrices,
+        cones=None
+        if cones is None
+        else dict(soc=list(cones.soc), psd=list(cones.psd), exp=cones.exp),
+    )
+    _export.write(path, "lp", meta, arrays)
+
+
+def load_lp(path, dtype=None):
+    """
+    Read a ``JaddleLP`` written by ``save_lp``, ready for ``solve()``.
+
+    ``dtype=None`` keeps the saved dtype; a float64 file then needs
+    ``jax_enable_x64``. Pass a dtype (e.g. ``jnp.float32``) to convert the
+    numbers on loading instead.
+    """
+    meta, arrays, _ = _export.read(path, "lp")
+    if dtype is None:
+        dtype = np.dtype(meta["dtype"])
+        if dtype.itemsize == 8 and not jax.config.jax_enable_x64:
+            raise ValueError(
+                f"{path} was saved in {dtype.name}: enable "
+                "jax.config.update('jax_enable_x64', True) before loading it, "
+                "or pass dtype=jnp.float32 to convert"
+            )
+    dtype = jnp.dtype(dtype)
+
+    # jax.device_put, not jnp.asarray: the latter compiles a per-shape
+    # jit(stage) for every numpy upload.
+    def put(name):
+        return jax.device_put(arrays[name].astype(dtype))
+
+    def matrix(name):
+        info = meta["matrices"][name]
+        return jsp.BCOO(
+            (put(f"{name}_data"), jax.device_put(arrays[f"{name}_indices"])),
+            shape=tuple(info["shape"]),
+            indices_sorted=info["indices_sorted"],
+            unique_indices=info["unique_indices"],
+        )
+
+    cones = meta["cones"]
+    return JaddleLP(
+        put("c"),
+        matrix("A_eq"),
+        put("b_eq"),
+        matrix("A_ineq"),
+        put("b_ineq"),
+        put("lower_bounds"),
+        put("upper_bounds"),
+        cones=None if cones is None else Cones(**cones),
+    )
 
 
 def _highs_model(model, highs_options=None):

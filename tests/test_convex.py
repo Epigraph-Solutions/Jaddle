@@ -724,3 +724,148 @@ def test_no_averaging(update_mode, restarts):
     )
     assert result["converged"]
     np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)
+
+
+def test_save_load_cp_solves_like_original(tmp_path):
+    cp, expected = simplex_problem()
+    path = tmp_path / "simplex.jcp"
+    jc.save_cp(cp, path)
+    loaded = jc.load_cp(path)
+    result = solve(loaded)  # gradient_scaling on (the default)
+    assert result["converged"]
+    np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)
+    original = solve(cp)
+    np.testing.assert_allclose(
+        result["solution"].primal, original["solution"].primal, atol=1e-6
+    )
+
+
+def test_save_load_cp_values_and_gradients(tmp_path):
+    # n=60, m=40 > probes=16: the scales come from random JVPs, which the
+    # loaded CP cannot take itself.
+    rng = np.random.default_rng(0)
+    A = rng.standard_normal((40, 60))
+    a = rng.standard_normal(60)
+    cp = jc.JaddleCP(
+        num_variables=60,
+        objective=lambda x: jnp.sum((x - a) ** 2) + jnp.sum(jnp.sin(x)),
+        constraints_eq=lambda x: jnp.array([jnp.sum(x) - 1.0]),
+        constraints_ineq=lambda x: jnp.asarray(A) @ x - 1.0,
+        lower_bounds=-jnp.ones(60),
+        upper_bounds=jnp.ones(60),
+        dual_bound=lambda d_ineq, d_eq: -jnp.sum(d_ineq**2) + jnp.sum(d_eq),
+        residuals=lambda s: (
+            jnp.max(jnp.abs(s.primal)),
+            jnp.sum(s.dual_ineq),
+            jnp.sum(s.dual_eq),
+        ),
+    )
+    path = tmp_path / "cp.jcp"
+    jc.save_cp(cp, path)
+    loaded = jc.load_cp(path)
+
+    x = jnp.asarray(rng.uniform(-1, 1, 60))
+    state = jc.SaddleState(
+        primal=x,
+        dual_ineq=jnp.asarray(rng.uniform(0, 1, 40)),
+        dual_eq=jnp.asarray(rng.standard_normal(1)),
+    )
+    for name in ("objective", "constraints_eq", "constraints_ineq"):
+        np.testing.assert_allclose(
+            getattr(loaded, name)(x), getattr(cp, name)(x), rtol=1e-6
+        )
+
+    def lagrangian(p, s):
+        return (
+            p.objective(s.primal)
+            + s.dual_ineq @ p.constraints_ineq(s.primal)
+            + s.dual_eq @ p.constraints_eq(s.primal)
+        )
+
+    for got, want in zip(
+        jax.tree.leaves(jax.grad(lambda s: lagrangian(loaded, s))(state)),
+        jax.tree.leaves(jax.grad(lambda s: lagrangian(cp, s))(state)),
+    ):
+        np.testing.assert_allclose(got, want, rtol=1e-6)
+    np.testing.assert_allclose(
+        loaded.dual_bound(state.dual_ineq, state.dual_eq),
+        cp.dual_bound(state.dual_ineq, state.dual_eq),
+        rtol=1e-6,
+    )
+    np.testing.assert_allclose(loaded.residuals(state), cp.residuals(state), rtol=1e-6)
+    for got, want in zip(
+        loaded.gradient_scales(x), jc._gradient_scales(cp, x, 16)
+    ):
+        np.testing.assert_allclose(got, want, rtol=1e-6)
+    np.testing.assert_array_equal(loaded.lower_bounds, cp.lower_bounds)
+    assert loaded.num_eq_constraints() == 1
+    assert loaded.num_ineq_constraints() == 40
+
+
+def test_load_cp_without_optional_parts(tmp_path):
+    cp, _ = simplex_problem()
+    jc.save_cp(cp, tmp_path / "cp.jcp")
+    loaded = jc.load_cp(tmp_path / "cp.jcp")
+    assert loaded.dual_bound is None
+    assert loaded.residuals is None
+
+
+def test_save_load_solver(tmp_path):
+    a = np.random.default_rng(3).standard_normal(30)
+    solve_fn = jc.make_solver(build_scaled_simplex, max_epochs=300)
+    params = (jnp.asarray(a), jnp.asarray(1.5))
+    jc.save_solver(solve_fn, tmp_path / "solver.jcp", params)
+    loaded = jc.load_solver(tmp_path / "solver.jcp")
+    result = loaded(params)
+    expected = solve_fn(params)
+    assert bool(result.converged)
+    np.testing.assert_allclose(
+        result.solution.primal, expected.solution.primal, atol=1e-10
+    )
+    np.testing.assert_allclose(
+        jax.jit(loaded)(params).solution.primal, expected.solution.primal, atol=1e-6
+    )
+
+
+def test_save_load_solver_batched(tmp_path):
+    rng = np.random.default_rng(4)
+    solve_fn = jc.make_solver(build_scaled_simplex, max_epochs=300)
+    one = (jnp.zeros(30), jnp.asarray(1.0))
+    jc.save_solver(solve_fn, tmp_path / "batched.jcp", one, batch=True)
+    loaded = jc.load_solver(tmp_path / "batched.jcp")
+    for size in (1, 4):  # any batch size from the one file
+        batch = (jnp.asarray(rng.standard_normal((size, 30))), jnp.linspace(1.0, 2.0, size))
+        result = loaded(batch)
+        expected = jax.vmap(solve_fn)(batch)
+        np.testing.assert_allclose(
+            result.solution.primal, expected.solution.primal, atol=1e-10
+        )
+        np.testing.assert_array_equal(result.epochs, expected.epochs)
+
+
+def test_save_load_differentiable_solver(tmp_path):
+    a = jnp.asarray(np.random.default_rng(5).standard_normal(30))
+    params = (a, jnp.asarray(1.5))
+    value_fn = jc.make_optimal_value(build_scaled_simplex, **TIGHT)
+    jc.save_solver(value_fn, tmp_path / "value.jcp", params, vjp_order=1)
+    loaded = jc.load_solver(tmp_path / "value.jcp")
+    np.testing.assert_allclose(loaded(params), value_fn(params), rtol=1e-8)
+    for got, want in zip(jax.grad(loaded)(params), jax.grad(value_fn)(params)):
+        np.testing.assert_allclose(got, want, atol=1e-8)
+
+    x_fn = jc.make_solution(build_scaled_simplex, **TIGHT)
+    jc.save_solver(x_fn, tmp_path / "x.jcp", params, batch=True, vjp_order=1)
+    loaded_x = jc.load_solver(tmp_path / "x.jcp")
+    batch = jax.tree.map(lambda p: jnp.stack([p, 1.1 * p]), params)
+    loss = lambda f: lambda b: jnp.sum(f(b) ** 2)
+    for got, want in zip(
+        jax.grad(loss(loaded_x))(batch), jax.grad(loss(jax.vmap(x_fn)))(batch)
+    ):
+        np.testing.assert_allclose(got, want, atol=1e-8)
+
+
+def test_load_checks_file_kind(tmp_path):
+    cp, _ = simplex_problem()
+    jc.save_cp(cp, tmp_path / "cp.jcp")
+    with pytest.raises(ValueError, match="load_cp"):
+        jc.load_solver(tmp_path / "cp.jcp")
