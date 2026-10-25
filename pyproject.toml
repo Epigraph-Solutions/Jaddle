@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jaddle"
-version = "0.2.5"
+version = "0.2.6"
 description = "First-order primal-dual solvers for large-scale linear and convex programs, written in JAX"
 readme = "README.md"
 license = "MIT"
@@ -38,6 +38,9 @@ dependencies = [
     "numpy>=2.0",
     "scipy>=1.13",
     "highspy>=1.14",
+    # jax.export needs it to serialize functions (save_solver, save_cp), but
+    # jax does not install it.
+    "flatbuffers>=24",
 ]
 
 [project.optional-dependencies]

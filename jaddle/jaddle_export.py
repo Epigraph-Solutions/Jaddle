@@ -45,7 +45,9 @@ def serialized(fn, args, platforms, vjp_order):
     try:
         blob = exp.serialize(vjp_order=vjp_order)
     except Exception as exc:
-        if vjp_order:
+        # An ImportError (e.g. flatbuffers missing) has nothing to do with
+        # the gradient, so don't blame it.
+        if vjp_order and not isinstance(exc, ImportError):
             exc.add_note(
                 f"Saving with vjp_order={vjp_order} exports the function's "
                 "gradient, which must be pure JAX. make_solver's solve loop has "

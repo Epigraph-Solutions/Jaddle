@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.6
+
+### Fixed
+
+- `flatbuffers` is now a dependency. `jax.export` needs it to save and load
+  functions (`jl.save_solver` / `jl.load_solver`, `jc.save_cp` /
+  `jc.load_cp`, `jc.save_solver` / `jc.load_solver`), but `jax` does not
+  install it, so these failed with an `ImportError` in a clean install.
+- A failed save with `vjp_order=1` no longer blames the function's gradient
+  when the cause is a missing package.
+
 ## 0.2.5
 
 ### Added
