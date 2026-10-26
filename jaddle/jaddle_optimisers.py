@@ -46,8 +46,12 @@ def configure_jax(jax_profile: Optional[str] = None):
               indistinguishable from "out of precision". Full-precision matmuls
               (no TF32) so the extra mantissa actually counts.
             - "float32": single precision, maximum speed. TF32 matmuls.
-            - "float16": half precision, maximum speed. TF32 matmuls; the
-              tightest memory/bandwidth footprint, at the cost of precision.
+            - "float16": the scaled LP or QP matrices the solvers iterate on
+              are stored in half precision; iterates, norms, step sizes and
+              certificates stay float32. Solves reach relative tolerances of
+              about 1e-3; for LPs, use solve_with_refinement for tighter ones.
+              General convex problems (jaddle_convex.solve) take the dtype of
+              their own data.
             If None, reads JADDLE_JAX_PROFILE, defaulting to "float64". Any
             other name raises ValueError.
 
@@ -135,10 +139,11 @@ def configure_jax(jax_profile: Optional[str] = None):
         dtype = PROFILE
 
         if PROFILE == "float16":
-            # Half precision: accumulate matmuls in float32 so f16 inputs don't
-            # lose the running sum to rounding, and keep softmax/reduction math
-            # in f32 for stability. The f16 footprint comes from the array dtype;
-            # this just makes the reductions over it survivable.
+            # Half precision: accumulate dense matmuls in float32 so f16 inputs
+            # don't lose the running sum to rounding. This setting does not
+            # reach JAX's sparse matvec (jaddle_basic_types.spmv sums in float32
+            # itself), and the LP solver keeps its iterates and scalars in
+            # float32 regardless (jaddle_linear._wide).
             _set_matmul_precision("float32")
         else:
             # float32: TF32 matmuls trade a few mantissa bits for throughput.

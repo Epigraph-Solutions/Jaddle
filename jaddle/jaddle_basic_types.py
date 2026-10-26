@@ -174,6 +174,44 @@ def _concrete_indices(indices):
     return np.asarray(indices)
 
 
+def _wide(dtype):
+    """``dtype`` widened to at least float32. Under the float16 profile only
+    the scaled problem data is stored in half precision. The iterates, norms,
+    dot products and scalar state (k, eta, merits) use this dtype: float16
+    squares overflow above 256 and flush to zero below ~2.4e-4, which turns
+    step-size tests into inf/inf = NaN, and float16 iterates lose any step
+    smaller than ~1/2000 of their value to rounding."""
+    return jnp.promote_types(dtype, jnp.float32)
+
+
+def _dot(a, b):
+    """``vdot(a, b)`` computed and returned in at least float32."""
+    w = _wide(jnp.result_type(a, b))
+    return jnp.vdot(jnp.asarray(a, w), jnp.asarray(b, w))
+
+
+def spmv(A, x):
+    """``A @ x`` for a BCOO ``A``.
+
+    Below 32 bits (the float16 profile) the sum runs in float32 and the result
+    is cast back: JAX's float16 sparse scatter-add is 7-24x slower than float32
+    on GPU, and the global matmul-precision setting does not reach it. Float32
+    and float64 take the plain ``A @ x`` path.
+    """
+    import jax.experimental.sparse as _jsp
+
+    dtype = jnp.result_type(A.data, x)
+    if jnp.dtype(dtype).itemsize >= 4:
+        return A @ x
+    out = _jsp.bcoo_dot_general(
+        A,
+        x,
+        dimension_numbers=(([1], [0]), ([], [])),
+        preferred_element_type=jnp.float32,
+    )
+    return out.astype(dtype)
+
+
 def scipy_to_bcoo(A, dtype):
     """Sorted, deduplicated BCOO of the scipy matrix ``A`` with ``dtype`` data.
 
@@ -286,15 +324,18 @@ class JaddleLP:
         """Build a ``JaddleLP`` directly from scipy sparse blocks + numpy vectors.
 
         Mirrors ``jaddle_linear.to_jaddle_sparse``: resolves the active precision
-        profile (float64 under x64, else float32; float16 lives only in JAX since
-        scipy cannot hold it), converts each constraint block to a sorted,
-        deduplicated BCOO, and casts the data array to the profile dtype. This is
+        profile (float64 under x64, else float32; the float16 profile also
+        builds float32 here, since only the scaled copy the solver iterates on
+        is stored in float16), converts each constraint block to a sorted,
+        deduplicated BCOO, and casts the data array to that dtype. This is
         the JAX-native entry point — callers (e.g. ``highs_to_standard_form_sparse``)
         no longer route through a scipy ``LP``.
         """
         from jaddle.jaddle_optimisers import jaddle_dtype
 
-        float_dtype = jaddle_dtype()
+        # At least float32: float16 is only used for the scaled copy the
+        # solver iterates on (raw coefficients overflow its range).
+        float_dtype = jnp.promote_types(jaddle_dtype(), jnp.float32)
         if float_dtype == jnp.float64 and not jax.config.jax_enable_x64:
             float_dtype = jnp.float32
 
@@ -372,16 +413,16 @@ class JaddleLP:
         return self.A_eq.shape[0] + self.A_ineq.shape[0]
 
     def ineq_slack(self, x):
-        return jnp.max(jnp.maximum(self.A_ineq @ x - self.b_ineq, 0.0), initial=0.0)
+        return jnp.max(jnp.maximum(spmv(self.A_ineq, x) - self.b_ineq, 0.0), initial=0.0)
 
     def eq_slack(self, x):
-        return jnp.max(jnp.abs(self.A_eq @ x - self.b_eq), initial=0.0)
+        return jnp.max(jnp.abs(spmv(self.A_eq, x) - self.b_eq), initial=0.0)
 
     def diff_eq_slack(self, x):
-        return self.A_eq @ x - self.b_eq
+        return spmv(self.A_eq, x) - self.b_eq
 
     def complementarity_slack(self, x, dual_ineq):
-        return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
+        return (dual_ineq * (spmv(self.A_ineq, x) - self.b_ineq)).sum()
 
     def initial_solution(self):
         """Default start point: the box-projected zero primal with zero duals

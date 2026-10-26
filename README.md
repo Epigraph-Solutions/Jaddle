@@ -803,7 +803,7 @@ arrays:
 |---|---|---|
 | `"float64"` (default) | Double precision, full-precision matrix products | Real-world LPs and any problem needing tight tolerances. Wide-dynamic-range instances can stall on rounding error in single precision. |
 | `"float32"` | Single precision, TF32 matrix products | Throughput on well-conditioned problems. |
-| `"float16"` | Half precision, accumulating in float32 | Memory- and bandwidth-limited experiments. |
+| `"float16"` | The scaled LP or QP matrices in half precision; iterates, norms, step sizes and the final certificate in float32 | Memory-limited problems, and dense QPs (half the memory, about 20% faster at n = 4000). Matrices are rounded to about 3 significant digits, so solves reach relative tolerances of about 1e-3; for LPs, `solve_with_refinement` gets past that. Not suited to an ill-conditioned `Q`, which the rounding can make indefinite. |
 
 The profile can also be set through the `JADDLE_JAX_PROFILE` environment
 variable. `configure_jax` also enables a persistent XLA compilation cache in

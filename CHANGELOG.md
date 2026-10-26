@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The `float16` profile now stores only the scaled LP the solver iterates on
+  in half precision. Iterates, norms, dot products, the step size and primal
+  weight, and the final certificate use float32, and `to_jaddle_sparse` /
+  `JaddleLP.from_scipy` build the unscaled LP in float32. Before, the profile
+  returned NaN or a stalled start point on most MIPLIB instances: float16
+  squares overflow above 256, which turned the step-size test into
+  `inf / inf`, and residuals below ~1e-3 rounded to exactly 0. Plain solves
+  reach relative tolerances of about 1e-3 (the matrix's rounding);
+  `solve_with_refinement` reaches tighter ones.
+- Likewise for `jaddle_convex.quadratic_program` and `make_qp_solver`: under
+  `float16` the scaled Q and constraint matrices are stored in half precision
+  and the vectors and iterates in float32 (they were all float16). A dense QP
+  then takes half the memory and runs about 20% faster than under float32
+  (n = 4000). `quadratic_program`'s `converged` also requires the float64
+  certificate to meet the tolerances, since float16 used to report
+  convergence with residuals above them.
+- `jaddle_convex.solve` computes its step-size test, primal-weight
+  initialisation and primal-weight update in at least float32, and keeps k
+  and eta in at least float32, whatever the dtype of the problem's data.
+
+### Fixed
+
+- The `float16` profile's sparse matrix-vector products sum in float32.
+  JAX's float16 sparse sum ran 7-24x slower than float32 on GPU (dc1l: 271 s
+  to 1.2 s for 20 epochs).
+- The primal-weight update (in both `jaddle_linear.solve` and
+  `jaddle_convex.solve`) no longer turns `k` into NaN after an epoch in which
+  the primal or the dual did not move. Its `+ 1e-60` guard was 0 outside
+  float64; such an epoch now keeps `k`.
+
 ## 0.2.6
 
 ### Fixed

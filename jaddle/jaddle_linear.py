@@ -13,7 +13,16 @@ from typing import NamedTuple
 import threading
 import time
 from scipy import sparse as sp
-from jaddle.jaddle_basic_types import LP, JaddleLP, LPValues, SaddleState, scipy_to_bcoo
+from jaddle.jaddle_basic_types import (
+    LP,
+    JaddleLP,
+    LPValues,
+    SaddleState,
+    _dot,
+    _wide,
+    scipy_to_bcoo,
+    spmv,
+)
 from scipy.sparse.linalg import gmres
 from jax.scipy.sparse.linalg import gmres
 import jaddle.jaddle_optimisers as jo
@@ -62,13 +71,13 @@ def estimate_augmented_spectral_norm(
 
     def M_matvec(u, s):
         # M @ [u; s] = [A u - b s; cᵀ u]
-        top = A @ u - b * s
+        top = spmv(A, u) - b * s
         bottom = c @ u
         return top, bottom
 
     def MT_matvec(p, q):
         # Mᵀ @ [p; q] = [Aᵀ p + c q; -bᵀ p]
-        top = A_T @ p + c * q
+        top = spmv(A_T, p) + c * q
         bottom = -(b @ p)
         return top, bottom
 
@@ -126,7 +135,7 @@ def estimate_augmented_inf_norm(lp: JaddleLP):
     # Absolute row sums of A via one matvec against the all-ones vector.
     abs_A = jsp.BCOO((jnp.abs(A.data), A.indices), shape=A.shape)
     ones_n = jnp.ones(A.shape[1], dtype=c.dtype)
-    top_row_sums = abs_A @ ones_n + jnp.abs(b)  # rows [A_i, -b_i]
+    top_row_sums = spmv(abs_A, ones_n) + jnp.abs(b)  # rows [A_i, -b_i]
     bottom_row_sum = jnp.sum(jnp.abs(c))  # row [cᵀ, 0]
 
     return jnp.maximum(jnp.max(top_row_sums, initial=0.0), bottom_row_sum)
@@ -204,7 +213,7 @@ def _make_epoch_fn(
     def grad_primal_only(state):
         # Primal partial: c + Aᵀd (+ damping). One sparse matvec (Aᵀ @ d).
         dual = jnp.concatenate([state.dual_eq, state.dual_ineq])
-        ATd = lp.A_T @ dual
+        ATd = spmv(lp.A_T, dual)
         return lp.c + ATd + primal_damping * state.primal
 
     def grad_dual_only_from_Ax(Ax, state):
@@ -250,13 +259,13 @@ def _make_epoch_fn(
             dy_eq = cand.dual_eq - state.dual_eq
             dy_ineq = cand.dual_ineq - state.dual_ineq
             if diag_on:
-                move = k * jnp.vdot(dx, dx / t) + (1.0 / k) * (
-                    jnp.vdot(dy_eq, dy_eq / s_eq)
-                    + jnp.vdot(dy_ineq, dy_ineq / s_ineq)
+                move = k * _dot(dx, dx / t) + (1.0 / k) * (
+                    _dot(dy_eq, dy_eq / s_eq)
+                    + _dot(dy_ineq, dy_ineq / s_ineq)
                 )
             else:
-                move = k * jnp.vdot(dx, dx) + (1.0 / k) * (
-                    jnp.vdot(dy_eq, dy_eq) + jnp.vdot(dy_ineq, dy_ineq)
+                move = k * _dot(dx, dx) + (1.0 / k) * (
+                    _dot(dy_eq, dy_eq) + _dot(dy_ineq, dy_ineq)
                 )
             # No movement => any step is fine (avoid 0/0); flag with +inf so
             # the retry loop accepts and the eta-growth branch is suppressed.
@@ -280,7 +289,7 @@ def _make_epoch_fn(
                 x_new, roots = projection_primal(state.primal - tau * gp, roots)
             else:
                 x_new = projection_primal(state.primal - tau * gp)
-            Ax_new = lp.A @ x_new
+            Ax_new = spmv(lp.A, x_new)
             A_dx = Ax_new - Ax_old
             Ax_bar = Ax_old + (1.0 + theta) * A_dx
             gd_ineq, gd_eq = grad_dual_only_from_Ax(Ax_bar, state)
@@ -290,7 +299,7 @@ def _make_epoch_fn(
             if not adaptive_step:
                 return cand, None, Ax_new, roots
             dy = jnp.concatenate([dual_eq - state.dual_eq, dual_ineq - state.dual_ineq])
-            interaction = jnp.abs(jnp.vdot(dy, A_dx))
+            interaction = jnp.abs(_dot(dy, A_dx))
             return cand, _descent_bound(state, cand, k, interaction), Ax_new, roots
 
         def step(carry, _):
@@ -419,12 +428,12 @@ def _make_epoch_fn(
                 k0,
                 eta0,
                 anchor0,
-                lp.A @ anchor0.primal,
-                lp.A @ state.primal,
+                spmv(lp.A, anchor0.primal),
+                spmv(lp.A, state.primal),
             )
         else:
             k0, eta0 = opt_state
-            opt_state = (k0, eta0, lp.A @ state.primal)
+            opt_state = (k0, eta0, spmv(lp.A, state.primal))
         if exp_on:
             opt_state = opt_state + (jnp.full(lp.cones.exp, jnp.nan, state.primal.dtype),)
 
@@ -479,7 +488,7 @@ def _make_epoch_fn(
                     step_carry,
                     jnp.asarray(False),
                     jnp.asarray(False),
-                    jnp.asarray(jnp.inf, state.primal.dtype),
+                    jnp.asarray(jnp.inf, _wide(state.primal.dtype)),
                 ),
             )
         i, state, average_state, opt_state, total_weight = scan_out[:5]
@@ -502,7 +511,10 @@ _UNBOUNDED_EPOCHS = 2**30
 
 
 def _vector_norm(v, norm):
-    """‖v‖∞ (``norm="inf"``) or ‖v‖₂ (``"l2"``); 0 for an empty vector."""
+    """‖v‖∞ (``norm="inf"``) or ‖v‖₂ (``"l2"``); 0 for an empty vector.
+    Computed and returned in at least float32 (see ``_wide``)."""
+    v = jnp.asarray(v)
+    v = v.astype(_wide(v.dtype))
     if norm == "l2":
         return jnp.linalg.norm(v)
     return jnp.max(jnp.abs(v), initial=0.0)
@@ -794,8 +806,8 @@ def _device_solver(
             objective_value = (_report_c @ average_state.primal) * c_max
 
         dual_avg = jnp.concatenate([average_state.dual_eq, average_state.dual_ineq])
-        Ax_avg = lp.A @ average_state.primal
-        grad_primal = lp.c + lp.A_T @ dual_avg
+        Ax_avg = spmv(lp.A, average_state.primal)
+        grad_primal = lp.c + spmv(lp.A_T, dual_avg)
         Ax_minus_b = Ax_avg - lp.b
         grad_dual_eq = Ax_minus_b[: lp.n_eq]
         grad_dual_ineq = Ax_minus_b[lp.n_eq :]
@@ -1153,8 +1165,8 @@ def _device_solver(
     # starting symmetric.
     if k_init is None:
         # Kept on the device (no float()) so this runs under jit / vmap.
-        norm_c = jnp.linalg.norm(lp.c) + 1e-30
-        norm_b = jnp.linalg.norm(lp.b) + 1e-30
+        norm_c = _vector_norm(lp.c, "l2") + 1e-30
+        norm_b = _vector_norm(lp.b, "l2") + 1e-30
         k_init = jnp.clip(norm_c / norm_b, k_lo, k_hi)
 
     if initial_opt_state is not None:
@@ -1163,7 +1175,8 @@ def _device_solver(
         # Step-size state (k, eta); halpern also carries the anchor z_0
         # (cycle-start iterate), seeded from the initial solution and reset at
         # each restart.
-        _pik_dtype = initial_solution.primal.dtype
+        # k and eta are scalars: keep them at least float32 (see _wide).
+        _pik_dtype = _wide(initial_solution.primal.dtype)
         opt_state = (
             jnp.asarray(k_init, _pik_dtype),
             jnp.asarray(eta_init, _pik_dtype),
@@ -1253,17 +1266,23 @@ def _device_solver(
             ]
         )
         if diag is None:
-            move_p2 = jnp.vdot(dp, dp) + 1e-60
-            move_d2 = jnp.vdot(dd, dd) + 1e-60
+            move_p2 = _dot(dp, dp)
+            move_d2 = _dot(dd, dd)
         else:
             # diag_adapt: measure the movement in the metric the cycle ran
             # under (‖·‖_{t⁻¹}, ‖·‖_{s⁻¹}), matching the line search's `move`.
             t, s = diag
-            move_p2 = jnp.vdot(dp, dp / t) + 1e-60
-            move_d2 = jnp.vdot(dd, dd / s) + 1e-60
+            move_p2 = _dot(dp, dp / t)
+            move_d2 = _dot(dd, dd / s)
         # PDLP primal-weight update: omega = ||dy|| / ||dx|| under tau = eta/k,
-        # sigma = eta*k, balancing k||dx||^2 against ||dy||^2 / k.
-        k_target = jnp.sqrt(move_d2 / move_p2)
+        # sigma = eta*k, balancing k||dx||^2 against ||dy||^2 / k. If either
+        # side did not move, the ratio carries no information (0/0 = NaN, or
+        # 0 / inf): keep k. (A `+ 1e-60` guard only works in float64; it is 0
+        # in float32 and float16.)
+        moved = (move_p2 > 0) & (move_d2 > 0) & jnp.isfinite(move_p2 + move_d2)
+        k_target = jnp.where(
+            moved, jnp.sqrt(move_d2 / jnp.where(moved, move_p2, 1.0)), k_prev
+        )
         log_k = theta * jnp.log(k_target) + (1.0 - theta) * jnp.log(k_prev)
         return jnp.clip(jnp.exp(log_k), k_lo, k_hi)
 
@@ -2351,7 +2370,9 @@ def solve(
     # f64 under x64), which mismatches the profile dtype the LP data carries
     # (e.g. float16). Cast the state to match so the solve runs end-to-end in
     # the active precision instead of silently upcasting.
-    _state_dtype = lp.c.dtype
+    # Iterates are at least float32: float16 is only a storage format for the
+    # scaled LP data (see _wide).
+    _state_dtype = _wide(lp.c.dtype)
     initial_solution = SaddleState(
         primal=initial_solution.primal.astype(_state_dtype),
         dual_ineq=initial_solution.dual_ineq.astype(_state_dtype),
@@ -2458,7 +2479,9 @@ def solve(
         ),
     )
     programs = _solve_programs(lp.n_eq, lp.cones, tuple(settings.items()))
-    _state_dtype = lp.c.dtype
+    # Iterates are at least float32: float16 is only a storage format for the
+    # scaled LP data (see _wide).
+    _state_dtype = _wide(lp.c.dtype)
     problem = dict(
         lp=_lp_arrays(lp),
         c_true=c_true,
@@ -2863,7 +2886,7 @@ def make_solver(
         if eta == "auto":
             eta = 0.99 / estimate_augmented_spectral_norm(scaled)
 
-        state_dtype = scaled.c.dtype
+        state_dtype = _wide(scaled.c.dtype)
         row_scale_eq = dr[:n_eq].astype(state_dtype)
         row_scale_ineq = dr[n_eq:].astype(state_dtype)
         col_scale = dc.astype(state_dtype)
@@ -3067,7 +3090,7 @@ def make_optimal_value(build_lp, return_solution=False, **settings):
         x, y_eq, y_ineq = solution.primal, solution.dual_eq, solution.dual_ineq
         eq_rows, eq_cols = lp.A_eq.indices[:, 0], lp.A_eq.indices[:, 1]
         ineq_rows, ineq_cols = lp.A_ineq.indices[:, 0], lp.A_ineq.indices[:, 1]
-        reduced_cost = values.c + lp.A_T @ jnp.concatenate([y_eq, y_ineq])
+        reduced_cost = values.c + spmv(lp.A_T, jnp.concatenate([y_eq, y_ineq]))
         finite_lower = jnp.isfinite(values.lower_bounds)
         finite_upper = jnp.isfinite(values.upper_bounds)
         grad = LPValues(
@@ -3262,7 +3285,7 @@ def make_solution(build_lp, active_tol=1e-6, **settings):
             & ~at_lower
         )
         basic = ~(at_lower | at_upper)
-        slack = lp.A @ x - lp.b
+        slack = spmv(lp.A, x) - lp.b
         active_rows = row_has_entries & (
             (jnp.arange(m) < n_eq)
             | (jnp.abs(slack) <= active_tol * (1 + jnp.abs(lp.b)))
@@ -3276,7 +3299,7 @@ def make_solution(build_lp, active_tol=1e-6, **settings):
             g,
             vmap_method="sequential",
         )
-        w = g - lp.A_T @ lam
+        w = g - spmv(lp.A_T, lam)
         lam_eq, lam_ineq = lam[:n_eq], lam[n_eq:]
         grad = LPValues(
             c=jnp.zeros_like(x),
@@ -4077,7 +4100,10 @@ def to_jaddle_sparse(lp: LP):
 
     The vectors become JAX arrays and the constraint matrices JAX ``BCOO``
     sparse arrays, all in the dtype of the active precision profile (see
-    ``jaddle_optimisers.configure_jax``). ``solve`` converts an ``LP`` itself;
+    ``jaddle_optimisers.configure_jax``), but at least float32: under the
+    float16 profile only the scaled copy ``solve`` iterates on is stored in
+    float16, since raw coefficients and objectives overflow its range
+    (65504). ``solve`` converts an ``LP`` itself;
     call this to get at the ``JaddleLP``, e.g. for its ``values()``.
 
     It also runs on traced numbers (inside ``make_solver``'s ``build_lp``).
@@ -4092,7 +4118,7 @@ def to_jaddle_sparse(lp: LP):
     Returns:
         JaddleLP: The same LP on the device.
     """
-    float_dtype, _ = __profile_dtypes()
+    _, float_dtype = __profile_dtypes()
 
     lp_jax = JaddleLP(
         jnp.asarray(lp.c, dtype=float_dtype),
@@ -4694,12 +4720,12 @@ def project_onto_eq(lp: JaddleLP, primal: jnp.ndarray, tol=1e-6) -> jnp.ndarray:
 
     A_eq_T = lp.A_eq.transpose()
 
-    residual = lp.b_eq - lp.A_eq @ primal
+    residual = lp.b_eq - spmv(lp.A_eq, primal)
 
     def matvec(v):
-        return A_eq_T @ (lp.A_eq @ v)
+        return spmv(A_eq_T, spmv(lp.A_eq, v))
 
-    delta, info = gmres(matvec, A_eq_T @ residual, tol=tol)
+    delta, info = gmres(matvec, spmv(A_eq_T, residual), tol=tol)
 
     if info != 0:
         print(f"GMRES did not converge (info={info})")
@@ -5119,9 +5145,18 @@ def evaluate_lp_certificate(
         raise ValueError(
             f"dual_residual must be 'pdlp' or 'projected', got {dual_residual!r}"
         )
+    # Judge in at least float32: in float16, Ax - b rounds to exactly 0 for
+    # residuals below ~1e-3 relative, and objectives overflow above 65504.
+    wide = _wide(lp.c.dtype)
+    if wide != lp.c.dtype:
+        lp = lp.with_values(LPValues(*(v.astype(wide) for v in lp.values())))
+    primal, dual_eq, dual_ineq = (
+        jnp.asarray(v).astype(_wide(jnp.asarray(v).dtype))
+        for v in (primal, dual_eq, dual_ineq)
+    )
     dual = jnp.concatenate([dual_eq, dual_ineq])
-    Ax = lp.A @ primal
-    reduced_cost = lp.c + lp.A_T @ dual
+    Ax = spmv(lp.A, primal)
+    reduced_cost = lp.c + spmv(lp.A_T, dual)
     Ax_minus_b = Ax - lp.b
     grad_dual_eq = Ax_minus_b[: lp.n_eq]
     grad_dual_ineq = Ax_minus_b[lp.n_eq :]
@@ -5274,7 +5309,7 @@ def solve_dual_feasibility(
         # on stp3d: r=0 seed corrupted the polish within single-digit PDHG
         # iterations even though the warm y0 was already near-optimal).
         y0 = jnp.concatenate([y_eq0, y_ineq0])
-        r0 = lp.c + lp.A_T @ y0
+        r0 = lp.c + spmv(lp.A_T, y0)
         r0_rest = r0[rest_idx]
         r0_two_sided = r0[two_sided_idx]
         # r = r_plus - r_minus with both >= 0: seed the positive part on
@@ -5886,14 +5921,14 @@ def _correction_lp(base, lp, x, y_eq, y_ineq, scale_p, scale_d, fix_threshold=No
     result is always certified on the original LP."""
     n_eq = lp.n_eq
     y = jnp.concatenate([y_eq, y_ineq])
-    reduced_cost = scale_d * (lp.c + lp.A_T @ y)
+    reduced_cost = scale_d * (lp.c + spmv(lp.A_T, y))
     slack_cost = scale_d * y_ineq
     if fix_threshold is not None:
         lower, upper = lp.lower_bounds, lp.upper_bounds
         fix_lower = (scale_p * (x - lower) <= 1.0) & (reduced_cost >= fix_threshold)
         fix_upper = (scale_p * (upper - x) <= 1.0) & (reduced_cost <= -fix_threshold)
         x = jnp.where(fix_lower, lower, jnp.where(fix_upper, upper, x))
-    Ax = lp.A @ x
+    Ax = spmv(lp.A, x)
     slack = jnp.maximum(lp.b[n_eq:] - Ax[n_eq:], 0.0)
     if fix_threshold is not None:
         fix_slack = (scale_p * slack <= 1.0) & (slack_cost >= fix_threshold)
@@ -6248,7 +6283,7 @@ def evaluate_infeasibility_certificate(
     # Farkas ray. A positive q_j is bounded below only by a finite lower
     # bound, a negative one only by a finite upper bound.
     y = jnp.concatenate([y_eq, y_ineq])
-    q = lp.A_T @ y
+    q = spmv(lp.A_T, y)
     absorb_lower = (q > 0.0) & finite_lower
     absorb_upper = (q < 0.0) & finite_upper
     box_infimum = jnp.where(
@@ -6271,7 +6306,7 @@ def evaluate_infeasibility_certificate(
     )
 
     # Unbounded ray.
-    Ad = lp.A @ d
+    Ad = spmv(lp.A, d)
     primal_ray_objective = lp.c @ d
     primal_ray_infeasibility = jnp.maximum(
         jnp.max(jnp.abs(Ad[: lp.n_eq]), initial=0.0),

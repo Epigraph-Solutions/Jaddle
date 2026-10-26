@@ -216,6 +216,27 @@ def test_accepts_jaddle_lp():
     assert_certified(lp, result, reference_objective(lp))
 
 
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16, jnp.float32])
+def test_spmv(dtype):
+    from jaddle.jaddle_basic_types import scipy_to_bcoo, spmv
+
+    rng = np.random.default_rng(0)
+    S = sp.random(60, 40, density=0.2, random_state=1, format="csr")
+    A = scipy_to_bcoo(S, dtype)
+    x = jnp.asarray(rng.standard_normal(40), dtype)
+    y = spmv(A, x)
+    assert y.dtype == dtype
+    expected = S @ np.asarray(x, np.float64)
+    tol = 1e-5 if dtype == jnp.float32 else 2e-2
+    np.testing.assert_allclose(np.asarray(y, np.float64), expected, rtol=tol, atol=tol)
+    # Batched and vmapped inputs give the same result as one at a time.
+    X = jnp.stack([x, 2 * x], axis=1)
+    np.testing.assert_array_equal(spmv(A, X)[:, 0], y)
+    np.testing.assert_array_equal(jax.vmap(lambda v: spmv(A, v))(X.T)[0], y)
+    if dtype == jnp.float32:
+        np.testing.assert_array_equal(y, A @ x)
+
+
 def test_epoch_budget():
     result = solve(random_lp(), tol=1e-12, max_epochs=1)
     assert not result["converged"]

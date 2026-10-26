@@ -5,7 +5,7 @@ from optax.projections import projection_non_negative, projection_box
 import optax
 from typing import NamedTuple
 import time
-from jaddle.jaddle_basic_types import JaddleCP, SaddleState
+from jaddle.jaddle_basic_types import JaddleCP, SaddleState, _dot, _wide
 import jaddle.jaddle_optimisers as jo
 from jaddle import jaddle_export as _export
 import numpy as np
@@ -115,7 +115,7 @@ def _gradient_scales(cp, x0, probes):
             1.0,
         )
 
-    return scale(jnp.vdot(grad_f, grad_f)), scale(row_norm2)
+    return scale(_dot(grad_f, grad_f)), scale(row_norm2)
 
 
 def _gradient_scaled(cp, x0, probes):
@@ -196,7 +196,7 @@ def _init_k_slot(k, eta, state, update_mode):
     # pdhg and alternating validate each step one iteration late: z_prev is
     # the iterate the current one was stepped from (at step eta), F_prev the
     # saddle operator there. valid=False (fresh start / restart) skips the check once.
-    dtype = state.primal.dtype
+    dtype = _wide(state.primal.dtype)  # scalars at least float32
     k = jnp.asarray(k, dtype)
     if eta is None:
         return k
@@ -395,20 +395,20 @@ def _make_epoch_fn(
             # T = (eta/k) diag(t), Σ = eta k diag(s).
             def _znorm2(p, de, di, k):
                 if diag_on:
-                    return k * jnp.vdot(p, p / t) + (1.0 / k) * (
-                        jnp.vdot(de, de / s_eq) + jnp.vdot(di, di / s_ineq)
+                    return k * _dot(p, p / t) + (1.0 / k) * (
+                        _dot(de, de / s_eq) + _dot(di, di / s_ineq)
                     )
-                return k * jnp.vdot(p, p) + (1.0 / k) * (
-                    jnp.vdot(de, de) + jnp.vdot(di, di)
+                return k * _dot(p, p) + (1.0 / k) * (
+                    _dot(de, de) + _dot(di, di)
                 )
 
             def _gnorm2(p, de, di, k):
                 if diag_on:
-                    return (1.0 / k) * jnp.vdot(p, p * t) + k * (
-                        jnp.vdot(de, de * s_eq) + jnp.vdot(di, di * s_ineq)
+                    return (1.0 / k) * _dot(p, p * t) + k * (
+                        _dot(de, de * s_eq) + _dot(di, di * s_ineq)
                     )
-                return (1.0 / k) * jnp.vdot(p, p) + k * (
-                    jnp.vdot(de, de) + jnp.vdot(di, di)
+                return (1.0 / k) * _dot(p, p) + k * (
+                    _dot(de, de) + _dot(di, di)
                 )
 
             def _advance_eta(eta_bar, eta0, ip1):
@@ -990,8 +990,8 @@ def _device_solver(
             return c, b
 
         c, b = jax.jit(_k_init_fn)(zero)
-        norm_c2 = jnp.vdot(c, c)
-        norm_b2 = jnp.vdot(b, b)
+        norm_c2 = _dot(c, c)
+        norm_b2 = _dot(b, b)
         # Kept on the device (no float()) so this runs under jit / vmap. As in
         # PDLP, a zero norm (e.g. constraints with no constant term, b = 0)
         # gives k = 1: the ratio would sit at the clamp, which under the wide
@@ -1044,14 +1044,20 @@ def _device_solver(
             ]
         )
         if diag is None:
-            move_p2 = jnp.vdot(dp, dp) + 1e-60
-            move_d2 = jnp.vdot(dd, dd) + 1e-60
+            move_p2 = _dot(dp, dp)
+            move_d2 = _dot(dd, dd)
         else:
             # diag_adapt: movement in the metric the cycle ran under.
             t, s = diag
-            move_p2 = jnp.vdot(dp, dp / t) + 1e-60
-            move_d2 = jnp.vdot(dd, dd / s) + 1e-60
-        k_target = jnp.sqrt(move_d2 / move_p2)
+            move_p2 = _dot(dp, dp / t)
+            move_d2 = _dot(dd, dd / s)
+        # If either side did not move, the ratio carries no information
+        # (0/0 = NaN, or 0 / inf): keep k. (A `+ 1e-60` guard only works in
+        # float64; it is 0 in float32 and float16.)
+        moved = (move_p2 > 0) & (move_d2 > 0) & jnp.isfinite(move_p2 + move_d2)
+        k_target = jnp.where(
+            moved, jnp.sqrt(move_d2 / jnp.where(moved, move_p2, 1.0)), k_prev
+        )
         log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(k_prev)
         return jnp.clip(jnp.exp(log_k), k_lo, k_hi)
 
@@ -2241,7 +2247,7 @@ def make_solution(build_cp, active_tol=1e-6, gmres_tol=1e-10, **settings):
             transpose_jacobian, rhs, tol=gmres_tol, atol=0.0, restart=50, maxiter=50
         )
         residual = jax.tree.map(lambda a, b: a - b, transpose_jacobian(w), rhs)
-        flat_norm = lambda t: jnp.sqrt(sum(jnp.vdot(a, a) for a in jax.tree.leaves(t)))
+        flat_norm = lambda t: jnp.sqrt(sum(_dot(a, a) for a in jax.tree.leaves(t)))
         ok = flat_norm(residual) <= 1e3 * gmres_tol * (1 + flat_norm(rhs))
 
         _, vjp_params = jax.vjp(lambda p: kkt(z, p, masks), params)
@@ -2359,6 +2365,11 @@ def _matvec(M, v):
     return M @ v
 
 
+def _norm(v):
+    """‖v‖₂ computed in at least float32 (see ``_wide``)."""
+    return jnp.sqrt(_dot(v, v))
+
+
 def _scaled_qp_cp(matrices, c_s, b_eq_s, b_ineq_s, c_norm, b_norm):
     """The ``JaddleCP`` of a KKT-scaled QP, with the QP certificate (in the
     problem's own units) as its ``residuals``. ``matrices`` is
@@ -2393,10 +2404,10 @@ def _scaled_qp_cp(matrices, c_s, b_eq_s, b_ineq_s, c_norm, b_norm):
             reduced_cost
             * jnp.where(at_lower, lower_s, jnp.where(at_upper, upper_s, 0.0))
         )
-        dual_residual = jnp.linalg.norm(
+        dual_residual = _norm(
             jnp.where(at_lower | at_upper, 0.0, reduced_cost) / d
         )
-        primal_residual = jnp.linalg.norm(
+        primal_residual = _norm(
             jnp.concatenate(
                 [
                     (_matvec(A_eq_s, x) - b_eq_s) / e_eq,
@@ -2412,7 +2423,7 @@ def _scaled_qp_cp(matrices, c_s, b_eq_s, b_ineq_s, c_norm, b_norm):
             + bound_term
         )
         return (
-            dual_residual / (1 + jnp.maximum(c_norm, jnp.linalg.norm(Qx / d))),
+            dual_residual / (1 + jnp.maximum(c_norm, _norm(Qx / d))),
             primal_residual / (1 + b_norm),
             jnp.abs(primal_objective - dual_objective)
             / (1 + jnp.abs(primal_objective) + jnp.abs(dual_objective)),
@@ -2462,15 +2473,18 @@ def _scale_qp(
         Q, sp.vstack([A_eq, A_ineq]), ruiz_iterations, pc_iterations
     )
     D = sp.diags(d)
-    dtype = jo.jaddle_dtype()
+    # Under the float16 profile only the matrices are stored in half
+    # precision; the vectors, and so the iterates, are at least float32.
+    matrix_dtype = jo.jaddle_dtype()
+    dtype = _wide(matrix_dtype)
     A_eq_scipy = sp.diags(e[:m_eq]) @ A_eq @ D
     A_ineq_scipy = sp.diags(e[m_eq:]) @ A_ineq @ D
     matrices = (
-        _device_matrix(D @ Q @ D, dtype),
-        _device_matrix(A_eq_scipy, dtype),
-        _device_matrix(A_eq_scipy.T, dtype),
-        _device_matrix(A_ineq_scipy, dtype),
-        _device_matrix(A_ineq_scipy.T, dtype),
+        _device_matrix(D @ Q @ D, matrix_dtype),
+        _device_matrix(A_eq_scipy, matrix_dtype),
+        _device_matrix(A_eq_scipy.T, matrix_dtype),
+        _device_matrix(A_ineq_scipy, matrix_dtype),
+        _device_matrix(A_ineq_scipy.T, matrix_dtype),
         jnp.asarray(lower / d, dtype=dtype),
         jnp.asarray(upper / d, dtype=dtype),
         jnp.asarray(d, dtype=dtype),
@@ -2527,6 +2541,12 @@ def quadratic_program(
     gap relative to ``1 + |primal| + |dual|``, where the dual objective is the
     Lagrangian bound with the quadratic linearised at ``x``.
 
+    Under the float16 profile the scaled matrices are stored in half precision
+    (the vectors and iterates in float32), so the solver meets its tolerances
+    on matrices rounded to about 3 significant digits. ``"converged"`` then
+    also requires the ``"certificate"``, computed from the matrices as given,
+    to meet them.
+
     Returns ``solve()``'s dict, with these keys replaced or added:
 
     * ``"solution"``: a ``SaddleState`` in the problem's own units. The
@@ -2557,7 +2577,7 @@ def quadratic_program(
     m_eq = A_eq.shape[0]
     b_eq = np.asarray(b_eq, dtype=np.float64) if m_eq else np.zeros(0)
     b_ineq = np.asarray(b_ineq, dtype=np.float64) if A_ineq.shape[0] else np.zeros(0)
-    dtype = jo.jaddle_dtype()
+    dtype = _wide(jo.jaddle_dtype())  # iterates at least float32
     cp = _scaled_qp_cp(
         matrices,
         jnp.asarray(d * c, dtype=dtype),
@@ -2600,6 +2620,17 @@ def quadratic_program(
     result.update(
         solution=solution, objective=certificate["objective"], certificate=certificate
     )
+    if jnp.dtype(jo.jaddle_dtype()).itemsize < 4:
+        # Under the float16 profile the solver met its tolerances on matrices
+        # rounded to ~3 digits; judge the answer on the QP as given.
+        result["converged"] = bool(
+            result["converged"]
+            and certificate["relative_primal_feasibility_residual"]
+            <= primal_feasibility_tolerance
+            and certificate["relative_dual_feasibility_residual"]
+            <= dual_feasibility_tolerance
+            and certificate["relative_gap"] <= dual_gap_tolerance
+        )
     return result
 
 
@@ -2659,7 +2690,7 @@ def make_qp_solver(
         pc_iterations,
     )
     m_eq, m_ineq = A_eq.shape[0], A_ineq.shape[0]
-    dtype = jo.jaddle_dtype()
+    dtype = _wide(jo.jaddle_dtype())  # iterates at least float32
     d = jnp.asarray(d, dtype=dtype)
     e_eq, e_ineq = jnp.asarray(e[:m_eq], dtype=dtype), jnp.asarray(e[m_eq:], dtype=dtype)
 
