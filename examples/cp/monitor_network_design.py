@@ -111,7 +111,9 @@ def load_year(year):
     index = {site: i for i, site in enumerate(info)}
     values = np.full((days, len(info)), np.nan)
     for (site, date), v in readings.items():
-        values[(datetime.date.fromisoformat(date) - start).days, index[site]] = np.mean(v)
+        values[(datetime.date.fromisoformat(date) - start).days, index[site]] = np.mean(
+            v
+        )
     return info, list(index), values
 
 
@@ -194,7 +196,9 @@ def fit_factor_model(y, p):
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)
     top = np.argsort(eigenvalues)[::-1][:p]
     W = eigenvectors[:, top] * np.sqrt(eigenvalues[top])
-    d = np.maximum(np.diag(covariance) - np.sum(W**2, axis=1), 0.05 * np.diag(covariance))
+    d = np.maximum(
+        np.diag(covariance) - np.sum(W**2, axis=1), 0.05 * np.diag(covariance)
+    )
     return mu, W, d
 
 
@@ -223,7 +227,9 @@ def errors(selected, model, y):
 
 
 def random_network(k):
-    return np.isin(np.arange(m), rng.choice(np.flatnonzero(candidate), k, replace=False))
+    return np.isin(
+        np.arange(m), rng.choice(np.flatnonzero(candidate), k, replace=False)
+    )
 
 
 week = np.arange(len(train_y)) // 7
@@ -231,7 +237,9 @@ random_networks = [random_network(50) for _ in range(5)]
 print("Factors  log RMSE on held-out 2023 weeks")
 for p_try in (5, 10, 20, 30, 40, 60):
     model = fit_factor_model(train_y[week % 2 == 1], p_try)
-    score = np.mean([errors(s, model, train_y[week % 2 == 0])[0] for s in random_networks])
+    score = np.mean(
+        [errors(s, model, train_y[week % 2 == 0])[0] for s in random_networks]
+    )
     print(f"{p_try:7d}  {score:.4f}")
 
 # %% [markdown]
@@ -243,7 +251,9 @@ p = 20
 mu, W, d = fit_factor_model(train_y, p)
 model = (mu, W, d)
 C = W[target].T @ W[target]
-print(f"{p} factors explain {np.sum(W**2) / (np.sum(W**2) + d.sum()):.0%} of the variance")
+print(
+    f"{p} factors explain {np.sum(W**2) / (np.sum(W**2) + d.sum()):.0%} of the variance"
+)
 
 # %% [markdown]
 # ## The design problem
@@ -331,13 +341,17 @@ print(
     f"Converged: {result['converged']} after {result['epochs']} epochs "
     f"({time.perf_counter() - start:.1f} s including compilation)"
 )
-print(f"Σz = {z_relaxed.sum():.6f}, z in [{z_relaxed.min():.2e}, {z_relaxed.max():.6f}]")
+print(
+    f"Σz = {z_relaxed.sum():.6f}, z in [{z_relaxed.min():.2e}, {z_relaxed.max():.6f}]"
+)
 print(
     f"{np.sum(z_relaxed > 1 - 1e-4)} sites at 1, "
     f"{np.sum((z_relaxed > 1e-4) & (z_relaxed < 1 - 1e-4))} fractional, "
     f"the other candidates at 0"
 )
-print(f"Relaxed optimum: φ = {bound:.5f}, a lower bound for every {BUDGET}-monitor network")
+print(
+    f"Relaxed optimum: φ = {bound:.5f}, a lower bound for every {BUDGET}-monitor network"
+)
 
 # %% [markdown]
 # The optimality conditions are easy to read off. With `ν` the dual of
@@ -351,8 +365,12 @@ nu = float(result["solution"].dual_eq[0]) * float(scale)
 fractional = (z_relaxed > 1e-4) & (z_relaxed < 1 - 1e-4)
 print(f"ν = {nu:.3e}")
 print(f"fractional: max |∂φ/∂z + ν| = {np.max(np.abs(gradient[fractional] + nu)):.1e}")
-print(f"at 0:       min (∂φ/∂z + ν) = {np.min(gradient[candidate & (z_relaxed <= 1e-4)] + nu):.1e}")
-print(f"at 1:       max (∂φ/∂z + ν) = {np.max(gradient[z_relaxed >= 1 - 1e-4] + nu):.1e}")
+print(
+    f"at 0:       min (∂φ/∂z + ν) = {np.min(gradient[candidate & (z_relaxed <= 1e-4)] + nu):.1e}"
+)
+print(
+    f"at 1:       max (∂φ/∂z + ν) = {np.max(gradient[z_relaxed >= 1 - 1e-4] + nu):.1e}"
+)
 
 # %% [markdown]
 # ## From the relaxation to a network
@@ -400,7 +418,9 @@ def exchange_values(selected, criterion="I"):
         b = jnp.diag(B)
         tr_CM = jnp.trace(C @ M)
         add = (tr_CM - b / (1 + a)) / trace_C
-        numerator = (a[:, None] - 1) * b[None, :] - 2 * A * B + (1 + a[None, :]) * b[:, None]
+        numerator = (
+            (a[:, None] - 1) * b[None, :] - 2 * A * B + (1 + a[None, :]) * b[:, None]
+        )
         swap = (tr_CM - numerator / det_K) / trace_C
     else:
         logdet = -jnp.linalg.slogdet(M)[1]
@@ -495,7 +515,15 @@ print(
 # %%
 def spread_out(k):
     xy = np.c_[lon * np.cos(np.deg2rad(lat)), lat]
-    chosen = [int(np.argmin(np.where(candidate, np.linalg.norm(xy - xy.mean(axis=0), axis=1), np.inf)))]
+    chosen = [
+        int(
+            np.argmin(
+                np.where(
+                    candidate, np.linalg.norm(xy - xy.mean(axis=0), axis=1), np.inf
+                )
+            )
+        )
+    ]
     distance = np.where(candidate, np.linalg.norm(xy - xy[chosen[0]], axis=1), -np.inf)
     for _ in range(k - 1):
         chosen.append(int(np.argmax(distance)))
@@ -537,7 +565,9 @@ for name, selected in networks.items():
     log_rmse, ug_rmse = errors(selected, model, test_y)
     print(f"{name:22s} {value(selected):10.4f}  {log_rmse:15.4f} {ug_rmse:8.2f}")
     if name == "No monitors":
-        print(f"{'Random (mean of 20)':22s} {random_phi:10.4f}  {random_errors[0]:15.4f} {random_errors[1]:8.2f}")
+        print(
+            f"{'Random (mean of 20)':22s} {random_phi:10.4f}  {random_errors[0]:15.4f} {random_errors[1]:8.2f}"
+        )
 print(f"{'Relaxation bound':22s} {bound:10.4f}")
 
 # %% [markdown]
@@ -563,13 +593,26 @@ print(f"{'Relaxation bound':22s} {bound:10.4f}")
 
 # %%
 fig, ax = plt.subplots(figsize=(11, 6))
-ax.scatter(lon[target], lat[target], marker="x", s=14, color="grey", label="Target sites")
+ax.scatter(
+    lon[target], lat[target], marker="x", s=14, color="grey", label="Target sites"
+)
 points = ax.scatter(
-    lon[candidate], lat[candidate], c=z_relaxed[candidate], cmap="viridis", s=14, vmin=0, vmax=1
+    lon[candidate],
+    lat[candidate],
+    c=z_relaxed[candidate],
+    cmap="viridis",
+    s=14,
+    vmin=0,
+    vmax=1,
 )
 ax.scatter(
-    lon[designed], lat[designed], s=90, facecolors="none", edgecolors="C3",
-    linewidths=1.5, label=f"Chosen network ({BUDGET} sites)",
+    lon[designed],
+    lat[designed],
+    s=90,
+    facecolors="none",
+    edgecolors="C3",
+    linewidths=1.5,
+    label=f"Chosen network ({BUDGET} sites)",
 )
 fig.colorbar(points, ax=ax, label="Relaxed weight zᵢ")
 ax.set_xlabel("Longitude")
@@ -595,7 +638,9 @@ plt.show()
 budgets = np.unique(np.round(np.geomspace(5, 150, 16)))
 scales = jax.vmap(uniform_value, in_axes=(0, None))(jnp.asarray(budgets), d_j)
 sweep = jax.jit(
-    jax.vmap(jc.make_solver(build_cp, max_epochs=1000, **tolerances), in_axes=((0, 0, None),))
+    jax.vmap(
+        jc.make_solver(build_cp, max_epochs=1000, **tolerances), in_axes=((0, 0, None),)
+    )
 )
 start = time.perf_counter()
 curve = sweep((jnp.asarray(budgets), scales, d_j))
@@ -604,10 +649,15 @@ print(
     f"{len(budgets)} budgets in {time.perf_counter() - start:.1f} s, "
     f"converged: {int(curve.converged.sum())}/{len(budgets)}"
 )
-curve_bound = np.asarray(jax.vmap(i_criterion, in_axes=(0, None))(curve.solution.primal, d_j))
+curve_bound = np.asarray(
+    jax.vmap(i_criterion, in_axes=(0, None))(curve.solution.primal, d_j)
+)
 marginal = np.asarray(curve.solution.dual_eq[:, 0] * scales)
 
-exchanged = [exchange(top_k(z, int(k)))[0] for z, k in zip(np.asarray(curve.solution.primal), budgets)]
+exchanged = [
+    exchange(top_k(z, int(k)))[0]
+    for z, k in zip(np.asarray(curve.solution.primal), budgets)
+]
 greedy = [np.isin(np.arange(m), greedy_order[: int(k)]) for k in budgets]
 randoms = [[random_network(int(k)) for _ in range(10)] for k in budgets]
 phi = {
@@ -618,11 +668,15 @@ phi = {
 rmse = {
     "I-optimal (exchanged)": [errors(s, model, test_y)[1] for s in exchanged],
     "Greedy": [errors(s, model, test_y)[1] for s in greedy],
-    "Random (mean of 10)": [np.mean([errors(s, model, test_y)[1] for s in r]) for r in randoms],
+    "Random (mean of 10)": [
+        np.mean([errors(s, model, test_y)[1] for s in r]) for r in randoms
+    ],
 }
 gap = np.array(phi["I-optimal (exchanged)"]) / curve_bound - 1
 print("Budget   bound φ   exchanged φ   gap    greedy φ   ν (per monitor)")
-for row in zip(budgets, curve_bound, phi["I-optimal (exchanged)"], gap, phi["Greedy"], marginal):
+for row in zip(
+    budgets, curve_bound, phi["I-optimal (exchanged)"], gap, phi["Greedy"], marginal
+):
     print("{:6.0f} {:9.4f} {:12.4f} {:7.1%} {:10.4f} {:12.2e}".format(*row))
 
 # %%
@@ -637,7 +691,12 @@ ax_phi.set_ylabel("Unexplained regional variance φ")
 ax_phi.set_title("Design criterion (2023 model)")
 ax_phi.legend()
 
-ax_rmse.axhline(errors(np.zeros(m, bool), model, test_y)[1], color="grey", ls=":", label="No monitors")
+ax_rmse.axhline(
+    errors(np.zeros(m, bool), model, test_y)[1],
+    color="grey",
+    ls=":",
+    label="No monitors",
+)
 for (label, values), style in zip(rmse.items(), ("o-", "s-", "^-")):
     ax_rmse.plot(budgets, values, style, ms=4, label=label)
 ax_rmse.set_xscale("log")
@@ -694,7 +753,8 @@ start = time.perf_counter()
 d_value_dk, _, d_value_dd = jax.grad(optimal_value)((float(BUDGET), scale, d_j))
 print(f"Gradient in {time.perf_counter() - start:.1f} s")
 finite_difference = (
-    optimal_value((BUDGET + 1.0, scale, d_j)) - optimal_value((BUDGET - 1.0, scale, d_j))
+    optimal_value((BUDGET + 1.0, scale, d_j))
+    - optimal_value((BUDGET - 1.0, scale, d_j))
 ) / 2
 print(
     f"dφ*/dk: gradient {float(d_value_dk * scale):.4e}, "
@@ -703,10 +763,14 @@ print(
 
 # How much φ* would fall if site i's dᵢ were 10% smaller.
 gain = 0.1 * np.asarray(d_value_dd * scale) * d
-print("\nSites whose local noise costs the network most (fall in φ* for 10% less noise):")
+print(
+    "\nSites whose local noise costs the network most (fall in φ* for 10% less noise):"
+)
 for i in np.argsort(-gain)[:5]:
     print(f"  {names[i]:50s} z = {z_relaxed[i]:.2f}   {gain[i]:.2e}")
-print(f"Sites with no derivative (targets, and candidates the design leaves out): {np.sum(np.abs(gain) < 1e-12)}")
+print(
+    f"Sites with no derivative (targets, and candidates the design leaves out): {np.sum(np.abs(gain) < 1e-12)}"
+)
 
 # %% [markdown]
 # Only the sites in the relaxed design have a nonzero derivative: a quieter
