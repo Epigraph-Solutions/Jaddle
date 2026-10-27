@@ -3457,11 +3457,13 @@ def load_lp(path, dtype=None):
     )
 
 
-def _highs_model(model, highs_options=None):
+def _highs_model(model, highs_options=None, relax_integrality=True):
     """A ``highspy.Highs`` holding the LP relaxation of ``model``: a path to a
     file HiGHS reads, a ``highspy.Highs`` with a model loaded (used in place),
     a ``highspy.HighsLp``, or a Jaddle ``LP`` / ``JaddleLP``. Output is off
-    unless ``highs_options`` (a dict of HiGHS options) turns it on."""
+    unless ``highs_options`` (a dict of HiGHS options) turns it on.
+    ``relax_integrality=False`` keeps the integer columns (for
+    ``jaddle_mip``)."""
     import highspy
     from jaddle import highs_helpers as hh
 
@@ -3478,7 +3480,7 @@ def _highs_model(model, highs_options=None):
     elif not isinstance(model, highspy.Highs):
         raise TypeError(f"unsupported model type {type(model).__name__}")
     n = highs.getNumCol()
-    if n:
+    if n and relax_integrality:
         highs.changeColsIntegrality(
             n, np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.uint8)
         )

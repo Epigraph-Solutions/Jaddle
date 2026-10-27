@@ -172,11 +172,32 @@ def standard_form_basis_to_highs(basis, row_lower, row_upper):
     return out
 
 
-def jaddle_lp_to_highs(lp):
+def highs_integrality(lp: hspy.HighsLp):
+    """The integer columns of a ``highspy.HighsLp`` as a boolean mask. A model
+    with no integrality information is all continuous. Implicit integers
+    (which HiGHS's presolve can produce) count as integers. Semi-continuous
+    and semi-integer columns raise ``NotImplementedError``."""
+    n = lp.num_col_
+    kinds = list(lp.integrality_)
+    if not kinds:
+        return np.zeros(n, dtype=bool)
+    VT = hspy.HighsVarType
+    unsupported = {VT.kSemiContinuous, VT.kSemiInteger}
+    if any(kind in unsupported for kind in kinds):
+        raise NotImplementedError(
+            "semi-continuous and semi-integer variables are not supported"
+        )
+    return np.array(
+        [kind in (VT.kInteger, VT.kImplicitInteger) for kind in kinds], dtype=bool
+    )
+
+
+def jaddle_lp_to_highs(lp, integrality=None):
     """A ``highspy.HighsLp`` for a Jaddle ``LP`` / ``JaddleLP``: the equality
     rows (``b_eq <= a.x <= b_eq``) then the inequality rows
     (``a.x <= b_ineq``). ``rows_to_standard_form`` maps it back to the same rows in the
-    same order."""
+    same order. ``integrality`` (a boolean mask of the integer columns) makes
+    it a MIP."""
     if isinstance(lp, JaddleLP):
         A_eq = sp.csr_matrix(
             (np.asarray(lp.A_eq.data), np.asarray(lp.A_eq.indices).T),
@@ -207,4 +228,9 @@ def jaddle_lp_to_highs(lp):
     out.a_matrix_.value_ = A.data
     out.a_matrix_.num_col_ = A.shape[1]
     out.a_matrix_.num_row_ = A.shape[0]
+    if integrality is not None:
+        VT = hspy.HighsVarType
+        out.integrality_ = [
+            VT.kInteger if flag else VT.kContinuous for flag in np.asarray(integrality)
+        ]
     return out

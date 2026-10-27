@@ -4,6 +4,25 @@
 
 ### Added
 
+- `jaddle.jaddle_mip`: a branch-and-bound solver for mixed-integer linear
+  programs, with `jaddle_linear.solve` at every node.
+  - `MIP` holds a Jaddle LP and a mask of integer columns, plus the
+    objective constant and sense. `load` and `from_highs` read one from any
+    model HiGHS reads (MPS/LP files, `highspy.Highs`, `highspy.HighsLp`),
+    keeping its integrality, optionally after HiGHS's presolve; `to_highs`
+    goes the other way.
+  - `solve` runs the search: activity-based bound propagation at the root
+    and at every child, warm-started node LPs, pseudocost or
+    most-fractional branching, a dive to the first incumbent and then
+    best-bound search, a rounding heuristic (with an LP repair of the
+    continuous variables), and HiGHS presolve and postsolve with
+    `presolve=True`.
+  - Nodes are pruned on the Lagrangian bound of their duals
+    (`lagrangian_bound`), which is valid for approximate first-order
+    solutions and for LPs that did not converge.
+  - `examples/mip/facility_location.py` and `examples/mip/miplib.py`.
+- `highs_helpers.highs_integrality` reads a HiGHS model's integer columns,
+  and `highs_helpers.jaddle_lp_to_highs` takes an optional `integrality`.
 - `examples/cp/monitor_network_design.py`: optimal experimental design on
   open data. It chooses which of 470 candidate EPA PM2.5 sites to monitor so
   that the daily PM2.5 at 235 held-out target sites is predicted best. A

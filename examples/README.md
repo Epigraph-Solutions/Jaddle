@@ -4,6 +4,8 @@ Short, self-contained scripts that show how to set up and solve problems with
 Jaddle. They are grouped by solver:
 
 - [`lp/`](lp/): linear programs, solved with `jaddle.jaddle_linear`
+- [`mip/`](mip/): mixed-integer linear programs, solved by branch and bound
+  with `jaddle.jaddle_mip`
 - [`conic/`](conic/): second-order cone, semidefinite and exponential cone programs, solved with
   `jaddle.jaddle_linear` on cone-constrained variables
 - [`cp/`](cp/): general convex programs, solved with `jaddle.jaddle_convex`
@@ -78,6 +80,18 @@ bring the daily cost from $6.02 with no battery to $3.83. The problem is not
 convex, so the example repeats the run from an oversized battery: the two
 runs agree within 0.03% in cost (14.3 kWh against 14.6 kWh; the cost is flat
 near the optimum). It takes about 50 seconds on a CPU.
+
+## Mixed-integer programs (`mip/`)
+
+| Example | What it shows | Extra dependencies |
+|---|---|---|
+| [`facility_location.py`](mip/facility_location.py) | Capacitated facility location: binary site openings and continuous shipments, built as a `jm.MIP` from NumPy/SciPy arrays and solved with `jm.solve`. Prints the progress log, the sites opened and their loads, and checks the cost against HiGHS through `jm.to_highs`. | — |
+| [`miplib.py`](mip/miplib.py) | Load a MIPLIB instance with its integrality, run branch and bound on HiGHS's presolved MIP with a time limit, postsolve the incumbent, and compare with HiGHS's branch and cut under the same limit. | a MIPLIB `.mps` file |
+
+The MIPLIB example reads `data/<PROBLEM_NAME>.mps` (default `ns1830653`,
+5 minutes). Jaddle's branch and bound has no cutting planes and only a
+rounding heuristic, so on most MIPLIB instances it reports a valid bound and
+leaves a gap.
 
 ## Conic programs (`conic/`)
 

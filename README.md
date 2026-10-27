@@ -19,6 +19,9 @@ It provides two solvers:
   user supplies the objective and constraints as ordinary JAX functions, and
   Jaddle derives everything else by automatic differentiation.
 
+On top of the LP solver, **`jaddle.jaddle_mip`** is a simple branch-and-bound
+solver for mixed-integer linear programs.
+
 Both solvers run unchanged on CPU, GPU and TPU. Jaddle is not intended to
 replace a commercial or production-grade solver. It aims to be a compact,
 readable and hackable platform for first-order optimisation that still holds
@@ -30,6 +33,7 @@ up on demanding benchmarks.
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [The linear programming solver](#the-linear-programming-solver)
+- [The mixed-integer solver](#the-mixed-integer-solver)
 - [The convex programming solver](#the-convex-programming-solver)
 - [Modelling with CVXPY](#modelling-with-cvxpy)
 - [Numerical precision](#numerical-precision)
@@ -480,6 +484,112 @@ second-order, PSD and exponential constraints go through
 `jcv.JaddleConicSolver` (see
 [Modelling with CVXPY](#modelling-with-cvxpy)).
 
+## The mixed-integer solver
+
+`jaddle.jaddle_mip` is a simple branch-and-bound solver for mixed-integer
+linear programs, with `jaddle_linear.solve` solving the LP at every node.
+It is meant as a readable starting point, not a competitor to branch-and-cut
+codes: there are no cutting planes, and the only primal heuristic is
+rounding.
+
+### Problem form
+
+A `MIP` is a Jaddle LP in the standard form above plus a boolean mask of
+integer columns:
+
+```python
+import jaddle.jaddle_mip as jm
+
+mip = jm.MIP(lp, integrality)          # lp: a jl.LP or JaddleLP
+mip = jm.load("model.mps")             # any file HiGHS reads, integrality kept
+mip = jm.from_highs(highs)             # a highspy.Highs or HighsLp
+result = jm.solve(mip, verbose=True)   # or jm.solve("model.mps", presolve=True)
+```
+
+`MIP` keeps the objective constant (`offset`) and whether the model was a
+maximisation, so `mip.objective(x)` and the solver's reported values are in
+the model's own sense. The bounds of integer variables are rounded inward.
+`jm.to_highs(mip)` turns a `MIP` back into a HiGHS model, for example to
+compare against HiGHS's own MIP solver. Semi-continuous and semi-integer
+columns are not supported.
+
+### Algorithm
+
+- **Bound propagation.** Activity-based bound tightening runs at the root
+  and on every child after branching, so many infeasible children are
+  dropped without an LP solve. Proving infeasibility is slow for a
+  first-order method, so this matters more here than in a simplex-based
+  code.
+- **Root.** The root LP is solved by `jl.detect_infeasibility`, which
+  certifies optimality, infeasibility or an unbounded relaxation.
+- **Warm-started nodes.** Each child starts from its parent's primal–dual
+  point and step-size state. The node LPs share their shapes and solver
+  settings, so the compiled solver is reused and a small node takes a few
+  milliseconds.
+- **Sound bounds from approximate LPs.** A node is pruned on the
+  Lagrangian dual bound of its duals,
+  `g(y) = −bᵀy + Σⱼ min(rⱼlⱼ, rⱼuⱼ)` with `r = c + Aᵀy`, which is a valid
+  lower bound for any duals whether or not the LP converged. Duals that
+  diverge on an infeasible node therefore prune it once there is an
+  incumbent. A node LP that does not converge within `node_max_epochs` gets
+  an infeasibility check of the same length.
+- **Branching.** `"pseudocost"` (default) uses the product of the
+  estimated down and up gains learnt from solved nodes. `"most_fractional"`
+  picks the variable nearest ½.
+- **Node selection.** `"hybrid"` (default) dives depth first until the
+  first incumbent, then takes the best bound. `"best_first"` and
+  `"depth_first"` use one rule throughout.
+- **Incumbents.** LP points whose integers are integral, and the LP point
+  at every `heuristic_every`-th node, are rounded and checked against the
+  rows and bounds. With continuous variables, a rounded point that fails
+  the check is repaired by fixing the integers and solving the LP for the
+  rest.
+- **Presolve.** `presolve=True` runs HiGHS's MIP presolve, searches the
+  reduced problem, and maps the incumbent back with HiGHS's postsolve.
+
+The one place soundness rests on a tolerance is a reduced cost of the wrong
+sign on a variable with an infinite bound, which makes the Lagrangian bound
+`−inf`. When it is within the LP tolerance it is dropped, and the result
+reports `bound_rigorous=False`.
+
+### Principal options
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `mip_rel_gap`, `mip_abs_gap` | `1e-4`, `1e-6` | Stop once the incumbent is within these of the bound (HiGHS's defaults). |
+| `max_nodes`, `max_seconds` | `None` | Node and wall-clock budgets. |
+| `branching`, `node_selection` | `"pseudocost"`, `"hybrid"` | Search rules (see above). |
+| `integrality_tolerance` | `1e-5` | How close to an integer an LP value must be to count as integral. |
+| `feasibility_tolerance` | `1e-6` | Largest row violation (relative to `1 + ‖b‖∞`) and bound violation an incumbent may have. |
+| `lp_tolerance`, `lp_options` | `1e-6`, `None` | The node LPs' relative tolerances, and any other `jl.solve` option. |
+| `node_max_epochs`, `root_max_epochs` | `200`, `None` | Epoch budgets for a node LP and the root LP. |
+| `heuristic_every` | `10` | Run the rounding heuristic every this many nodes (`0` = only on integral LP points). |
+| `propagate` | `True` | Bound propagation at the root and at each child. |
+| `presolve`, `highs_options` | `False`, `None` | HiGHS presolve and postsolve, and options for the HiGHS instance. |
+| `verbose`, `log_every_seconds` | `False`, `1.0` | Progress table. |
+
+Use the `float64` profile for the default tolerances.
+
+### Results
+
+`solve` returns a dictionary with the keys `x` (the incumbent, or `None`),
+`objective`, `bound` (a lower bound for a minimisation, an upper bound for a
+maximisation), `gap`, `status` (`"optimal"`, `"infeasible"`,
+`"unbounded_or_infeasible"`, `"unresolved"`, `"time_limit"`, `"node_limit"`
+or `"interrupted"`), `converged`, `bound_rigorous`, the counts `nodes`,
+`infeasible_nodes`, `unresolved_nodes` and `lp_epochs`, `seconds`, and
+`history`, one entry per new incumbent. `"unresolved"` means the search
+ended but some nodes had nothing left to branch on and could not be settled
+(their LP did not converge, or their integral point failed the feasibility
+check); their bounds are still in `bound`. With `presolve=True` it also has
+`presolve` (HiGHS's presolve status) and `postsolve_feasible`.
+
+On small problems the search is fast once compiled: the facility-location
+example (8 binaries, 160 continuous flows) closes the gap in 61 nodes and
+about a second. On MIPLIB instances the weak relaxation and lack of
+cuts usually leave a gap. On ns1830653, 120 s on a CPU explored 52 nodes,
+with a valid bound but no incumbent yet.
+
 ## The convex programming solver
 
 ### Problem form
@@ -850,6 +960,7 @@ these results are described in [`benchmarks/README.md`](https://github.com/Brend
 | Path | Contents |
 |---|---|
 | [`jaddle/jaddle_linear.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_linear.py) | LP solver, scaling, certification and polishing |
+| [`jaddle/jaddle_mip.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_mip.py) | Branch-and-bound MIP solver and MIP readers |
 | [`jaddle/jaddle_convex.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_convex.py) | Convex solver |
 | [`jaddle/cones.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/cones.py) | Second-order and PSD cones for the LP solver |
 | [`jaddle/jaddle_cvxpy.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_cvxpy.py) | CVXPY front end |
@@ -857,7 +968,7 @@ these results are described in [`benchmarks/README.md`](https://github.com/Brend
 | [`jaddle/jaddle_optimisers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_optimisers.py) | Precision profiles and Optax saddle-point optimisers |
 | [`jaddle/presolve.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/presolve.py) | Defined-variable elimination and postsolve |
 | [`jaddle/highs_helpers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/highs_helpers.py) | HiGHS converters and presolve interface |
-| [`examples/`](https://github.com/BrendanVR/Jaddle/blob/main/examples/README.md) | Worked LP, conic and convex examples |
+| [`examples/`](https://github.com/BrendanVR/Jaddle/blob/main/examples/README.md) | Worked LP, MIP, conic and convex examples |
 | [`benchmarks/`](https://github.com/BrendanVR/Jaddle/blob/main/benchmarks/README.md) | MIPLIB and convex benchmark harnesses |
 | [`tests/`](https://github.com/BrendanVR/Jaddle/tree/main/tests) | Test suite (`pytest`) |
 | [`CHANGELOG.md`](https://github.com/BrendanVR/Jaddle/blob/main/CHANGELOG.md) | Changes in each release |
