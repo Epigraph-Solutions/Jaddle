@@ -1349,6 +1349,14 @@ def test_gomory_auto_follows_the_size(monkeypatch):
     assert not forced.gomory and forced.cut_rounds == 3
 
 
+def test_rins_solver_auto_follows_the_size(monkeypatch):
+    assert search_for(knapsack(), monkeypatch).rins_solver == "jaddle"
+    large = search_for(generalised_assignment(agents=50, jobs=120), monkeypatch)
+    assert large.rins_solver == "highs"
+    forced = search_for(knapsack(), monkeypatch, rins_solver="highs")
+    assert forced.rins_solver == "highs"
+
+
 def test_rejects_bad_gomory_and_rins_options():
     with pytest.raises(ValueError, match="gomory_cuts"):
         jm.solve(knapsack(), gomory_cuts="sometimes")

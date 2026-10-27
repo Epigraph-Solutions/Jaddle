@@ -1811,7 +1811,7 @@ class _BranchAndBound:
         log_every_seconds,
         start,
         device=None,
-        rins_solver="jaddle",
+        rins_solver="auto",
         rins_nodes=200,
         rens_seconds=None,
         rens_nodes=500,
@@ -1823,8 +1823,15 @@ class _BranchAndBound:
         self.settings = {
             key: value for key, value in locals().items() if key not in ("self", "mip")
         }
-        if rins_solver not in ("jaddle", "highs"):
-            raise ValueError(f"rins_solver must be 'jaddle' or 'highs', not {rins_solver!r}")
+        if rins_solver not in ("auto", "jaddle", "highs"):
+            raise ValueError(
+                f"rins_solver must be 'auto', 'jaddle' or 'highs', not {rins_solver!r}"
+            )
+        if rins_solver == "auto":
+            # On large MIPs a Jaddle sub-search is slow and weak: on
+            # ns1830653 it took a third of the run and left a 71% gap,
+            # against 52% with HiGHS.
+            rins_solver = "jaddle" if mip.A.nnz <= _SMALL_MIP_NNZ else "highs"
         self.rins_solver, self.rins_nodes = rins_solver, rins_nodes
         self.rins_seen = set()  # neighbourhoods searched by jaddle_rins
         # A warm start for the root LP (a sub-search's, from its parent).
@@ -3579,7 +3586,7 @@ def solve(
     highs_incumbent_seconds=0.0,
     rins_seconds=0.0,
     rins_every=50,
-    rins_solver="jaddle",
+    rins_solver="auto",
     rins_nodes=200,
     rens_seconds=None,
     rens_nodes=500,
@@ -3747,11 +3754,13 @@ def solve(
       root and every ``rins_every`` nodes once there is an incumbent: the
       integers on which the incumbent and the node's LP point agree are
       fixed, and the rest is searched for a better solution, marked
-      ``"N"``. With ``rins_solver="jaddle"`` (default) the sub-MIP is
+      ``"N"``. With ``rins_solver="jaddle"`` the sub-MIP is
       searched by this branch and bound (``_BranchAndBound.jaddle_rins``:
       up to ``rins_nodes`` nodes, pruned at the current cutoff, reusing
       the compiled LP solver); with ``"highs"``, by HiGHS
-      (``highs_rins``). A new incumbent from any other source also triggers
+      (``highs_rins``). ``"auto"`` (default) picks Jaddle for MIPs with at
+      most 10,000 nonzeros and HiGHS above that, where the Jaddle
+      sub-searches are slow and find little. A new incumbent from any other source also triggers
       a RINS call.
     * **RENS** (``rens_seconds``; ``None``, the default, gives 5s for MIPs
       with at most 10,000 nonzeros, else off). After the root heuristics,

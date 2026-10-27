@@ -708,7 +708,7 @@ reports `bound_rigorous=False`.
 | `rins_seconds`, `rins_every` | `0`, `50` | If set, RINS at the root and every `rins_every` nodes, to improve the incumbent (off by default). |
 | `rens_seconds`, `rens_nodes` | `None`, `500` | RENS at the root (`None`: 5s for MIPs with at most 10,000 nonzeros, else off). |
 | `dive_every`, `dive_depth` | `0`, `20` | LP-based dives every this many nodes and at the root (`0`: off), and their depth. |
-| `rins_solver`, `rins_nodes` | `"jaddle"`, `200` | Who searches the RINS sub-MIP: this branch and bound (up to `rins_nodes` nodes, reusing the compiled LP solver) or `"highs"`. On lseu the Jaddle sub-searches take ~0.4s each against HiGHS's ~0.01s. |
+| `rins_solver`, `rins_nodes` | `"auto"`, `200` | Who searches the RINS sub-MIP: `"jaddle"`, this branch and bound (up to `rins_nodes` nodes, reusing the compiled LP solver), or `"highs"`. `"auto"` picks Jaddle for MIPs with at most 10,000 nonzeros and HiGHS above that. On lseu the Jaddle sub-searches take ~0.4s each against HiGHS's ~0.01s. |
 | `pump_iterations`, `pump_tolerance` | `30`, `1e-4` | The pump's LP solves and their tolerance. |
 | `heuristic_seconds` | `None` | Time for the root heuristics (`None`: 20% of `max_seconds`, or no time limit without one). |
 | `propagate` | `True` | Bound propagation at the root and at each child. |

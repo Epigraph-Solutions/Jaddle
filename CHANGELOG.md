@@ -93,9 +93,12 @@
     its deadline fell between the time check and the LP solve.
   - RINS (`rins_seconds`, opt-in), at the root and every `rins_every` nodes,
     with the sub-MIP searched by Jaddle's own branch and bound
-    (`rins_solver="jaddle"`, default; `rins_nodes`) or by HiGHS
-    (`"highs"`). The Jaddle sub-search reuses the compiled LP solver,
-    warm-starts its root, and prunes at the parent's cutoff.
+    (`rins_solver="jaddle"`; `rins_nodes`) or by HiGHS (`"highs"`).
+    `"auto"` (default) uses Jaddle for MIPs with at most 10,000 nonzeros and
+    HiGHS above that: on ns1830653 (300s) the Jaddle sub-searches took a
+    third of the run and left a 71% gap, against 52% with HiGHS. The Jaddle
+    sub-search reuses the compiled LP solver, warm-starts its root, and
+    prunes at the parent's cutoff.
   - Primal heuristics: `fix_and_propagate` (chunked rounding with bound
     propagation, at the root and in the tree) and an objective feasibility
     pump at the root, whose LPs change only the cost and so reuse the
