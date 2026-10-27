@@ -87,7 +87,9 @@ mip = jm.MIP(lp, integer)
 # ## Solving
 # The log shows the node count, the open nodes, the best bound, the incumbent
 # and the gap. Lines marked `H` found an incumbent by rounding an LP point,
-# lines marked `T` at a node whose LP point was already integral.
+# `P` by fix-and-propagate, `J` by feasibility jump, `F` by the feasibility
+# pump, and `T` at a node
+# whose LP point was already integral.
 
 # %%
 result = jm.solve(mip, verbose=True)
@@ -98,9 +100,7 @@ print(f"Total cost: {result['objective']:.4f} (bound {result['bound']:.4f})")
 print(f"Open sites: {opened.tolist()}")
 flows = result["x"][n_sites:].reshape(n_sites, n_customers)
 for f in opened:
-    print(
-        f"  site {f}: ships {flows[f].sum():6.2f} of capacity {capacity[f]:6.2f}"
-    )
+    print(f"  site {f}: ships {flows[f].sum():6.2f} of capacity {capacity[f]:6.2f}")
 
 # %% [markdown]
 # ## Checking against HiGHS
@@ -109,7 +109,7 @@ for f in opened:
 
 # %%
 highs = highspy.Highs()
-highs.setOptionValue("output_flag", False)
+highs.setOptionValue("output_flag", True)
 highs.passModel(jm.to_highs(mip))
 highs.run()
 reference = highs.getInfo().objective_function_value
@@ -118,3 +118,5 @@ relative_error = abs(result["objective"] - reference) / abs(reference)
 print(f"Relative difference: {relative_error:.2e}")
 assert result["status"] == "optimal"
 assert relative_error <= 1e-4  # the default mip_rel_gap
+
+# %%

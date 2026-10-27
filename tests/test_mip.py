@@ -247,7 +247,9 @@ def test_limits_report_valid_bounds():
         assert mip.is_feasible(result["x"])
         assert result["objective"] >= ref - 1e-6 * (1 + abs(ref))
 
-    result = jm.solve(mip, max_seconds=0.5)
+    # A limit spent before the root LP finishes (0.5 s was enough to solve
+    # this MIP once compiled).
+    result = jm.solve(mip, max_seconds=1e-3)
     assert result["status"] == "time_limit"
     assert result["bound"] <= ref + 1e-6 * (1 + abs(ref))
 
@@ -361,6 +363,24 @@ def test_propagate_bounds_tightens_and_detects_infeasibility():
     assert infeasible
 
 
+def test_propagate_bounds_checks_the_final_box():
+    # Binaries with x0 = 1, x0 <= x1, x0 <= x3 and x1 + x3 <= 1. One pass
+    # raises x1 and x3 to 1 together, which breaks the third row; a pass
+    # limit of 1 ends right after that tightening, so only a check of the
+    # final box finds it.
+    A = sp.csr_matrix(
+        np.array([[1.0, -1.0, 0.0], [1.0, 0.0, -1.0], [0.0, 1.0, 1.0]])
+    )
+    row_upper = np.array([0.0, 0.0, 1.0])
+    lower, upper = np.array([1.0, 0.0, 0.0]), np.ones(3)
+    for passes in (1, 5):
+        _, _, infeasible = jm.propagate_bounds(
+            A, np.full(3, -np.inf), row_upper, lower, upper, np.ones(3, bool),
+            max_passes=passes,
+        )
+        assert infeasible
+
+
 def test_propagate_bounds_handles_infinite_bounds():
     # x0 + x1 = 4 with x0 free and x1 in [0, 1]: x0 in [3, 4].
     A = sp.csr_matrix([[1.0, 1.0]])
@@ -420,3 +440,733 @@ def test_lagrangian_bound():
         mip.c, mip.A, mip.b, mip.n_eq, mip.lower, mip.upper, y_bad
     )
     assert bound == -np.inf and rigorous
+
+
+# %% Cutting planes
+def test_mir_cut_textbook():
+    # x0 + x1 <= 1.5 with x integer in [0, 5], at (0.75, 0.75): the MIR with
+    # divisor 1 is x0 + x1 <= 1.
+    idx = np.array([0, 1])
+    cut = jm.mir_cut(
+        idx,
+        np.array([1.0, 1.0]),
+        1.5,
+        np.array([0.75, 0.75]),
+        np.zeros(2),
+        np.full(2, 5.0),
+        np.array([True, True]),
+    )
+    assert cut is not None
+    cut_idx, coef, rhs = cut
+    np.testing.assert_allclose(coef, [1.0, 1.0])
+    assert rhs == pytest.approx(1.0)
+
+
+def test_mir_cut_mixed_row():
+    # x0 - y <= 0.5 with x0 integer, y >= 0 continuous, at (0.5, 0): the MIR
+    # is x0 - 2y <= 0.
+    cut = jm.mir_cut(
+        np.array([0, 1]),
+        np.array([1.0, -1.0]),
+        0.5,
+        np.array([0.5, 0.0]),
+        np.zeros(2),
+        np.array([5.0, np.inf]),
+        np.array([True, False]),
+    )
+    _, coef, rhs = cut
+    np.testing.assert_allclose(coef, [1.0, -2.0])
+    assert rhs == pytest.approx(0.0, abs=1e-8)
+
+
+def test_cover_cut_textbook():
+    # 5 x0 + 5 x1 + 5 x2 + 9 x3 <= 12 over binaries at (0.8, 0.8, 0.8, 0):
+    # {0, 1, 2} is a cover, extended by x3 (heavier): x0+x1+x2+x3 <= 2.
+    cut = jm.cover_cut(
+        np.arange(4),
+        np.array([5.0, 5.0, 5.0, 9.0]),
+        12.0,
+        np.array([0.8, 0.8, 0.8, 0.0]),
+        np.zeros(4),
+        np.ones(4),
+        np.ones(4, bool),
+    )
+    cut_idx, coef, rhs = cut
+    np.testing.assert_array_equal(cut_idx, np.arange(4))
+    np.testing.assert_allclose(coef, 1.0)
+    assert rhs == pytest.approx(2.0)
+
+
+def test_cover_cut_complements_negative_coefficients():
+    # 4 x0 - 4 x1 <= 0 (x0 <= x1) is 4 x0 + 4 z1 <= 4 with z1 = 1 - x1; the
+    # cover {x0, z1} gives x0 + z1 <= 1, i.e. x0 - x1 <= 0. At (0.5, 0) it is
+    # violated.
+    cut = jm.cover_cut(
+        np.arange(2),
+        np.array([4.0, -4.0]),
+        0.0,
+        np.array([0.5, 0.25]),
+        np.zeros(2),
+        np.ones(2),
+        np.ones(2, bool),
+    )
+    _, coef, rhs = cut
+    np.testing.assert_allclose(coef, [1.0, -1.0])
+    assert rhs == pytest.approx(0.0, abs=1e-8)
+
+
+@pytest.mark.parametrize("make", [knapsack, facility_location, general_integer])
+def test_separated_cuts_are_valid(make):
+    # Each cut's largest left-hand side over the MIP's feasible points is at
+    # most its right-hand side, and it cuts off the LP point.
+    from scipy.optimize import linprog
+
+    mip = make()
+    lower, upper, _ = jm.propagate_bounds(
+        mip.A, mip.row_lower, mip.row_upper, mip.lower, mip.upper, mip.integrality
+    )
+    A = mip.A.toarray()
+    bounds = [(lo, None if np.isinf(hi) else hi) for lo, hi in zip(mip.lower, mip.upper)]
+    lp = linprog(
+        mip.c,
+        A_ub=A[mip.n_eq :],
+        b_ub=mip.b[mip.n_eq :],
+        A_eq=A[: mip.n_eq] if mip.n_eq else None,
+        b_eq=mip.b[: mip.n_eq] if mip.n_eq else None,
+        bounds=bounds,
+    )
+    cuts = jm.CutSeparator(mip, lower, upper)(lp.x)
+    if make is not general_integer:
+        assert cuts
+    for _, idx, coef, rhs in cuts:
+        assert coef @ lp.x[idx] > rhs
+        objective = np.zeros(mip.num_variables)
+        objective[idx] = -coef
+        best = milp(
+            objective,
+            constraints=LinearConstraint(A, mip.row_lower, mip.row_upper),
+            integrality=mip.integrality.astype(int),
+            bounds=Bounds(mip.lower, mip.upper),
+        )
+        assert -best.fun <= rhs + 1e-7 * (1 + abs(rhs))
+
+
+def test_cut_block_padding():
+    cuts = [
+        dict(idx=np.array([0, 2]), coef=np.array([1.0, 2.0]), rhs=3.0),
+        dict(idx=np.array([1]), coef=np.array([-1.0]), rhs=0.5),
+    ]
+    A, b = jm._cut_block(cuts, n=4, min_rows=8, min_nnz=16)
+    assert A.shape == (8, 4) and A.nnz == 16
+    np.testing.assert_allclose(A[:2].toarray(), [[1, 0, 2, 0], [0, -1, 0, 0]])
+    assert np.count_nonzero(A.toarray()[2:]) == 0
+    np.testing.assert_allclose(b, [3.0, 0.5, 0, 0, 0, 0, 0, 0])
+
+
+def test_cuts_strengthen_the_root():
+    mip = facility_location()
+    ref = reference(mip)
+    with_cuts = jm.solve(mip)
+    without = jm.solve(mip, cuts=False)
+    for result in (with_cuts, without):
+        assert_solved(result, mip, ref)
+    assert with_cuts["cuts"]["mir"] > 0
+    assert without["cuts"] == {"gomory": 0, "cover": 0, "mir": 0}
+    assert without["root_bound_before_cuts"] is None
+    # The cuts close part of the root gap and the tree is no larger.
+    root = with_cuts["root_bound_before_cuts"]
+    history_bound = with_cuts["history"][0]["bound"]
+    assert history_bound > root + 1e-3 * abs(ref - root)
+    assert with_cuts["nodes"] <= without["nodes"]
+
+
+# %% Primal heuristics
+def generalised_assignment(seed=0, agents=5, jobs=20, tightness=0.8):
+    """Each job goes to exactly one agent within the agents' capacities.
+    Rounding its LP point almost never gives a feasible assignment."""
+    rng = np.random.default_rng(seed)
+    weight = rng.integers(5, 25, (agents, jobs)).astype(float)
+    cost = rng.integers(10, 50, (agents, jobs)).astype(float)
+    capacity = tightness * weight.sum(1) / agents
+    n = agents * jobs
+    A_eq = sp.lil_matrix((jobs, n))
+    A_ineq = sp.lil_matrix((agents, n))
+    for i in range(agents):
+        for j in range(jobs):
+            A_eq[j, i * jobs + j] = 1.0
+            A_ineq[i, i * jobs + j] = weight[i, j]
+    lp = jl.LP(
+        c=cost.ravel(),
+        A_eq=A_eq.tocsc(),
+        b_eq=np.ones(jobs),
+        A_ineq=A_ineq.tocsc(),
+        b_ineq=capacity,
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    return jm.MIP(lp, np.ones(n, bool))
+
+
+def lp_point(mip):
+    result = jl.solve(
+        mip.lp,
+        primal_feasibility_tolerance=1e-7,
+        dual_feasibility_tolerance=1e-7,
+        dual_gap_tolerance=1e-7,
+    )
+    return np.asarray(result["solution"].primal, np.float64)
+
+
+def test_fix_and_propagate_finds_an_assignment():
+    mip = generalised_assignment()
+    x = lp_point(mip)
+    propagator = jm.BoundPropagator(
+        mip.A, mip.row_lower, mip.row_upper, mip.integrality
+    )
+    candidate = jm.fix_and_propagate(x, mip.lower, mip.upper, mip.integrality, propagator)
+    assert candidate is not None
+    assert mip.is_feasible(candidate)
+    # Plain rounding of the same point is not feasible.
+    assert not mip.is_feasible(np.round(x))
+
+
+def test_fix_and_propagate_gives_up_on_an_infeasible_box():
+    mip = generalised_assignment()
+    propagator = jm.BoundPropagator(
+        mip.A, mip.row_lower, mip.row_upper, mip.integrality
+    )
+    # No agent may take job 0: its assignment row cannot be met.
+    upper = mip.upper.copy()
+    upper[np.arange(5) * 20] = 0.0
+    x = np.full(mip.num_variables, 0.2)
+    assert jm.fix_and_propagate(x, mip.lower, upper, mip.integrality, propagator) is None
+
+
+@pytest.mark.parametrize("seed", [0, 1, 5])
+def test_root_heuristics_find_incumbents(seed):
+    mip = generalised_assignment(seed)
+    ref = reference(mip)
+    off = jm.solve(
+        mip,
+        max_nodes=1,
+        cuts=False,
+        fix_and_propagate=False,
+        feasibility_jump=False,
+        feasibility_pump=False,
+    )
+    assert off["x"] is None
+    result = jm.solve(mip, max_nodes=1, cuts=False)
+    assert result["x"] is not None and mip.is_feasible(result["x"])
+    assert result["objective"] >= ref - 1e-6
+    assert result["history"][0]["source"] in ("P", "J", "F")
+    assert result["heuristic_seconds"] >= 0.0
+
+
+def test_feasibility_pump_alone():
+    # Seed 5: the pump succeeds without any fix-and-propagate (on some other
+    # seeds it needs fix-and-propagate as its rounding step).
+    mip = generalised_assignment(5)
+    result = jm.solve(
+        mip,
+        max_nodes=1,
+        cuts=False,
+        fix_and_propagate=False,
+        feasibility_jump=False,
+    )
+    assert result["x"] is not None and mip.is_feasible(result["x"])
+    assert result["history"][0]["source"] == "F"
+
+
+def test_heuristics_keep_the_optimum():
+    mip = generalised_assignment(3)
+    assert_solved(jm.solve(mip), mip, reference(mip))
+
+
+# %% Gomory cuts
+def vertex_and_basis(mip):
+    result = jl.solve(
+        mip.lp,
+        primal_feasibility_tolerance=1e-8,
+        dual_feasibility_tolerance=1e-8,
+        dual_gap_tolerance=1e-8,
+    )
+    crossed = jl.crossover(mip.lp, result["solution"])
+    assert crossed["converged"]
+    return np.asarray(crossed["solution"].primal, np.float64), crossed["basis"]
+
+
+def test_gomory_cut_textbook():
+    # max x1 + x2 s.t. 2 x1 + 2 x2 <= 3, x integer in [0, 5]: the LP vertex
+    # has x1 + x2 = 1.5, and the Gomory cut from it is x1 + x2 <= 1.
+    lp = jl.LP(
+        c=np.array([-1.0, -1.0]),
+        A_eq=sp.csc_matrix((0, 2)),
+        b_eq=np.zeros(0),
+        A_ineq=sp.csc_matrix([[2.0, 2.0]]),
+        b_ineq=np.array([3.0]),
+        lower_bounds=np.zeros(2),
+        upper_bounds=np.full(2, 5.0),
+    )
+    mip = jm.MIP(lp, [True, True])
+    x, basis = vertex_and_basis(mip)
+    cuts = jm.gomory_cuts(
+        mip.A, mip.b, mip.n_eq, mip.lower, mip.upper, mip.integrality, basis, x
+    )
+    assert cuts
+    family, idx, coef, rhs = cuts[0]
+    assert family == "gomory"
+    assert coef @ x[idx] > rhs + 0.1  # cuts off the vertex
+    # Every integer point of the box that meets the row meets the cut.
+    for x1 in range(6):
+        for x2 in range(6):
+            point = np.array([x1, x2], float)
+            if 2 * x1 + 2 * x2 <= 3:
+                assert coef @ point[idx] <= rhs + 1e-9
+
+
+@pytest.mark.parametrize(
+    "make", [knapsack, facility_location, general_integer, generalised_assignment]
+)
+def test_gomory_cuts_are_valid(make):
+    mip = make()
+    x, basis = vertex_and_basis(mip)
+    cuts = jm.gomory_cuts(
+        mip.A, mip.b, mip.n_eq, mip.lower, mip.upper, mip.integrality, basis, x
+    )
+    assert cuts
+    A = mip.A.toarray()
+    for _, idx, coef, rhs in cuts:
+        assert coef @ x[idx] > rhs
+        objective = np.zeros(mip.num_variables)
+        objective[idx] = -coef
+        best = milp(
+            objective,
+            constraints=LinearConstraint(A, mip.row_lower, mip.row_upper),
+            integrality=mip.integrality.astype(int),
+            bounds=Bounds(mip.lower, mip.upper),
+        )
+        assert -best.fun <= rhs + 1e-7 * (1 + abs(rhs))
+
+
+def test_gomory_cuts_in_the_search():
+    mip = general_integer()
+    ref = reference(mip)
+    result = jm.solve(mip, gomory_cuts=True)
+    assert_solved(result, mip, ref)
+    assert result["cuts"]["gomory"] > 0
+    off = jm.solve(mip)  # off by default
+    assert_solved(off, mip, ref)
+    assert off["cuts"]["gomory"] == 0
+
+
+# %% Feasibility jump
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_feasibility_jump_assignment(seed):
+    mip = generalised_assignment(seed)
+    for start in (np.zeros(mip.num_variables), lp_point(mip)):
+        x, feasible, steps = jm.feasibility_jump(mip, start)
+        assert feasible and steps > 0
+        assert mip.is_feasible(x)
+        np.testing.assert_array_equal(x, np.round(x))
+
+
+def test_feasibility_jump_knapsack_and_mixed():
+    mip = knapsack()
+    x, feasible, _ = jm.feasibility_jump(mip, np.ones(mip.num_variables))
+    assert feasible and mip.is_feasible(x)
+    # Facility location has continuous flows: the jump finds openings and
+    # flows that meet every row.
+    mip = facility_location()
+    x, feasible, _ = jm.feasibility_jump(mip, np.zeros(mip.num_variables))
+    assert feasible and mip.is_feasible(x)
+
+
+def test_feasibility_jump_gives_up_on_infeasible():
+    n = 6
+    lp = jl.LP(
+        c=np.arange(n, dtype=float),
+        A_eq=sp.csc_matrix(2.0 * np.ones((1, n))),
+        b_eq=np.array([3.0]),
+        A_ineq=sp.csc_matrix((0, n)),
+        b_ineq=np.zeros(0),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    _, feasible, steps = jm.feasibility_jump(
+        jm.MIP(lp, np.ones(n, bool)), np.zeros(n), max_iterations=2000
+    )
+    assert not feasible and steps == 2000
+
+
+def test_feasibility_jump_in_the_search():
+    mip = generalised_assignment(2)
+    result = jm.solve(
+        mip, max_nodes=1, cuts=False, fix_and_propagate=False, feasibility_pump=False
+    )
+    assert result["x"] is not None and mip.is_feasible(result["x"])
+    assert result["history"][0]["source"] == "J"
+
+
+# %% Repair
+def broken_assignment(seed=0):
+    """A generalised assignment MIP and an integer point that breaks some
+    of its rows: an optimal assignment with three jobs moved to agent 0."""
+    mip = generalised_assignment(seed)
+    best = milp(
+        mip.c,
+        constraints=LinearConstraint(mip.A.toarray(), mip.row_lower, mip.row_upper),
+        integrality=mip.integrality.astype(int),
+        bounds=Bounds(mip.lower, mip.upper),
+    )
+    x = np.round(best.x)
+    jobs = 20
+    x = x.reshape(5, jobs)
+    for job in range(3):  # three jobs piled onto agent 0
+        x[:, job] = 0.0
+        x[0, job] = 1.0
+    return mip, x.ravel()
+
+
+def test_repair_fixes_a_near_miss():
+    mip, x = broken_assignment()
+    assert not mip.is_feasible(x)
+    repaired = jm.repair(mip, x, max_seconds=60)
+    assert repaired is not None and mip.is_feasible(repaired)
+    # Only variables near the broken rows moved.
+    assert np.count_nonzero(repaired != x) < mip.num_variables
+
+
+def test_repair_returns_a_feasible_point_unchanged():
+    mip, x = broken_assignment()
+    good = jm.repair(mip, x, max_seconds=60)
+    np.testing.assert_array_equal(jm.repair(mip, good, max_seconds=60), good)
+
+
+def test_repair_gives_up_when_the_neighbourhood_is_infeasible():
+    # 2 (x1 + ... + x6) = 3 has no integer point at all.
+    n = 6
+    lp = jl.LP(
+        c=np.arange(n, dtype=float),
+        A_eq=sp.csc_matrix(2.0 * np.ones((1, n))),
+        b_eq=np.array([3.0]),
+        A_ineq=sp.csc_matrix((0, n)),
+        b_ineq=np.zeros(0),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    assert jm.repair(jm.MIP(lp, np.ones(n, bool)), np.zeros(n), max_seconds=30) is None
+
+
+def test_highs_incumbent_fallback():
+    mip = generalised_assignment(0)
+    off = dict(
+        max_nodes=1,
+        cuts=False,
+        fix_and_propagate=False,
+        feasibility_jump=False,
+        feasibility_pump=False,
+    )
+    assert jm.solve(mip, **off)["x"] is None  # the fallback is off by default
+    result = jm.solve(mip, highs_incumbent_seconds=10, **off)
+    assert result["x"] is not None and mip.is_feasible(result["x"])
+    assert result["history"][0]["source"] == "X"
+    x = jm.highs_incumbent(mip, max_seconds=10)
+    assert x is not None and mip.is_feasible(x)
+
+
+# %% Improving the incumbent
+def test_highs_rins_improves_an_incumbent():
+    mip, _ = broken_assignment()
+    best = milp(
+        mip.c,
+        constraints=LinearConstraint(mip.A.toarray(), mip.row_lower, mip.row_upper),
+        integrality=mip.integrality.astype(int),
+        bounds=Bounds(mip.lower, mip.upper),
+    )
+    optimum = np.round(best.x)
+    # HiGHS's first solution, usually worse than the optimum.
+    worse = jm.highs_incumbent(mip)
+    assert worse is not None
+    value = mip.c @ worse
+    found = jm.highs_rins(mip, worse, optimum, cutoff=value - 1e-6, max_seconds=10)
+    if np.allclose(worse, optimum):
+        assert found is None  # nothing better exists
+    else:
+        assert found is not None and mip.is_feasible(found)
+        assert mip.c @ found < value
+
+
+def test_highs_rins_skips_small_agreement():
+    mip, x = broken_assignment()
+    # An LP point that agrees nowhere with the incumbent.
+    assert jm.highs_rins(mip, x, 1.0 - x, cutoff=np.inf) is None
+
+
+@pytest.mark.parametrize("plunge_depth", [0, 8])
+def test_plunging_keeps_the_optimum(plunge_depth):
+    mip = generalised_assignment(2)
+    assert_solved(jm.solve(mip, plunge_depth=plunge_depth), mip, reference(mip))
+
+
+def test_rins_in_the_search():
+    mip = generalised_assignment(2)
+    result = jm.solve(mip, rins_seconds=5, rins_every=5)
+    assert_solved(result, mip, reference(mip))
+
+
+# %% Batched node solves
+@pytest.mark.parametrize(
+    "make", [knapsack, general_integer, facility_location, generalised_assignment]
+)
+def test_batched_search_matches_reference(make):
+    mip = make()
+    result = jm.solve(mip, batch_size=4)
+    assert_solved(result, mip, reference(mip))
+    assert result["batches"] > 0
+
+
+def test_batch_larger_than_the_tree():
+    # Far more slots than open nodes: every batch is padded.
+    mip = facility_location()
+    result = jm.solve(mip, batch_size=64)
+    assert_solved(result, mip, reference(mip))
+    assert 0 < result["batches"] <= result["nodes"]
+
+
+def test_batched_search_limits_and_infeasibility():
+    mip = general_integer(n=12, m_ineq=8)
+    ref = reference(mip)
+    result = jm.solve(mip, batch_size=4, max_nodes=6)
+    assert result["status"] == "node_limit" and result["nodes"] <= 6
+    assert result["bound"] <= ref + 1e-6 * (1 + abs(ref))
+
+    n = 6
+    lp = jl.LP(
+        c=np.arange(n, dtype=float),
+        A_eq=sp.csc_matrix(2.0 * np.ones((1, n))),
+        b_eq=np.array([3.0]),
+        A_ineq=sp.csc_matrix((0, n)),
+        b_ineq=np.zeros(0),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    assert jm.solve(jm.MIP(lp, np.ones(n, bool)), batch_size=4)["status"] == "infeasible"
+
+
+def test_batch_size_must_be_positive():
+    with pytest.raises(ValueError, match="batch_size"):
+        jm.solve(knapsack(), batch_size=0)
+
+
+# %% Bounds from duals: child bounds, reduced-cost fixing, integral objective
+def scaled_objective(mip, factor):
+    """``mip`` with its costs multiplied by ``factor``."""
+    A_eq, A_ineq = mip.A[: mip.n_eq], mip.A[mip.n_eq :]
+    lp = jl.LP(
+        c=factor * mip.c,
+        A_eq=A_eq.tocsc(),
+        b_eq=mip.b[: mip.n_eq],
+        A_ineq=A_ineq.tocsc(),
+        b_ineq=mip.b[mip.n_eq :],
+        lower_bounds=mip.lower,
+        upper_bounds=mip.upper,
+    )
+    return jm.MIP(lp, mip.integrality)
+
+
+def optimum(mip):
+    """An optimal point of ``mip``, from SciPy's HiGHS."""
+    result = milp(
+        mip.c,
+        constraints=LinearConstraint(mip.A.toarray(), mip.row_lower, mip.row_upper),
+        integrality=mip.integrality.astype(int),
+        bounds=Bounds(mip.lower, mip.upper),
+    )
+    assert result.success
+    return result.x
+
+
+def lp_duals(mip):
+    """Optimal duals of ``mip``'s LP relaxation in Jaddle's convention."""
+    from scipy.optimize import linprog
+
+    lp = mip.lp.to_scipy()
+    bounds = [(lo, None if np.isinf(hi) else hi) for lo, hi in zip(mip.lower, mip.upper)]
+    ref = linprog(
+        mip.c,
+        A_ub=lp.A_ineq,
+        b_ub=lp.b_ineq,
+        A_eq=lp.A_eq if lp.A_eq.shape[0] else None,
+        b_eq=lp.b_eq if lp.A_eq.shape[0] else None,
+        bounds=bounds,
+        method="highs",
+    )
+    eq = ref.eqlin.marginals if lp.A_eq.shape[0] else np.zeros(0)
+    return -np.concatenate([eq, ref.ineqlin.marginals])
+
+
+def test_objective_step():
+    ints = np.array([True, True, True, False])
+    assert jm.objective_step(np.array([2.0, -4.0, 6.0, 0.0]), ints) == 2.0
+    assert jm.objective_step(np.array([0.5, 1.5, 0.0, 0.0]), ints) == 0.5
+    assert jm.objective_step(np.array([0.25, 1.0, 0.0, 0.0]), ints) == 0.25
+    # A cost on a continuous variable, an irrational ratio, no costs at all.
+    assert jm.objective_step(np.array([1.0, 2.0, 0.0, 0.1]), ints) is None
+    assert jm.objective_step(np.array([1.0, np.sqrt(2.0), 0.0, 0.0]), ints) is None
+    assert jm.objective_step(np.zeros(4), ints) is None
+
+
+def test_box_bound_matches_lagrangian_bound():
+    mip = general_integer()
+    y = np.random.default_rng(0).standard_normal(mip.A.shape[0])
+    constant, r = jm.lagrangian_terms(mip.c, mip.A, mip.b, mip.n_eq, y)
+    assert jm.box_bound(constant, r, mip.lower, mip.upper) == jm.lagrangian_bound(
+        mip.c, mip.A, mip.b, mip.n_eq, mip.lower, mip.upper, y
+    )
+    # A smaller box gives a bound at least as high.
+    upper = mip.upper.copy()
+    upper[0] = 2.0
+    assert (
+        jm.box_bound(constant, r, mip.lower, upper)[0]
+        >= jm.box_bound(constant, r, mip.lower, mip.upper)[0]
+    )
+
+
+def test_reduced_cost_tightening_textbook():
+    r = np.array([3.0, -2.0, 1.0, 0.0])
+    ints = np.array([True, True, False, True])
+    lower, upper = np.zeros(4), np.full(4, 10.0)
+    # cᵀx >= 10 + 3·x0 and cᵀx >= 10 + 2·(10 − x1): below 16 needs x0 <= 2 and
+    # x1 >= 7. The continuous x2 and the zero reduced cost of x3 stay.
+    lo, up, changed = jm.reduced_cost_tightening(r, 10.0, 16.0, lower, upper, ints)
+    assert changed
+    np.testing.assert_array_equal(lo, [0.0, 7.0, 0.0, 0.0])
+    np.testing.assert_array_equal(up, [2.0, 10.0, 10.0, 10.0])
+    assert lower[1] == 0.0 and upper[0] == 10.0  # the inputs are not changed
+    # No incumbent (an infinite cutoff): nothing to do.
+    assert not jm.reduced_cost_tightening(r, 10.0, np.inf, lower, upper, ints)[2]
+
+
+@pytest.mark.parametrize("make", [knapsack, general_integer, generalised_assignment])
+def test_reduced_cost_tightening_keeps_better_solutions(make):
+    mip = make()
+    x_star = optimum(mip)
+    cutoff = mip.c @ x_star + 1e-9 * (1 + abs(mip.c @ x_star))
+    y = lp_duals(mip)
+    rng = np.random.default_rng(0)
+    tightened = 0
+    for noise in [0.0] + [0.01, 0.1, 1.0] * 5:
+        y_trial = y + noise * rng.standard_normal(y.shape)
+        constant, r = jm.lagrangian_terms(mip.c, mip.A, mip.b, mip.n_eq, y_trial)
+        bound, rigorous = jm.box_bound(constant, r, mip.lower, mip.upper)
+        assert rigorous
+        lo, up, changed = jm.reduced_cost_tightening(
+            r, bound, cutoff, mip.lower, mip.upper, mip.integrality
+        )
+        # The optimum (below the cutoff) stays in the box.
+        assert np.all(lo <= x_star + 1e-9) and np.all(x_star <= up + 1e-9)
+        tightened += changed
+    assert tightened > 0
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_bounds_from_duals_in_the_search(batch_size):
+    mip = generalised_assignment(1)
+    result = jm.solve(mip, batch_size=batch_size)
+    assert_solved(result, mip, reference(mip))
+    assert result["objective_step"] == 1.0
+    assert result["reduced_cost_tightenings"] > 0
+    # The bound is rounded to the step.
+    assert result["bound"] == round(result["bound"])
+
+
+@pytest.mark.parametrize("factor", [0.5, -0.25])
+def test_fractional_objective_step(factor):
+    mip = scaled_objective(knapsack(n=25), factor)
+    result = jm.solve(mip)
+    assert result["objective_step"] == abs(factor)
+    assert_solved(result, mip, reference(mip))
+
+
+def test_integral_objective_with_offset_and_maximisation():
+    # Values are integers in the model's own sense, with a fractional offset.
+    n = 12
+    rng = np.random.default_rng(3)
+    w = rng.integers(5, 30, n).astype(float)
+    highs = highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    lp = highspy.HighsLp()
+    lp.num_col_, lp.num_row_ = n, 1
+    lp.col_cost_ = list(w + rng.integers(0, 10, n))
+    lp.col_lower_, lp.col_upper_ = [0.0] * n, [1.0] * n
+    lp.row_lower_, lp.row_upper_ = [-highspy.kHighsInf], [w.sum() / 3]
+    lp.a_matrix_.format_ = highspy.MatrixFormat.kColwise
+    lp.a_matrix_.start_ = list(range(n + 1))
+    lp.a_matrix_.index_ = [0] * n
+    lp.a_matrix_.value_ = list(w)
+    lp.integrality_ = [highspy.HighsVarType.kInteger] * n
+    lp.sense_ = highspy.ObjSense.kMaximize
+    lp.offset_ = 0.3
+    highs.passModel(lp)
+    mip = jm.from_highs(highs)
+    assert mip.maximise
+    result = jm.solve(mip)
+    assert result["objective_step"] == 1.0
+    assert_solved(result, mip, reference(mip))
+
+
+# %% Incumbent repair
+def search_for(mip, monkeypatch, **options):
+    """The ``_BranchAndBound`` that ``solve`` builds, before it runs."""
+    monkeypatch.setattr(jm._BranchAndBound, "run", lambda self: self)
+    return jm.solve(mip, **options)
+
+
+def count_lp_solves(monkeypatch, fake=None):
+    """Count ``jl.solve`` calls (made by ``fake`` instead, if given)."""
+    calls = []
+    real = jl.solve
+
+    def counted(*args, **kwargs):
+        calls.append(kwargs)
+        return (fake or real)(*args, **kwargs)
+
+    monkeypatch.setattr(jl, "solve", counted)
+    return calls
+
+
+def test_repair_skipped_when_propagation_proves_the_fixed_box_infeasible(monkeypatch):
+    # Every facility closed: the demand rows can't be met by any flows.
+    mip = facility_location()
+    search = search_for(mip, monkeypatch)
+    calls = count_lp_solves(monkeypatch)
+    assert not search.try_incumbent(np.zeros(mip.num_variables), "H", None)
+    assert calls == []
+    assert search.lp_repairs == 0 and search.lp_repairs_skipped == 1
+
+
+def test_failed_repair_is_not_repeated(monkeypatch):
+    # Every facility open, no flows: worth a repair, which (faked) fails.
+    mip = facility_location()
+    search = search_for(mip, monkeypatch)
+    x = np.where(mip.integrality, 1.0, 0.0)
+
+    def failing_solve(lp, **kwargs):
+        solution = type("Solution", (), {"primal": np.zeros(mip.num_variables)})()
+        return {"solution": solution, "epochs": 1}
+
+    calls = count_lp_solves(monkeypatch, failing_solve)
+    assert not search.try_incumbent(x, "H", None)
+    assert not search.try_incumbent(x, "H", None)
+    assert len(calls) == 1
+    assert calls[0]["max_epochs"] == search.repair_max_epochs == 20
+    assert search.lp_repairs == 1 and search.lp_repairs_skipped == 1
+
+
+def test_repair_finds_the_continuous_variables(monkeypatch):
+    # Every facility open, no flows: the repair LP routes the demand.
+    mip = facility_location()
+    search = search_for(mip, monkeypatch)
+    x = np.where(mip.integrality, 1.0, 0.0)
+    assert search.try_incumbent(x, "H", None)
+    assert search.lp_repairs == 1 and mip.is_feasible(search.incumbent[1])

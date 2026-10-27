@@ -20,7 +20,9 @@ It provides two solvers:
   Jaddle derives everything else by automatic differentiation.
 
 On top of the LP solver, **`jaddle.jaddle_mip`** is a simple branch-and-bound
-solver for mixed-integer linear programs.
+solver for mixed-integer linear programs. It is **highly experimental**: its
+interface, defaults and behaviour may change without notice, and its results
+should be checked against an established MIP solver.
 
 Both solvers run unchanged on CPU, GPU and TPU. Jaddle is not intended to
 replace a commercial or production-grade solver. It aims to be a compact,
@@ -486,11 +488,18 @@ second-order, PSD and exponential constraints go through
 
 ## The mixed-integer solver
 
+> **Highly experimental.** The MIP solver is under active development. Its
+> interface, defaults and behaviour may change between releases without
+> notice, and it has been tested on far fewer problems than the LP solver.
+> Check its solutions and bounds against an established MIP solver (such as
+> HiGHS, through `jm.to_highs`) before relying on them.
+
 `jaddle.jaddle_mip` is a simple branch-and-bound solver for mixed-integer
 linear programs, with `jaddle_linear.solve` solving the LP at every node.
 It is meant as a readable starting point, not a competitor to branch-and-cut
-codes: there are no cutting planes, and the only primal heuristic is
-rounding.
+codes: cuts are added at the root only and come from two families, and the
+primal heuristics are rounding, fix-and-propagate, feasibility jump and a
+feasibility pump.
 
 ### Problem form
 
@@ -522,6 +531,33 @@ columns are not supported.
   code.
 - **Root.** The root LP is solved by `jl.detect_infeasibility`, which
   certifies optimality, infeasibility or an unbounded relaxation.
+- **Root cuts.** Up to `cut_rounds` rounds of knapsack cover cuts (with
+  complemented variables and extended-cover lifting) and complemented MIR
+  cuts, from single rows and from aggregations of up to three rows through
+  shared continuous variables. Both families are derived from a row and the
+  bounds alone, so they are valid however inaccurate the LP point is; the
+  point only picks which cuts to keep. A round keeps the most efficacious
+  cuts that are not near-parallel, retires cuts that sat slack with a zero
+  dual for two rounds, and re-solves the LP warm. Cuts are not added in the
+  tree: every new row count recompiles the LP solver, so node cuts would
+  recompile at nearly every node. During the rounds the cut block is
+  padded to power-of-two sizes with room to grow, so the rounds share one
+  compiled shape; afterwards idle cuts are dropped and the block is rebuilt
+  at a tight size, so the node LPs pay only for the cuts in use.
+- **Gomory cuts (opt-in).** `gomory_cuts=True` adds Gomory mixed-integer
+  cuts. Each round then crosses the root point over to an optimal vertex
+  with `jl.crossover`, reads tableau rows from a sparse LU of its basis,
+  and separates all three families at the vertex. On small test problems
+  they raised the root bound but made the search slower: the dense cuts
+  cost more per node LP than the smaller trees saved. On ns1830653
+  (presolved) they lift the root bound from 7,297 to 7,631, where cover
+  and MIR cuts stop. So they are off by default.
+- **Batched nodes.** With `batch_size > 1`, up to that many open nodes are
+  solved in one device call: `jax.vmap` of `jl.make_solver` over the
+  nodes' bounds and warm starts, compiled once, since the node LPs differ
+  only in their bounds. The nodes are then evaluated in order on the host
+  as in the serial search. Members run in lockstep, so one slow node holds
+  its batch to `node_max_epochs`.
 - **Warm-started nodes.** Each child starts from its parent's primal–dual
   point and step-size state. The node LPs share their shapes and solver
   settings, so the compiled solver is reused and a small node takes a few
@@ -533,17 +569,59 @@ columns are not supported.
   diverge on an infeasible node therefore prune it once there is an
   incumbent. A node LP that does not converge within `node_max_epochs` gets
   an infeasibility check of the same length.
+- **Bounds from duals.** The Lagrangian terms `(−bᵀy, r)` bound any box,
+  so each child is bounded by its parent's duals over its own propagated
+  box before its LP is solved, and closed at once when that reaches the
+  cutoff. The same terms give reduced-cost fixing: once there is an
+  incumbent, an integer variable with `rⱼ > 0` must satisfy
+  `xⱼ ≤ lⱼ + (cutoff − g(y))/rⱼ` in any better solution (and likewise from
+  the upper bound when `rⱼ < 0`). Each node tightens the bounds its children
+  inherit, and the root box is tightened with the root's duals whenever the
+  incumbent improves. Both hold for any duals, so approximate node LPs are
+  fine.
+- **Integral objective.** When every objective value is a multiple of a
+  step `g` (integer costs that are multiples of `g` after scaling by up to
+  10⁴, and no cost on continuous variables), node bounds are rounded up to
+  multiples of `g` and the cutoff becomes at most `incumbent − g/2`.
 - **Branching.** `"pseudocost"` (default) uses the product of the
   estimated down and up gains learnt from solved nodes. `"most_fractional"`
   picks the variable nearest ½.
 - **Node selection.** `"hybrid"` (default) dives depth first until the
-  first incumbent, then takes the best bound. `"best_first"` and
+  first incumbent, then takes the best bound with plunges: after each
+  best-bound node, up to `plunge_depth` steps follow its preferred child, so
+  the search keeps reaching leaves and finding better incumbents while it
+  raises the bound. `"best_first"` and
   `"depth_first"` use one rule throughout.
 - **Incumbents.** LP points whose integers are integral, and the LP point
   at every `heuristic_every`-th node, are rounded and checked against the
   rows and bounds. With continuous variables, a rounded point that fails
   the check is repaired by fixing the integers and solving the LP for the
-  rest.
+  rest, within `repair_max_epochs`. A first-order method can't prove that
+  LP infeasible quickly, so the repair is skipped when those integers
+  already failed, when no violated row has a continuous variable, or when
+  bound propagation shows the fixed box infeasible.
+- **Primal heuristics.** Rounding an LP point rarely satisfies assignment
+  or partitioning rows, so two heuristics run at the root after the cuts.
+  *Fix-and-propagate* fixes the integers to their rounded LP values in
+  chunks, those rounding above their lower bound first, with bound
+  propagation after each chunk; a rejected chunk is split and retried. It
+  needs no LP solve, so it also runs in the tree wherever rounding fails.
+  *Feasibility jump* (Luteberget and Sartor) is an LP-free weighted local
+  search on the rows: each step considers, for every variable in a violated
+  row, the value that satisfies its heaviest violated row, scores each such
+  move by its exact effect on the weighted violation, and makes the best
+  one; at a local minimum the violated rows get heavier. Every step is a
+  few sparse passes over the nonzeros, run on the device in compiled
+  chunks. It starts from the rounded root LP point and from the bounds
+  nearest zero, and once more from the pump's last point if the pump
+  fails.
+  The *objective feasibility pump* (Achterberg and Berthold) alternates
+  rounding with an LP that minimises the distance to the rounded point,
+  blended with a decaying share of the objective, and breaks cycles by
+  flipping variables. Only the cost changes between its LPs, so they reuse
+  the root's compiled solver, warm-started, at a loose tolerance. On
+  generalised assignment problems where rounding finds nothing,
+  one or the other finds an incumbent at the root in well under a second.
 - **Presolve.** `presolve=True` runs HiGHS's MIP presolve, searches the
   reduced problem, and maps the incumbent back with HiGHS's postsolve.
 
@@ -563,8 +641,20 @@ reports `bound_rigorous=False`.
 | `feasibility_tolerance` | `1e-6` | Largest row violation (relative to `1 + ‖b‖∞`) and bound violation an incumbent may have. |
 | `lp_tolerance`, `lp_options` | `1e-6`, `None` | The node LPs' relative tolerances, and any other `jl.solve` option. |
 | `node_max_epochs`, `root_max_epochs` | `200`, `None` | Epoch budgets for a node LP and the root LP. |
-| `heuristic_every` | `10` | Run the rounding heuristic every this many nodes (`0` = only on integral LP points). |
+| `heuristic_every` | `10` | Run rounding (then fix-and-propagate if it fails) every this many nodes (`0` = only on integral LP points). |
+| `fix_and_propagate`, `feasibility_jump`, `feasibility_pump` | `True`, `True`, `True` | The primal heuristics. |
+| `repair_max_epochs` | `20` | Epoch budget of the LP that repairs a rounded point's continuous variables (skipped for integers that already failed, or when propagation shows the fixed box infeasible). |
+| `jump_iterations` | `None` | Feasibility jump steps per start (`None`: `max(10000, 20·(n + m))`). |
+| `plunge_depth` | `8` | Steps a plunge follows a best-bound node's children (`0`: pure best-bound). |
+| `batch_size` | `1` | Open nodes solved together in one `vmap`-ed device call (try 8–32 on a GPU). |
+| `highs_incumbent_seconds` | `0` | If set, HiGHS supplies a first incumbent when Jaddle's heuristics find none (off by default). |
+| `rins_seconds`, `rins_every` | `0`, `50` | If set, RINS with HiGHS on the sub-MIP every `rins_every` nodes, to improve the incumbent (off by default). |
+| `pump_iterations`, `pump_tolerance` | `30`, `1e-4` | The pump's LP solves and their tolerance. |
+| `heuristic_seconds` | `None` | Time for the root heuristics (`None`: 20% of `max_seconds`, or no time limit without one). |
 | `propagate` | `True` | Bound propagation at the root and at each child. |
+| `cuts`, `cut_rounds` | `True`, `5` | Root cover and MIR cuts, and the most rounds of them. |
+| `max_cuts_per_round`, `cut_min_progress` | `100`, `1e-4` | Cuts added per round, and the relative bound gain below which the rounds stop. |
+| `gomory_cuts` | `False` | Gomory mixed-integer cuts from a crossover basis at each root round. |
 | `presolve`, `highs_options` | `False`, `None` | HiGHS presolve and postsolve, and options for the HiGHS instance. |
 | `verbose`, `log_every_seconds` | `False`, `1.0` | Progress table. |
 
@@ -578,17 +668,24 @@ maximisation), `gap`, `status` (`"optimal"`, `"infeasible"`,
 `"unbounded_or_infeasible"`, `"unresolved"`, `"time_limit"`, `"node_limit"`
 or `"interrupted"`), `converged`, `bound_rigorous`, the counts `nodes`,
 `infeasible_nodes`, `unresolved_nodes` and `lp_epochs`, `seconds`, and
-`history`, one entry per new incumbent. `"unresolved"` means the search
+`history`, one entry per new incumbent, `cuts` (the cuts in the final LP by
+family: `gomory`, `cover`, `mir`), `root_bound_before_cuts`, `heuristic_seconds`,
+`objective_step` (or `None`), `reduced_cost_tightenings`, `children_pruned`
+(children closed on their parent's duals), and `lp_repairs` / `lp_repairs_skipped`
+(repair LPs solved, and rounded points rejected without one). `"unresolved"` means the search
 ended but some nodes had nothing left to branch on and could not be settled
 (their LP did not converge, or their integral point failed the feasibility
 check); their bounds are still in `bound`. With `presolve=True` it also has
 `presolve` (HiGHS's presolve status) and `postsolve_feasible`.
 
-On small problems the search is fast once compiled: the facility-location
-example (8 binaries, 160 continuous flows) closes the gap in 61 nodes and
-about a second. On MIPLIB instances the weak relaxation and lack of
-cuts usually leave a gap. On ns1830653, 120 s on a CPU explored 52 nodes,
-with a valid bound but no incumbent yet.
+On small problems the search is fast once compiled. In the facility-location
+example (8 binaries, 160 continuous flows), five rounds of MIR cuts raise the
+root bound from 986.8 to 1204.6 (the optimum is 1209.0, so 98% of the root
+gap), and the tree closes in 5 nodes against 61 without cuts. On MIPLIB instances the two cut families close
+little of a weak relaxation, and a gap usually remains. On ns1830653
+(presolved) a single cover cut raises the root bound from 6,797 to 7,297
+(the optimum is 20,622), and 240 s on a CPU explored 98 nodes without an
+incumbent.
 
 ## The convex programming solver
 

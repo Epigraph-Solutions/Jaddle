@@ -1,11 +1,12 @@
 # Jaddle Benchmarks
 
-Scripts for measuring Jaddle's solvers. They come in three kinds:
+Scripts for measuring Jaddle's solvers. They come in four kinds:
 
 | Kind | Scripts | Purpose |
 |---|---|---|
 | **LP harnesses** | [`benchmark.py`](benchmark.py), [`benchmark_mpax.py`](benchmark_mpax.py), [`benchmark_pipeline.py`](benchmark_pipeline.py) | Solve the LP relaxations of a directory of MIPLIB instances with `jaddle_linear.solve`, then write a CSV and a README-ready markdown table. `benchmark_mpax.py` also runs [MPAX](https://github.com/MIT-Lu-Lab/MPAX) on the same presolved LPs for a head-to-head comparison. `benchmark_pipeline.py` runs the whole `jl.solve_with_presolve` pipeline with polishing and crossover. |
 | **Convex A/B suites** | [`benchmark_convex.py`](benchmark_convex.py), [`benchmark_convex_heavy.py`](benchmark_convex_heavy.py) | Compare `jaddle_convex.solve` configurations (update mode, adaptive step, restarts) on synthetic convex problems. |
+| **MIP comparison** | [`benchmark_small.py`](benchmark_small.py) | Run `jaddle_mip.solve` and HiGHS on 28 small MIPLIB 3.0 instances, downloaded into `data/small/` on first use, with a time limit each (`--seconds`, default 120). Writes `results/small_mips.csv` and prints a summary table. |
 | **Instance diagnostics** | [`scan_bigm.py`](scan_bigm.py) | Flag MPS instances whose big-M structure is known to stall saddle-point solvers. The LP harnesses use it to skip those instances. |
 
 Run every script from the repo root as `python benchmarks/<script>.py`. The

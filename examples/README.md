@@ -89,9 +89,10 @@ near the optimum). It takes about 50 seconds on a CPU.
 | [`miplib.py`](mip/miplib.py) | Load a MIPLIB instance with its integrality, run branch and bound on HiGHS's presolved MIP with a time limit, postsolve the incumbent, and compare with HiGHS's branch and cut under the same limit. | a MIPLIB `.mps` file |
 
 The MIPLIB example reads `data/<PROBLEM_NAME>.mps` (default `ns1830653`,
-5 minutes). Jaddle's branch and bound has no cutting planes and only a
-rounding heuristic, so on most MIPLIB instances it reports a valid bound and
-leaves a gap.
+5 minutes). Jaddle's branch and bound adds only root cover and MIR cuts,
+and its heuristics (rounding, fix-and-propagate, a feasibility pump) are
+simple, so on most MIPLIB instances it reports a valid bound and leaves a
+gap.
 
 ## Conic programs (`conic/`)
 

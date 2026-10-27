@@ -4,8 +4,10 @@
 
 ### Added
 
-- `jaddle.jaddle_mip`: a branch-and-bound solver for mixed-integer linear
-  programs, with `jaddle_linear.solve` at every node.
+- `jaddle.jaddle_mip` (**highly experimental**): a branch-and-bound solver
+  for mixed-integer linear programs, with `jaddle_linear.solve` at every
+  node. Its interface, defaults and behaviour may change without notice;
+  check its results against an established MIP solver.
   - `MIP` holds a Jaddle LP and a mask of integer columns, plus the
     objective constant and sense. `load` and `from_highs` read one from any
     model HiGHS reads (MPS/LP files, `highspy.Highs`, `highspy.HighsLp`),
@@ -17,6 +19,45 @@
     best-bound search, a rounding heuristic (with an LP repair of the
     continuous variables), and HiGHS presolve and postsolve with
     `presolve=True`.
+  - Bounds from duals: each child is bounded by its parent's duals over
+    its own propagated box (`lagrangian_terms`, `box_bound`) and closed
+    without an LP solve when that reaches the cutoff; reduced-cost fixing
+    (`reduced_cost_tightening`) at every node and on the root box whenever
+    the incumbent improves.
+  - Cheaper incumbent repair: the LP over a rounded point's continuous
+    variables gets its own budget (`repair_max_epochs`, default 20), and is
+    skipped for integers that already failed, when no violated row has a
+    continuous variable, or when propagation shows the fixed box
+    infeasible (`lp_repairs`, `lp_repairs_skipped` in the result). On
+    flugpl these LPs took two thirds of the time.
+  - Integral objectives (`objective_step`): when every objective value is a
+    multiple of a step, node bounds are rounded up to it and the cutoff is
+    at most half a step below the incumbent.
+  - Root cuts (cut-and-branch): knapsack cover cuts with extended-cover
+    lifting and c-MIR cuts on single and aggregated rows (`cover_cut`,
+    `mir_cut`, `CutSeparator`), in up to `cut_rounds` rounds. The cut block
+    is padded to power-of-two sizes so the rounds and the tree share one
+    compiled LP solver. On a 6-site, 12-customer facility-location MIP
+    they close 73% of the root gap.
+  - Opt-in Gomory mixed-integer cuts (`gomory_cuts=True`, `gomory_cuts()`):
+    each root round crosses over to an optimal vertex with
+    `jaddle_linear.crossover` and builds GMI cuts from its basis. Off by
+    default: on small problems they slowed the search.
+  - After the cut rounds the cut block is rebuilt without idle cuts or
+    growth padding, so node LPs stay small.
+  - Feasibility jump (`feasibility_jump`): an LP-free weighted local search
+    for feasible points, run on the device in compiled chunks, at the root
+    before the feasibility pump.
+  - Plunging in the default `"hybrid"` node selection (`plunge_depth`).
+  - Batched node solves (`batch_size`): open nodes solved together in one
+    `vmap`-ed `jaddle_linear.make_solver` call.
+  - Opt-in HiGHS help for hard instances: `highs_incumbent_seconds` (a first
+    incumbent from HiGHS) and `rins_seconds` (RINS with HiGHS solving the
+    sub-MIP, to improve the incumbent).
+  - Primal heuristics: `fix_and_propagate` (chunked rounding with bound
+    propagation, at the root and in the tree) and an objective feasibility
+    pump at the root, whose LPs change only the cost and so reuse the
+    root's compiled solver.
   - Nodes are pruned on the Lagrangian bound of their duals
     (`lagrangian_bound`), which is valid for approximate first-order
     solutions and for LPs that did not converge.
