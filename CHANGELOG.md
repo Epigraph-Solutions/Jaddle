@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Added
+
+- `examples/cp/monitor_network_design.py`: optimal experimental design on
+  open data. It chooses which of 470 candidate EPA PM2.5 sites to monitor so
+  that the daily PM2.5 at 235 held-out target sites is predicted best. A
+  factor model is fitted to 2023 data. The relaxed I-optimal design (one budget row, box bounds) is
+  solved with `jc.solve`, rounded, and improved by Woodbury-updated
+  exchanges, and its optimum certifies the 50-monitor network to within
+  1.3%. The chosen networks are checked on 2024 against random,
+  evenly spread, greedy and D-optimal ones; the designed networks have 8%
+  less error than random ones. Other parts of the example:
+  - one `vmap`-ed `jc.make_solver` call sweeps 16 budgets, and the dual of
+    the budget row gives the marginal value of a monitor;
+  - one `jax.grad` of `jc.make_optimal_value` differentiates the optimal
+    design's error with respect to the budget and all 705 noise variances.
+
 ### Changed
 
 - The `float16` profile now stores only the scaled LP the solver iterates on

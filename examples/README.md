@@ -105,6 +105,7 @@ residuals (`≤ 0`), and box bounds. Jaddle differentiates them automatically.
 | [`mpc_fleet.py`](cp/mpc_fleet.py) | Model predictive control of a fleet of 1000 oscillating-mass systems (Wang & Boyd's benchmark), 30 closed-loop steps. Each step is 1000 small QPs (105 variables, soft position limits) that share their matrices. `jc.make_qp_solver` scales the matrices once, and one `vmap`-ed solve handles the whole fleet, warm-started from the shifted previous plans. Benchmarked against warm-started SCS looping over the fleet, with a reference check of both solvers' accuracy and a sweep of time per QP from 1 to 10,000 systems on the GPU and the CPU. Writes `mpc_fleet.gif`, an animation of four systems' masses and actuators beside the whole fleet's positions. | `scs` (installed with `cvxpy`), `matplotlib` |
 | [`rag_reranker.py`](cp/rag_reranker.py) | A hybrid retrieval stack for SciFact: BM25 and dense embeddings (bge-small via `fastembed`, computed once and cached) merged by reciprocal rank fusion, then a linear ranking SVM that reranks the top 100 over 17 features per (query, document), including a cross-fitted learned term-weight score. Each regularisation path is one `vmap`-ed `jc.make_qp_solver` call, checked against Clarabel, with bootstrap intervals on the gains. A keyword-only reranker on the same candidates shows what the embeddings add. | `rag_examples` extra, the dataset download, and a ~130 MB model download |
 | [`kernel_svm.py`](cp/kernel_svm.py) | Train an RBF-kernel support vector machine on two interleaved half-moons. The SVM dual is a quadratic program, solved with `jc.quadratic_program`; the intercept is read off the equality constraint's dual. Plots the decision boundary, margins and support vectors. | `matplotlib` |
+| [`monitor_network_design.py`](cp/monitor_network_design.py) | Optimal experimental design on open data: which of 470 candidate EPA PM2.5 sites to monitor so that the daily PM2.5 at 235 held-out target sites is predicted best. A 20-factor model is fitted to 2023 data. The relaxed I-optimal design (one budget row, box bounds) is solved with `jc.solve`, rounded, and improved by Woodbury-updated exchanges, and the relaxation's optimum certifies the result. The chosen networks are checked on 2024 against random, evenly spread, greedy and D-optimal ones. A `vmap`-ed `jc.make_solver` sweeps 16 budgets, and the dual of the budget row gives the marginal value of a monitor. One `jax.grad` of `jc.make_optimal_value` gives the derivatives with respect to the budget and all 705 noise variances. | `matplotlib`, and a ~20 MB download of EPA data |
 
 ### `rag_reranker.py`
 
@@ -131,6 +132,39 @@ The hybrid reranker beats RRF by +0.040 (95% interval [+0.021, +0.060]) and
 the keyword reranker by +0.046 ([+0.023, +0.071]). Each 11-QP path solves in
 about 3 s on an RTX 5070 Ti laptop GPU. Embedding SciFact takes about
 4 minutes on the CPU the first time, and the run then takes about 35 s.
+
+### `monitor_network_design.py`
+
+Each site's daily `log(1 + PM2.5)` follows a probabilistic-PCA factor model,
+`y = μ + W f + ε`. A random third of the 705 well-covered sites are targets,
+whose PM2.5 we want to predict, and the rest are candidate monitor sites. A
+network `z` gives the factors a posterior precision
+`P(z) = I + Σ zᵢ wᵢwᵢᵀ/dᵢ`. The I-optimal criterion `φ(z) = tr(C P(z)⁻¹) / tr(C)`,
+with `C = W_Tᵀ W_T` over the targets, is the share of the targets' regional
+variance left unexplained. With `0 ≤ z ≤ 1` on candidates, `z = 0` on
+targets and `Σz = k`, it is a convex `JaddleCP`, and `P(z) ⪰ I` keeps every
+iterate in its domain.
+
+At `k = 50`, with prediction errors measured at the targets:
+
+| Network | φ (2023 model) | 2024 RMSE, µg/m³ |
+|---|---|---|
+| No monitors (target averages) | 1.000 | 5.21 |
+| Random (mean of 20) | 0.139 | 4.04 |
+| Spread out (farthest-point) | 0.126 | 4.16 |
+| Greedy | 0.067 | 3.70 |
+| D-optimal, exchanged | 0.069 | 3.69 |
+| **I-optimal, exchanged** | **0.066** | **3.71** |
+| Relaxation (lower bound) | 0.066 | |
+
+The relaxation's bound puts the I-optimal network within 1.3% of the best of
+the ~10⁶⁸ possible 50-site networks, under the model. The designed networks
+are about equal on 2024, and 8% better than random ones. Across the budget
+sweep, about 35 designed monitors predict the targets as well as 150 random
+ones. The bound is within 5% from about 24 monitors up, but loose (up to 45%)
+below the model's 20 factors. The marginal value of a monitor falls roughly
+as `k^-1.7`. The run takes under 2 minutes on an RTX 5070 Ti laptop GPU and
+about 3½ on the CPU, most of it in the 16-budget sweep.
 
 The first two examples use `jc.solve(cp)` with its default settings, so they
 are a good starting template: replace the objective and constraint functions
