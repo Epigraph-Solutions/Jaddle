@@ -531,27 +531,70 @@ columns are not supported.
   code.
 - **Root.** The root LP is solved by `jl.detect_infeasibility`, which
   certifies optimality, infeasibility or an unbounded relaxation.
+- **Coefficient tightening.** Ruiz and Pock–Chambolle scaling rescale whole
+  rows and columns, so they cannot flatten a big-M row such as
+  `y − M z ≤ 0`, where one coefficient dwarfs its rowmates. Over the
+  propagated root box, a binary's coefficient in an inequality row needs
+  no larger magnitude than the row's excess `maxact − b`, so larger ones
+  are cut to it (`tighten_coefficients`). The integer-feasible points are
+  unchanged, the LP relaxation is tighter, and the rows are better
+  conditioned for the first-order LP solver. On fixnet6 it cuts 308
+  coefficients and the median within-row spread from 500 to 5, as HiGHS
+  presolve does. Incumbents are still checked against the MIP as given.
 - **Root cuts.** Up to `cut_rounds` rounds of knapsack cover cuts (with
-  complemented variables and extended-cover lifting) and complemented MIR
-  cuts, from single rows and from aggregations of up to three rows through
-  shared continuous variables. Both families are derived from a row and the
+  complemented variables, up to three covers per row, and exact
+  sequential lifting by a dynamic program over the knapsack) and
+  complemented MIR cuts (`cmir_cut`: every integer coefficient is tried as
+  the scaling, then each integer variable's complementation is flipped
+  while that deepens the cut), from single rows and from aggregations of
+  up to three rows through shared continuous variables. With
+  `aggregate_integers` (`"auto"`, the default: on for MIPs with at most
+  10,000 nonzeros), aggregates of up to five rows also cancel the most
+  fractional integer term, so pure-integer rows combine too; MIR and cover
+  cuts come from every aggregate. Both families are derived from a row and the
   bounds alone, so they are valid however inaccurate the LP point is; the
   point only picks which cuts to keep. A round keeps the most efficacious
   cuts that are not near-parallel, retires cuts that sat slack with a zero
-  dual for two rounds, and re-solves the LP warm. Cuts are not added in the
-  tree: every new row count recompiles the LP solver, so node cuts would
-  recompile at nearly every node. During the rounds the cut block is
-  padded to power-of-two sizes with room to grow, so the rounds share one
-  compiled shape; afterwards idle cuts are dropped and the block is rebuilt
-  at a tight size, so the node LPs pay only for the cuts in use.
-- **Gomory cuts (opt-in).** `gomory_cuts=True` adds Gomory mixed-integer
-  cuts. Each round then crosses the root point over to an optimal vertex
-  with `jl.crossover`, reads tableau rows from a sparse LU of its basis,
-  and separates all three families at the vertex. On small test problems
-  they raised the root bound but made the search slower: the dense cuts
-  cost more per node LP than the smaller trees saved. On ns1830653
-  (presolved) they lift the root bound from 7,297 to 7,631, where cover
-  and MIR cuts stop. So they are off by default.
+  dual for two rounds, and re-solves the LP warm. During the rounds the cut
+  block is padded to power-of-two sizes with room to grow, so the rounds
+  share one compiled shape; afterwards idle cuts are dropped and the block
+  is rebuilt at a tight size, so the node LPs pay only for the cuts in use.
+- **Tree cuts (opt-in).** `tree_cuts=True` turns the search into branch and
+  cut. The compiled LP solver takes the sparsity pattern as data, so only
+  the shapes must stay fixed: after the root cuts the block is rebuilt at a
+  fixed capacity, and every `tree_cut_every` nodes up to 10 cover and MIR
+  cuts violated at the node's LP point (separated over the root box, so
+  valid everywhere) fill free rows or replace idle cuts. The node is not
+  re-solved; its children solve against the new cuts. On lseu, 400 nodes
+  end with a bound of 1,080 instead of 1,064 (optimum 1,120), with no
+  recompiles, for about 40% more time per node. Serial search only: the
+  batched solver captures the pattern, so `batch_size > 1` turns them off.
+- **Gomory cuts.** Gomory mixed-integer cuts need a basis: each round
+  crosses the root point over to an optimal vertex with `jl.crossover`,
+  reads tableau rows from a sparse LU of its basis, and separates all three
+  families at the vertex. `gomory_cuts="auto"` (default) turns them on for
+  MIPs with at most 10,000 nonzeros, where a crossover takes milliseconds
+  on the CPU, and then allows 40 rounds (stopping once three rounds
+  together gain less than 0.1%). On ns1830653 (presolved) they lift the
+  root bound from 7,297 to 7,631; that size is above the threshold, so
+  there they stay opt-in (`gomory_cuts=True`).
+- **Root bounds on small MIPLIB instances.** With Gomory cuts and integer
+  aggregation (the small-MIP defaults), against the earlier cover and MIR
+  cuts and against HiGHS's cuts alone (presolve, restarts and heuristics
+  off):
+
+  | Instance | Before | Now | HiGHS cuts only | Optimum |
+  |---|---|---|---|---|
+  | lseu | 1,022 | 1,091 | 1,092 | 1,120 |
+  | p0033 | 2,974 | 3,084 | 3,007 | 3,089 |
+  | p0282 | 245,918 | 258,174 | 254,593 | 258,411 |
+  | mod008 | 300 | 302 | 302 | 307 |
+  | p0201 | 7,125 | 7,125 | 7,400 | 7,615 |
+
+  lseu now solves in 473 nodes and 34s (it took 1,929 nodes and 53s). The
+  rounds cost root time: 16s on lseu and 26s on mod008, since every round
+  re-solves a larger LP. `tableau_mir=True` in `gomory_cuts` also runs
+  c-MIR on the tableau rows; it added little, so it is off.
 - **Batched nodes.** With `batch_size > 1`, up to that many open nodes are
   solved in one device call: `jax.vmap` of `jl.make_solver` over the
   nodes' bounds and warm starts, compiled once, since the node LPs differ
@@ -622,6 +665,19 @@ columns are not supported.
   the root's compiled solver, warm-started, at a loose tolerance. On
   generalised assignment problems where rounding finds nothing,
   one or the other finds an incumbent at the root in well under a second.
+  *RENS* (on for small MIPs, `rens_seconds`) then fixes the integers that
+  are integral at the root LP point, restricts the fractional ones to
+  their floor and ceiling, and searches that sub-MIP with this branch and
+  bound, reusing the compiled LP solver. Once there is an incumbent, the
+  propagation inside fix-and-propagate (and dives) carries the row
+  `c·x ≤ cutoff`, so it rejects roundings that cannot improve.
+  LP-based *dives* (`dive_every`) and *RINS* (`rins_seconds`) are opt-in.
+  Measured on lseu, p0201, p0282, flugpl, p0033 and bell5 (60s each):
+  objective-aware propagation cut lseu from 473 to 437 nodes and p0282
+  from 301 to 252; RENS cut p0282 to 141 nodes (16s, from 21s). Dives
+  helped flugpl (302 → 204 nodes) but cost time elsewhere, and RINS found
+  p0201's optimum at node 550 instead of 1,085 but doubled its run time
+  (each Jaddle sub-search costs ~0.4s), so both stay off by default.
 - **Presolve.** `presolve=True` runs HiGHS's MIP presolve, searches the
   reduced problem, and maps the incumbent back with HiGHS's postsolve.
 
@@ -646,15 +702,23 @@ reports `bound_rigorous=False`.
 | `repair_max_epochs` | `20` | Epoch budget of the LP that repairs a rounded point's continuous variables (skipped for integers that already failed, or when propagation shows the fixed box infeasible). |
 | `jump_iterations` | `None` | Feasibility jump steps per start (`None`: `max(10000, 20·(n + m))`). |
 | `plunge_depth` | `8` | Steps a plunge follows a best-bound node's children (`0`: pure best-bound). |
+| `device` | `"auto"` | `"auto"` runs MIPs with at most 10,000 nonzeros on the CPU (their node LPs are latency-bound on a GPU: flugpl takes 3s on the CPU, 18s on a GPU); `"cpu"`/`"gpu"`/`"tpu"` pick one, `None` keeps JAX's default. |
 | `batch_size` | `1` | Open nodes solved together in one `vmap`-ed device call (try 8–32 on a GPU). |
 | `highs_incumbent_seconds` | `0` | If set, HiGHS supplies a first incumbent when Jaddle's heuristics find none (off by default). |
-| `rins_seconds`, `rins_every` | `0`, `50` | If set, RINS with HiGHS on the sub-MIP every `rins_every` nodes, to improve the incumbent (off by default). |
+| `rins_seconds`, `rins_every` | `0`, `50` | If set, RINS at the root and every `rins_every` nodes, to improve the incumbent (off by default). |
+| `rens_seconds`, `rens_nodes` | `None`, `500` | RENS at the root (`None`: 5s for MIPs with at most 10,000 nonzeros, else off). |
+| `dive_every`, `dive_depth` | `0`, `20` | LP-based dives every this many nodes and at the root (`0`: off), and their depth. |
+| `rins_solver`, `rins_nodes` | `"jaddle"`, `200` | Who searches the RINS sub-MIP: this branch and bound (up to `rins_nodes` nodes, reusing the compiled LP solver) or `"highs"`. On lseu the Jaddle sub-searches take ~0.4s each against HiGHS's ~0.01s. |
 | `pump_iterations`, `pump_tolerance` | `30`, `1e-4` | The pump's LP solves and their tolerance. |
 | `heuristic_seconds` | `None` | Time for the root heuristics (`None`: 20% of `max_seconds`, or no time limit without one). |
 | `propagate` | `True` | Bound propagation at the root and at each child. |
-| `cuts`, `cut_rounds` | `True`, `5` | Root cover and MIR cuts, and the most rounds of them. |
-| `max_cuts_per_round`, `cut_min_progress` | `100`, `1e-4` | Cuts added per round, and the relative bound gain below which the rounds stop. |
-| `gomory_cuts` | `False` | Gomory mixed-integer cuts from a crossover basis at each root round. |
+| `coefficient_tightening` | `True` | Shrink binaries' big-M coefficients at the root (see above). |
+| `cuts`, `cut_rounds` | `True`, `None` | Root cuts, and the most rounds of them (`None`: 20 for small MIPs with Gomory cuts, else 5). |
+| `max_cuts_per_round`, `cut_min_progress` | `100`, `None` | Cuts added per round, and the relative bound gain below which the rounds stop. |
+| `cut_round_epochs` | `20` | Epoch budget of each cut round's root re-solve (`None`: to convergence); the root is converged once the rounds end. |
+| `gomory_cuts` | `"auto"` | Gomory mixed-integer cuts from a crossover basis at each root round (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
+| `aggregate_integers` | `"auto"` | Aggregate rows through integer variables too, up to five rows, for MIR and cover cuts (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
+| `tree_cuts`, `tree_cut_every` | `False`, `10` | Global cover and MIR cuts added in the tree every this many nodes (branch and cut; serial search only). |
 | `presolve`, `highs_options` | `False`, `None` | HiGHS presolve and postsolve, and options for the HiGHS instance. |
 | `verbose`, `log_every_seconds` | `False`, `1.0` | Progress table. |
 
@@ -669,10 +733,11 @@ maximisation), `gap`, `status` (`"optimal"`, `"infeasible"`,
 or `"interrupted"`), `converged`, `bound_rigorous`, the counts `nodes`,
 `infeasible_nodes`, `unresolved_nodes` and `lp_epochs`, `seconds`, and
 `history`, one entry per new incumbent, `cuts` (the cuts in the final LP by
-family: `gomory`, `cover`, `mir`), `root_bound_before_cuts`, `heuristic_seconds`,
+family: `gomory`, `cover`, `mir`), `root_bound_before_cuts`, `tree_cuts_added`, `rins_calls`, `heuristic_seconds`,
 `objective_step` (or `None`), `reduced_cost_tightenings`, `children_pruned`
 (children closed on their parent's duals), and `lp_repairs` / `lp_repairs_skipped`
-(repair LPs solved, and rounded points rejected without one). `"unresolved"` means the search
+(repair LPs solved, and rounded points rejected without one), and
+`coefficients_tightened`. `"unresolved"` means the search
 ended but some nodes had nothing left to branch on and could not be settled
 (their LP did not converge, or their integral point failed the feasibility
 check); their bounds are still in `bound`. With `presolve=True` it also has

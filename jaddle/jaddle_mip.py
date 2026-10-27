@@ -410,6 +410,79 @@ def propagate_bounds(
     return propagator(lower, upper, max_passes=max_passes)
 
 
+def tighten_coefficients(mip, lower, upper):
+    """
+    Big-M coefficient tightening of the inequality rows over the box
+    ``[lower, upper]``, which must hold every feasible point (the root's,
+    after propagation).
+
+    In a row ``a·x <= b`` let ``e = maxact − b``, the most the row's maximum
+    activity over the box exceeds ``b``. A binary ``z`` with ``|a_z| > e``
+    can have its coefficient cut to magnitude ``e`` without changing the
+    row at ``z = 0`` or ``z = 1``:
+
+    * ``a_z < 0`` (a big-M row such as ``y − M z <= 0``): the row is
+      redundant at ``z = 1`` already, so ``a_z`` becomes ``−e``;
+    * ``a_z > 0``: the row is redundant at ``z = 0``, so ``a_z`` becomes
+      ``e`` and ``b`` drops by ``a_z − e``.
+
+    Neither change moves ``e``, so every binary of a row is tightened in one
+    pass. The integer-feasible points are unchanged; the LP relaxation is
+    tighter and the rows' coefficient spread smaller, which helps a
+    first-order LP solver. Continuous bounds are widened by 1e-7 (relative)
+    against rounding error, and a cut is made only when it shrinks a
+    coefficient by more than 1e-3 (relative), on rows with ``e`` above
+    1e-6·(1 + |b|).
+
+    Returns ``(mip, count)``: a new ``MIP`` (the same object when nothing
+    changed) and the number of coefficients tightened.
+    """
+    A = sp.csr_matrix(mip.A, copy=True)
+    m = A.shape[0]
+    integrality = mip.integrality
+    cont = ~integrality
+    lower = np.where(cont, lower - 1e-7 * (1.0 + np.abs(lower)), lower)
+    upper = np.where(cont, upper + 1e-7 * (1.0 + np.abs(upper)), upper)
+    binary = integrality & (lower == 0.0) & (upper == 1.0)
+
+    rows = np.repeat(np.arange(m), np.diff(A.indptr))
+    cols, a = A.indices, A.data
+    with np.errstate(invalid="ignore"):
+        contribution = np.where(a > 0, a * upper[cols], a * lower[cols])
+    infinite = ~np.isfinite(contribution)
+    n_infinite = np.bincount(rows, weights=infinite.astype(np.float64), minlength=m)
+    max_activity = np.bincount(
+        rows, weights=np.where(infinite, 0.0, contribution), minlength=m
+    )
+    b = mip.b.copy()
+    excess = max_activity - b
+    usable = (
+        (np.arange(m) >= mip.n_eq)
+        & (n_infinite == 0)
+        & (excess > 1e-6 * (1.0 + np.abs(b)))
+    )
+    # A little looser than e, against rounding error (looser stays valid).
+    target = excess + 1e-9 * (1.0 + np.abs(b) + np.abs(max_activity))
+    e = target[rows]
+    hit = usable[rows] & binary[cols] & (np.abs(a) > (1.0 + 1e-3) * e)
+    if not hit.any():
+        return mip, 0
+    positive = hit & (a > 0)
+    b -= np.bincount(rows[positive], weights=a[positive] - e[positive], minlength=m)
+    A.data = np.where(hit, np.sign(a) * e, a)
+
+    lp = LP(
+        mip.c,
+        A[: mip.n_eq].tocsc(),
+        b[: mip.n_eq],
+        A[mip.n_eq :].tocsr(),
+        b[mip.n_eq :],
+        mip.lower,
+        mip.upper,
+    )
+    return MIP(lp, integrality, mip.offset, mip.maximise), int(hit.sum())
+
+
 def lagrangian_bound(
     c, A, b, n_eq, lower, upper, y, A_T=None, reduced_cost_tolerance=0.0
 ):
@@ -536,6 +609,10 @@ _CUT_MAX_ROWS = 2000
 _CUT_MAX_AGGREGATION = 2
 # Two cuts this parallel (cosine) are duplicates.
 _CUT_MAX_PARALLELISM = 0.99
+# Tree cuts (``tree_cuts``): most added per node round, and the least room
+# reserved for them (rows) beyond the root's cuts.
+_TREE_CUTS_PER_ROUND = 10
+_TREE_CUT_MIN_ROWS = 32
 
 
 def _clean_cut(idx, coef, rhs, lower, upper):
@@ -559,20 +636,16 @@ def _clean_cut(idx, coef, rhs, lower, upper):
     return idx, coef, rhs + 1e-9 * (1.0 + abs(rhs))
 
 
-def cover_cut(idx, a, b, x, lower, upper, is_binary):
-    """
-    A lifted knapsack cover cut from the row ``a · x[idx] <= b``, or ``None``.
+# Covers tried per row: greedy by (1 − z*)/w, by 1 − z*, and heaviest first.
+_COVER_ORDERS = 3
 
-    Variables that are not binary are moved to their bound that minimises
-    the row, leaving a knapsack over the binaries; binaries with negative
-    coefficients are complemented (``z = 1 − x``). A cover ``C`` is a set
-    whose weights exceed the capacity, so not all of it can be 1:
-    ``Σ_C z <= |C| − 1``. ``C`` is found greedily by ``(1 − z*)/w`` at the
-    LP point ``x``, made minimal, and lifted to the extended cover (adding
-    every item at least as heavy as ``C``'s heaviest). Returns
-    ``(idx, coef, rhs)`` for ``coef · x[idx] <= rhs``, only if it cuts off
-    ``x``.
-    """
+
+def _knapsack(idx, a, b, x, lower, upper, is_binary):
+    """The binary knapsack of the row ``a · x[idx] <= b``: non-binary
+    variables moved to the bound that minimises the row, binaries with
+    negative coefficients complemented (``z = 1 − x``). Returns
+    ``(cols, w, complemented, z, capacity)`` with weights ``w > 0`` and the
+    LP point ``z`` in complemented form, or ``None`` when no cover exists."""
     binary = is_binary[idx]
     if binary.sum() < 2:
         return None
@@ -591,109 +664,204 @@ def cover_cut(idx, a, b, x, lower, upper, is_binary):
     z = np.clip(np.where(complemented, 1.0 - x[cols], x[cols]), 0.0, 1.0)
     useful = w > 1e-12
     cols, w, complemented, z = cols[useful], w[useful], complemented[useful], z[useful]
-    threshold = capacity + 1e-9 * (1.0 + abs(capacity))
-    if capacity < 0 or w.sum() <= threshold:
+    if capacity < 0 or w.sum() <= capacity + 1e-9 * (1.0 + abs(capacity)):
         return None
-
-    order = np.argsort((1.0 - z) / w, kind="stable")
-    exceeds = np.cumsum(w[order]) > threshold
-    if not exceeds.any():
-        return None
-    cover = order[: np.argmax(exceeds) + 1]
-    # Minimal cover: drop the items the LP point uses least while it still
-    # exceeds the capacity.
-    total = w[cover].sum()
-    keep = np.ones(cover.size, dtype=bool)
-    for position in np.argsort(z[cover], kind="stable"):
-        if total - w[cover[position]] > threshold:
-            total -= w[cover[position]]
-            keep[position] = False
-    cover = cover[keep]
-    size = cover.size
-    if z[cover].sum() <= size - 1 + 1e-6:
-        return None
-    members = np.union1d(cover, np.flatnonzero(w >= w[cover].max()))
-    coef = np.where(complemented[members], -1.0, 1.0)
-    rhs = size - 1.0 - complemented[members].sum()
-    return cols[members], coef, rhs
+    return cols, w, complemented, z, capacity
 
 
-def mir_cut(idx, a, b, x, lower, upper, is_int, max_divisors=8):
+def _lift_cover(cover, w, z, capacity):
+    """Sequential up-lifting of the cover inequality ``Σ_C z <= |C| − 1``
+    over the knapsack ``w · z <= capacity``. Each item outside ``C`` (most
+    used by the LP point first) gets ``α_j = |C| − 1 − max{π · z : w · z <=
+    capacity − w_j}`` over the items placed so far, solved exactly by a
+    dynamic program over the (integer) values ``π``: ``least[v]`` is the
+    least weight reaching value ``v``. Returns the coefficients ``π``."""
+    rhs = cover.size - 1
+    pi = np.zeros(w.size)
+    pi[cover] = 1.0
+    least = np.full(rhs + 1, np.inf)
+    least[0] = 0.0
+    for item in cover:
+        update = least[:-1] + w[item]
+        least[1:] = np.minimum(least[1:], update)
+    slack = 1e-9 * (1.0 + abs(capacity))
+    rest = np.setdiff1d(np.arange(w.size), cover)
+    for item in rest[np.lexsort((-w[rest], -z[rest]))]:
+        room = capacity - w[item] + slack
+        if room < 0:
+            alpha = rhs  # z_item = 1 alone breaks the row
+        else:
+            alpha = rhs - int(np.flatnonzero(least <= room).max())
+        if alpha <= 0:
+            continue
+        pi[item] = alpha
+        if alpha <= rhs:
+            update = least[: rhs + 1 - alpha] + w[item]
+            least[alpha:] = np.minimum(least[alpha:], update)
+    return pi
+
+
+def cover_cuts(idx, a, b, x, lower, upper, is_binary, max_covers=_COVER_ORDERS):
     """
-    The best complemented mixed-integer rounding (c-MIR) cut from the row
-    ``a · x[idx] <= b``, or ``None``.
+    Lifted knapsack cover cuts from the row ``a · x[idx] <= b`` that cut off
+    ``x``, most violated first.
 
-    Every variable is shifted to its nearer finite bound at the LP point,
-    ``t = x − l`` or ``t = u − x``, so ``t >= 0`` (and integral for an
-    integer variable, whose bounds are integers). With
-    ``s = Σ −aⱼtⱼ`` over continuous terms with negative coefficient (the
-    positive ones are dropped), the row gives ``Σ_I aⱼtⱼ − s <= b'``. For a
-    divisor ``δ``, with ``f = frac(b'/δ)`` and ``fⱼ = frac(aⱼ/δ)``, the MIR
-    inequality
+    Variables that are not binary are moved to their bound that minimises
+    the row, leaving a knapsack over the binaries; binaries with negative
+    coefficients are complemented (``z = 1 − x``). A cover ``C`` is a set
+    whose weights exceed the capacity, so not all of it can be 1:
+    ``Σ_C z <= |C| − 1``. Covers are built greedily in up to ``max_covers``
+    orders at the LP point (by ``(1 − z*)/w``, by ``1 − z*``, heaviest
+    first), made minimal, and lifted exactly (``_lift_cover``). Returns a
+    list of ``(idx, coef, rhs)`` for ``coef · x[idx] <= rhs``.
+    """
+    knapsack = _knapsack(idx, a, b, x, lower, upper, is_binary)
+    if knapsack is None:
+        return []
+    cols, w, complemented, z, capacity = knapsack
+    threshold = capacity + 1e-9 * (1.0 + abs(capacity))
+    orders = (
+        np.argsort((1.0 - z) / w, kind="stable"),
+        np.lexsort((-w, 1.0 - z)),
+        np.argsort(-w, kind="stable"),
+    )[:max_covers]
+    seen, cuts = set(), []
+    for order in orders:
+        exceeds = np.cumsum(w[order]) > threshold
+        if not exceeds.any():
+            continue
+        cover = order[: np.argmax(exceeds) + 1]
+        # Minimal cover: drop the items the LP point uses least while it
+        # still exceeds the capacity.
+        total = w[cover].sum()
+        keep = np.ones(cover.size, dtype=bool)
+        for position in np.argsort(z[cover], kind="stable"):
+            if total - w[cover[position]] > threshold:
+                total -= w[cover[position]]
+                keep[position] = False
+        cover = np.sort(cover[keep])
+        key = cover.tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        pi = _lift_cover(cover, w, z, capacity)
+        rhs_z = cover.size - 1.0
+        violation = pi @ z - rhs_z
+        if violation <= 1e-6:
+            continue
+        members = np.flatnonzero(pi)
+        coef = np.where(complemented[members], -pi[members], pi[members])
+        rhs = rhs_z - pi[members][complemented[members]].sum()
+        cuts.append((violation / np.linalg.norm(pi[members]), cols[members], coef, rhs))
+    cuts.sort(key=lambda cut: -cut[0])
+    return [cut[1:] for cut in cuts]
+
+
+def cover_cut(idx, a, b, x, lower, upper, is_binary):
+    """The most violated of ``cover_cuts`` (by efficacy), or ``None``."""
+    cuts = cover_cuts(idx, a, b, x, lower, upper, is_binary)
+    return cuts[0] if cuts else None
+
+
+def _cmir_for(a, b, xv, lo, up, integer, use_upper, delta):
+    """The c-MIR cut of ``a · x <= b`` for one complementation (``use_upper``:
+    which variables are shifted to their upper bound) and scaling ``delta``,
+    as ``(efficacy, coef, rhs)`` in the original variables, or ``None``."""
+    bound = np.where(use_upper, up, lo)
+    sign = np.where(use_upper, -1.0, 1.0)
+    at = a * sign
+    beta = (b - a @ bound) / delta
+    f = beta - np.floor(beta)
+    if f < 0.01 or f > 0.99:
+        return None
+    g = at / delta
+    fj = g - np.floor(g)
+    coef_t = np.where(
+        integer,
+        np.floor(g) + np.maximum(fj - f, 0.0) / (1.0 - f),
+        np.where(~integer & (at < 0), at / (delta * (1.0 - f)), 0.0),
+    )
+    coef = coef_t * sign
+    norm = np.linalg.norm(coef)
+    if norm == 0:
+        return None
+    rhs = np.floor(beta) + coef @ bound
+    return (coef @ xv - rhs) / norm, coef, rhs
+
+
+def cmir_cut(idx, a, b, x, lower, upper, is_int, max_divisors=64):
+    """
+    The best complemented mixed-integer rounding (c-MIR) cut from the
+    inequality ``a · x[idx] <= b``, or ``None``.
+
+    Every variable is shifted to a finite bound, ``t = x − l`` or
+    ``t = u − x``, so ``t >= 0`` (and integral for an integer variable, whose
+    bounds are integers). With ``s = Σ −aⱼtⱼ`` over continuous terms with
+    negative coefficient (the positive ones are dropped), the row gives
+    ``Σ_I aⱼtⱼ − s <= b'``. For a scaling ``δ``, with ``f = frac(b'/δ)`` and
+    ``fⱼ = frac(aⱼ/δ)``, the MIR inequality
 
         Σ_I (⌊aⱼ/δ⌋ + max(fⱼ − f, 0)/(1 − f)) tⱼ − s / (δ(1 − f)) <= ⌊b'/δ⌋
 
-    holds for every integer point. Divisors are the coefficients of integer
-    variables away from their bounds, then halvings of the best. Returns
-    ``(idx, coef, rhs)`` in the original variables, only if it cuts off
-    ``x``.
+    holds for every integer point. The search (Marchand and Wolsey):
+    complement each variable to its bound nearer the LP point ``x``; try as
+    ``δ`` every distinct |coefficient| of an integer variable away from its
+    bound (up to ``max_divisors``, largest first) and 1, then halvings of the
+    best; then flip the complementation of each integer variable strictly
+    between its bounds (farthest from a bound first), keeping a flip when it
+    raises the efficacy. Cuts are compared by efficacy (distance cut off) in
+    the original variables. Returns ``(idx, coef, rhs)``, only if it cuts
+    off ``x``.
     """
     lo, up, xv, integer = lower[idx], upper[idx], x[idx], is_int[idx]
     if not integer.any():
         return None
     use_upper = np.isfinite(up) & (~np.isfinite(lo) | (up - xv < xv - lo))
-    bound = np.where(use_upper, up, lo)
-    if not np.all(np.isfinite(bound)):
+    if not np.all(np.isfinite(np.where(use_upper, up, lo))):
         return None
-    sign = np.where(use_upper, -1.0, 1.0)
-    at = a * sign
-    bt = b - a @ bound
-    t = np.maximum(sign * (xv - bound), 0.0)
-    negative_continuous = ~integer & (at < 0)
-
-    divisors = np.abs(at[integer & (t > 1e-6)])
+    t = np.maximum(np.where(use_upper, up - xv, xv - lo), 0.0)
+    divisors = np.abs(a[integer & (t > 1e-6)])
     divisors = np.unique(divisors[divisors > 1e-9])[::-1][:max_divisors]
     if divisors.size == 0:
         return None
+    divisors = np.append(divisors, 1.0)
 
-    def cut_for(delta):
-        beta = bt / delta
-        f = beta - np.floor(beta)
-        if f < 0.05 or f > 0.95:
-            return -np.inf, None
-        g = at / delta
-        fj = g - np.floor(g)
-        coef = np.where(
-            integer,
-            np.floor(g) + np.maximum(fj - f, 0.0) / (1.0 - f),
-            np.where(negative_continuous, at / (delta * (1.0 - f)), 0.0),
-        )
-        rhs = np.floor(beta)
-        norm = np.linalg.norm(coef)
-        if norm == 0:
-            return -np.inf, None
-        return (coef @ t - rhs) / norm, (coef, rhs)
-
-    best_efficacy, best, best_delta = -np.inf, None, None
+    best, best_delta = None, None
     for delta in divisors:
-        efficacy, cut = cut_for(delta)
-        if efficacy > best_efficacy:
-            best_efficacy, best, best_delta = efficacy, cut, delta
+        cut = _cmir_for(a, b, xv, lo, up, integer, use_upper, delta)
+        if cut is not None and (best is None or cut[0] > best[0]):
+            best, best_delta = cut, delta
     if best is None:
         return None
     for k in (2.0, 4.0, 8.0):
-        efficacy, cut = cut_for(best_delta / k)
-        if efficacy > best_efficacy:
-            best_efficacy, best = efficacy, cut
-    if best_efficacy <= 0:
+        cut = _cmir_for(a, b, xv, lo, up, integer, use_upper, best_delta / k)
+        if cut is not None and cut[0] > best[0]:
+            best, best_delta = cut, best_delta / k
+    # Complementation flips, for integer variables strictly inside their
+    # (finite) bounds.
+    with np.errstate(invalid="ignore"):
+        inside = integer & np.isfinite(lo) & np.isfinite(up) & (xv > lo + 1e-6) & (xv < up - 1e-6)
+    distance = np.minimum(xv - lo, up - xv)
+    for j in np.flatnonzero(inside)[np.argsort(-distance[inside], kind="stable")]:
+        flipped = use_upper.copy()
+        flipped[j] = not flipped[j]
+        cut = _cmir_for(a, b, xv, lo, up, integer, flipped, best_delta)
+        if cut is not None and cut[0] > best[0] + 1e-12:
+            best, use_upper = cut, flipped
+    efficacy, coef, rhs = best
+    if efficacy <= 1e-9:
         return None
-    coef_t, rhs_t = best
-    # Back to x: t = sign·(x − bound).
-    coef = coef_t * sign
-    return idx, coef, rhs_t + coef @ bound
+    return idx, coef, rhs
 
 
-def gomory_cuts(A, b, n_eq, lower, upper, integrality, basis, x, max_cuts=200):
+def mir_cut(idx, a, b, x, lower, upper, is_int, max_divisors=64):
+    """``cmir_cut`` (kept under its earlier name)."""
+    return cmir_cut(idx, a, b, x, lower, upper, is_int, max_divisors)
+
+
+def gomory_cuts(
+    A, b, n_eq, lower, upper, integrality, basis, x, max_cuts=200, tableau_mir=False
+):
     """
     Gomory mixed-integer (GMI) cuts from an optimal basis of the LP
     ``A[:n_eq] x = b[:n_eq], A[n_eq:] x <= b[n_eq:], lower <= x <= upper``.
@@ -715,6 +883,12 @@ def gomory_cuts(A, b, n_eq, lower, upper, integrality, basis, x, max_cuts=200):
     columns do not come out as a unit vector is skipped as numerically
     unreliable. Returns a list of ``("gomory", idx, coef, rhs)``, at most
     ``max_cuts``, for the basic variables nearest ½ first.
+
+    With ``tableau_mir``, each tableau row is also handed to ``cmir_cut`` as
+    an equation over the variables and the inequality slacks (continuous,
+    ``>= 0``), in both senses; the slacks are mapped back through
+    ``s = b − A x``. Per row, the deeper of the GMI cut and the c-MIR cuts
+    is kept, the latter as ``"tableau_mir"``.
     """
     import highspy
     from scipy.sparse.linalg import splu
@@ -775,6 +949,19 @@ def gomory_cuts(A, b, n_eq, lower, upper, integrality, basis, x, max_cuts=200):
     nonbasic_slack = ~row_basic & ineq_row
     AT = A.T.tocsr()
     cuts = []
+    if tableau_mir:
+        # The extended space: the variables, then the inequality slacks.
+        ineq = np.flatnonzero(ineq_row)
+        A_ineq_T = A[ineq].T.tocsr()
+        ext_lower = np.concatenate([lower, np.zeros(ineq.size)])
+        ext_upper = np.concatenate([upper, np.full(ineq.size, np.inf)])
+        ext_int = np.concatenate([integrality, np.zeros(ineq.size, bool)])
+        ext_x = np.concatenate([x, np.maximum(b[ineq] - A[ineq] @ x, 0.0)])
+
+    def efficacy(cut):
+        _, idx, coef, rhs = cut
+        return (coef @ x[idx] - rhs) / np.linalg.norm(coef)
+
     for _, p, k in candidates[:max_cuts]:
         e = np.zeros(m)
         e[p] = 1.0
@@ -812,8 +999,37 @@ def gomory_cuts(A, b, n_eq, lower, upper, integrality, basis, x, max_cuts=200):
         if idx.size == 0 or idx.size > max(n // 2, min(n, 100)):
             continue
         cleaned = _clean_cut(idx, -coef_ge[idx], -rhs_ge, lower, upper)
-        if cleaned is not None:
-            cuts.append(("gomory", *cleaned))
+        best = ("gomory", *cleaned) if cleaned is not None else None
+        if tableau_mir:
+            # The row Σ āⱼxⱼ + Σ uᵢsᵢ = u·b (equality slacks are 0).
+            row = np.concatenate([abar, u[ineq]])
+            row_idx = np.flatnonzero(np.abs(row) > 1e-12)
+            for sense in (1.0, -1.0):
+                found = cmir_cut(
+                    row_idx, sense * row[row_idx], sense * (u @ b),
+                    ext_x, ext_lower, ext_upper, ext_int,
+                )
+                if found is None:
+                    continue
+                c_idx, c_coef, c_rhs = found
+                c_x = np.zeros(n)
+                c_s = np.zeros(ineq.size)
+                in_x = c_idx < n
+                c_x[c_idx[in_x]] = c_coef[in_x]
+                c_s[c_idx[~in_x] - n] = c_coef[~in_x]
+                coef_x = c_x - A_ineq_T @ c_s
+                rhs_x = c_rhs - c_s @ b[ineq]
+                x_idx = np.flatnonzero(coef_x)
+                if x_idx.size == 0 or x_idx.size > max(n // 2, min(n, 100)):
+                    continue
+                cleaned = _clean_cut(x_idx, coef_x[x_idx], rhs_x, lower, upper)
+                if cleaned is None:
+                    continue
+                candidate = ("tableau_mir", *cleaned)
+                if best is None or efficacy(candidate) > efficacy(best):
+                    best = candidate
+        if best is not None:
+            cuts.append(best)
     return cuts
 
 
@@ -821,7 +1037,15 @@ class CutSeparator:
     """Cover and c-MIR separation from the rows of a ``MIP`` over bounds that
     hold for every feasible point (the root's, after propagation)."""
 
-    def __init__(self, mip, lower, upper):
+    def __init__(
+        self, mip, lower, upper, aggregate_integers=False,
+        max_aggregation=_CUT_MAX_AGGREGATION,
+    ):
+        # ``aggregate_integers``: when an aggregate has no continuous variable
+        # left to cancel, cancel its most fractional integer term instead (so
+        # pure-integer rows aggregate too). ``max_aggregation``: rows added.
+        self.aggregate_integers = aggregate_integers
+        self.max_aggregation = max_aggregation
         self.A = sp.csr_matrix(mip.A)
         self.A_csc = self.A.tocsc()
         self.b = mip.b
@@ -848,14 +1072,11 @@ class CutSeparator:
             if idx.size == 0:
                 continue
             for s in (1.0, -1.0) if self.is_eq[r] else (1.0,):
-                found = cover_cut(
+                for found in cover_cuts(
                     idx, s * a, s * self.b[r], x, self.lower, self.upper, self.is_binary
-                )
-                if found is not None:
+                ):
                     cuts.append(("cover", *found))
-                found = self.aggregated_mir(r, s, x)
-                if found is not None:
-                    cuts.append(("mir", *found))
+                cuts += self.aggregated_mir(r, s, x)
         out = []
         for family, idx, coef, rhs in cuts:
             cleaned = _clean_cut(idx, coef, rhs, self.lower, self.upper)
@@ -864,25 +1085,34 @@ class CutSeparator:
         return out
 
     def aggregated_mir(self, r, s, x):
-        """The best c-MIR cut from row ``r`` (times ``s``) and up to
-        ``_CUT_MAX_AGGREGATION`` more rows, each added to cancel the
-        continuous variable furthest from its bounds."""
+        """Cuts from row ``r`` (times ``s``) and aggregates of it with up to
+        ``max_aggregation`` more rows, each added to cancel the continuous
+        variable furthest from its bounds (or, with ``aggregate_integers``
+        and none left, the integer term ``|aⱼ|·min(fⱼ, 1 − fⱼ)`` largest at
+        ``x``). Returns the best c-MIR cut over the aggregates, and the cover
+        cuts of the aggregates beyond the row itself."""
         idx, a = self.row(r)
         a, b = s * a, s * self.b[r]
         used = {r}
         best, best_efficacy = None, 0.0
-        for level in range(_CUT_MAX_AGGREGATION + 1):
-            cut = mir_cut(idx, a, b, x, self.lower, self.upper, self.is_int)
+        covers = []
+        for level in range(self.max_aggregation + 1):
+            cut = cmir_cut(idx, a, b, x, self.lower, self.upper, self.is_int)
             if cut is not None:
                 c_idx, c_coef, c_rhs = cut
                 efficacy = (c_coef @ x[c_idx] - c_rhs) / np.linalg.norm(c_coef)
                 if efficacy > best_efficacy:
                     best, best_efficacy = cut, efficacy
-            if level == _CUT_MAX_AGGREGATION:
+            if level > 0:
+                covers += [
+                    ("cover", *found)
+                    for found in cover_cuts(
+                        idx, a, b, x, self.lower, self.upper, self.is_binary
+                    )
+                ]
+            if level == self.max_aggregation:
                 break
             continuous = ~self.is_int[idx]
-            if not continuous.any():
-                break
             with np.errstate(invalid="ignore"):
                 distance = np.minimum(
                     x[idx] - self.lower[idx], self.upper[idx] - x[idx]
@@ -890,7 +1120,15 @@ class CutSeparator:
             distance = np.where(continuous, np.nan_to_num(distance, posinf=1e30), -1.0)
             pos = int(np.argmax(distance))
             if distance[pos] <= 1e-6:
-                break
+                if not self.aggregate_integers:
+                    break
+                frac = x[idx] - np.floor(x[idx])
+                score = np.where(
+                    self.is_int[idx], np.abs(a) * np.minimum(frac, 1.0 - frac), -1.0
+                )
+                pos = int(np.argmax(score))
+                if score[pos] <= 1e-6:
+                    break
             col, coef = idx[pos], a[pos]
             start, end = self.A_csc.indptr[col], self.A_csc.indptr[col + 1]
             partner = None
@@ -922,7 +1160,7 @@ class CutSeparator:
             used.add(r2)
             if idx.size == 0:
                 break
-        return best
+        return ([("mir", *best)] if best is not None else []) + covers
 
 
 def select_cuts(cuts, x, n, min_efficacy=1e-4, max_cuts=100):
@@ -1485,6 +1723,29 @@ def _propagation_search(propagator, hint, lower, upper, ints, free, budget, dead
     return None
 
 
+# ``device="auto"`` runs MIPs with at most this many nonzeros on the CPU:
+# their node LPs are latency-bound on an accelerator. Measured (ms per LP
+# epoch, CPU vs GPU): 98 nonzeros 0.7 vs 4.2, 8,937 nonzeros 4.2 vs 5.1,
+# 100,933 nonzeros 73 vs 7.5; the crossover is near 10k.
+_SMALL_MIP_NNZ = 10_000
+
+
+def _search_device(device, nnz):
+    """The JAX device for the search (``None``: JAX's default)."""
+    if device is None:
+        return None
+    if device == "auto":
+        if nnz > _SMALL_MIP_NNZ:
+            return None
+        device = "cpu"
+    if device not in ("cpu", "gpu", "tpu"):
+        raise ValueError(f"unknown device {device!r}")
+    try:
+        return jax.devices(device)[0]
+    except RuntimeError as error:
+        raise ValueError(f"no {device} device available") from error
+
+
 # %%
 # Branch and bound
 class _Node:
@@ -1521,11 +1782,16 @@ class _BranchAndBound:
         infeasibility_tolerance,
         heuristic_every,
         propagate,
+        coefficient_tightening,
         cuts,
         cut_rounds,
         max_cuts_per_round,
         cut_min_progress,
+        cut_round_epochs,
         gomory_cuts,
+        aggregate_integers,
+        tree_cuts,
+        tree_cut_every,
         fix_and_propagate,
         feasibility_jump,
         jump_iterations,
@@ -1544,7 +1810,28 @@ class _BranchAndBound:
         verbose,
         log_every_seconds,
         start,
+        device=None,
+        rins_solver="jaddle",
+        rins_nodes=200,
+        rens_seconds=None,
+        rens_nodes=500,
+        dive_every=0,
+        dive_depth=20,
+        initial_cutoff=None,
     ):
+        # Every setting, for sub-searches (``jaddle_rins``).
+        self.settings = {
+            key: value for key, value in locals().items() if key not in ("self", "mip")
+        }
+        if rins_solver not in ("jaddle", "highs"):
+            raise ValueError(f"rins_solver must be 'jaddle' or 'highs', not {rins_solver!r}")
+        self.rins_solver, self.rins_nodes = rins_solver, rins_nodes
+        self.rins_seen = set()  # neighbourhoods searched by jaddle_rins
+        # A warm start for the root LP (a sub-search's, from its parent).
+        self.root_warm = None
+        self.rins_skipped = 0
+        # A cutoff known before the search (a sub-MIP's parent's).
+        self.initial_cutoff = np.inf if initial_cutoff is None else float(initial_cutoff)
         if branching not in ("pseudocost", "most_fractional"):
             raise ValueError(f"unknown branching rule {branching!r}")
         if node_selection not in ("hybrid", "best_first", "depth_first"):
@@ -1554,13 +1841,45 @@ class _BranchAndBound:
         if reserved:
             raise ValueError(f"lp_options cannot set {', '.join(reserved)}")
 
-        self.base = mip  # the MIP as given; cuts extend ``self.mip``
+        self.original = mip  # the MIP as given: incumbents are checked on it
+        self.device = _search_device(device, mip.A.nnz)
+        # The MIP searched: the original, or it with tightened coefficients;
+        # cuts extend ``self.mip``.
+        self.base = mip
+        self.use_coefficient_tightening = coefficient_tightening
+        self.coefficients_tightened = 0
         self.cuts, self.cut_rounds = cuts, cut_rounds
         self.max_cuts_per_round, self.cut_min_progress = (
             max_cuts_per_round,
             cut_min_progress,
         )
-        self.gomory = gomory_cuts
+        # Small MIPs get Gomory cuts and more cut rounds by default: their
+        # crossovers take milliseconds.
+        small = mip.A.nnz <= _SMALL_MIP_NNZ
+        if gomory_cuts not in ("auto", True, False):
+            raise ValueError(f"gomory_cuts must be 'auto', True or False, not {gomory_cuts!r}")
+        self.gomory = small if gomory_cuts == "auto" else bool(gomory_cuts)
+        if aggregate_integers not in ("auto", True, False):
+            raise ValueError(
+                f"aggregate_integers must be 'auto', True or False, not {aggregate_integers!r}"
+            )
+        self.aggregate_integers = (
+            small if aggregate_integers == "auto" else bool(aggregate_integers)
+        )
+        many_rounds = self.gomory and small
+        if cut_rounds is None:
+            self.cut_rounds = 40 if many_rounds else 5
+        if cut_min_progress is None:
+            # Late rounds slow the root LP for little gain, so stop once three
+            # rounds together gain less than 0.1%.
+            self.cut_min_progress = 1e-3 if many_rounds else 1e-4
+        # Global cuts in the tree need one sparsity pattern per compiled
+        # solver; the batched solver captures it, so they are serial only.
+        self.use_tree_cuts = bool(tree_cuts) and int(batch_size) == 1
+        if tree_cuts and not self.use_tree_cuts and verbose:
+            print("Tree cuts are off with batch_size > 1")
+        self.tree_cut_every = tree_cut_every
+        self.tree_cuts_added = 0
         self.cut_list = []
         self.root_bound_before_cuts = None
         self.use_fix_and_propagate = fix_and_propagate
@@ -1568,7 +1887,15 @@ class _BranchAndBound:
         self.use_repair = repair
         self.repair_max_epochs = repair_max_epochs
         self.highs_seconds = highs_incumbent_seconds
+        # RENS defaults on for small MIPs (``None``: auto).
+        if rens_seconds is None:
+            rens_seconds = 5.0 if small else 0.0
         self.rins_seconds, self.rins_every = rins_seconds, rins_every
+        self.rins_pending = False  # a new incumbent asks for a RINS call
+        self.rens_seconds, self.rens_nodes = rens_seconds, rens_nodes
+        self.dive_every, self.dive_depth = dive_every, dive_depth
+        self.dives = 0
+        self.use_objective_propagation = True
         self.rins_calls = 0
         self.plunge_depth = plunge_depth
         self.plunge_node = None  # the child the next step plunges into
@@ -1589,6 +1916,7 @@ class _BranchAndBound:
         self.int_tol = integrality_tolerance
         self.feas_tol = feasibility_tolerance
         self.node_max_epochs, self.root_max_epochs = node_max_epochs, root_max_epochs
+        self.cut_round_epochs = cut_round_epochs
         self.infeas_tol = infeasibility_tolerance
         self.heuristic_every = heuristic_every
         self.verbose, self.log_every = verbose, log_every_seconds
@@ -1653,23 +1981,46 @@ class _BranchAndBound:
             mip.A, mip.row_lower, mip.row_upper, self.is_int
         )
         self.propagator = self.row_propagator if self.propagate else None
+        # The rows plus the objective row c·x <= cutoff, for heuristics that
+        # should only find improving points (``heuristic_propagator``).
+        self.objective_propagator = BoundPropagator(
+            sp.vstack([mip.A, sp.csr_matrix(mip.c[None, :])], format="csr"),
+            np.append(mip.row_lower, -np.inf),
+            np.append(mip.row_upper, np.inf),
+            self.is_int,
+        )
+
+    def heuristic_propagator(self):
+        """The propagator for heuristics: with the objective row at the
+        current cutoff once there is one, so roundings that cannot improve
+        on the incumbent are rejected; else the rows alone."""
+        cutoff = self.cutoff()
+        if not (self.use_objective_propagation and np.isfinite(cutoff)):
+            return self.row_propagator
+        self.objective_propagator.row_upper[-1] = cutoff
+        return self.objective_propagator
 
     # -- bookkeeping ---------------------------------------------------------
     def seconds_left(self):
-        return None if self.deadline is None else self.deadline - time.time()
+        """Seconds to the deadline (``None``: no deadline), at least 1ms:
+        the deadline can pass between a time check and an LP solve, and
+        ``jl.solve`` needs a positive limit (it then stops at once)."""
+        if self.deadline is None:
+            return None
+        return max(self.deadline - time.time(), 1e-3)
 
     def out_of_time(self):
         return self.deadline is not None and time.time() >= self.deadline
 
     def cutoff(self):
         if self.incumbent is None:
-            return np.inf
+            return self.initial_cutoff
         value = self.incumbent[0] + self.mip.offset
         cutoff = self.incumbent[0] - max(self.abs_gap, self.rel_gap * abs(value))
         if self.objective_step is not None:
             # A better solution is at least one step better.
             cutoff = min(cutoff, self.incumbent[0] - 0.5 * self.objective_step)
-        return cutoff
+        return min(cutoff, self.initial_cutoff)
 
     def round_bound(self, bound):
         """``bound`` rounded up to a multiple of the objective step, less a
@@ -1814,7 +2165,7 @@ class _BranchAndBound:
         """``reduced_cost_tightening`` of a box against the cutoff, then
         propagation. Returns ``(lower, upper, infeasible)``, where
         ``infeasible`` means the box holds no solution below the cutoff."""
-        if self.incumbent is None:
+        if not np.isfinite(self.cutoff()):
             return lower, upper, False
         bound, rigorous = self.bound_over(terms, lower, upper)
         if not rigorous:
@@ -1867,7 +2218,7 @@ class _BranchAndBound:
         key = candidate[self.is_int].tobytes()
         if key in self.failed_roundings:
             return False
-        rows = _violated_rows(self.base, candidate, self.feas_tol)
+        rows = _violated_rows(self.original, candidate, self.feas_tol)
         worth = bool(self.row_has_continuous[rows].any())
         if worth:
             _, _, infeasible = self.row_propagator(fixed_lower, fixed_upper)
@@ -1884,7 +2235,7 @@ class _BranchAndBound:
         mip = self.mip
         candidate = np.clip(np.asarray(x, np.float64), mip.lower, mip.upper)
         candidate[self.is_int] = np.round(candidate[self.is_int])
-        if not self.base.is_feasible(candidate, self.feas_tol):
+        if not self.original.is_feasible(candidate, self.feas_tol):
             if not self.has_continuous or self.out_of_time():
                 return False
             fixed_lower = np.where(self.is_int, candidate, mip.lower)
@@ -1915,16 +2266,20 @@ class _BranchAndBound:
                 fixed_upper,
             )
             candidate[self.is_int] = fixed_lower[self.is_int]
-            if not self.base.is_feasible(candidate, self.feas_tol):
+            if not self.original.is_feasible(candidate, self.feas_tol):
                 self.failed_roundings.add(candidate[self.is_int].tobytes())
                 return False
         value = float(mip.c @ candidate)
+        if value >= self.initial_cutoff:
+            return True  # feasible, but no better than the parent search's cutoff
         if self.incumbent is not None and value >= self.incumbent[0] - 1e-12 * (
             1.0 + abs(self.incumbent[0])
         ):
             return True
         switch = self.incumbent is None
         self.incumbent = (value, candidate)
+        if source != "N":
+            self.rins_pending = True
         bound = self.global_bound()
         self.history.append(
             dict(
@@ -2090,7 +2445,7 @@ class _BranchAndBound:
             if not self.try_incumbent(x, "H", warm) and self.use_fix_and_propagate:
                 started = time.time()
                 candidate = fix_and_propagate(
-                    x, lower, upper, self.is_int, self.row_propagator
+                    x, lower, upper, self.is_int, self.heuristic_propagator()
                 )
                 if candidate is not None:
                     self.try_incumbent(candidate, "P", warm)
@@ -2101,10 +2456,16 @@ class _BranchAndBound:
         if (
             self.rins_seconds
             and self.incumbent is not None
-            and self.nodes % self.rins_every == 0
+            and (self.nodes % self.rins_every == 0 or self.rins_pending)
             and not self.out_of_time()
         ):
+            self.rins_pending = False
             self.rins(x, warm)
+            if bound >= self.cutoff():
+                self.close(bound, rigorous)
+                return
+        if self.dive_every and self.nodes % self.dive_every == 0 and not self.out_of_time():
+            self.dive(x, lower, upper, warm)
             if bound >= self.cutoff():
                 self.close(bound, rigorous)
                 return
@@ -2125,6 +2486,12 @@ class _BranchAndBound:
             return
         else:
             var = self.choose_variable(x, fractional)
+        if (
+            self.use_tree_cuts
+            and self.tree_cut_every
+            and self.nodes % self.tree_cut_every == 0
+        ):
+            warm = self.tree_cut_round(x, warm)
         self.branch(node, lower, upper, x, var, bound, value, warm, terms)
 
     def log(self, source, bound, depth, force=False):
@@ -2168,6 +2535,16 @@ class _BranchAndBound:
             print("----------------------------------------------")
             print(f"Status: {status}")
             print(f"Nodes: {self.nodes}, LP epochs: {self.lp_epochs}")
+            if self.cut_list or self.root_bound_before_cuts is not None:
+                families = [cut["family"] for cut in self.cut_list]
+                line = (
+                    f"Cuts: {len(families)} in the LP ({families.count('cover')} "
+                    f"cover, {families.count('mir')} MIR, "
+                    f"{families.count('gomory')} Gomory)"
+                )
+                if self.use_tree_cuts:
+                    line += f", {self.tree_cuts_added} added in the tree"
+                print(line)
             if objective is not None:
                 print(f"Objective: {objective:.10g}")
             print(f"Bound: {self.model_value(bound):.10g}")
@@ -2200,6 +2577,9 @@ class _BranchAndBound:
             "children_pruned": self.children_pruned,
             "lp_repairs": self.lp_repairs,
             "lp_repairs_skipped": self.lp_repairs_skipped,
+            "coefficients_tightened": self.coefficients_tightened,
+            "tree_cuts_added": self.tree_cuts_added,
+            "rins_calls": self.rins_calls,
         }
 
     def root_vertex(self, lower, upper, solution):
@@ -2226,9 +2606,15 @@ class _BranchAndBound:
         base = self.base
         n = base.num_variables
         base_m = base.A.shape[0] - base.n_eq
-        separator = CutSeparator(base, lower, upper)
+        # Separate from the rows as searched and, when coefficient tightening
+        # changed them, from the rows as given too: tightening lifts the LP
+        # bound, but the original knapsack rows can give stronger covers.
+        separators = [self.separator(base, lower, upper)]
+        if self.original is not base:
+            separators.append(self.separator(self.original, lower, upper))
         bound, _ = self.lp_bound(result["solution"], lower, upper)
         self.root_bound_before_cuts = bound
+        history = [bound]  # the best bound after each round
         capacity = None
         for round_number in range(1, self.cut_rounds + 1):
             if self.out_of_time():
@@ -2253,7 +2639,8 @@ class _BranchAndBound:
                         x,
                         max_cuts=2 * self.max_cuts_per_round,
                     )
-            candidates += separator(x)
+            for separator in separators:
+                candidates += separator(x)
             found = select_cuts(candidates, x, n, max_cuts=self.max_cuts_per_round)
             if not found:
                 break
@@ -2287,7 +2674,7 @@ class _BranchAndBound:
             lp = self.node_lp(lower, upper)
             detection = self.detect(
                 lp, {"solution": warm, "opt_state": result["opt_state"]},
-                self.root_max_epochs,
+                self.round_epochs(),
             )
             if detection["status"] == "primal_infeasible":
                 return "infeasible"
@@ -2314,12 +2701,29 @@ class _BranchAndBound:
                     f"MIR in the LP, bound {self.model_value(new_bound):.6e}, "
                     f"{time.time() - self.start:.1f}s"
                 )
-            gain = new_bound - bound
             bound = max(bound, new_bound)
+            history.append(bound)
+            # Progress comes in bursts, so judge it over the last three
+            # rounds rather than the last one.
+            gain = history[-1] - history[max(0, len(history) - 4)]
             scale = max(1.0, abs(bound + self.mip.offset))
             if not np.isfinite(gain) or gain <= self.cut_min_progress * scale:
                 break
-        return self.compact_cuts(lower, upper, result)
+        result = self.compact_cuts(lower, upper, result)
+        if isinstance(result, dict) and not result["converged"] and not self.out_of_time():
+            # The rounds stopped early; the tree starts from a converged root.
+            detection = self.detect(self.node_lp(lower, upper), result, self.root_max_epochs)
+            if detection["status"] == "primal_infeasible":
+                return "infeasible"
+            result = detection["result"]
+        return result
+
+    def round_epochs(self):
+        """The epoch budget of a cut round's re-solve: ``cut_round_epochs``
+        (separation needs only a reasonable point, and the Lagrangian bound
+        holds at any duals), within ``root_max_epochs``."""
+        budgets = [e for e in (self.cut_round_epochs, self.root_max_epochs) if e]
+        return min(budgets) if budgets else None
 
     def compact_cuts(self, lower, upper, result):
         """Rebuild the cut block for the tree: keep the cuts that were tight
@@ -2352,6 +2756,145 @@ class _BranchAndBound:
         if detection["status"] == "primal_infeasible":
             return "infeasible"
         return detection["result"]
+
+    def separator(self, mip, lower, upper):
+        """A ``CutSeparator`` with this search's aggregation settings."""
+        return CutSeparator(
+            mip,
+            lower,
+            upper,
+            aggregate_integers=self.aggregate_integers,
+            max_aggregation=4 if self.aggregate_integers else _CUT_MAX_AGGREGATION,
+        )
+
+    def reserve_tree_cuts(self, result):
+        """Rebuild the cut block at a fixed capacity with room for tree cuts,
+        so every later block (``tree_cut_round``) has the same shape and the
+        node LPs keep one compiled solver. Returns the root result with its
+        duals padded to the new rows (padding rows are ``0 <= 0``)."""
+        base = self.base
+        n = base.num_variables
+        base_m = base.A.shape[0] - base.n_eq
+        root_rows = len(self.cut_list)
+        root_nnz = sum(cut["idx"].size for cut in self.cut_list)
+        self.tree_nnz_cap = _next_power_of_two(
+            max(256, 2 * root_nnz, _TREE_CUT_MIN_ROWS * min(n, 16))
+        )
+        # Enough rows for the cuts plus the zero rows that pad the nonzeros.
+        self.tree_padding_rows = -(-self.tree_nnz_cap // n)
+        self.tree_rows_cap = _next_power_of_two(
+            max(_TREE_CUT_MIN_ROWS, 2 * root_rows) + self.tree_padding_rows
+        )
+        dual_ineq = np.asarray(result["solution"].dual_ineq)
+        self.set_mip(base.with_rows(*self.tree_block()))
+        if self.verbose:
+            print(
+                f"Tree cuts: room for {self.tree_rows_cap - self.tree_padding_rows} "
+                f"cuts ({self.tree_nnz_cap} nonzeros), {root_rows} from the root, "
+                f"a round every {self.tree_cut_every} nodes"
+            )
+        duals = np.zeros(base_m + self.tree_rows_cap, dtype=dual_ineq.dtype)
+        keep = base_m + root_rows
+        duals[:keep] = dual_ineq[:keep]
+        solution = result["solution"]._replace(dual_ineq=jnp.asarray(duals))
+        return dict(result, solution=solution)
+
+    def tree_block(self):
+        """The cut pool as a block of exactly the reserved capacity."""
+        n = self.base.num_variables
+        A_cuts, b_cuts = _cut_block(
+            self.cut_list, n, self.tree_rows_cap, self.tree_nnz_cap
+        )
+        assert A_cuts.shape[0] == self.tree_rows_cap
+        assert A_cuts.nnz == self.tree_nnz_cap
+        return A_cuts, b_cuts
+
+    def tree_cut_round(self, x, warm):
+        """Separate globally valid cuts at a node's LP point ``x`` (over the
+        root box) and put the violated ones into the pool: in free capacity,
+        or in place of cuts that have been slack with a zero dual for two
+        rounds. The current node is not re-solved; its children solve
+        against the new cuts. Returns ``warm`` with the duals of replaced
+        rows zeroed."""
+        base = self.base
+        n = base.num_variables
+        base_m = base.A.shape[0] - base.n_eq
+        solution = warm[0]
+        y = np.asarray(solution.dual_ineq, np.float64)[base_m:]
+        y_scale = 1e-9 * (1.0 + np.abs(y).max(initial=0.0))
+        for i, cut in enumerate(self.cut_list):
+            slack = cut["rhs"] - cut["coef"] @ x[cut["idx"]]
+            idle = slack > 1e-6 * (1.0 + abs(cut["rhs"])) and y[i] <= y_scale
+            cut["age"] = cut["age"] + 1 if idle else 0
+
+        separators = [self.separator(base, self.root_lower, self.root_upper)]
+        if self.original is not base:
+            separators.append(
+                self.separator(self.original, self.root_lower, self.root_upper)
+            )
+        candidates = [cut for separator in separators for cut in separator(x)]
+        # Not near-duplicates of the pool's cuts.
+        if self.cut_list and candidates:
+            pool = sp.csr_matrix(
+                (
+                    np.concatenate([c["coef"] / np.linalg.norm(c["coef"]) for c in self.cut_list]),
+                    np.concatenate([c["idx"] for c in self.cut_list]),
+                    np.concatenate([[0], np.cumsum([c["idx"].size for c in self.cut_list])]),
+                ),
+                shape=(len(self.cut_list), n),
+            )
+            fresh = []
+            for cut in candidates:
+                _, idx, coef, _ = cut
+                direction = np.zeros(n)
+                direction[idx] = coef / np.linalg.norm(coef)
+                if np.abs(pool @ direction).max() <= _CUT_MAX_PARALLELISM:
+                    fresh.append(cut)
+            candidates = fresh
+        found = select_cuts(candidates, x, n, max_cuts=_TREE_CUTS_PER_ROUND)
+        if not found:
+            return warm
+
+        max_rows = self.tree_rows_cap - self.tree_padding_rows
+        nnz = sum(cut["idx"].size for cut in self.cut_list)
+        replaced, placed, families = [], 0, []
+        for family, idx, coef, rhs in found:
+            new = dict(family=family, idx=idx, coef=coef, rhs=rhs, age=0)
+            if len(self.cut_list) < max_rows and nnz + idx.size <= self.tree_nnz_cap:
+                self.cut_list.append(new)
+                nnz += idx.size
+                placed += 1
+                families.append(family)
+                continue
+            slots = [
+                i
+                for i, cut in enumerate(self.cut_list)
+                if cut["age"] >= 2 and nnz - cut["idx"].size + idx.size <= self.tree_nnz_cap
+            ]
+            if not slots:
+                continue
+            slot = max(slots, key=lambda i: self.cut_list[i]["age"])
+            nnz += idx.size - self.cut_list[slot]["idx"].size
+            self.cut_list[slot] = new
+            replaced.append(slot)
+            placed += 1
+            families.append(family)
+        if not placed:
+            return warm
+        self.tree_cuts_added += placed
+        self.set_mip(base.with_rows(*self.tree_block()))
+        if self.verbose:
+            print(
+                f"C {self.nodes:8d} {len(self.open):8d}   cuts +{placed} "
+                f"({families.count('cover')} cover, {families.count('mir')} MIR)"
+                + (f", {len(replaced)} replacing idle cuts" if replaced else "")
+                + f", pool {len(self.cut_list)}/{max_rows}"
+            )
+        if replaced:
+            duals = np.asarray(solution.dual_ineq).copy()
+            duals[[base_m + i for i in replaced]] = 0.0
+            warm = (solution._replace(dual_ineq=jnp.asarray(duals)), warm[1])
+        return warm
 
     def feasibility_pump(self, lower, upper, result, deadline):
         """The objective feasibility pump (Achterberg & Berthold) from the
@@ -2443,18 +2986,221 @@ class _BranchAndBound:
         return False
 
     def rins(self, x, warm):
-        """``highs_rins`` around the incumbent and the node LP point ``x``."""
+        """RINS around the incumbent and the node LP point ``x``, with the
+        sub-MIP solved by Jaddle (``jaddle_rins``) or HiGHS
+        (``highs_rins``), per ``rins_solver``."""
         started = time.time()
         seconds = self.rins_seconds
         if self.deadline is not None:
             seconds = min(seconds, self.deadline - started)
-        found = highs_rins(
-            self.base, self.incumbent[1], x, self.cutoff(), max_seconds=seconds
-        )
+        if self.rins_solver == "highs":
+            found = highs_rins(
+                self.base, self.incumbent[1], x, self.cutoff(), max_seconds=seconds
+            )
+        else:
+            found = self.jaddle_rins(x, seconds, warm)
         self.rins_calls += 1
         if found is not None:
             self.try_incumbent(found, "N", warm)
         self.heuristic_seconds += time.time() - started
+
+    def sub_search(self, lower, upper, seconds, nodes, warm=None):
+        """
+        Search the sub-MIP of ``self.base`` with the box ``[lower, upper]``
+        for up to ``seconds`` and ``nodes`` nodes, pruned at this search's
+        cutoff (``initial_cutoff``), so only better points come back. The
+        sub-MIP has the rows of ``self.base`` and so reuses its compiled LP
+        solver; root cuts, tree cuts, the pump, the feasibility jump and the
+        sub-MIP heuristics are off in it. Its root LP is warm-started from
+        ``warm`` (with the duals of cut rows dropped). Returns the best point
+        found, or ``None``.
+        """
+        base = self.base
+        dtype = base.lp.c.dtype
+        lp = base.lp.with_values(
+            base.lp.values()._replace(
+                lower_bounds=jnp.asarray(lower, dtype),
+                upper_bounds=jnp.asarray(upper, dtype),
+            )
+        )
+        sub_mip = MIP(lp, self.is_int, base.offset, base.maximise)
+        started = time.time()
+        settings = dict(
+            self.settings,
+            deadline=started + seconds,
+            start=started,
+            max_nodes=nodes,
+            initial_cutoff=self.cutoff(),
+            cuts=False,
+            gomory_cuts=False,
+            tree_cuts=False,
+            coefficient_tightening=False,
+            feasibility_pump=False,
+            feasibility_jump=False,
+            highs_incumbent_seconds=0.0,
+            rins_seconds=0.0,
+            rens_seconds=0.0,
+            dive_every=0,
+            batch_size=1,
+            verbose=False,
+        )
+        search = _BranchAndBound(sub_mip, **settings)
+        if warm is not None:
+            m_ineq = base.A.shape[0] - base.n_eq
+            solution = warm[0]._replace(dual_ineq=warm[0].dual_ineq[:m_ineq])
+            search.root_warm = {"solution": solution, "opt_state": None}
+        return search.run()["x"]
+
+    def rens(self, x, lower, upper, warm, min_fixed=0.5):
+        """
+        RENS (relaxation enforced neighbourhood search) from the root LP
+        point ``x``: the integers integral at ``x`` are fixed there, the
+        fractional ones restricted to ``[floor, ceil]``, and that sub-MIP
+        searched (``sub_search``, ``rens_seconds`` and ``rens_nodes``).
+        Needs no incumbent. Skipped when fewer than ``min_fixed`` of the
+        integers are integral. A point found is marked ``"E"``.
+        """
+        ints = self.is_int
+        x = np.asarray(x, np.float64)
+        integral = ints & (np.abs(x - np.round(x)) <= self.int_tol)
+        if integral.sum() < min_fixed * ints.sum():
+            return
+        started = time.time()
+        sub_lower = np.where(ints, np.maximum(lower, np.floor(x + self.int_tol)), self.base.lower)
+        sub_upper = np.where(ints, np.minimum(upper, np.ceil(x - self.int_tol)), self.base.upper)
+        sub_lower = np.where(integral, np.round(x), sub_lower)
+        sub_upper = np.where(integral, np.round(x), sub_upper)
+        if np.any(sub_lower > sub_upper):
+            return
+        seconds = self.rens_seconds
+        if self.deadline is not None:
+            seconds = min(seconds, self.deadline - started)
+        if seconds <= 0:
+            return
+        found = self.sub_search(sub_lower, sub_upper, seconds, self.rens_nodes, warm)
+        if found is not None:
+            self.try_incumbent(found, "E", warm)
+        self.heuristic_seconds += time.time() - started
+
+    def dive(self, x, lower, upper, warm, rule=None):
+        """
+        An LP-based dive from a node's LP point ``x`` in its box: round one
+        fractional integer (chosen by ``rule``), propagate (objective-aware,
+        ``heuristic_propagator``), re-solve the LP warm with a quarter of the
+        node epoch budget, and repeat, up to ``dive_depth`` times. Stops at
+        an integral LP point (tried as an incumbent, ``"D"``), an infeasible
+        box (after flipping the last rounding once), or a bound at the
+        cutoff. ``rule``: ``"fractional"`` (the most nearly integral
+        variable, to its nearer integer), ``"guided"`` (towards the
+        incumbent, the variable closest to it first) or ``"pseudocost"``
+        (the cheaper direction by pseudocost); ``None`` rotates through
+        them.
+        """
+        started = time.time()
+        ints = self.is_int
+        if rule is None:
+            rules = ["fractional", "pseudocost"] + (
+                ["guided"] if self.incumbent is not None else []
+            )
+            rule = rules[self.dives % len(rules)]
+        self.dives += 1
+        x = np.asarray(x, np.float64)
+        lower, upper = lower.copy(), upper.copy()
+        epochs = max(self.node_max_epochs // 4, 10)
+        flipped = False
+        try:
+            for _ in range(self.dive_depth):
+                frac = x - np.floor(x)
+                fractional = (
+                    ints & (np.abs(x - np.round(x)) > self.int_tol) & (x > lower) & (x < upper)
+                )
+                if not fractional.any():
+                    self.try_incumbent(x, "D", warm)
+                    return
+                cand = np.flatnonzero(fractional)
+                f = frac[cand]
+                if rule == "guided" and self.incumbent is not None:
+                    target = self.incumbent[1][cand]
+                    pick = int(np.argmin(np.abs(x[cand] - target)))
+                    up = target[pick] > x[cand[pick]]
+                elif rule == "pseudocost" and self.pc_count.any():
+                    known = self.pc_count > 0
+                    mean = np.array([
+                        self.pc_sum[d][known[d]].sum() / self.pc_count[d][known[d]].sum()
+                        if known[d].any() else 1.0
+                        for d in range(2)
+                    ])
+                    pc = np.where(
+                        known[:, cand],
+                        self.pc_sum[:, cand] / np.maximum(self.pc_count[:, cand], 1),
+                        mean[:, None],
+                    )
+                    down_cost, up_cost = f * pc[0], (1.0 - f) * pc[1]
+                    cheaper = np.minimum(down_cost, up_cost)
+                    pick = int(np.argmin(cheaper))
+                    up = up_cost[pick] < down_cost[pick]
+                else:
+                    distance = np.minimum(f, 1.0 - f)
+                    pick = int(np.argmin(distance))
+                    up = f[pick] >= 0.5
+                j = cand[pick]
+                for attempt in (up, not up):
+                    lo, hi = lower.copy(), upper.copy()
+                    if attempt:
+                        lo[j] = math.ceil(x[j])
+                    else:
+                        hi[j] = math.floor(x[j])
+                    lo, hi, infeasible = self.heuristic_propagator()(lo, hi)
+                    if not infeasible:
+                        break
+                    if flipped:
+                        return
+                    flipped = True
+                else:
+                    return
+                lower, upper = lo, hi
+                result = self.solve_lp(self.node_lp(lower, upper), warm, epochs)
+                if result["stop_reason"] in ("interrupted", "time_limit"):
+                    return
+                bound, _ = self.lp_bound(result["solution"], lower, upper)
+                if self.round_bound(bound) >= self.cutoff():
+                    return
+                x = np.asarray(result["solution"].primal, np.float64)
+                warm = (result["solution"], result["opt_state"])
+            self.try_incumbent(x, "D", warm)
+        finally:
+            self.heuristic_seconds += time.time() - started
+
+    def jaddle_rins(self, x, seconds, warm=None, min_fixed=0.3):
+        """
+        RINS with Jaddle's own search as the sub-MIP solver. The integers on
+        which the incumbent and ``x`` agree (within the integrality
+        tolerance) are fixed at the incumbent's values, and the rest is
+        searched for up to ``seconds`` and ``rins_nodes`` nodes, pruned at
+        this search's cutoff (``initial_cutoff``), so only better points come
+        back. The sub-MIP has the rows of ``self.base`` and so reuses its
+        compiled LP solver; root cuts, tree cuts, the pump and RINS itself
+        are off in it, as is the feasibility jump (fix-and-propagate covers a
+        small neighbourhood). Its root LP is warm-started from ``warm`` (the
+        node's point, with the duals of the cut rows dropped). Skipped
+        (``None``) when fewer than ``min_fixed`` of the integers agree, or
+        when the same neighbourhood was searched at the same cutoff. Returns
+        the best point found, or ``None``.
+        """
+        ints = self.is_int
+        incumbent = self.incumbent[1]
+        agree = ints & (np.abs(np.asarray(x, np.float64) - incumbent) <= self.int_tol)
+        if seconds <= 0 or agree.sum() < min_fixed * ints.sum():
+            return None
+        # The same neighbourhood with the same cutoff has been searched.
+        key = (agree.tobytes(), incumbent[agree].tobytes(), self.cutoff())
+        if key in self.rins_seen:
+            self.rins_skipped += 1
+            return None
+        self.rins_seen.add(key)
+        lower = np.where(agree, incumbent, self.base.lower)
+        upper = np.where(agree, incumbent, self.base.upper)
+        return self.sub_search(lower, upper, seconds, self.rins_nodes, warm)
 
     def jump(self, start, lower, upper, warm, deadline, seed):
         """``feasibility_jump`` on the MIP as given from ``start``; a point it
@@ -2504,7 +3250,7 @@ class _BranchAndBound:
         x = np.asarray(result["solution"].primal, np.float64)
         if self.use_fix_and_propagate:
             candidate = fix_and_propagate(
-                x, lower, upper, self.is_int, self.row_propagator
+                x, lower, upper, self.is_int, self.heuristic_propagator()
             )
             if candidate is not None:
                 self.try_incumbent(candidate, "P", warm)
@@ -2640,6 +3386,13 @@ class _BranchAndBound:
             self.log(" ", None, node.depth)
 
     def run(self):
+        """The search, on ``self.device`` when one is set."""
+        if self.device is None:
+            return self._run()
+        with jax.default_device(self.device):
+            return self._run()
+
+    def _run(self):
         mip = self.mip
         lower, upper = mip.lower.copy(), mip.upper.copy()
         if np.any(lower > upper):
@@ -2648,18 +3401,39 @@ class _BranchAndBound:
             lower, upper, infeasible = self.propagator(lower, upper, max_passes=20)
             if infeasible:
                 return self.result("infeasible")
+        if self.use_coefficient_tightening:
+            box = (lower, upper)
+            if self.propagator is None:
+                box = self.row_propagator(lower, upper, max_passes=20)[:2]
+            tightened, count = tighten_coefficients(mip, *box)
+            if count:
+                # Same integer-feasible points; search the tightened rows
+                # (incumbents are still checked against the MIP as given).
+                self.coefficients_tightened = count
+                self.base = tightened
+                self.set_mip(tightened)
+                mip = tightened
+                if self.propagator is not None:
+                    lower, upper, infeasible = self.propagator(
+                        lower, upper, max_passes=20
+                    )
+                    if infeasible:
+                        return self.result("infeasible")
         self.root_lower, self.root_upper = lower, upper
         if self.verbose:
             print(
                 f"MIP: {mip.num_variables} variables ({mip.num_integers} integer), "
-                f"{mip.A.shape[0]} rows, {mip.A.nnz} nonzeros"
+                f"{mip.A.shape[0]} rows, {mip.A.nnz} nonzeros, on "
+                f"{(self.device or jax.devices()[0]).platform}"
             )
+            if self.coefficients_tightened:
+                print(f"Coefficient tightening: {self.coefficients_tightened} coefficients")
             if self.objective_step is not None:
                 print(f"Objective values are multiples of {self.objective_step:g}")
 
         root = _Node(-np.inf, 0, None, None, None)
         lp = self.node_lp(lower, upper)
-        detection = self.detect(lp, None, self.root_max_epochs)
+        detection = self.detect(lp, self.root_warm, self.root_max_epochs)
         if detection["status"] == "primal_infeasible":
             return self.result("infeasible")
         if detection["status"] == "dual_infeasible":
@@ -2694,6 +3468,9 @@ class _BranchAndBound:
                 lp = self.node_lp(lower, upper)
             if result["stop_reason"] == "interrupted":
                 return self.result("interrupted")
+        if self.use_tree_cuts:
+            result = self.reserve_tree_cuts(result)
+            lp = self.node_lp(lower, upper)
         if result["stop_reason"] == "time_limit" or self.out_of_time():
             bound, rigorous = self.lp_bound(result["solution"], lower, upper)
             self.close(bound, rigorous)
@@ -2705,6 +3482,17 @@ class _BranchAndBound:
             or self.highs_seconds
         ):
             self.root_heuristics(lower, upper, result)
+        root_x = np.asarray(result["solution"].primal, np.float64)
+        root_warm = (result["solution"], result["opt_state"])
+        if self.rens_seconds and not self.out_of_time():
+            self.rens(root_x, lower, upper, root_warm)
+        if self.dive_every and not self.out_of_time():
+            self.dive(root_x, lower, upper, root_warm, rule="fractional")
+            if self.incumbent is not None:
+                self.dive(root_x, lower, upper, root_warm, rule="guided")
+        if self.rins_seconds and self.incumbent is not None and not self.out_of_time():
+            self.rins_pending = False
+            self.rins(root_x, root_warm)
         if self.verbose:
             print(
                 f"  {'Nodes':>8} {'Open':>8} {'Depth':>6} {'Bound':>13} "
@@ -2773,11 +3561,16 @@ def solve(
     infeasibility_tolerance=1e-8,
     heuristic_every=10,
     propagate=True,
+    coefficient_tightening=True,
     cuts=True,
-    cut_rounds=5,
+    cut_rounds=None,
     max_cuts_per_round=100,
-    cut_min_progress=1e-4,
-    gomory_cuts=False,
+    cut_min_progress=None,
+    cut_round_epochs=20,
+    gomory_cuts="auto",
+    aggregate_integers="auto",
+    tree_cuts=False,
+    tree_cut_every=10,
     fix_and_propagate=True,
     feasibility_jump=True,
     jump_iterations=None,
@@ -2786,6 +3579,12 @@ def solve(
     highs_incumbent_seconds=0.0,
     rins_seconds=0.0,
     rins_every=50,
+    rins_solver="jaddle",
+    rins_nodes=200,
+    rens_seconds=None,
+    rens_nodes=500,
+    dive_every=0,
+    dive_depth=20,
     plunge_depth=8,
     batch_size=1,
     feasibility_pump=True,
@@ -2797,6 +3596,7 @@ def solve(
     lp_options=None,
     verbose=False,
     log_every_seconds=1.0,
+    device="auto",
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -2812,24 +3612,65 @@ def solve(
       (``propagate``), and the root LP is solved by
       ``jaddle_linear.detect_infeasibility``, which certifies optimality,
       infeasibility or an unbounded relaxation.
-    * **Root cuts** (``cuts``). Up to ``cut_rounds`` rounds of Gomory
-      mixed-integer cuts (``gomory_cuts``, opt-in with ``gomory_cuts=True``), knapsack
+    * **Coefficient tightening** (``coefficient_tightening``). Over the
+      propagated root box, each binary's coefficient in an inequality row is
+      cut to the row's excess ``maxact − b`` when it is larger
+      (``tighten_coefficients``). This shrinks big-M rows such as
+      ``y − M z <= 0`` to the bound on ``y`` that the other rows imply,
+      without changing the integer-feasible points; the search then runs on
+      the tightened rows, and incumbents are still checked against the MIP
+      as given.
+    * **Root cuts** (``cuts``). Up to ``cut_rounds`` rounds (default: 40
+      for a MIP with at most 10,000 nonzeros and Gomory cuts, else 5) of
+      Gomory mixed-integer cuts (``gomory_cuts``; ``"auto"``, the default,
+      turns them on for MIPs with at most 10,000 nonzeros, whose crossovers
+      take milliseconds), knapsack
       cover cuts (``cover_cut``) and c-MIR cuts on single rows and on
       aggregations of up to three (``mir_cut``). With Gomory cuts on, each
       round first crosses the root LP point over to an optimal vertex
       (``jaddle_linear.crossover``, limited to 5% of ``max_seconds``): the
       Gomory cuts come from its basis, and all three families are separated
-      at the vertex. Cover and MIR cuts are separated by ``CutSeparator``. A round keeps at most
+      at the vertex. MIR cuts are complemented MIR (``cmir_cut``): every
+      integer coefficient is tried as the scaling, then each integer
+      variable's complementation is flipped while that deepens the cut.
+      They come from single rows and from aggregates of up to three rows
+      that cancel continuous variables; with ``aggregate_integers``
+      (``"auto"``, the default: on for MIPs with at most 10,000 nonzeros),
+      aggregates of up to five rows also cancel the most fractional integer
+      term, so pure-integer rows combine. On lseu that lifts the root bound
+      (exact LPs) from 1,061 to 1,100. Cover and MIR cuts are separated by
+      ``CutSeparator``:
+      up to three covers per row (``cover_cuts``), each lifted exactly by
+      a dynamic program over the knapsack. With coefficient tightening,
+      they are separated from the rows as given as well as the tightened
+      rows, since the original knapsacks can give stronger covers. A
+      round keeps at most
       ``max_cuts_per_round`` cuts with efficacy (distance cut off) at least
       1e-4 that are not near-parallel, retires cuts that have been slack
       with a zero dual for two rounds, and re-solves the LP warm. The rounds
-      stop when the bound gains less than ``cut_min_progress`` (relative).
+      stop when the bound gains less than ``cut_min_progress`` (relative)
+      over the last three rounds (default 1e-3 with the 40-round setting,
+      else 1e-4). Each round's re-solve stops after ``cut_round_epochs``
+      (default 20): separation needs only a reasonable point and the
+      Lagrangian bound holds at any duals; the root is solved to convergence
+      once the rounds end. On lseu that cuts the root from 17s to 7s (bound
+      1,091 → 1,095).
       Cover and MIR cuts follow from a row and the bounds alone, so they
       are valid whatever the LP point's accuracy; Gomory cuts rest on the
       basis, which HiGHS proves optimal, and skip tableau rows that do not
       reproduce the basis to 1e-7. The cut block is padded to
-      power-of-two sizes, so rounds rarely recompile the LP solver; cuts
-      are not added at the nodes, where each new shape would recompile.
+      power-of-two sizes, so rounds rarely recompile the LP solver.
+    * **Tree cuts** (``tree_cuts``, off by default). Every
+      ``tree_cut_every`` nodes, cover and MIR cuts are separated at the
+      node's LP point over the root box (so they are valid everywhere),
+      and up to 10 violated ones join the cut pool, in free room or in
+      place of cuts slack with a zero dual for two rounds. The node is not
+      re-solved; its children solve against the new cuts. The pool has a
+      fixed capacity, reserved after the root cuts, so its rows and
+      nonzeros keep one shape and the LP solver is not recompiled (the
+      compiled solver takes the sparsity pattern as data). Serial search
+      only: the batched solver captures the pattern, so ``batch_size > 1``
+      turns tree cuts off.
     * **Nodes.** Each child is warm-started from its parent's primal-dual
       point and step-size state; with the compiled solver cached, a small
       node takes milliseconds. A node is pruned when its Lagrangian bound
@@ -2857,6 +3698,11 @@ def solve(
       the host exactly as in the serial search. Members run in lockstep, so
       a node that will not converge holds its batch to ``node_max_epochs``.
       Worth it on a GPU; on a CPU the members run one after another.
+    * **Device** (``device``). ``"auto"`` (default) runs MIPs with at
+      most 10,000 nonzeros on the CPU: their node LPs are latency-bound
+      on an accelerator (flugpl: 3s on the CPU, 18s on a GPU).
+      ``"cpu"``, ``"gpu"`` or ``"tpu"`` pick one; ``None`` keeps JAX's
+      default device.
     * **Branching** (``branching``): ``"pseudocost"`` (default) scores each
       fractional variable by the product of its estimated down and up bound
       gains, learnt from the nodes solved so far (most fractional until
@@ -2897,11 +3743,31 @@ def solve(
       violated rows), marked ``"R"``. ``highs_incumbent_seconds > 0`` asks
       HiGHS (``highs_incumbent``) for a first incumbent when all of these
       fail, marked ``"X"``; it is off by default, so the search stays
-      Jaddle's own. Likewise ``rins_seconds > 0`` runs RINS
-      (``highs_rins``) every ``rins_every`` nodes once there is an
-      incumbent: the integers on which the incumbent and the node's LP
-      point agree are fixed, and HiGHS searches the rest for a better
-      solution, marked ``"N"``.
+      Jaddle's own. Likewise ``rins_seconds > 0`` runs RINS once at the
+      root and every ``rins_every`` nodes once there is an incumbent: the
+      integers on which the incumbent and the node's LP point agree are
+      fixed, and the rest is searched for a better solution, marked
+      ``"N"``. With ``rins_solver="jaddle"`` (default) the sub-MIP is
+      searched by this branch and bound (``_BranchAndBound.jaddle_rins``:
+      up to ``rins_nodes`` nodes, pruned at the current cutoff, reusing
+      the compiled LP solver); with ``"highs"``, by HiGHS
+      (``highs_rins``). A new incumbent from any other source also triggers
+      a RINS call.
+    * **RENS** (``rens_seconds``; ``None``, the default, gives 5s for MIPs
+      with at most 10,000 nonzeros, else off). After the root heuristics,
+      the integers that are integral at the root LP point are fixed and the
+      fractional ones restricted to their floor and ceiling, and that
+      sub-MIP is searched as RINS's is (up to ``rens_nodes`` nodes), marked
+      ``"E"``. It needs no incumbent.
+    * **Dives** (``dive_every``, off by default). LP-based dives at the
+      root and every ``dive_every`` nodes: round a fractional integer
+      (fractional, guided or pseudocost rule), propagate, re-solve the LP
+      warm, up to ``dive_depth`` times; an integral end point is marked
+      ``"D"``.
+    * **Objective-aware propagation.** Once there is a cutoff, the
+      propagation inside fix-and-propagate and dives includes the row
+      ``c·x <= cutoff``, so they reject roundings that cannot improve on the
+      incumbent.
 
     ``lp_tolerance`` is the relative tolerance of every node LP (all three of
     ``solve()``'s tolerances); ``lp_options`` (a dict) passes any other
@@ -2952,6 +3818,8 @@ def solve(
       before their LP was solved.
     * ``"lp_repairs"``, ``"lp_repairs_skipped"``: repair LPs solved for
       rounded points, and rounded points rejected without one.
+    * ``"coefficients_tightened"``: coefficients cut by coefficient
+      tightening; ``"tree_cuts_added"``: cuts added in the tree.
     * ``"cuts"``: the number of cuts in the final LP, by family
       (``"gomory"``, ``"cover"``, ``"mir"``); ``"root_bound_before_cuts"``: the root bound
       before them (``None`` when no cut round ran).
@@ -2973,11 +3841,16 @@ def solve(
         infeasibility_tolerance=infeasibility_tolerance,
         heuristic_every=heuristic_every,
         propagate=propagate,
+        coefficient_tightening=coefficient_tightening,
         cuts=cuts,
         cut_rounds=cut_rounds,
         max_cuts_per_round=max_cuts_per_round,
         cut_min_progress=cut_min_progress,
+        cut_round_epochs=cut_round_epochs,
         gomory_cuts=gomory_cuts,
+        aggregate_integers=aggregate_integers,
+        tree_cuts=tree_cuts,
+        tree_cut_every=tree_cut_every,
         fix_and_propagate=fix_and_propagate,
         feasibility_jump=feasibility_jump,
         jump_iterations=jump_iterations,
@@ -2986,6 +3859,12 @@ def solve(
         highs_incumbent_seconds=highs_incumbent_seconds,
         rins_seconds=rins_seconds,
         rins_every=rins_every,
+        rins_solver=rins_solver,
+        rins_nodes=rins_nodes,
+        rens_seconds=rens_seconds,
+        rens_nodes=rens_nodes,
+        dive_every=dive_every,
+        dive_depth=dive_depth,
         plunge_depth=plunge_depth,
         batch_size=batch_size,
         feasibility_pump=feasibility_pump,
@@ -2996,6 +3875,7 @@ def solve(
         verbose=verbose,
         log_every_seconds=log_every_seconds,
         start=start,
+        device=device,
     )
     if presolve:
         return _solve_with_presolve(model, highs_options, feasibility_tolerance, settings)
@@ -3040,6 +3920,9 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "children_pruned": 0,
             "lp_repairs": 0,
             "lp_repairs_skipped": 0,
+            "coefficients_tightened": 0,
+            "tree_cuts_added": 0,
+            "rins_calls": 0,
             "presolve": status.name,
         }
 

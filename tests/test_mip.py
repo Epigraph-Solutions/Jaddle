@@ -481,7 +481,8 @@ def test_mir_cut_mixed_row():
 
 def test_cover_cut_textbook():
     # 5 x0 + 5 x1 + 5 x2 + 9 x3 <= 12 over binaries at (0.8, 0.8, 0.8, 0):
-    # {0, 1, 2} is a cover, extended by x3 (heavier): x0+x1+x2+x3 <= 2.
+    # {0, 1, 2} is a cover. Lifting x3: with x3 = 1 only 3 is left, so no
+    # cover item fits and x3 gets 2: x0 + x1 + x2 + 2 x3 <= 2.
     cut = jm.cover_cut(
         np.arange(4),
         np.array([5.0, 5.0, 5.0, 9.0]),
@@ -493,7 +494,7 @@ def test_cover_cut_textbook():
     )
     cut_idx, coef, rhs = cut
     np.testing.assert_array_equal(cut_idx, np.arange(4))
-    np.testing.assert_allclose(coef, 1.0)
+    np.testing.assert_allclose(coef, [1.0, 1.0, 1.0, 2.0])
     assert rhs == pytest.approx(2.0)
 
 
@@ -754,7 +755,7 @@ def test_gomory_cuts_in_the_search():
     result = jm.solve(mip, gomory_cuts=True)
     assert_solved(result, mip, ref)
     assert result["cuts"]["gomory"] > 0
-    off = jm.solve(mip)  # off by default
+    off = jm.solve(mip, gomory_cuts=False)
     assert_solved(off, mip, ref)
     assert off["cuts"]["gomory"] == 0
 
@@ -920,7 +921,7 @@ def test_rins_in_the_search():
 )
 def test_batched_search_matches_reference(make):
     mip = make()
-    result = jm.solve(mip, batch_size=4)
+    result = jm.solve(mip, batch_size=4, gomory_cuts=False)
     assert_solved(result, mip, reference(mip))
     assert result["batches"] > 0
 
@@ -928,7 +929,7 @@ def test_batched_search_matches_reference(make):
 def test_batch_larger_than_the_tree():
     # Far more slots than open nodes: every batch is padded.
     mip = facility_location()
-    result = jm.solve(mip, batch_size=64)
+    result = jm.solve(mip, batch_size=64, gomory_cuts=False)
     assert_solved(result, mip, reference(mip))
     assert 0 < result["batches"] <= result["nodes"]
 
@@ -1072,7 +1073,10 @@ def test_reduced_cost_tightening_keeps_better_solutions(make):
 @pytest.mark.parametrize("batch_size", [1, 4])
 def test_bounds_from_duals_in_the_search(batch_size):
     mip = generalised_assignment(1)
-    result = jm.solve(mip, batch_size=batch_size)
+    # Without the root's strongest cuts there is a tree to fix bounds in.
+    result = jm.solve(
+        mip, batch_size=batch_size, gomory_cuts=False, aggregate_integers=False
+    )
     assert_solved(result, mip, reference(mip))
     assert result["objective_step"] == 1.0
     assert result["reduced_cost_tightenings"] > 0
@@ -1170,3 +1174,343 @@ def test_repair_finds_the_continuous_variables(monkeypatch):
     x = np.where(mip.integrality, 1.0, 0.0)
     assert search.try_incumbent(x, "H", None)
     assert search.lp_repairs == 1 and mip.is_feasible(search.incumbent[1])
+
+
+# %% Coefficient tightening
+def two_row_mip(A_ineq, b_ineq, upper, integrality):
+    n = A_ineq.shape[1]
+    lp = jl.LP(
+        c=-np.ones(n),
+        A_eq=sp.csc_matrix((0, n)),
+        b_eq=np.zeros(0),
+        A_ineq=sp.csc_matrix(A_ineq),
+        b_ineq=np.asarray(b_ineq, float),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.asarray(upper, float),
+    )
+    return jm.MIP(lp, np.asarray(integrality, bool))
+
+
+def test_tighten_coefficients_textbook():
+    # Row 0: y − 100 z <= 0 with y <= 7 cuts −100 to −7.
+    # Row 1: 5 z + w <= 6 with w <= 3 (excess 2) becomes 2 z + w <= 3.
+    mip = two_row_mip(
+        np.array([[1.0, -100.0, 0.0], [0.0, 5.0, 1.0]]),
+        [0.0, 6.0],
+        [7.0, 1.0, 3.0],
+        [False, True, False],
+    )
+    tightened, count = jm.tighten_coefficients(mip, mip.lower, mip.upper)
+    assert count == 2
+    A = tightened.A.toarray()
+    np.testing.assert_allclose(A, [[1.0, -7.0, 0.0], [0.0, 2.0, 1.0]], rtol=1e-6)
+    np.testing.assert_allclose(tightened.b, [0.0, 3.0], atol=1e-6)
+    # Nothing to tighten: the same MIP back.
+    again, count = jm.tighten_coefficients(tightened, mip.lower, mip.upper)
+    assert count == 0 and again is tightened
+
+
+def test_tighten_coefficients_needs_finite_bounds():
+    # y unbounded: y − 100 z <= 0 stays.
+    mip = two_row_mip(np.array([[1.0, -100.0]]), [0.0], [np.inf, 1.0], [False, True])
+    assert jm.tighten_coefficients(mip, mip.lower, mip.upper)[1] == 0
+
+
+@pytest.mark.parametrize(
+    "make", [knapsack, general_integer, facility_location, generalised_assignment]
+)
+def test_tighten_coefficients_keeps_the_optimum(make):
+    mip = make()
+    lower, upper, _ = jm.propagate_bounds(
+        mip.A, mip.row_lower, mip.row_upper, mip.lower, mip.upper,
+        mip.integrality, max_passes=20,
+    )
+    tightened, _ = jm.tighten_coefficients(mip, lower, upper)
+    assert reference(tightened) == pytest.approx(reference(mip), rel=1e-9, abs=1e-9)
+
+
+def test_coefficient_tightening_in_the_search():
+    # Capacities well above total demand: the capacity rows' big-M shrinks.
+    mip = facility_location(seed=4, n_fac=4, n_cust=4)
+    on = jm.solve(mip)
+    assert on["coefficients_tightened"] > 0
+    assert_solved(on, mip, reference(mip))
+    off = jm.solve(mip, coefficient_tightening=False)
+    assert off["coefficients_tightened"] == 0
+    assert_solved(off, mip, reference(mip))
+
+
+# %% Lifted cover cuts
+@pytest.mark.parametrize("seed", range(20))
+def test_lifted_cover_cuts_are_valid(seed):
+    # Every cut holds at every 0/1 point of the row, with some coefficients
+    # negative (complemented) and a continuous variable moved to its bound.
+    rng = np.random.default_rng(seed)
+    n = 10
+    a = rng.integers(1, 20, n).astype(float) * rng.choice([1.0, 1.0, -1.0], n)
+    a = np.append(a, 3.0)  # a continuous variable in [0, 2]
+    b = 0.4 * np.abs(a[:n]).sum() - np.abs(a[:n][a[:n] < 0]).sum()
+    lower, upper = np.zeros(n + 1), np.append(np.ones(n), 2.0)
+    is_binary = np.append(np.ones(n, bool), False)
+    x = np.append(rng.uniform(0, 1, n), 0.0)
+    points = ((np.arange(2**n)[:, None] >> np.arange(n)) & 1).astype(float)
+    feasible = points[points @ a[:n] <= b]
+    cuts = jm.cover_cuts(np.arange(n + 1), a, b, x, lower, upper, is_binary)
+    for idx, coef, rhs in cuts:
+        assert np.all(feasible[:, idx[idx < n]] @ coef[idx < n] <= rhs + 1e-9)
+        assert coef @ x[idx] > rhs  # each cut cuts off the LP point
+
+
+def test_lifting_beats_the_extended_cover():
+    # 8 x0 + 8 x1 + 8 x2 + 3 x3 + 3 x4 <= 17 at (0.9, 0.9, 0.9, 0, 0): the
+    # extended cover of {0, 1, 2} adds nothing (no item weighs 8). Lifting
+    # x3: with x3 = 1 the room is 14, which fits one cover item, so x3 gets
+    # 2 − 1 = 1. Then x4 gets 0 (one cover item plus x3 fit in 14, value 2).
+    cuts = jm.cover_cuts(
+        np.arange(5),
+        np.array([8.0, 8.0, 8.0, 3.0, 3.0]),
+        17.0,
+        np.array([0.9, 0.9, 0.9, 0.0, 0.0]),
+        np.zeros(5),
+        np.ones(5),
+        np.ones(5, bool),
+    )
+    assert cuts
+    idx, coef, rhs = cuts[0]
+    np.testing.assert_array_equal(idx, [0, 1, 2, 3])
+    np.testing.assert_allclose(coef, 1.0)
+    assert rhs == pytest.approx(2.0)
+
+
+# %% Device
+def test_device_cpu_matches_reference():
+    mip = facility_location()
+    result = jm.solve(mip, device="cpu")
+    assert_solved(result, mip, reference(mip))
+
+
+def test_device_auto_picks_the_cpu_for_small_mips(monkeypatch):
+    search = search_for(knapsack(), monkeypatch, device="auto")
+    assert search.device.platform == "cpu"
+    assert search_for(knapsack(), monkeypatch, device=None).device is None
+
+
+def test_device_must_be_known():
+    with pytest.raises(ValueError, match="device"):
+        jm.solve(knapsack(), device="abacus")
+
+
+# %% Tree cuts
+@pytest.mark.parametrize("make", [knapsack, generalised_assignment, facility_location])
+def test_tree_cuts_keep_the_optimum(make, monkeypatch):
+    mip = make()
+    search = search_for(mip, monkeypatch, tree_cuts=True, tree_cut_every=1)
+    monkeypatch.undo()  # sub-searches (RENS) need the real run()
+    result = search._run()
+    assert_solved(result, mip, reference(mip))
+    # Every cut in the pool (root and tree) holds at the optimum.
+    x_star = optimum(mip)
+    for cut in search.cut_list:
+        assert cut["coef"] @ x_star[cut["idx"]] <= cut["rhs"] + 1e-6
+
+
+def test_tree_cuts_are_added_without_recompiling(monkeypatch):
+    mip = generalised_assignment(1)
+    traces = []
+    real = jl._SolvePrograms._device
+
+    def counted(self, problem):
+        traces.append(1)
+        return real(self, problem)
+
+    monkeypatch.setattr(jl._SolvePrograms, "_device", counted)
+    # Without Gomory cuts the root leaves a tree to cut in.
+    options = dict(tree_cuts=True, tree_cut_every=1, max_nodes=40, gomory_cuts=False)
+    jm.solve(mip, **options)  # compile
+    traces.clear()
+    result = jm.solve(mip, **options)
+    assert result["tree_cuts_added"] > 0
+    assert traces == []  # the same shapes throughout
+
+
+def test_tree_cuts_are_off_when_batched():
+    result = jm.solve(knapsack(), tree_cuts=True, batch_size=4)
+    assert result["tree_cuts_added"] == 0
+
+
+# %% Gomory defaults and Jaddle RINS
+def test_gomory_auto_follows_the_size(monkeypatch):
+    small = search_for(knapsack(), monkeypatch)
+    assert small.gomory and small.cut_rounds == 40 and small.cut_min_progress == 1e-3
+    large = search_for(generalised_assignment(agents=50, jobs=120), monkeypatch)
+    assert large.A_T.nnz > 10_000
+    assert not large.gomory and large.cut_rounds == 5 and large.cut_min_progress == 1e-4
+    forced = search_for(knapsack(), monkeypatch, gomory_cuts=False, cut_rounds=3)
+    assert not forced.gomory and forced.cut_rounds == 3
+
+
+def test_rejects_bad_gomory_and_rins_options():
+    with pytest.raises(ValueError, match="gomory_cuts"):
+        jm.solve(knapsack(), gomory_cuts="sometimes")
+    with pytest.raises(ValueError, match="rins_solver"):
+        jm.solve(knapsack(), rins_solver="cplex")
+
+
+def test_jaddle_rins_returns_only_better_points(monkeypatch):
+    mip = generalised_assignment(1)
+    search = search_for(mip, monkeypatch, max_nodes=15)
+    monkeypatch.undo()  # sub-searches need the real run()
+    search._run()
+    assert search.incumbent is not None
+    # An LP point that agrees with the incumbent on 60% of the integers.
+    x = search.incumbent[1].copy()
+    free = np.random.default_rng(0).random(x.size) < 0.4
+    x[free] = 0.5
+    cutoff = search.cutoff()
+    traces = []
+    real = jl._SolvePrograms._device
+
+    def counted(self, problem):
+        traces.append(1)
+        return real(self, problem)
+
+    monkeypatch.setattr(jl._SolvePrograms, "_device", counted)
+    found = search.jaddle_rins(x, seconds=10.0)
+    assert traces == []  # the sub-MIP reuses the compiled solver
+    if found is not None:
+        assert mip.is_feasible(found)
+        assert mip.c @ found < cutoff + 1e-9
+    # The same neighbourhood again is skipped.
+    assert search.jaddle_rins(x, seconds=10.0) is None
+    assert search.rins_skipped == 1
+
+
+@pytest.mark.parametrize("solver", ["jaddle", "highs"])
+def test_rins_in_the_search_with_either_solver(solver):
+    mip = generalised_assignment(2)
+    result = jm.solve(mip, rins_seconds=2, rins_every=10, rins_solver=solver)
+    assert_solved(result, mip, reference(mip))
+    assert result["rins_calls"] > 0
+
+
+# %% Stronger cut generator
+def max_over_mip(mip, idx, coef):
+    """The largest ``coef · x[idx]`` over the MIP's feasible points."""
+    objective = np.zeros(mip.num_variables)
+    objective[idx] = -coef
+    best = milp(
+        objective,
+        constraints=LinearConstraint(mip.A.toarray(), mip.row_lower, mip.row_upper),
+        integrality=mip.integrality.astype(int),
+        bounds=Bounds(mip.lower, mip.upper),
+    )
+    return -best.fun
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_cmir_cut_is_valid_by_brute_force(seed):
+    # Four integers in 0..3 and a continuous y in [0, 5]: the cut holds at
+    # every feasible point (for each integer point, at both ends of y's
+    # feasible interval, since the cut is linear in y).
+    rng = np.random.default_rng(seed)
+    a = np.append(rng.integers(-6, 9, 4).astype(float), rng.choice([-2.5, 1.5]))
+    b = float(rng.integers(3, 15)) + 0.5
+    lower, upper = np.zeros(5), np.array([3.0, 3.0, 3.0, 3.0, 5.0])
+    is_int = np.array([True, True, True, True, False])
+    x = np.append(rng.uniform(0, 3, 4), rng.uniform(0, 5))
+    cut = jm.cmir_cut(np.arange(5), a, b, x, lower, upper, is_int)
+    if cut is None:
+        return
+    idx, coef, rhs = cut
+    full = np.zeros(5)
+    full[idx] = coef
+    assert full @ x > rhs  # it cuts off the point
+    grid = np.array(np.meshgrid(*[np.arange(4)] * 4)).reshape(4, -1).T.astype(float)
+    for point in grid:
+        room = b - a[:4] @ point  # a_y · y <= room
+        if a[4] > 0:
+            ends = (0.0, min(5.0, room / a[4]))
+        else:
+            ends = (max(0.0, room / a[4]), 5.0)
+        for y in ends:
+            if ends[0] <= ends[1] + 1e-12:
+                assert full[:4] @ point + full[4] * y <= rhs + 1e-9
+
+
+@pytest.mark.parametrize(
+    "make", [knapsack, general_integer, facility_location, generalised_assignment]
+)
+def test_tableau_mir_cuts_are_valid(make):
+    mip = make()
+    x, basis = vertex_and_basis(mip)
+    cuts = jm.gomory_cuts(
+        mip.A, mip.b, mip.n_eq, mip.lower, mip.upper, mip.integrality, basis, x,
+        tableau_mir=True,
+    )
+    for _, idx, coef, rhs in cuts:
+        assert coef @ x[idx] > rhs
+        assert max_over_mip(mip, idx, coef) <= rhs + 1e-7 * (1 + abs(rhs))
+
+
+@pytest.mark.parametrize("make", [knapsack, general_integer, generalised_assignment])
+def test_integer_aggregation_cuts_are_valid(make):
+    mip = make()
+    x, _ = vertex_and_basis(mip)
+    lower, upper, _ = jm.propagate_bounds(
+        mip.A, mip.row_lower, mip.row_upper, mip.lower, mip.upper, mip.integrality
+    )
+    separator = jm.CutSeparator(mip, lower, upper, aggregate_integers=True, max_aggregation=4)
+    for _, idx, coef, rhs in separator(x):
+        assert max_over_mip(mip, idx, coef) <= rhs + 1e-7 * (1 + abs(rhs))
+
+
+# %% Incumbent heuristics: RENS, dives, objective-aware propagation
+def test_rens_returns_only_better_points(monkeypatch):
+    mip = generalised_assignment(1)
+    search = search_for(mip, monkeypatch, max_nodes=1, rens_seconds=0, rins_seconds=0, dive_every=0)
+    search._run()
+    monkeypatch.undo()
+    x = search.incumbent[1] if search.incumbent is not None else np.zeros(mip.num_variables)
+    # A point that is integral on most integers and fractional on a few.
+    x = x.copy()
+    x[:5] = 0.5
+    cutoff = search.cutoff()
+    search.rens_seconds = 5.0
+    before = search.incumbent
+    search.rens(x, search.root_lower, search.root_upper, None)
+    if search.incumbent is not before:
+        assert mip.is_feasible(search.incumbent[1])
+        assert search.incumbent[0] < cutoff
+
+
+@pytest.mark.parametrize("rule", ["fractional", "guided", "pseudocost"])
+def test_dive_finds_feasible_points_or_nothing(rule, monkeypatch):
+    mip = generalised_assignment(2)
+    search = search_for(mip, monkeypatch, max_nodes=20, rens_seconds=0, rins_seconds=0)
+    search._run()
+    monkeypatch.undo()
+    lp = search.node_lp(search.root_lower, search.root_upper)
+    result = search.solve_lp(lp, None, 200)
+    x = np.asarray(result["solution"].primal, np.float64)
+    before = search.incumbent
+    search.dive(x, search.root_lower, search.root_upper,
+                (result["solution"], result["opt_state"]), rule=rule)
+    if search.incumbent is not before:
+        assert mip.is_feasible(search.incumbent[1])
+        assert before is None or search.incumbent[0] < before[0]
+
+
+def test_objective_propagation_rejects_non_improving_roundings(monkeypatch):
+    # Knapsack (as a minimisation of −value): with the cutoff at the value of
+    # the empty knapsack, fixing everything to 0 cannot improve.
+    mip = knapsack()
+    search = search_for(mip, monkeypatch)
+    search.root_lower, search.root_upper = mip.lower.copy(), mip.upper.copy()
+    search.initial_cutoff = -1.0  # better than 0 (the empty knapsack)
+    propagator = search.heuristic_propagator()
+    zeros = np.zeros(mip.num_variables)
+    _, _, infeasible = propagator(zeros, zeros.copy())
+    assert infeasible
+    search.use_objective_propagation = False
+    _, _, infeasible = search.heuristic_propagator()(zeros, zeros.copy())
+    assert not infeasible

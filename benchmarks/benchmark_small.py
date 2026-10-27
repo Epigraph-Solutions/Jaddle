@@ -36,7 +36,7 @@ jax.config.update("jax_platform_name", "cpu")
 
 import jaddle.jaddle_optimisers as jo
 
-jo.configure_jax("float64")
+jo.configure_jax("float32")
 
 import highspy
 
@@ -95,6 +95,7 @@ FIELDS = [
     "objective_step",
     "lp_repairs",
     "lp_repairs_skipped",
+    "tree_cuts_added",
     "highs_status",
     "highs_objective",
     "highs_seconds",
@@ -151,7 +152,11 @@ def run_instance(name, path, args):
             presolve=args.presolve,
             max_seconds=args.seconds,
             batch_size=args.batch_size,
+            tree_cuts=args.tree_cuts,
+            lp_tolerance=1e-2,
+            device=None if args.device == "default" else args.device,
             verbose=args.verbose,
+            gomory_cuts=True,
         )
         row.update(
             {
@@ -168,6 +173,7 @@ def run_instance(name, path, args):
                     "objective_step",
                     "lp_repairs",
                     "lp_repairs_skipped",
+                    "tree_cuts_added",
                 )
             }
         )
@@ -222,6 +228,12 @@ def main():
     parser.add_argument("--seconds", type=float, default=120.0, help="time limit each")
     parser.add_argument("--presolve", action="store_true", help="HiGHS presolve first")
     parser.add_argument("--batch-size", type=int, default=1, help="jm.solve batch_size")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="jm.solve device: auto (CPU when small), cpu, gpu, or default (JAX's)",
+    )
+    parser.add_argument("--tree-cuts", action="store_true", help="branch and cut")
     parser.add_argument("--verbose", action="store_true", help="jm.solve progress log")
     parser.add_argument("--out", default=RESULTS, help="CSV path")
     args = parser.parse_args()

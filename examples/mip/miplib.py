@@ -62,9 +62,11 @@ result = jm.solve(
     feasibility_pump=False,
     highs_incumbent_seconds=30,
     rins_seconds=10,  # RINS every 50 nodes, HiGHS on the sub-MIP (log: N)
-    batch_size=16,  # on a GPU: solve 16 open nodes per device call
+    batch_size=1,  # on a GPU: solve 16 open nodes per device call
+    tree_cuts=True,
     verbose=True,
     log_every_seconds=10,
+    device="cpu",
 )
 print(f"Status: {result['status']}")
 print(f"Bound: {result['bound']:.6g}")
