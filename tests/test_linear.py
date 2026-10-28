@@ -1546,3 +1546,45 @@ def test_save_lp_rejects_scipy_lp(tmp_path):
     jl.save_lp(jl.to_jaddle_sparse(random_lp()), tmp_path / "lp.jlp")
     with pytest.raises(ValueError, match="load_lp"):
         jl.load_solver(tmp_path / "lp.jlp")
+
+
+@pytest.mark.parametrize("precision", ["float32", "float16"])
+@pytest.mark.parametrize("scale", [True, False])
+def test_per_call_precision(precision, scale):
+    import jaddle.jaddle_optimisers as jo
+
+    lp = random_lp()
+    J = jl.to_jaddle_sparse(lp)
+    result = solve(J, tol=1e-3, precision=precision, scale=scale, max_epochs=3000)
+    assert result["solution"].primal.dtype == jnp.float32
+    assert_certified(lp, result, reference_objective(lp), tol=1e-3)
+    # The global float64 profile is back.
+    assert jax.config.jax_enable_x64
+    assert jo.jaddle_dtype() == jnp.float64
+    assert jl.solve(J, max_epochs=1)["solution"].primal.dtype == jnp.float64
+
+
+def test_per_call_precision_warm_start_and_scipy_lp():
+    lp = random_lp()
+    ref = reference_objective(lp)
+    warm = solve(lp)["solution"]  # float64
+    result = solve(lp, tol=1e-4, precision="float32", initial_solution=warm)
+    assert result["solution"].primal.dtype == jnp.float32
+    assert_certified(lp, result, ref, tol=1e-4)
+
+
+@pytest.mark.parametrize("device", ["cpu", jax.devices("cpu")[0]])
+def test_per_call_device(device):
+    lp = random_lp()
+    result = solve(lp, device=device)
+    assert_certified(lp, result, reference_objective(lp))
+    assert result["solution"].primal.devices() == {jax.devices("cpu")[0]}
+
+
+@pytest.mark.parametrize(
+    "options, match",
+    [(dict(device="nope"), "unknown device"), (dict(precision="float8"), "profile")],
+)
+def test_per_call_settings_rejected(options, match):
+    with pytest.raises(ValueError, match=match):
+        jl.solve(toy_lp(), **options)

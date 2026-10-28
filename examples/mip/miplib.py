@@ -66,7 +66,7 @@ result = jm.solve(
     tree_cuts=True,
     verbose=True,
     log_every_seconds=10,
-    device="gpu",
+    device="cpu",
 )
 print(f"Status: {result['status']}")
 print(f"Bound: {result['bound']:.6g}")

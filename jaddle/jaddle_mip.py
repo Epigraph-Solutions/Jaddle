@@ -42,7 +42,8 @@ import scipy.sparse as sp
 
 from jaddle import highs_helpers as hh
 from jaddle import jaddle_linear as jl
-from jaddle.jaddle_basic_types import LP, JaddleLP
+from jaddle import jaddle_optimisers as jo
+from jaddle.jaddle_basic_types import LP, JaddleLP, _wide
 
 # Slack when rounding bounds of integer variables, so 2.9999999 becomes 3.
 _ROUND_SLACK = 1e-6
@@ -1732,18 +1733,11 @@ _SMALL_MIP_NNZ = 10_000
 
 def _search_device(device, nnz):
     """The JAX device for the search (``None``: JAX's default)."""
-    if device is None:
-        return None
-    if device == "auto":
+    if isinstance(device, str) and device == "auto":
         if nnz > _SMALL_MIP_NNZ:
             return None
         device = "cpu"
-    if device not in ("cpu", "gpu", "tpu"):
-        raise ValueError(f"unknown device {device!r}")
-    try:
-        return jax.devices(device)[0]
-    except RuntimeError as error:
-        raise ValueError(f"no {device} device available") from error
+    return jo._resolve_device(device)
 
 
 # %%
@@ -1760,7 +1754,14 @@ class _Node:
         self.warm, self.branch = warm, branch
 
 
-_LP_RESERVED = ("initial_solution", "initial_opt_state", "max_epochs", "max_seconds")
+_LP_RESERVED = (
+    "initial_solution",
+    "initial_opt_state",
+    "max_epochs",
+    "max_seconds",
+    "device",
+    "precision",
+)
 
 
 class _BranchAndBound:
@@ -3604,6 +3605,7 @@ def solve(
     verbose=False,
     log_every_seconds=1.0,
     device="auto",
+    precision=None,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -3708,8 +3710,14 @@ def solve(
     * **Device** (``device``). ``"auto"`` (default) runs MIPs with at
       most 10,000 nonzeros on the CPU: their node LPs are latency-bound
       on an accelerator (flugpl: 3s on the CPU, 18s on a GPU).
-      ``"cpu"``, ``"gpu"`` or ``"tpu"`` pick one; ``None`` keeps JAX's
-      default device.
+      ``"cpu"``, ``"gpu"``, ``"tpu"`` or a ``jax.Device`` pick one;
+      ``None`` keeps JAX's default device.
+    * **Precision** (``precision``). ``"float64"``, ``"float32"`` or
+      ``"float16"`` runs the whole search, node LPs included, at that
+      profile (see ``jaddle_optimisers.configure_jax``); ``None`` (default)
+      keeps the global one. A ``MIP`` built at another precision is
+      converted. Propagation, cuts and feasibility checks stay in float64
+      on the host either way.
     * **Branching** (``branching``): ``"pseudocost"`` (default) scores each
       fractional variable by the product of its estimated down and up bound
       gains, learnt from the nodes solved so far (most fractional until
@@ -3886,10 +3894,26 @@ def solve(
         start=start,
         device=device,
     )
-    if presolve:
-        return _solve_with_presolve(model, highs_options, feasibility_tolerance, settings)
-    mip = model if isinstance(model, MIP) else from_highs(model, highs_options=highs_options)
-    return _BranchAndBound(mip, **settings).run()
+    with jo.local_settings(precision=precision):
+        if presolve:
+            return _solve_with_presolve(
+                model, highs_options, feasibility_tolerance, settings
+            )
+        if isinstance(model, MIP):
+            mip = model
+            if precision is not None:
+                # The width from_highs would build the LP at under this profile.
+                dtype = _wide(jo.jaddle_dtype())
+                if mip.lp.c.dtype != dtype:
+                    mip = MIP(
+                        jl._cast_lp(mip.lp, dtype),
+                        mip.integrality,
+                        mip.offset,
+                        mip.maximise,
+                    )
+        else:
+            mip = from_highs(model, highs_options=highs_options)
+        return _BranchAndBound(mip, **settings).run()
 
 
 def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):

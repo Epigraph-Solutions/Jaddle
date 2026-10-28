@@ -1925,6 +1925,36 @@ def _solve_programs(n_eq, cones, settings):
     return _SolvePrograms(n_eq, cones, settings)
 
 
+def _cast_lp(lp: JaddleLP, dtype) -> JaddleLP:
+    """``lp`` with its numbers in ``dtype`` (``lp`` itself if they already
+    are). Works on any ``JaddleLP``, including one without sort permutations."""
+    if lp.c.dtype == dtype:
+        return lp
+
+    def bcoo(A):
+        return jsp.BCOO(
+            (A.data.astype(dtype), A.indices),
+            shape=A.shape,
+            indices_sorted=A.indices_sorted,
+            unique_indices=A.unique_indices,
+        )
+
+    out = copy.copy(lp)
+    for key in ("c", "b", "b_eq", "b_ineq", "lower_bounds", "upper_bounds"):
+        setattr(out, key, getattr(lp, key).astype(dtype))
+    for key in ("A_eq", "A_ineq", "A", "A_T"):
+        setattr(out, key, bcoo(getattr(lp, key)))
+    return out
+
+
+def _cast_state(state, dtype):
+    """A ``SaddleState`` with its arrays in ``dtype`` (``None`` stays ``None``)."""
+    if state is None:
+        return None
+    return SaddleState(*(jnp.asarray(v, dtype=dtype) for v in state))
+
+
+@jo._with_local_settings
 def solve(
     lp: JaddleLP,
     max_epochs=None,
@@ -1982,6 +2012,8 @@ def solve(
     diag_clamp=10.0,
     _polish_trigger=None,
     cancel=None,
+    device=None,
+    precision=None,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -2239,6 +2271,16 @@ def solve(
             ``>= not_before_epoch`` (counted within this call) where the gap
             test passes and, unless ``factor`` is ``None``, both relative
             residuals are within ``factor`` times their tolerances.
+        device: Where the solve runs: ``"cpu"``, ``"gpu"``, ``"tpu"`` or a
+            ``jax.Device``. ``None`` (default) keeps JAX's default device.
+            The returned arrays live on this device.
+        precision: Precision profile for this solve: ``"float64"``,
+            ``"float32"`` or ``"float16"`` (see
+            ``jaddle_optimisers.configure_jax``). ``None`` (default) keeps
+            the global profile. The LP and ``initial_solution`` are converted
+            to it, and the returned arrays are in it (float32 for
+            ``"float16"``, whose iterates are float32). XLA flags and memory
+            settings stay global (see ``jaddle_optimisers.local_settings``).
 
     Returns:
         dict: The solution together with diagnostics. Keys:
@@ -2273,6 +2315,15 @@ def solve(
     solve_entry_time = time.time()
     if max_seconds is not None and max_seconds <= 0:
         raise ValueError("max_seconds must be > 0 (or None for no limit)")
+
+    if precision is not None:
+        # The decorator set the profile; bring the caller's data to it (at
+        # the width to_jaddle_sparse builds under it). A scipy LP needs no
+        # cast: scale_problem / to_jaddle_sparse read the profile.
+        _, compute_dtype = __profile_dtypes()
+        if isinstance(lp, JaddleLP):
+            lp = _cast_lp(lp, compute_dtype)
+        initial_solution = _cast_state(initial_solution, compute_dtype)
 
     lp = __pad_empty_blocks(lp)
 

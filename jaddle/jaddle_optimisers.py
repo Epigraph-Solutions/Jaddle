@@ -1,3 +1,7 @@
+import contextlib
+import contextvars
+import functools
+import inspect
 import math
 import os
 import warnings
@@ -17,8 +21,21 @@ from jaddle.jaddle_basic_types import (
 # state in the active precision.
 _PROFILES = ("float64", "float32", "float16")
 
+# The profile set by ``local_settings`` for the current context, or None to
+# use the global one.
+_PROFILE_OVERRIDE = contextvars.ContextVar("jaddle_profile", default=None)
+
+# Matrix-product precision for each profile (see configure_jax).
+_MATMUL_PRECISION = {
+    "float64": "highest",
+    "float32": "tensorfloat32",
+    "float16": "float32",
+}
+
 
 def _active_profile(profile: Optional[str] = None) -> str:
+    if profile is None:
+        profile = _PROFILE_OVERRIDE.get()
     if profile is None:
         profile = os.environ.get("JADDLE_JAX_PROFILE", "float64")
     profile = profile.lower()
@@ -32,6 +49,75 @@ def _active_profile(profile: Optional[str] = None) -> str:
 def jaddle_dtype():
     """Return the JAX dtype for the currently-configured precision profile."""
     return getattr(jnp, _active_profile())
+
+
+def _matmul_precision(profile: str) -> str:
+    """The matmul precision for ``profile``; a user-set
+    ``JAX_DEFAULT_MATMUL_PRECISION`` wins."""
+    return os.environ.get("JAX_DEFAULT_MATMUL_PRECISION", _MATMUL_PRECISION[profile])
+
+
+def _resolve_device(device):
+    """The JAX device for ``device``: ``None`` (JAX's default), ``"cpu"``,
+    ``"gpu"``, ``"tpu"`` or a ``jax.Device``."""
+    if device is None or isinstance(device, jax.Device):
+        return device
+    if device not in ("cpu", "gpu", "tpu"):
+        raise ValueError(
+            f"unknown device {device!r}; expected 'cpu', 'gpu', 'tpu', "
+            "a jax.Device or None"
+        )
+    try:
+        return jax.devices(device)[0]
+    except RuntimeError as error:
+        raise ValueError(f"no {device} device available") from error
+
+
+@contextlib.contextmanager
+def local_settings(precision: Optional[str] = None, device=None):
+    """Run the enclosed code at ``precision`` and on ``device``.
+
+    ``precision`` is a profile name (``"float64"``, ``"float32"`` or
+    ``"float16"``, as in ``configure_jax``) and ``device`` is ``"cpu"``,
+    ``"gpu"``, ``"tpu"`` or a ``jax.Device``. ``None`` keeps the global
+    setting. Inside the block, 64-bit types are on exactly when the profile
+    is float64, matrix products use the profile's precision, and
+    ``jaddle_dtype()`` returns the profile's dtype; everything is restored on
+    exit. Arrays made inside keep their dtype and device afterwards.
+
+    XLA flags and allocator settings (``configure_jax``'s autotuning and
+    memory preallocation) are process-wide and are not changed.
+
+    The settings are thread-local: threads started inside the block use the
+    global ones.
+    """
+    with contextlib.ExitStack() as stack:
+        if precision is not None:
+            profile = _active_profile(precision)
+            token = _PROFILE_OVERRIDE.set(profile)
+            stack.callback(_PROFILE_OVERRIDE.reset, token)
+            stack.enter_context(jax.enable_x64(profile == "float64"))
+            stack.enter_context(
+                jax.default_matmul_precision(_matmul_precision(profile))
+            )
+        device = _resolve_device(device)
+        if device is not None:
+            stack.enter_context(jax.default_device(device))
+        yield
+
+
+def _with_local_settings(fn):
+    """Run ``fn`` inside ``local_settings`` with its own ``precision`` and
+    ``device`` arguments."""
+    signature = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        arguments = signature.bind_partial(*args, **kwargs).arguments
+        with local_settings(arguments.get("precision"), arguments.get("device")):
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 def configure_jax(jax_profile: Optional[str] = None):

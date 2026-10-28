@@ -85,6 +85,18 @@ SCRIPT = textwrap.dedent(
     # past the float16 rounding of the matrix.
     check(random_lp(0), 1e-6, refine=True)
 
+    # A float64 solve in this float16 session: x64 on for the call only.
+    import jax
+    lp = random_lp(0)
+    r = jl.solve(jl.to_jaddle_sparse(lp), precision="float64",
+                 primal_feasibility_tolerance=1e-8,
+                 dual_feasibility_tolerance=1e-8, dual_gap_tolerance=1e-8)
+    assert r["converged"] and r["solution"].primal.dtype == jnp.float64
+    ref = reference(lp)
+    obj = float(np.asarray(lp.c) @ np.asarray(r["solution"].primal))
+    assert abs(obj - ref) / (1 + abs(ref)) < 1e-7, (obj, ref)
+    assert not jax.config.jax_enable_x64 and jo.jaddle_dtype() == jnp.float16
+
     # Quadratic programs: float16 matrices, float32 iterates, and a
     # `converged` that is judged on the QP as given.
     import jaddle.jaddle_convex as jc

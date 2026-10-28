@@ -4,6 +4,7 @@ import jax.numpy as jnp
 from optax.projections import projection_non_negative, projection_box
 import optax
 from typing import NamedTuple
+import copy
 import time
 from jaddle.jaddle_basic_types import JaddleCP, SaddleState, _dot, _wide
 import jaddle.jaddle_optimisers as jo
@@ -1356,6 +1357,7 @@ def _device_solver(
     return _build_chunk, carry
 
 
+@jo._with_local_settings
 def solve(
     cp: JaddleCP,
     optimiser=None,
@@ -1390,6 +1392,8 @@ def solve(
     gradient_scaling=True,
     gradient_scaling_probes=16,
     precompile=True,
+    device=None,
+    precision=None,
 ):
     """
     Solve a convex saddle-point problem via saddle-point optimisation.
@@ -1584,6 +1588,19 @@ def solve(
             rather than XLA compilation. The compile still counts against
             ``max_seconds``. A restart that changes ``iterations_per_epoch``
             compiles a new loop inside the timed region.
+        device: Where the solve runs: ``"cpu"``, ``"gpu"``, ``"tpu"`` or a
+            ``jax.Device``. ``None`` (default) keeps JAX's default device.
+            The returned arrays live on this device.
+        precision: Precision profile for this solve: ``"float64"``,
+            ``"float32"`` or ``"float16"`` (see
+            ``jaddle_optimisers.configure_jax``). ``None`` (default) keeps
+            the global profile. The bounds and ``initial_solution`` are
+            converted to it, and the CP's functions run at it (JAX converts
+            the constants they capture). Iterates are at least float32, so
+            ``"float16"`` runs a general CP in float32; ``quadratic_program``
+            is where it stores matrices in half precision. XLA flags and
+            memory settings stay global (see
+            ``jaddle_optimisers.local_settings``).
 
     Returns:
         dict: The solution together with diagnostics. Keys:
@@ -1608,6 +1625,17 @@ def solve(
     solve_entry_time = time.time()
     if max_seconds is not None and max_seconds <= 0:
         raise ValueError("max_seconds must be > 0 (or None for no limit)")
+
+    if precision is not None:
+        # The decorator set the profile; bring the caller's data to it.
+        dtype = _wide(jo.jaddle_dtype())
+        cp = copy.copy(cp)
+        cp.lower_bounds = jnp.asarray(cp.lower_bounds, dtype=dtype)
+        cp.upper_bounds = jnp.asarray(cp.upper_bounds, dtype=dtype)
+        if initial_solution is not None:
+            initial_solution = SaddleState(
+                *(jnp.asarray(v, dtype=dtype) for v in initial_solution)
+            )
 
     if log_every < 1:
         raise ValueError("log_every must be >= 1")
@@ -2494,6 +2522,7 @@ def _scale_qp(
     return Q, A_eq, A_ineq, lower, upper, d, e, matrices
 
 
+@jo._with_local_settings
 def quadratic_program(
     Q,
     c,
@@ -2509,6 +2538,8 @@ def quadratic_program(
     ruiz_iterations=10,
     pc_iterations=1,
     initial_solution=None,
+    device=None,
+    precision=None,
     **solve_options,
 ):
     """
@@ -2562,6 +2593,10 @@ def quadratic_program(
     ``initial_opt_state`` is passed to ``solve()`` unchanged. The KKT scaling
     already equilibrates the rows, so ``gradient_scaling`` defaults to
     ``False`` here.
+
+    ``device`` and ``precision`` are as in ``solve()``, and also cover the
+    scaled matrices built here (stored in half precision under
+    ``"float16"``).
     """
     c = np.asarray(c, dtype=np.float64)
     Q, A_eq, A_ineq, lower, upper, d, e, matrices = _scale_qp(

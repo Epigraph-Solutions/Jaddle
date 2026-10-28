@@ -4,6 +4,15 @@
 
 ### Added
 
+- Per-call `device` and `precision`. `jl.solve`, `jc.solve` and
+  `jc.quadratic_program` take `device=` (`"cpu"`, `"gpu"`, `"tpu"` or a
+  `jax.Device`; `None` keeps JAX's default). They also take `precision=`
+  (`"float64"`, `"float32"` or `"float16"`; `None` keeps the global
+  profile), and so does `jm.solve`. The problem and warm start are converted
+  to the requested precision. `jaddle_optimisers.local_settings(precision,
+  device)` applies both to a whole block of code. `jm.solve`'s `device` also
+  accepts a `jax.Device`, and `lp_options` can no longer set `device` or
+  `precision`.
 - `jaddle.jaddle_mip` (**highly experimental**): a branch-and-bound solver
   for mixed-integer linear programs, with `jaddle_linear.solve` at every
   node. Its interface, defaults and behaviour may change without notice;

@@ -294,6 +294,8 @@ the dual objective as in PDLP, so far-away finite bounds do not swamp the gap.
 | `initial_solution`, `initial_opt_state` | `None` | Warm start from a previous solve's `solution` and `opt_state`. |
 | `vertex_bias` | `0.0` | Small cost perturbation that steers the solver to a vertex of the optimal face rather than its interior. Useful before `jl.crossover`. |
 | `verbose`, `log_every` | `False`, `1` | Per-epoch progress logging. |
+| `device` | `None` | Where the solve runs: `"cpu"`, `"gpu"`, `"tpu"` or a `jax.Device` (`None` keeps JAX's default). |
+| `precision` | `None` | `"float64"`, `"float32"` or `"float16"` for this solve (`None` keeps the global profile; see [Numerical precision](#numerical-precision)). |
 
 ### Results
 
@@ -702,7 +704,8 @@ reports `bound_rigorous=False`.
 | `repair_max_epochs` | `20` | Epoch budget of the LP that repairs a rounded point's continuous variables (skipped for integers that already failed, or when propagation shows the fixed box infeasible). |
 | `jump_iterations` | `None` | Feasibility jump steps per start (`None`: `max(10000, 20·(n + m))`). |
 | `plunge_depth` | `8` | Steps a plunge follows a best-bound node's children (`0`: pure best-bound). |
-| `device` | `"auto"` | `"auto"` runs MIPs with at most 10,000 nonzeros on the CPU (their node LPs are latency-bound on a GPU: flugpl takes 3s on the CPU, 18s on a GPU); `"cpu"`/`"gpu"`/`"tpu"` pick one, `None` keeps JAX's default. |
+| `device` | `"auto"` | `"auto"` runs MIPs with at most 10,000 nonzeros on the CPU (their node LPs are latency-bound on a GPU: flugpl takes 3s on the CPU, 18s on a GPU); `"cpu"`/`"gpu"`/`"tpu"` or a `jax.Device` pick one, `None` keeps JAX's default. |
+| `precision` | `None` | `"float64"`, `"float32"` or `"float16"` for the whole search, node LPs included (`None` keeps the global profile). |
 | `batch_size` | `1` | Open nodes solved together in one `vmap`-ed device call (try 8–32 on a GPU). |
 | `highs_incumbent_seconds` | `0` | If set, HiGHS supplies a first incumbent when Jaddle's heuristics find none (off by default). |
 | `rins_seconds`, `rins_every` | `0`, `50` | If set, RINS at the root and every `rins_every` nodes, to improve the incumbent (off by default). |
@@ -852,6 +855,7 @@ their tolerances:
 | `diag_adapt`, `diag_theta`, `diag_clamp` | `True`, `0.5`, `10.0` | Per-coordinate diagonal step metric, adapted at each restart. |
 | `gradient_scaling` | `True` | Rescale the objective and constraint rows by their gradients at the start point. |
 | `initial_solution`, `initial_opt_state` | `None` | Warm start. |
+| `device`, `precision` | `None`, `None` | As for `jl.solve`. Iterates are at least float32, so `"float16"` runs a general problem in float32. |
 
 `solve` returns a dictionary containing `solution` (a `SaddleState`),
 `converged`, `stop_reason`, `opt_state` and `solve_seconds`.
@@ -1078,7 +1082,21 @@ arrays:
 | `"float16"` | The scaled LP or QP matrices in half precision; iterates, norms, step sizes and the final certificate in float32 | Memory-limited problems, and dense QPs (half the memory, about 20% faster at n = 4000). Matrices are rounded to about 3 significant digits, so solves reach relative tolerances of about 1e-3; for LPs, `solve_with_refinement` gets past that. Not suited to an ill-conditioned `Q`, which the rounding can make indefinite. |
 
 The profile can also be set through the `JADDLE_JAX_PROFILE` environment
-variable. `configure_jax` also enables a persistent XLA compilation cache in
+variable.
+
+`jl.solve`, `jc.solve`, `jc.quadratic_program` and `jm.solve` also take
+`precision=` for a single call, along with `device=` to choose where it runs:
+
+```python
+result = jl.solve(lp, precision="float32", device="gpu")
+```
+
+The problem and any warm start are converted to the requested precision, and
+the result comes back in it. To run several steps at one precision and on one
+device (loading, solving and post-processing), wrap them in
+`jaddle.jaddle_optimisers.local_settings(precision=..., device=...)`. XLA
+flags and GPU memory settings are fixed when the process starts, so
+`configure_jax`'s autotuning and preallocation settings do not change per call. `configure_jax` also enables a persistent XLA compilation cache in
 `~/.cache/jaddle_jax`, so repeated solves of problems with the same shape skip
 recompilation.
 

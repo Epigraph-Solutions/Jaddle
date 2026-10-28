@@ -1522,3 +1522,26 @@ def test_objective_propagation_rejects_non_improving_roundings(monkeypatch):
     search.use_objective_propagation = False
     _, _, infeasible = search.heuristic_propagator()(zeros, zeros.copy())
     assert not infeasible
+
+
+@pytest.mark.parametrize("make", [knapsack, general_integer])
+def test_per_call_precision(make):
+    import jax
+    import jax.numpy as jnp
+
+    mip = make()  # built in float64
+    assert_solved(jm.solve(mip, precision="float32"), mip, reference(mip))
+    assert jax.config.jax_enable_x64 and mip.lp.c.dtype == jnp.float64
+
+
+def test_lp_options_cannot_set_device_or_precision():
+    for key, value in (("device", "cpu"), ("precision", "float32")):
+        with pytest.raises(ValueError, match=key):
+            jm.solve(knapsack(), lp_options={key: value})
+
+
+def test_device_accepts_jax_device():
+    import jax
+
+    mip = knapsack()
+    assert_solved(jm.solve(mip, device=jax.devices("cpu")[0]), mip, reference(mip))

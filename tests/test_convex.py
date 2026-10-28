@@ -869,3 +869,32 @@ def test_load_checks_file_kind(tmp_path):
     jc.save_cp(cp, tmp_path / "cp.jcp")
     with pytest.raises(ValueError, match="load_cp"):
         jc.load_solver(tmp_path / "cp.jcp")
+
+
+@pytest.mark.parametrize("precision", ["float32", "float16"])
+def test_per_call_precision(precision):
+    cp, expected = simplex_problem()
+    tols = {key: 1e-4 for key in TOLS}
+    result = jc.solve(cp, iterations_per_epoch=200, max_epochs=300,
+                      precision=precision, device="cpu", **tols)
+    assert result["converged"]
+    # Iterates are at least float32.
+    assert result["solution"].primal.dtype == jnp.float32
+    np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-3)
+    assert jax.config.jax_enable_x64 and jo.jaddle_dtype() == jnp.float64
+
+
+def test_quadratic_program_per_call_precision():
+    rng = np.random.default_rng(0)
+    n = 10
+    M = rng.standard_normal((n, n))
+    qp = dict(Q=M @ M.T + np.eye(n), c=rng.standard_normal(n),
+              A_ineq=np.ones((1, n)), b_ineq=np.ones(1), lower_bounds=np.zeros(n))
+    ref = jc.quadratic_program(**qp)
+    for precision in ("float32", "float16"):
+        result = jc.quadratic_program(**qp, precision=precision)
+        assert result["converged"]
+        assert result["solution"].primal.dtype == jnp.float32
+        assert abs(result["objective"] - ref["objective"]) < 1e-3 * (
+            1 + abs(ref["objective"])
+        )
