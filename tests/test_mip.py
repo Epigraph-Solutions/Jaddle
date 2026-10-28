@@ -760,6 +760,50 @@ def test_gomory_cuts_in_the_search():
     assert off["cuts"]["gomory"] == 0
 
 
+@pytest.mark.parametrize("make", [general_integer, generalised_assignment])
+def test_cut_rounds_drop_slack_cuts(make, monkeypatch):
+    """With Gomory cuts, a cut whose row is basic (slack) in a round's
+    crossover basis is gone from the next round's LP; binding ones stay."""
+    rounds = []  # (cuts before the round, basis) per crossover
+    after = []  # the cut list each round's LP was built from
+    real_vertex = jm._BranchAndBound.root_vertex
+    real_set_mip = jm._BranchAndBound.set_mip
+    real_compact = jm._BranchAndBound.compact_cuts
+    compacting = []
+
+    def root_vertex(self, lower, upper, solution):
+        vertex, basis = real_vertex(self, lower, upper, solution)
+        rounds.append((list(self.cut_list), basis))
+        return vertex, basis
+
+    def set_mip(self, mip):
+        if not compacting and len(after) < len(rounds):
+            after.append(list(getattr(self, "cut_list", [])))
+        real_set_mip(self, mip)
+
+    def compact_cuts(self, *args):
+        compacting.append(True)  # the rounds are over
+        return real_compact(self, *args)
+
+    monkeypatch.setattr(jm._BranchAndBound, "root_vertex", root_vertex)
+    monkeypatch.setattr(jm._BranchAndBound, "set_mip", set_mip)
+    monkeypatch.setattr(jm._BranchAndBound, "compact_cuts", compact_cuts)
+    mip = make()
+    result = jm.solve(mip, gomory_cuts=True, max_nodes=1)
+    assert result["cuts"]["gomory"] > 0
+    m = mip.A.shape[0]
+    checked = 0
+    for (before, basis), cuts in zip(rounds, after):
+        if basis is None:
+            continue
+        kept = {id(cut) for cut in cuts}
+        for i, cut in enumerate(before):
+            basic = basis.row_status[m + i] == highspy.HighsBasisStatus.kBasic
+            assert (id(cut) in kept) == (not basic)
+            checked += 1
+    assert checked > 0
+
+
 # %% Feasibility jump
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
 def test_feasibility_jump_assignment(seed):
@@ -886,12 +930,18 @@ def test_highs_rins_improves_an_incumbent():
     )
     optimum = np.round(best.x)
     # HiGHS's first solution, usually worse than the optimum.
-    worse = jm.highs_incumbent(mip)
-    assert worse is not None
+    highs = highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.setOptionValue("mip_max_improving_sols", 1)
+    highs.passModel(jm.to_highs(mip))
+    highs.run()
+    worse = np.array(highs.getSolution().col_value)
+    assert mip.is_feasible(worse)
     value = mip.c @ worse
     found = jm.highs_rins(mip, worse, optimum, cutoff=value - 1e-6, max_seconds=10)
-    if np.allclose(worse, optimum):
-        assert found is None  # nothing better exists
+    if value <= best.fun + 1e-6:
+        # Nothing better exists.
+        assert found is None or mip.c @ found >= best.fun - 1e-6
     else:
         assert found is not None and mip.is_feasible(found)
         assert mip.c @ found < value
@@ -1470,6 +1520,100 @@ def test_integer_aggregation_cuts_are_valid(make):
     separator = jm.CutSeparator(mip, lower, upper, aggregate_integers=True, max_aggregation=4)
     for _, idx, coef, rhs in separator(x):
         assert max_over_mip(mip, idx, coef) <= rhs + 1e-7 * (1 + abs(rhs))
+
+
+def fixed_charge(seed=0, n=6):
+    """Open facilities (binary ``z``) to meet a demand with flows ``y``: a
+    flow needs its facility open (``y_j <= u_j·z_j``) and an open one ships
+    at least ``l_j`` (``y_j >= l_j·z_j``). Columns: ``z`` then ``y``; rows:
+    the upper bounds, the lower bounds, then the demand."""
+    rng = np.random.default_rng(seed)
+    u = rng.integers(10, 30, n).astype(float)
+    low = np.floor(0.2 * u)
+    demand = 0.55 * u.sum() + 0.5
+    A_ineq = sp.lil_matrix((2 * n + 1, 2 * n))
+    for j in range(n):
+        A_ineq[j, n + j], A_ineq[j, j] = 1.0, -u[j]  # y_j − u_j z_j <= 0
+        A_ineq[n + j, n + j], A_ineq[n + j, j] = -1.0, low[j]  # l_j z_j − y_j <= 0
+        A_ineq[2 * n, n + j] = -1.0  # −Σ y >= −demand
+    b_ineq = np.zeros(2 * n + 1)
+    b_ineq[-1] = -demand
+    A_eq, b_eq = no_rows(2 * n)
+    lp = jl.LP(
+        c=np.concatenate([rng.uniform(20, 60, n), rng.uniform(1, 4, n)]),
+        A_eq=A_eq,
+        b_eq=b_eq,
+        A_ineq=sp.csc_matrix(A_ineq),
+        b_ineq=b_ineq,
+        lower_bounds=np.zeros(2 * n),
+        upper_bounds=np.concatenate([np.ones(n), np.full(n, u.sum())]),
+    )
+    return jm.MIP(lp, np.arange(2 * n) < n), u, low
+
+
+def test_variable_bounds_found():
+    mip, u, low = fixed_charge()
+    n = u.size
+    bounds = jm.variable_bounds(mip)
+    assert sorted(bounds) == list(range(n, 2 * n))
+    for j in range(n):
+        assert bounds[n + j]["ub"] == [(j, pytest.approx(u[j]), pytest.approx(0.0))]
+        assert bounds[n + j]["lb"] == [(j, pytest.approx(low[j]), pytest.approx(0.0))]
+    # A pure integer MIP has none.
+    assert jm.variable_bounds(knapsack()) == {}
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_variable_bound_cmir_cuts_are_valid(seed):
+    mip, u, _ = fixed_charge(seed)
+    n = u.size
+    bounds = jm.variable_bounds(mip)
+    demand = 2 * n
+    idx, a = mip.A[demand].indices, mip.A[demand].data
+    rng = np.random.default_rng(seed)
+    x_lp, _ = vertex_and_basis(mip)
+    # The LP vertex, then points with fractional z and flows between their
+    # variable bounds, so either kind of bound can be the nearest.
+    points = [x_lp] + [
+        np.concatenate([z, rng.uniform(0.0, 1.0, n) * u * z])
+        for z in rng.uniform(0.05, 0.95, (5, n))
+    ]
+    found = 0
+    for x in points:
+        cut = jm.cmir_cut(
+            idx, a, mip.b[demand], x, mip.lower, mip.upper, mip.integrality,
+            variable_bounds=bounds,
+        )
+        if cut is None:
+            continue
+        c_idx, coef, rhs = cut
+        assert coef @ x[c_idx] > rhs
+        assert max_over_mip(mip, c_idx, coef) <= rhs + 1e-7 * (1 + abs(rhs))
+        found += 1
+    assert found > 0
+    separator = jm.CutSeparator(mip, mip.lower, mip.upper)
+    assert separator.variable_bounds
+    for _, c_idx, coef, rhs in separator(x_lp):
+        assert max_over_mip(mip, c_idx, coef) <= rhs + 1e-7 * (1 + abs(rhs))
+
+
+def test_variable_bound_cmir_is_stronger():
+    # At the LP vertex the flows sit on their upper bounds u_j·z_j, which
+    # the plain cut cannot see.
+    mip, u, _ = fixed_charge()
+    demand = 2 * u.size
+    idx, a = mip.A[demand].indices, mip.A[demand].data
+    x, _ = vertex_and_basis(mip)
+    args = (idx, a, mip.b[demand], x, mip.lower, mip.upper, mip.integrality)
+    plain = jm.cmir_cut(*args)
+    substituted = jm.cmir_cut(*args, variable_bounds=jm.variable_bounds(mip))
+    assert substituted is not None
+
+    def efficacy(cut):
+        c_idx, coef, rhs = cut
+        return (coef @ x[c_idx] - rhs) / np.linalg.norm(coef)
+
+    assert plain is None or efficacy(substituted) > efficacy(plain) + 1e-6
 
 
 # %% Incumbent heuristics: RENS, dives, objective-aware propagation

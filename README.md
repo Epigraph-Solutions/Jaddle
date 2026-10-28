@@ -707,7 +707,7 @@ reports `bound_rigorous=False`.
 | `device` | `"auto"` | `"auto"` runs MIPs with at most 10,000 nonzeros on the CPU (their node LPs are latency-bound on a GPU: flugpl takes 3s on the CPU, 18s on a GPU); `"cpu"`/`"gpu"`/`"tpu"` or a `jax.Device` pick one, `None` keeps JAX's default. |
 | `precision` | `None` | `"float64"`, `"float32"` or `"float16"` for the whole search, node LPs included (`None` keeps the global profile). |
 | `batch_size` | `1` | Open nodes solved together in one `vmap`-ed device call (try 8–32 on a GPU). |
-| `highs_incumbent_seconds` | `0` | If set, HiGHS supplies a first incumbent when Jaddle's heuristics find none (off by default). |
+| `highs_incumbent_seconds` | `0` | If set, HiGHS supplies its best incumbent within this many seconds when Jaddle's heuristics find none (off by default). |
 | `rins_seconds`, `rins_every` | `0`, `50` | If set, RINS at the root and every `rins_every` nodes, to improve the incumbent (off by default). |
 | `rens_seconds`, `rens_nodes` | `None`, `500` | RENS at the root (`None`: 5s for MIPs with at most 10,000 nonzeros, else off). |
 | `dive_every`, `dive_depth` | `0`, `20` | LP-based dives every this many nodes and at the root (`0`: off), and their depth. |

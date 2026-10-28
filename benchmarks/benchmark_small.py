@@ -36,7 +36,7 @@ jax.config.update("jax_platform_name", "cpu")
 
 import jaddle.jaddle_optimisers as jo
 
-jo.configure_jax("float32")
+jo.configure_jax("float64")
 
 import highspy
 
@@ -126,7 +126,7 @@ def instance_path(name):
 
 def run_highs(path, seconds):
     highs = highspy.Highs()
-    highs.setOptionValue("output_flag", False)
+    highs.setOptionValue("output_flag", True)
     highs.setOptionValue("time_limit", float(seconds))
     highs.readModel(path)
     started = time.time()
@@ -153,7 +153,7 @@ def run_instance(name, path, args):
             max_seconds=args.seconds,
             batch_size=args.batch_size,
             tree_cuts=args.tree_cuts,
-            lp_tolerance=1e-2,
+            lp_tolerance=1e-4,
             device=None if args.device == "default" else args.device,
             verbose=args.verbose,
             gomory_cuts=True,

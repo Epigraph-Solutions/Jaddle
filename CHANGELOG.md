@@ -134,6 +134,26 @@
 
 ### Changed
 
+- `jm.solve` root Gomory cuts. `gomory_cuts` takes `max_nnz` (`"auto"`, the
+  old cap of `max(n // 2, min(n, 100))` nonzeros, or `None` for no cap), and
+  the root cut loop uses `None`: the cap rejected 197 of 198 GMI cuts at the
+  root of ns1830653. With Gomory cuts on, each round now drops the cuts
+  whose rows are basic (slack) in its crossover basis, instead of keeping
+  them for two rounds, and the default is 40 rounds whatever the MIP's size.
+  On ns1830653 (`gomory_cuts=True`) the root bound goes from 7,630 to
+  11,622 (HiGHS's root bound) in 13 s, with 10 cuts left in the tree LP.
+- c-MIR cuts use variable bounds. `jm.variable_bounds(mip)` reads the
+  two-term rows that bound a continuous variable by an integer one (such as
+  `y <= u·z`), and `cmir_cut(..., variable_bounds=...)` may shift a
+  continuous variable to such a bound when it is nearer the LP point than
+  its simple bounds, keeping the better of that cut and the plain one.
+  `CutSeparator` passes them in, so root and tree cuts both use them. On
+  vpm1 (`gomory_cuts=True`) the root bound goes from 18.9 to 20, the
+  optimum, and the search from 173 nodes to 31. Root bounds: vpm2 12.50 →
+  13.00, pp08a 7,014 → 7,182, fixnet6 3,594 → 3,712.
+- `jm.highs_incumbent` (`highs_incumbent_seconds`) returns HiGHS's best
+  solution within its time limit instead of its first. On ns1830653 the
+  first was 133,808, against 36,622 a few seconds later.
 - The `float16` profile now stores only the scaled LP the solver iterates on
   in half precision. Iterates, norms, dot products, the step size and primal
   weight, and the final certificate use float32, and `to_jaddle_sparse` /

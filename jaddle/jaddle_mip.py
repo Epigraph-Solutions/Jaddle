@@ -790,7 +790,9 @@ def _cmir_for(a, b, xv, lo, up, integer, use_upper, delta):
     return (coef @ xv - rhs) / norm, coef, rhs
 
 
-def cmir_cut(idx, a, b, x, lower, upper, is_int, max_divisors=64):
+def cmir_cut(
+    idx, a, b, x, lower, upper, is_int, max_divisors=64, variable_bounds=None
+):
     """
     The best complemented mixed-integer rounding (c-MIR) cut from the
     inequality ``a · x[idx] <= b``, or ``None``.
@@ -813,7 +815,147 @@ def cmir_cut(idx, a, b, x, lower, upper, is_int, max_divisors=64):
     raises the efficacy. Cuts are compared by efficacy (distance cut off) in
     the original variables. Returns ``(idx, coef, rhs)``, only if it cuts
     off ``x``.
+
+    With ``variable_bounds`` (from ``variable_bounds``), a continuous ``y``
+    may also be shifted to a variable bound ``y <= d + c·z`` or
+    ``y >= d + c·z`` on an integer ``z``, when that bound is at least as
+    close to ``x`` as ``y``'s simple bounds (``_substituted_cmir``); the
+    better of that cut and the plain one is returned. On fixed-charge rows
+    (a demand over flows ``y_j <= u_j·z_j``) the plain cut sees only
+    ``0 <= y_j <= U``: with exact LPs, Gomory and these cuts close the root
+    gap of vpm1 (it is solved at the root) against 77% without, vpm2 71%
+    against 56%, pp08a 95% against 91%.
     """
+    plain = _cmir_search(idx, a, b, x, lower, upper, is_int, max_divisors)
+    if not variable_bounds:
+        return plain
+    substituted = _substituted_cmir(
+        idx, a, b, x, lower, upper, is_int, max_divisors, variable_bounds
+    )
+    if substituted is None:
+        return plain
+    if plain is None or _efficacy(substituted, x) > _efficacy(plain, x):
+        return substituted
+    return plain
+
+
+def _efficacy(cut, x):
+    idx, coef, rhs = cut
+    return (coef @ x[idx] - rhs) / np.linalg.norm(coef)
+
+
+def variable_bounds(mip):
+    """
+    The variable bounds in ``mip``'s rows: each row with exactly two
+    nonzeros, on a continuous ``y`` and an integer ``z``, reads
+    ``a_y·y + a_z·z <= b`` (or ``= b``) and so bounds ``y`` by
+    ``d + c·z`` with ``d = b/a_y`` and ``c = −a_z/a_y``: from above when
+    ``a_y > 0`` (a VUB, such as ``y <= u·z``), from below when ``a_y < 0``,
+    and both ways on an equality row. Returns
+    ``{y: {"ub": [(z, c, d), ...], "lb": [...]}}``. These are rows of the
+    MIP, so cuts that use them are valid everywhere.
+    """
+    A = sp.csr_matrix(mip.A)
+    integer = mip.integrality
+    out = {}
+    two = np.flatnonzero(np.diff(A.indptr) == 2)
+    for r in two:
+        start = A.indptr[r]
+        cols, vals = A.indices[start : start + 2], A.data[start : start + 2]
+        if integer[cols].sum() != 1:
+            continue
+        k = 0 if not integer[cols[0]] else 1
+        y, z, a_y, a_z = int(cols[k]), int(cols[1 - k]), vals[k], vals[1 - k]
+        if abs(a_y) <= 1e-9 or not np.isfinite(mip.b[r]):
+            continue
+        d, c = mip.b[r] / a_y, -a_z / a_y
+        if r < mip.n_eq:
+            kinds = ("ub", "lb")
+        else:
+            kinds = ("ub",) if a_y > 0 else ("lb",)
+        bounds = out.setdefault(y, {"ub": [], "lb": []})
+        for kind in kinds:
+            bounds[kind].append((z, float(c), float(d)))
+    return out
+
+
+def _substituted_cmir(idx, a, b, x, lower, upper, is_int, max_divisors, bounds):
+    """
+    ``cmir_cut`` of the row ``a · x[idx] <= b`` with each continuous ``y``
+    shifted to its variable bound nearest ``x`` (``bounds``, from
+    ``variable_bounds``), when that is at least as near as a simple bound:
+    ``y = d + c·z − t`` (upper) or ``y = d + c·z + t`` (lower), with a new
+    continuous ``t >= 0``. The cut is found over the variables and the
+    ``t``s, then each ``t`` is mapped back through its bound. ``None`` when
+    no term has a variable bound, or no cut is found.
+    """
+    n = x.size
+    coef = dict(zip(idx.tolist(), a.tolist()))
+    subs = []  # (kind, y, z, c, d)
+    t_coef, t_value = [], []
+    for y in idx.tolist():
+        if is_int[y] or y not in bounds:
+            continue
+        a_y, x_y = coef[y], x[y]
+        best_distance = min(x_y - lower[y], upper[y] - x_y)
+        best = None
+        for kind in ("ub", "lb"):
+            for z, c, d in bounds[y][kind]:
+                implied = d + c * x[z]
+                distance = implied - x_y if kind == "ub" else x_y - implied
+                if distance <= best_distance + 1e-9:
+                    best_distance, best = distance, (kind, z, c, d)
+        if best is None:
+            continue
+        kind, z, c, d = best
+        del coef[y]
+        coef[z] = coef.get(z, 0.0) + a_y * c
+        b = b - a_y * d
+        implied = d + c * x[z]
+        subs.append((kind, y, z, c, d))
+        t_coef.append(-a_y if kind == "ub" else a_y)
+        t_value.append(max(implied - x_y if kind == "ub" else x_y - implied, 0.0))
+    if not subs:
+        return None
+    k = len(subs)
+    ext_idx = np.array(list(coef) + list(range(n, n + k)), dtype=np.int64)
+    ext_a = np.array(list(coef.values()) + t_coef)
+    keep = np.abs(ext_a) > 1e-12 * np.abs(ext_a).max(initial=1.0)
+    found = _cmir_search(
+        ext_idx[keep],
+        ext_a[keep],
+        b,
+        np.concatenate([x, t_value]),
+        np.concatenate([lower, np.zeros(k)]),
+        np.concatenate([upper, np.full(k, np.inf)]),
+        np.concatenate([is_int, np.zeros(k, dtype=bool)]),
+        max_divisors,
+    )
+    if found is None:
+        return None
+    c_idx, c_coef, rhs = found
+    out = {}
+    for j, g in zip(c_idx.tolist(), c_coef.tolist()):
+        if j < n:
+            out[j] = out.get(j, 0.0) + g
+            continue
+        kind, y, z, c, d = subs[j - n]
+        sign = 1.0 if kind == "ub" else -1.0  # t = sign·(d + c·z − y)
+        rhs -= sign * g * d
+        out[z] = out.get(z, 0.0) + sign * g * c
+        out[y] = out.get(y, 0.0) - sign * g
+    o_idx = np.array(sorted(out), dtype=np.int64)
+    o_coef = np.array([out[j] for j in o_idx])
+    nonzero = np.abs(o_coef) > 1e-12 * np.abs(o_coef).max(initial=1.0)
+    o_idx, o_coef = o_idx[nonzero], o_coef[nonzero]
+    if o_idx.size == 0:
+        return None
+    cut = (o_idx, o_coef, rhs)
+    return cut if _efficacy(cut, x) > 1e-9 else None
+
+
+def _cmir_search(idx, a, b, x, lower, upper, is_int, max_divisors):
+    """The search of ``cmir_cut`` over simple bounds."""
     lo, up, xv, integer = lower[idx], upper[idx], x[idx], is_int[idx]
     if not integer.any():
         return None
@@ -861,7 +1003,17 @@ def mir_cut(idx, a, b, x, lower, upper, is_int, max_divisors=64):
 
 
 def gomory_cuts(
-    A, b, n_eq, lower, upper, integrality, basis, x, max_cuts=200, tableau_mir=False
+    A,
+    b,
+    n_eq,
+    lower,
+    upper,
+    integrality,
+    basis,
+    x,
+    max_cuts=200,
+    tableau_mir=False,
+    max_nnz="auto",
 ):
     """
     Gomory mixed-integer (GMI) cuts from an optimal basis of the LP
@@ -890,6 +1042,12 @@ def gomory_cuts(
     ``>= 0``), in both senses; the slacks are mapped back through
     ``s = b − A x``. Per row, the deeper of the GMI cut and the c-MIR cuts
     is kept, the latter as ``"tableau_mir"``.
+
+    ``max_nnz`` caps a cut's nonzeros: ``"auto"`` (the default) allows
+    ``max(n // 2, min(n, 100))``, and ``None`` allows any. Slack terms
+    mapped back through their rows make GMI cuts dense, so the cap can
+    reject nearly all of them (197 of 198 at the root of ns1830653). The
+    root cut loop lifts it and keeps only the cuts that end up binding.
     """
     import highspy
     from scipy.sparse.linalg import splu
@@ -897,6 +1055,10 @@ def gomory_cuts(
     BS = highspy.HighsBasisStatus
     A = sp.csr_matrix(A)
     m, n = A.shape
+    if max_nnz == "auto":
+        max_nnz = max(n // 2, min(n, 100))
+    elif max_nnz is None:
+        max_nnz = n
     x = np.asarray(x, np.float64)
     col_status = list(basis.col_status)
     row_status = list(basis.row_status)
@@ -997,7 +1159,7 @@ def gomory_cuts(
         constant = -(pi_col * sign) @ bound + pi_slack @ b
         rhs_ge = 1.0 - constant
         idx = np.flatnonzero(coef_ge)
-        if idx.size == 0 or idx.size > max(n // 2, min(n, 100)):
+        if idx.size == 0 or idx.size > max_nnz:
             continue
         cleaned = _clean_cut(idx, -coef_ge[idx], -rhs_ge, lower, upper)
         best = ("gomory", *cleaned) if cleaned is not None else None
@@ -1021,7 +1183,7 @@ def gomory_cuts(
                 coef_x = c_x - A_ineq_T @ c_s
                 rhs_x = c_rhs - c_s @ b[ineq]
                 x_idx = np.flatnonzero(coef_x)
-                if x_idx.size == 0 or x_idx.size > max(n // 2, min(n, 100)):
+                if x_idx.size == 0 or x_idx.size > max_nnz:
                     continue
                 cleaned = _clean_cut(x_idx, coef_x[x_idx], rhs_x, lower, upper)
                 if cleaned is None:
@@ -1054,6 +1216,9 @@ class CutSeparator:
         self.lower, self.upper = np.asarray(lower), np.asarray(upper)
         self.is_int = mip.integrality
         self.is_binary = self.is_int & (self.lower == 0.0) & (self.upper == 1.0)
+        # Variable bounds for c-MIR (``None`` without any, as on a pure
+        # integer MIP).
+        self.variable_bounds = variable_bounds(mip) or None
 
     def row(self, r):
         start, end = self.A.indptr[r], self.A.indptr[r + 1]
@@ -1098,7 +1263,10 @@ class CutSeparator:
         best, best_efficacy = None, 0.0
         covers = []
         for level in range(self.max_aggregation + 1):
-            cut = cmir_cut(idx, a, b, x, self.lower, self.upper, self.is_int)
+            cut = cmir_cut(
+                idx, a, b, x, self.lower, self.upper, self.is_int,
+                variable_bounds=self.variable_bounds,
+            )
             if cut is not None:
                 c_idx, c_coef, c_rhs = cut
                 efficacy = (c_coef @ x[c_idx] - c_rhs) / np.linalg.norm(c_coef)
@@ -1553,17 +1721,18 @@ def feasibility_jump(
 
 
 def highs_incumbent(mip, max_seconds=30.0):
-    """A feasible point of ``mip`` from HiGHS's MIP solver, which stops at
-    its first solution (``mip_max_improving_sols=1``) or after
-    ``max_seconds``. Returns it in ``mip``'s variables, or ``None``. This
-    hands the search to HiGHS; ``solve`` uses it only when asked
-    (``highs_incumbent_seconds``)."""
+    """The best feasible point of ``mip`` that HiGHS's MIP solver finds
+    within ``max_seconds`` (or its optimum, if it gets there first). Returns
+    it in ``mip``'s variables, or ``None``. HiGHS's first solution is
+    usually a trivial one from its own feasibility jump (133808 on
+    ns1830653, against 36622 from its root sub-MIP a few seconds later), so
+    it runs for the whole budget. This hands the search to HiGHS; ``solve``
+    uses it only when asked (``highs_incumbent_seconds``)."""
     import highspy
 
     highs = highspy.Highs()
     highs.setOptionValue("output_flag", False)
     highs.setOptionValue("time_limit", float(max_seconds))
-    highs.setOptionValue("mip_max_improving_sols", 1)
     highs.passModel(to_highs(mip))
     highs.run()
     if highs.getInfo().primal_solution_status != 2:  # kSolutionStatusFeasible
@@ -1861,8 +2030,8 @@ class _BranchAndBound:
             max_cuts_per_round,
             cut_min_progress,
         )
-        # Small MIPs get Gomory cuts and more cut rounds by default: their
-        # crossovers take milliseconds.
+        # Small MIPs get Gomory cuts by default: their crossovers take
+        # milliseconds.
         small = mip.A.nnz <= _SMALL_MIP_NNZ
         if gomory_cuts not in ("auto", True, False):
             raise ValueError(f"gomory_cuts must be 'auto', True or False, not {gomory_cuts!r}")
@@ -1874,7 +2043,9 @@ class _BranchAndBound:
         self.aggregate_integers = (
             small if aggregate_integers == "auto" else bool(aggregate_integers)
         )
-        many_rounds = self.gomory and small
+        # Rounds are cheap with Gomory cuts on (slack ones are dropped every
+        # round), and the bound keeps climbing past five on larger MIPs.
+        many_rounds = self.gomory
         if cut_rounds is None:
             self.cut_rounds = 40 if many_rounds else 5
         if cut_min_progress is None:
@@ -2606,8 +2777,14 @@ class _BranchAndBound:
         return np.asarray(crossed["solution"].primal, np.float64), crossed["basis"]
 
     def cut_loop(self, lower, upper, result):
-        """Rounds of root cuts: separate at the LP point, append the cuts
-        (retiring ones slack with a zero dual for two rounds), re-solve warm.
+        """Rounds of root cuts: separate at the LP point, append the cuts,
+        re-solve warm. With Gomory cuts, each round's crossover basis says
+        which cuts are binding, and the slack ones (basic rows) are dropped
+        before the new cuts go in. Dense GMI cuts are needed for a round or
+        two, so this keeps the LP near its own size: on ns1830653 the cut
+        rows held about 170 nonzeros after eight rounds instead of 220,000,
+        for the same bound. Without a basis, a cut is dropped once it has
+        been slack with a zero dual for two rounds.
         Stops when a round finds no cut or the bound gains less than
         ``cut_min_progress`` (relative). Returns the last root LP result, or
         a status string when a re-solve settles the search."""
@@ -2630,6 +2807,7 @@ class _BranchAndBound:
             solution = result["solution"]
             x = np.asarray(solution.primal, np.float64)
             candidates = []
+            basis = None
             if self.gomory:
                 # Cross over to a vertex: its basis gives the Gomory cuts, and
                 # the other families separate better from a vertex too.
@@ -2646,6 +2824,9 @@ class _BranchAndBound:
                         basis,
                         x,
                         max_cuts=2 * self.max_cuts_per_round,
+                        # Dense cuts are fine here: the ones left slack
+                        # are dropped next round (see ``binding``).
+                        max_nnz=None,
                     )
             for separator in separators:
                 candidates += separator(x)
@@ -2653,10 +2834,23 @@ class _BranchAndBound:
             if not found:
                 break
             dual_ineq = np.asarray(solution.dual_ineq)
+            if basis is not None:
+                import highspy
+
+                # Basic rows are slack at the optimal vertex: dropping them
+                # keeps it optimal.
+                first = self.mip.n_eq + base_m
+                status = basis.row_status
+                binding = [
+                    status[first + i] != highspy.HighsBasisStatus.kBasic
+                    for i in range(len(self.cut_list))
+                ]
+            else:
+                binding = [cut["age"] < 2 for cut in self.cut_list]
             kept = [
                 (cut, dual_ineq[base_m + i])
                 for i, cut in enumerate(self.cut_list)
-                if cut["age"] < 2
+                if binding[i]
             ]
             self.cut_list = [cut for cut, _ in kept] + [
                 dict(family=family, idx=idx, coef=coef, rhs=rhs, age=0)
@@ -3630,7 +3824,7 @@ def solve(
       the tightened rows, and incumbents are still checked against the MIP
       as given.
     * **Root cuts** (``cuts``). Up to ``cut_rounds`` rounds (default: 40
-      for a MIP with at most 10,000 nonzeros and Gomory cuts, else 5) of
+      with Gomory cuts on, else 5) of
       Gomory mixed-integer cuts (``gomory_cuts``; ``"auto"``, the default,
       turns them on for MIPs with at most 10,000 nonzeros, whose crossovers
       take milliseconds), knapsack
@@ -3642,7 +3836,11 @@ def solve(
       at the vertex. MIR cuts are complemented MIR (``cmir_cut``): every
       integer coefficient is tried as the scaling, then each integer
       variable's complementation is flipped while that deepens the cut.
-      They come from single rows and from aggregates of up to three rows
+      A continuous variable with a variable bound in the MIP's rows
+      (``variable_bounds``: a two-term row such as ``y <= u·z``) may be
+      shifted to that bound instead of its simple ones, as HiGHS does, and
+      the better cut is kept; on vpm1 that takes the root bound from 18.9 to
+      20, the optimum. They come from single rows and from aggregates of up to three rows
       that cancel continuous variables; with ``aggregate_integers``
       (``"auto"``, the default: on for MIPs with at most 10,000 nonzeros),
       aggregates of up to five rows also cancel the most fractional integer
@@ -3655,8 +3853,13 @@ def solve(
       rows, since the original knapsacks can give stronger covers. A
       round keeps at most
       ``max_cuts_per_round`` cuts with efficacy (distance cut off) at least
-      1e-4 that are not near-parallel, retires cuts that have been slack
-      with a zero dual for two rounds, and re-solves the LP warm. The rounds
+      1e-4 that are not near-parallel, retires cuts that are slack, and
+      re-solves the LP warm. With Gomory cuts on, a cut is slack when its
+      row is basic in the round's crossover basis, and it goes at once:
+      GMI cuts are dense (hundreds of nonzeros on ns1830653), so they are
+      allowed at the root (``gomory_cuts(max_nnz=None)``) but leave as soon
+      as they stop binding. Without them, a cut goes after two rounds slack
+      with a zero dual. The rounds
       stop when the bound gains less than ``cut_min_progress`` (relative)
       over the last three rounds (default 1e-3 with the 40-round setting,
       else 1e-4). Each round's re-solve stops after ``cut_round_epochs``
@@ -3756,8 +3959,8 @@ def solve(
       history. A jump that ends near-feasible is handed to ``repair`` (a
       backtracking search with propagation over the variables around its
       violated rows), marked ``"R"``. ``highs_incumbent_seconds > 0`` asks
-      HiGHS (``highs_incumbent``) for a first incumbent when all of these
-      fail, marked ``"X"``; it is off by default, so the search stays
+      HiGHS (``highs_incumbent``) for its best incumbent within that many
+      seconds when all of these fail, marked ``"X"``; it is off by default, so the search stays
       Jaddle's own. Likewise ``rins_seconds > 0`` runs RINS once at the
       root and every ``rins_every`` nodes once there is an incumbent: the
       integers on which the incumbent and the node's LP point agree are
