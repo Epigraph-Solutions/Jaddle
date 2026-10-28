@@ -1588,3 +1588,75 @@ def test_per_call_device(device):
 def test_per_call_settings_rejected(options, match):
     with pytest.raises(ValueError, match=match):
         jl.solve(toy_lp(), **options)
+
+
+# %% bound_target: stop once the Lagrangian bound reaches a target
+def boxed_lp(seed=0, m_eq=4, m_ineq=12, n=25, infeasible=False):
+    """A feasible LP with every variable in [0, 2] (so the Lagrangian bound
+    is finite at any duals); ``infeasible`` adds contradictory rows."""
+    rng = np.random.default_rng(seed)
+    x0 = rng.uniform(0.2, 1.8, n)
+    A_eq = rng.standard_normal((m_eq, n))
+    A_ineq = rng.standard_normal((m_ineq, n))
+    b_ineq = A_ineq @ x0 + rng.uniform(0.1, 1.0, m_ineq)
+    if infeasible:
+        row = rng.standard_normal(n)
+        A_ineq = np.vstack([A_ineq, row, -row])
+        b_ineq = np.concatenate([b_ineq, [-1.0, -1.0]])  # row·x <= −1 and >= 1
+    return jl.LP(
+        c=rng.standard_normal(n),
+        A_eq=sp.csc_matrix(A_eq),
+        b_eq=A_eq @ x0,
+        A_ineq=sp.csc_matrix(A_ineq),
+        b_ineq=b_ineq,
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.full(n, 2.0),
+    )
+
+
+def lagrangian_of(lp, solution):
+    """The Lagrangian bound of a solution's duals, computed on the host."""
+    y_eq = np.asarray(solution.dual_eq, np.float64)[: lp.A_eq.shape[0]]
+    y_ineq = np.maximum(np.asarray(solution.dual_ineq, np.float64)[: lp.A_ineq.shape[0]], 0.0)
+    r = lp.c + lp.A_eq.T @ y_eq + lp.A_ineq.T @ y_ineq
+    box = np.where(r > 0, r * lp.lower_bounds, r * lp.upper_bounds)
+    return box.sum() - lp.b_eq @ y_eq - lp.b_ineq @ y_ineq
+
+
+TIGHT = dict(
+    primal_feasibility_tolerance=1e-8, dual_feasibility_tolerance=1e-8, dual_gap_tolerance=1e-8
+)
+
+
+def test_bound_target_stops_with_a_valid_bound():
+    lp = boxed_lp()
+    optimum = jl.solve(lp, **TIGHT)
+    z = float(lp.c @ np.asarray(optimum["solution"].primal))
+    target = z - 0.05 * (1 + abs(z))
+    result = jl.solve(lp, bound_target=target, max_epochs=2000, **TIGHT)
+    assert result["stop_reason"] == "bound_target" and not result["converged"]
+    assert result["epochs"] <= optimum["epochs"]
+    assert result["lagrangian_bound"] >= target
+    host = lagrangian_of(lp, result["solution"])
+    assert host == pytest.approx(result["lagrangian_bound"], rel=1e-8, abs=1e-8)
+    assert target <= host <= z + 1e-6 * (1 + abs(z))
+
+
+def test_bound_target_above_the_optimum_never_fires():
+    lp = boxed_lp(1)
+    result = jl.solve(lp, bound_target=1e6, **TIGHT)
+    assert result["stop_reason"] == "certificate" and result["converged"]
+    assert result["lagrangian_bound"] < 1e6
+
+
+def test_bound_target_catches_an_infeasible_lp():
+    lp = boxed_lp(2, infeasible=True)
+    result = jl.solve(lp, bound_target=1e3, max_epochs=500, **TIGHT)
+    assert result["stop_reason"] == "bound_target"
+    assert result["epochs"] < 50
+    assert lagrangian_of(lp, result["solution"]) >= 1e3
+
+
+def test_bound_target_needs_no_vertex_bias():
+    with pytest.raises(ValueError, match="bound_target"):
+        jl.solve(boxed_lp(), bound_target=0.0, vertex_bias=1e-6)

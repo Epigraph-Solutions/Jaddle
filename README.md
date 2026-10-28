@@ -305,7 +305,8 @@ the dual objective as in PDLP, so far-away finite bounds do not swamp the gap.
 |---|---|
 | `solution` | A `SaddleState(primal, dual_ineq, dual_eq)` in the original problem's units. |
 | `converged` | Whether a termination criterion was met. |
-| `stop_reason` | `"certificate"`, `"primal_stall"` (only when the opt-in `primal_stop` heuristic is enabled), `"max_epochs"`, `"time_limit"` or `"interrupted"`. |
+| `stop_reason` | `"certificate"`, `"primal_stall"` (only when the opt-in `primal_stop` heuristic is enabled), `"bound_target"` (only with `bound_target`: the Lagrangian bound of the duals reached it), `"max_epochs"`, `"time_limit"` or `"interrupted"`. |
+| `lagrangian_bound` | Only with `bound_target`: the last epoch's Lagrangian bound `−bᵀy + Σ min(rⱼlⱼ, rⱼuⱼ)`, a lower bound on the optimum at any duals. |
 | `opt_state` | Final step size and primal weight, for warm starting. |
 | `solve_seconds` | Time spent in the iteration loop, including the first-epoch compile. |
 | `corrected_seconds` | Iteration-loop time with the one-off compile amortised out. |
@@ -630,7 +631,24 @@ columns are not supported.
   multiples of `g` and the cutoff becomes at most `incumbent − g/2`.
 - **Branching.** `"pseudocost"` (default) uses the product of the
   estimated down and up gains learnt from solved nodes. `"most_fractional"`
-  picks the variable nearest ½.
+  picks the variable nearest ½. `"reliability"` first strong-branches the
+  variables whose pseudocosts are not yet reliable (fewer than
+  `reliability_threshold` observations in a direction). It runs as one
+  device pipeline, dispatched before the node's heuristics so the host keeps
+  working:
+  1. Both children of up to `strong_screen` candidates are propagated in JAX
+     (the same rules as the host propagator) and bounded by the node's duals.
+  2. The `strong_candidates` unreliable ones with the best gains get both
+     child LPs solved for `strong_epochs` epochs, in one vmapped call
+     warm-started from the node.
+  3. The children's Lagrangian bounds, which hold however far the LPs got,
+     are computed on the device.
+
+  All shapes are fixed, so it compiles once per MIP. The bounds seed the
+  pseudocosts, fix a variable whose child is closed to its other side, raise
+  the node's bound, and give the chosen children their bounds and warm
+  starts. `strong_backend="numpy"` runs the same steps on the host (tree
+  cuts use it).
 - **Node selection.** `"hybrid"` (default) dives depth first until the
   first incumbent, then takes the best bound with plunges: after each
   best-bound node, up to `plunge_depth` steps follow its preferred child, so
@@ -645,12 +663,27 @@ columns are not supported.
   LP infeasible quickly, so the repair is skipped when those integers
   already failed, when no violated row has a continuous variable, or when
   bound propagation shows the fixed box infeasible.
+- **Probing** (`probing`). Before the root LP, each integer variable is
+  split in two (0/1, or at its midpoint) and both sides are propagated: an
+  empty side fixes the variable to the other, and otherwise all bounds
+  tighten to the hull of the two sides. Large models probe chunks of
+  variables in one vmapped JAX call. On misc07 it fixes 21 binaries, on
+  p0201 6, and on fixnet6 it tightens 483 bounds, all in under a second.
+  What each side implies is kept for bulk rounding.
 - **Primal heuristics.** Rounding an LP point rarely satisfies assignment
   or partitioning rows, so two heuristics run at the root after the cuts.
   *Fix-and-propagate* fixes the integers to their rounded LP values in
   chunks, those rounding above their lower bound first, with bound
   propagation after each chunk; a rejected chunk is split and retried. It
   needs no LP solve, so it also runs in the tree wherever rounding fails.
+  When it fails at the root, *bulk fix-and-propagate* (`bulk_rounding`,
+  after cuOpt's bound-propagation rounding) rounds the LP point from
+  `bulk_starts` starts side by side. Each start fixes bulks of about √(free)
+  variables, ordered by implied slack, and draws two random roundings per
+  bulk. The probing cache screens the draws, and the survivors are
+  propagated together, in one vmapped JAX call on large models. Half the
+  starts fix the values that round up first, half use the paper's order:
+  each order suits different models.
   *Feasibility jump* (Luteberget and Sartor) is an LP-free weighted local
   search on the rows: each step considers, for every variable in a violated
   row, the value that satisfies its heaviest violated row, scores each such
@@ -662,18 +695,23 @@ columns are not supported.
   fails.
   The *objective feasibility pump* (Achterberg and Berthold) alternates
   rounding with an LP that minimises the distance to the rounded point,
-  blended with a decaying share of the objective, and breaks cycles by
-  flipping variables. Only the cost changes between its LPs, so they reuse
+  blended with a decaying share of the objective. As in cuOpt's extended
+  pump, each rounding that is not feasible gets a short feasibility jump
+  (`pump_jump_iterations`, within `pump_jump_share` of the pump's time),
+  and when the pump cycles the jump's best near miss becomes the next
+  rounding (random flips otherwise). Only the cost changes between its LPs, so they reuse
   the root's compiled solver, warm-started, at a loose tolerance. On
   generalised assignment problems where rounding finds nothing,
   one or the other finds an incumbent at the root in well under a second.
-  *RENS* (on for small MIPs, `rens_seconds`) then fixes the integers that
-  are integral at the root LP point, restricts the fractional ones to
-  their floor and ceiling, and searches that sub-MIP with this branch and
-  bound, reusing the compiled LP solver. Once there is an incumbent, the
+  *RENS* (`rens_seconds`) then fixes the integers that are integral at an
+  exact root vertex, restricts the fractional ones to their floor and
+  ceiling, and has HiGHS search that sub-MIP (it presolves it to a small
+  model), as HiGHS's own RENS does. Once there is an incumbent, the
   propagation inside fix-and-propagate (and dives) carries the row
   `c·x ≤ cutoff`, so it rejects roundings that cannot improve.
-  LP-based *dives* (`dive_every`) and *RINS* (`rins_seconds`) are opt-in.
+  *RINS* (`rins_seconds`) runs at the root, every `rins_every` nodes and
+  after each new incumbent, within `heuristic_effort` of the run time;
+  LP-based *dives* (`dive_every`) are opt-in.
   Measured on lseu, p0201, p0282, flugpl, p0033 and bell5 (60s each):
   objective-aware propagation cut lseu from 473 to 437 nodes and p0282
   from 301 to 252; RENS cut p0282 to 141 nodes (16s, from 21s). Dives
@@ -695,10 +733,14 @@ reports `bound_rigorous=False`.
 | `mip_rel_gap`, `mip_abs_gap` | `1e-4`, `1e-6` | Stop once the incumbent is within these of the bound (HiGHS's defaults). |
 | `max_nodes`, `max_seconds` | `None` | Node and wall-clock budgets. |
 | `branching`, `node_selection` | `"pseudocost"`, `"hybrid"` | Search rules (see above). |
+| `reliability_threshold`, `strong_candidates`, `strong_epochs`, `strong_max_depth` | `4`, `8`, `50`, `None` | Reliability branching (`branching="reliability"`): pseudocost observations per direction before a variable stops being strong-branched, the most variables whose child LPs are solved at a node, the epochs of each child LP, and the deepest node that strong-branches (`None`: any). |
+| `strong_screen`, `strong_backend` | `32`, `"jax"` | Candidates whose children are propagated and bounded on the device before the child LPs are picked; `"jax"` runs strong branching as one device pipeline, `"numpy"` on the host. |
 | `integrality_tolerance` | `1e-5` | How close to an integer an LP value must be to count as integral. |
 | `feasibility_tolerance` | `1e-6` | Largest row violation (relative to `1 + ‖b‖∞`) and bound violation an incumbent may have. |
 | `lp_tolerance`, `lp_options` | `1e-6`, `None` | The node LPs' relative tolerances, and any other `jl.solve` option. |
 | `node_max_epochs`, `root_max_epochs` | `200`, `None` | Epoch budgets for a node LP and the root LP. |
+| `node_lp_tolerance` | `None` | Tolerance for node LPs only (`None`: `lp_tolerance`). Experimental: looser node LPs are cheaper but give rougher branching and pseudocost data. |
+| `node_bound_stop` | `True` | Stop a node LP as soon as the Lagrangian bound of its duals closes the node against the cutoff (`jl.solve(bound_target=...)`); infeasible nodes stop within a few epochs. |
 | `heuristic_every` | `10` | Run rounding (then fix-and-propagate if it fails) every this many nodes (`0` = only on integral LP points). |
 | `fix_and_propagate`, `feasibility_jump`, `feasibility_pump` | `True`, `True`, `True` | The primal heuristics. |
 | `repair_max_epochs` | `20` | Epoch budget of the LP that repairs a rounded point's continuous variables (skipped for integers that already failed, or when propagation shows the fixed box infeasible). |
@@ -708,20 +750,27 @@ reports `bound_rigorous=False`.
 | `precision` | `None` | `"float64"`, `"float32"` or `"float16"` for the whole search, node LPs included (`None` keeps the global profile). |
 | `batch_size` | `1` | Open nodes solved together in one `vmap`-ed device call (try 8–32 on a GPU). |
 | `highs_incumbent_seconds` | `0` | If set, HiGHS supplies its best incumbent within this many seconds when Jaddle's heuristics find none (off by default). |
-| `rins_seconds`, `rins_every` | `0`, `50` | If set, RINS at the root and every `rins_every` nodes, to improve the incumbent (off by default). |
-| `rens_seconds`, `rens_nodes` | `None`, `500` | RENS at the root (`None`: 5s for MIPs with at most 10,000 nonzeros, else off). |
+| `rins_seconds`, `rins_every` | `None`, `50` | RINS at the root, every `rins_every` nodes and after each new incumbent (`None`: 5s a call; `0`: off). |
+| `heuristic_effort` | `0.1` | The share of the elapsed time RINS may take; calls stop while they have used more (`0`: no RINS). |
+| `rens_seconds`, `rens_nodes` | `None`, `500` | RENS at the root (`None`: 10% of `max_seconds` up to 30s, 10s without a limit; with `rins_solver="jaddle"`, 5s for small MIPs, else off). |
 | `dive_every`, `dive_depth` | `0`, `20` | LP-based dives every this many nodes and at the root (`0`: off), and their depth. |
-| `rins_solver`, `rins_nodes` | `"auto"`, `200` | Who searches the RINS sub-MIP: `"jaddle"`, this branch and bound (up to `rins_nodes` nodes, reusing the compiled LP solver), or `"highs"`. `"auto"` picks Jaddle for MIPs with at most 10,000 nonzeros and HiGHS above that. On lseu the Jaddle sub-searches take ~0.4s each against HiGHS's ~0.01s. |
+| `rins_solver`, `rins_nodes` | `"highs"`, `200` | Who searches the RENS and RINS sub-MIPs: `"highs"` (presolved by HiGHS, up to `rins_nodes` nodes, which adapts to success), `"jaddle"`, this branch and bound (reusing the compiled LP solver), or `"auto"` (Jaddle for MIPs with at most 10,000 nonzeros, HiGHS above). On lseu the Jaddle sub-searches take ~0.4s each against HiGHS's ~0.01s. |
 | `pump_iterations`, `pump_tolerance` | `30`, `1e-4` | The pump's LP solves and their tolerance. |
+| `pump_jump_iterations`, `pump_jump_share` | `3000`, `0.2` | Feasibility jump steps from each rounding the pump rejects (`0`: none), and the most of the pump's time the jumps may take. |
+| `probing`, `probing_seconds`, `probing_max_variables`, `probing_backend` | `True`, `None`, `None`, `"auto"` | Root probing; its budget (`None`: 5% of `max_seconds` up to 30 s, 10 s without one); the most variables probed; `"numpy"`, `"jax"` or `"auto"` (JAX above 10,000 nonzeros). |
+| `bulk_rounding`, `bulk_starts` | `True`, `4` | Bulk fix-and-propagate at the root and in the pump, and how many starts run side by side. |
 | `heuristic_seconds` | `None` | Time for the root heuristics (`None`: 20% of `max_seconds`, or no time limit without one). |
 | `propagate` | `True` | Bound propagation at the root and at each child. |
 | `coefficient_tightening` | `True` | Shrink binaries' big-M coefficients at the root (see above). |
-| `cuts`, `cut_rounds` | `True`, `None` | Root cuts, and the most rounds of them (`None`: 20 for small MIPs with Gomory cuts, else 5). |
+| `cuts`, `cut_rounds` | `True`, `None` | Root cuts, and the most rounds of them (`None`: 40 with Gomory cuts on, else 5). |
 | `max_cuts_per_round`, `cut_min_progress` | `100`, `None` | Cuts added per round, and the relative bound gain below which the rounds stop. |
 | `cut_round_epochs` | `20` | Epoch budget of each cut round's root re-solve (`None`: to convergence); the root is converged once the rounds end. |
 | `gomory_cuts` | `"auto"` | Gomory mixed-integer cuts from a crossover basis at each root round (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
+| `separation_backend` | `"jax"` | Run the c-MIR and flow cover searches batched in JAX (float64), or `"numpy"` for the per-row reference searches. |
+| `flow_covers` | `True` | Flow cover cuts from rows with continuous variables, over their variable bounds (`y <= u·z`). |
 | `aggregate_integers` | `"auto"` | Aggregate rows through integer variables too, up to five rows, for MIR and cover cuts (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
 | `tree_cuts`, `tree_cut_every` | `False`, `10` | Global cover and MIR cuts added in the tree every this many nodes (branch and cut; serial search only). |
+| `conflicts`, `conflict_pool_size`, `conflict_max_nnz` | `True`, `2000`, `None` | Learn dual proofs and no-goods from closed nodes and propagate them at every node before its LP (`None`: at most `max(25, n // 10)` variables per proof). |
 | `presolve`, `highs_options` | `False`, `None` | HiGHS presolve and postsolve, and options for the HiGHS instance. |
 | `verbose`, `log_every_seconds` | `False`, `1.0` | Progress table. |
 

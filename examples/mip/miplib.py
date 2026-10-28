@@ -53,20 +53,25 @@ print(
 # %%
 result = jm.solve(
     PATH_TO_MPS,
+    branching="reliability",
     presolve=True,
     max_seconds=MAX_SECONDS,
     gomory_cuts=True,
-    lp_tolerance=1e-6,
+    precision="float32",
+    cut_round_epochs=10,
+    lp_tolerance=1e-4,
+    node_lp_tolerance=1e-4,
+    max_cuts_per_round=1000,
+    heuristic_every=5,
     fix_and_propagate=False,
     feasibility_jump=False,
     feasibility_pump=False,
-    highs_incumbent_seconds=30,
-    rins_seconds=10,  # RINS every 50 nodes (log: N); HiGHS on the sub-MIP for large MIPs
-    batch_size=1,  # on a GPU: solve 16 open nodes per device call
+    rens_seconds=10,
+    # batch_size=16,  # on a GPU: solve 16 open nodes per device call
     tree_cuts=True,
     verbose=True,
     log_every_seconds=10,
-    device="cpu",
+    device="gpu",
 )
 print(f"Status: {result['status']}")
 print(f"Bound: {result['bound']:.6g}")

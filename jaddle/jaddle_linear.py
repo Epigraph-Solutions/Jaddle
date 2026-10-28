@@ -767,6 +767,7 @@ def _device_solver(
     diag_theta=0.5,
     diag_clamp=10.0,
     adaptive_step=True,
+    bound_stop=False,
 ):
     """The device side of ``solve()``: everything that runs inside its jitted
     epoch loop, built for one scaled problem.
@@ -1302,6 +1303,29 @@ def _device_solver(
     _CHUNK_TARGET_SECONDS = 1.0
     _LOG_CAP = 64  # buffered epoch-log rows per chunk
     _EVT_CAP = 64  # buffered restart events per chunk
+    _metrics_core = compute_epoch_metrics
+
+    def compute_epoch_metrics(average_state):
+        """The epoch metrics, then the Lagrangian bound of the point (see
+        ``lagrangian_bound_of``)."""
+        return (*_metrics_core(average_state), lagrangian_bound_of(average_state))
+
+    def lagrangian_bound_of(point):
+        """``−bᵀy + Σⱼ min(rⱼlⱼ, rⱼuⱼ)`` with ``r = c + Aᵀy`` and the
+        inequality duals clipped at 0, times ``c_max``: a lower bound on the
+        LP's optimum in true objective units for any duals (the scaled LP's
+        feasible points map one to one onto the LP's, at the same
+        objective). ``-inf`` without ``bound_stop`` (not computed), or when
+        a reduced cost meets an infinite bound."""
+        if not bound_stop:
+            return jnp.asarray(-jnp.inf, _wide(lp.c.dtype))
+        y = jnp.concatenate([point.dual_eq, jnp.maximum(point.dual_ineq, 0.0)])
+        r = lp.c + spmv(lp.A_T, y)
+        term = jnp.where(
+            r > 0, r * lp.lower_bounds, jnp.where(r < 0, r * lp.upper_bounds, 0.0)
+        )
+        return (jnp.sum(term) - lp.b @ y) * c_max
+
     _metric_shapes = jax.eval_shape(compute_epoch_metrics, initial_solution)
     _merit_dtype = _metric_shapes[3].dtype
 
@@ -1687,6 +1711,10 @@ def _device_solver(
                 primal_stall = converged_primal(metrics[10], obj_window)
             else:
                 primal_stall = jnp.asarray(False)
+            if bound_stop:
+                bound_hit = metrics[12] >= c["bound_target"]
+            else:
+                bound_hit = jnp.asarray(False)
             if polish_trigger is not None:
                 polish = (
                     polish_ready(
@@ -1732,11 +1760,16 @@ def _device_solver(
                 restarts_done=restarts_done,
                 ipe=ipe_next,
                 polish_after=c["polish_after"],
-                done=certificate | primal_stall | polish,
+                bound_target=c["bound_target"],
+                done=certificate | primal_stall | polish | bound_hit,
                 stop_code=jnp.where(
                     certificate,
                     1,
-                    jnp.where(primal_stall, 2, jnp.where(polish, 3, 0)),
+                    jnp.where(
+                        primal_stall,
+                        2,
+                        jnp.where(polish, 3, jnp.where(bound_hit, 4, 0)),
+                    ),
                 ),
                 log=log,
                 n_log=n_log,
@@ -1820,6 +1853,8 @@ def _device_solver(
         polish_after=jnp.asarray(
             0 if polish_trigger is None else int(polish_trigger[0])
         ),
+        # ``solve(bound_target=...)``: carried, so new targets reuse the jit.
+        bound_target=jnp.asarray(jnp.inf, _merit_dtype),
         done=jnp.asarray(False),
         stop_code=jnp.asarray(0),
         log=jnp.zeros((_LOG_CAP, 10), _merit_dtype) if verbose else None,
@@ -2010,6 +2045,7 @@ def solve(
     diag_adapt=True,
     diag_theta=0.5,
     diag_clamp=10.0,
+    bound_target=None,
     _polish_trigger=None,
     cancel=None,
     device=None,
@@ -2210,6 +2246,15 @@ def solve(
         primal_stop_obj_tol: Relative-change threshold for the objective stall:
             stop when ``|obj_now - obj_{window ago}| / (1 + |obj_now|)`` falls
             below this (default 1e-4). Only used when ``primal_stop=True``.
+        bound_target: Also stop (``stop_reason="bound_target"``, not
+            converged) once the Lagrangian bound of the reported point,
+            ``−bᵀy + Σⱼ min(rⱼlⱼ, rⱼuⱼ)`` with ``r = c + Aᵀy`` (inequality
+            duals clipped at 0), reaches this value. That bound holds for any
+            duals, so a branch-and-bound node whose bound passes its cutoff
+            can stop at once; on an infeasible LP the duals diverge along a
+            Farkas ray and the bound passes any finite target. ``None``
+            (default): off, and not computed. Not with ``vertex_bias`` or
+            cones. The result gains ``"lagrangian_bound"``.
         halpern_reanchor_per_epoch: Opt-in (default ``False``, ``"halpern"`` only).
             When ``True``, re-anchor ``z_0`` to the current iterate and reset the
             ``lambda_k = 1/(k+1)`` counter at **every** epoch boundary, not only at
@@ -2458,6 +2503,8 @@ def solve(
     # LP while being pulled toward a vertex — and polish/crossover run against the
     # true cost too. Default 0.0 = off (unchanged behaviour).
     c_true = lp.c
+    if bound_target is not None and (vertex_bias or lp.cones):
+        raise ValueError("bound_target needs vertex_bias=0 and an LP without cones")
     if vertex_bias:
         rng = np.random.default_rng(vertex_bias_seed)
         # Per-variable perturbation, scaled by |c| magnitude so the relative tilt
@@ -2525,6 +2572,7 @@ def solve(
         diag_theta=diag_theta,
         diag_clamp=diag_clamp,
         adaptive_step=adaptive_step,
+        bound_stop=bound_target is not None,
         polish_trigger=(
             None if _polish_trigger is None else (0, _polish_trigger[1])
         ),
@@ -2546,6 +2594,11 @@ def solve(
         eta_init=jnp.asarray(step_size, _state_dtype),
     )
     carry, termination_norms = programs.init(problem)
+    if bound_target is not None:
+        carry = {
+            **carry,
+            "bound_target": jnp.asarray(float(bound_target), carry["bound_target"].dtype),
+        }
     if _polish_trigger is not None:
         carry = {
             **carry,
@@ -2621,10 +2674,13 @@ def solve(
     try:
         while True:
             if done:
-                stop_reason = {1: "certificate", 2: "primal_stall", 3: "polish_ready"}[
-                    stop_code
-                ]
-                is_converged = stop_code != 3
+                stop_reason = {
+                    1: "certificate",
+                    2: "primal_stall",
+                    3: "polish_ready",
+                    4: "bound_target",
+                }[stop_code]
+                is_converged = stop_code not in (3, 4)
                 break
             if max_epochs and count >= max_epochs:
                 is_converged = False
@@ -2775,6 +2831,11 @@ def solve(
         "solve_seconds": solve_seconds,
         "corrected_seconds": corrected_seconds,
         "epochs": count,
+        **(
+            {"lagrangian_bound": float(carry["metrics"][12])}
+            if bound_target is not None
+            else {}
+        ),
     }
 
 

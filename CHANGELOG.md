@@ -4,6 +4,116 @@
 
 ### Added
 
+- Primal heuristics after cuOpt's GPU primal heuristics (Çördük et al.,
+  2025).
+  - **Root probing** (`probing=True`, `probing_seconds`,
+    `probing_max_variables`, `probing_backend`; `jm.probe`,
+    `jm.ProbingCache`). Each integer variable's two sides are propagated.
+    An empty side fixes the variable, and otherwise all bounds tighten to
+    the hull of the two sides. Conflict-prone variables go first. Above
+    10,000 nonzeros, chunks of variables run in one vmapped JAX call.
+    On misc07 it fixes 21 binaries, on p0201 6, and on fixnet6 it tightens
+    483 bounds, each in under a second; it never changed the optimum on the
+    19 models checked.
+  - **Bulk fix-and-propagate** (`bulk_rounding=True`, `bulk_starts=4`;
+    `jm.bulk_fix_and_propagate`). It runs after the classic one at the root
+    and in the pump, marked `"B"`. Bulks are √(free) variables in
+    implied-slack order. Two random roundings per bulk are screened by the
+    probing cache and propagated together. Several starts run side by side,
+    alternating two orders, because each suits different models: it finds
+    points on lseu where the classic one finds none, and the classic one
+    finds points on some models where it finds none.
+  - **Fused pump** (`pump_jump_iterations=3000`, `pump_jump_share=0.2`).
+    Each rounding the pump rejects gets a short feasibility jump, and a
+    cycling pump continues from the jump's near miss. New result keys:
+    `pump_jumps`, `pump_jump_finds`, `probing`.
+  - `benchmarks/benchmark_primal.py` measures root-heuristic coverage and
+    primal gap on MIPLIB 2017. It has not been run on the full set yet.
+- Reliability branching, opt-in (`branching="reliability"`,
+  `reliability_threshold=4`, `strong_candidates=8`, `strong_epochs=50`,
+  `strong_screen=32`, `strong_max_depth`, `strong_backend="jax"`).
+  Variables whose pseudocosts have fewer than `reliability_threshold`
+  observations per direction are strong-branched. Strong branching runs as
+  one device pipeline (fixed shapes, so it compiles once), dispatched
+  before the node's heuristics and read back after them:
+  1. Both children of up to `strong_screen` candidates are propagated in
+     JAX (`_propagate_jax`, matching `BoundPropagator`) and bounded by the
+     node's duals.
+  2. The best unreliable candidates get child LPs in one vmapped call.
+  3. The children's Lagrangian bounds are computed on the device.
+
+  Closed children fix their variable to the other side, and the node's
+  bound rises to the best candidate's lesser child bound. Gains (the
+  strong-branching scores and the pseudocost updates) are measured on
+  unrounded bounds. `strong_backend="numpy"` runs on the host, and tree
+  cuts use it. New result keys: `strong_branch_nodes`, `strong_branch_lps`,
+  `strong_branch_seconds`, `strong_fixings`. `solve_batch` now reads a
+  batch back in one transfer.
+
+  60 s, `gomory_cuts=True`, CPU, pseudocost → reliability:
+
+  | Instance | Nodes | Time / result |
+  |---|---|---|
+  | p0033 | 42 → 8 | 2.5 → 2.7 s |
+  | flugpl | 197 → 114 | 3.0 → 2.9 s |
+  | stein27 | 4354 → 4141 | 29.9 → 31.0 s |
+  | bell5 | both at the time limit | gap 0.088% → 0.078% |
+  | lseu | 397 → 668 | 13.0 → 46.9 s |
+  | p0201 | 521 → 66 | optimal in 31.5 s → 2% gap at the time limit; strong branching took 45 s for 732 child LPs |
+
+  Not the default: on instances with many root cuts, strong branching costs
+  too much per node.
+- `jm.solve` conflict analysis (`conflicts=True`, `conflict_pool_size`,
+  `conflict_max_nnz`; `jm.ConflictPool`). Nodes and children closed by
+  their Lagrangian bound leave dual proofs (`constant + r·x <= cutoff`,
+  valid at any duals), infeasible node LPs leave Farkas proofs from
+  `detect`'s dual ray, and children that propagation proves infeasible leave
+  no-goods over their binary fixings, minimised by a deletion filter.
+  Proofs are sparsified against the root box, and the pool is propagated at
+  every node before its LP; a node it shows empty is closed without its LP
+  (`conflict_pruned`). At Jaddle's node rates the effect is small so far:
+  ns1830653 (3 min) 111 nodes against 97, bound 11,660 against 11,644.
+- HiGHS-style primal heuristics by default. `rins_solver="highs"` (was
+  `"auto"`) now covers RENS too: `jm.highs_submip` has HiGHS presolve and
+  search the neighbourhood, with the cutoff as its `objective_bound` (no
+  dense cutoff row) and the incumbent as its start. RENS runs at the root
+  for every MIP size (`rens_seconds=None`: 10% of `max_seconds`, up to
+  30s) from an exact vertex (the cut loop's crossover); RINS is on
+  (`rins_seconds=None`: 5s a call), with an adaptive node limit and a
+  `heuristic_effort=0.1` time budget. Why: a HiGHS ablation showed its root
+  RENS is its most useful heuristic (misc07 20s → 45s without it; ns1830653
+  25,808 → 30,808 after 60s). Jaddle (60s, `gomory_cuts=True`): vpm2 reaches
+  its optimum 13.75 at 12s (14.5 before), pp08a is within 1% at 4.6s (30s
+  before) and optimal at 5.1s; misc07 is unchanged (its RENS neighbourhood
+  is infeasible). New result keys `submip_calls`, `submip_seconds`.
+- Early stopping of node LPs (`node_bound_stop=True`; `jl.solve(bound_target=...)`).
+  `jl.solve` can stop (`stop_reason="bound_target"`) once the Lagrangian
+  bound of the reported point, `−bᵀy + Σ min(rⱼlⱼ, rⱼuⱼ)`, reaches a target;
+  it is checked on the device every epoch and returned as
+  `"lagrangian_bound"`. Branch and bound passes the cutoff (rounded as its
+  pruning test rounds), so a node stops as soon as it would be pruned
+  anyway. An infeasible LP's duals diverge along a Farkas ray, so its bound
+  passes any finite target fast: 1 epoch against 500 unconverged on a test
+  LP. ns1830653 (3 minutes): 140 → 385 nodes, 21.9 → 10.2 LP epochs a
+  node, bound 11,678 → 11,976. No effect while the incumbent is far from the
+  bound (misc07: no node reached the cutoff).
+- Batched cut separation in JAX (`separation_backend="jax"`, the default;
+  `jm.batched_cmir_cuts`, `jm.batched_flow_cover_cuts`). `CutSeparator`
+  first builds every base inequality of a round (tight rows and their
+  aggregation paths), then runs the c-MIR search (plain and over variable
+  bounds) and the flow cover search on all of them in jitted float64
+  kernels, in chunks of 256 rows padded to widths 16, 64, 256, … Same cuts
+  as the per-row numpy searches (`"numpy"`) up to rounding in near-ties;
+  rounds with fewer than 32 base inequalities use numpy. Per round, warm:
+  fixnet6 277 → 113 ms, vpm2 4× faster over a root (5.8 → 1.35 s).
+  `select_cuts` is vectorised too (one sparse product per chosen cut), with
+  the same choices.
+- Flow cover cuts (`jm.flow_cover_cut`, family `"flowcover"`, `flow_covers=True`):
+  generalised flow cover inequalities from the single-node flow set of each
+  row and aggregate with a continuous variable, over its variable upper
+  bounds (`y <= u·z`). fixnet6 (`gomory_cuts=True`, 120 s): solved in 71 s
+  against a 4.3% gap at the time limit without them.
+
 - Per-call `device` and `precision`. `jl.solve`, `jc.solve` and
   `jc.quadratic_program` take `device=` (`"cpu"`, `"gpu"`, `"tpu"` or a
   `jax.Device`; `None` keeps JAX's default). They also take `precision=`
