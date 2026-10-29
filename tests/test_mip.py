@@ -1387,6 +1387,28 @@ def test_batched_search_limits_and_infeasibility():
     assert jm.solve(jm.MIP(lp, np.ones(n, bool)), batch_size=4)["status"] == "infeasible"
 
 
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("make", [knapsack, general_integer, generalised_assignment])
+def test_logged_bound_never_falls(monkeypatch, make, batch_size):
+    # Nodes in no list fell out of the global bound, so the logged bound read
+    # too high, then fell back: the root during the root heuristics (an
+    # incumbent showed a 0% gap) and a batch's members not yet evaluated.
+    logged = []
+    real = jm._BranchAndBound.log
+
+    def recorded(self, source, bound, depth, force=False):
+        logged.append(self.global_bound() if bound is None else bound)
+        return real(self, source, bound, depth, force)
+
+    monkeypatch.setattr(jm._BranchAndBound, "log", recorded)
+    mip = make()
+    result = jm.solve(mip, batch_size=batch_size, gomory_cuts=False)
+    assert_solved(result, mip, reference(mip))
+    assert logged
+    finite = [b for b in logged if np.isfinite(b)]
+    assert all(b <= a + 1e-9 * (1 + abs(a)) for a, b in zip(finite[1:], finite))
+
+
 def test_batch_size_must_be_positive():
     with pytest.raises(ValueError, match="batch_size"):
         jm.solve(knapsack(), batch_size=0)

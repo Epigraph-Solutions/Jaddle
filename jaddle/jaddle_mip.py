@@ -4253,6 +4253,8 @@ class _BranchAndBound:
         self.last_log = -np.inf
         # The bound of the node being evaluated (it is in no list meanwhile).
         self.active_bound = np.inf
+        # A batch's members still to be evaluated (also in no list meanwhile).
+        self.batch_waiting = []
         # Every objective value is a multiple of this (None: no such step).
         self.objective_step = objective_step(mip.c, mip.integrality)
         # The root's Lagrangian terms, for reduced-cost fixing of the root box
@@ -4394,6 +4396,7 @@ class _BranchAndBound:
         bound = min((node.bound for node in self.open_nodes()), default=np.inf)
         # Nodes a batch has evaluated but not yet split are in no list.
         bound = min(bound, min((d["bound"] for d in self.deferred_branches), default=np.inf))
+        bound = min(bound, min((node.bound for node in self.batch_waiting), default=np.inf))
         bound = min(bound, self.closed_floor, self.active_bound)
         if self.incumbent is not None:
             bound = min(bound, self.incumbent[0])
@@ -6711,6 +6714,7 @@ class _BranchAndBound:
             boxes.append(box)
         if not members:
             return
+        self.batch_waiting = members
         results = self.solve_batch(
             boxes,
             [node.warm[0] for node in members],
@@ -6722,6 +6726,7 @@ class _BranchAndBound:
         self.deferring = self.batch_on_device()
         try:
             for i, (node, result) in enumerate(zip(members, results)):
+                self.batch_waiting = members[i + 1 :]
                 self.nodes += 1
                 self.lp_epochs += result["epochs"]
                 self.bound_stops += result["stop_reason"] == "bound_target"
@@ -6734,6 +6739,7 @@ class _BranchAndBound:
                 self.log(" ", None, node.depth)
         finally:
             self.deferring = False
+            self.batch_waiting = []
         self.flush_roundings()
         self.flush_branches()
 
@@ -6892,6 +6898,10 @@ class _BranchAndBound:
                 print(f"Objective values are multiples of {self.objective_step:g}")
 
         root = _Node(-np.inf, 0, None, None, None)
+        # The root is in no list until it is evaluated: its bound holds the
+        # global bound down meanwhile (for incumbents logged by the root
+        # heuristics), from its LP bound once that is known.
+        self.active_bound = -np.inf
         lp = self.node_lp(lower, upper)
         detection = self.detect(lp, self.root_warm, self.root_max_epochs)
         if detection["status"] == "primal_infeasible":
@@ -6935,6 +6945,7 @@ class _BranchAndBound:
             bound, rigorous = self.lp_bound(result["solution"], lower, upper)
             self.close(bound, rigorous)
             return self.result("time_limit")
+        self.active_bound = self.round_bound(self.lp_bound(result["solution"], lower, upper)[0])
         if (
             self.use_fix_and_propagate
             or self.use_jump

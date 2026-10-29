@@ -362,6 +362,12 @@
 
 ### Fixed
 
+- `jm.solve`'s progress log no longer shows the bound falling. Nodes held
+  outside the queue were left out of the global bound, so it read too high:
+  the root while the root heuristics ran (an incumbent found there showed
+  bound = incumbent and a 0% gap), and a batch's members not yet evaluated
+  (`batch_size > 1`). Only the log and the incumbent history were affected;
+  the gap check runs between batches.
 - The `float16` profile's sparse matrix-vector products sum in float32.
   JAX's float16 sparse sum ran 7-24x slower than float32 on GPU (dc1l: 271 s
   to 1.2 s for 20 epochs).

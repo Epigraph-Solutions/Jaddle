@@ -25,11 +25,11 @@ import jaddle.jaddle_mip as jm
 # ## The instance
 
 # %%
-PROBLEM_NAME = "rmine11"  # name of the MIPLIB problem (without .mps)
+PROBLEM_NAME = "allcolor58"  # name of the MIPLIB problem (without .mps)
 PATH_TO_MPS = os.path.join(
     os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
 )
-MAX_SECONDS = 3600
+MAX_SECONDS = 36000
 
 mip = jm.load(PATH_TO_MPS)
 print(
@@ -70,12 +70,12 @@ result = jm.solve(
     node_lp_tolerance=1e-3,
     # Any other jl.solve option for node LPs only (root and heuristic LPs
     # keep lp_options), e.g. check convergence every 64 iterations:
-    node_lp_options={"iterations_per_epoch": 64},
+    node_lp_options={"iterations_per_epoch": 64, "update_mode": "pdhg"},
     max_cuts_per_round=1000,
     heuristic_every=5,
     # Primal heuristics, after cuOpt's GPU heuristics. On ns1830653 the
     # pump finds the first point at about 70 s, so 20 s was too short.
-    heuristic_seconds=50,
+    heuristic_seconds=10,
     probing=True,  # root probing, batched in JAX on large models
     fix_and_propagate=False,  # classic fix-and-propagate, then...
     bulk_rounding=True,  # ...bulk fix-and-propagate from 4 starts at once
@@ -88,7 +88,7 @@ result = jm.solve(
     # incumbent. (With rins_solver="jaddle", rens_seconds=None runs RENS only
     # on MIPs with at most 10,000 nonzeros.)
     rins_solver="highs",
-    highs_incumbent_seconds=0.0,
+    highs_incumbent_seconds=10,
     rens_seconds=None,
     # RINS improves the incumbent in the tree: run it often, and let it use up
     # to 30% of the run.
