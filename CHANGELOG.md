@@ -4,6 +4,35 @@
 
 ### Added
 
+- Node crossover (`jm.solve(node_crossover=True)`, opt-in). Every
+  `node_crossover_every` (1) nodes the LP bound does not close, HiGHS
+  crosses the node LP's PDHG point over to an optimal vertex
+  (`jl.crossover`, at most `node_crossover_seconds` (2) a call). The vertex
+  is used for the integrality test, so an integral vertex becomes a `T`
+  incumbent as in HiGHS's "evaluate node", and for branching and the
+  heuristics. Its duals' bound replaces the node's when higher. Results
+  report `node_crossovers`, `node_crossover_vertices`,
+  `node_crossover_integral` and `node_crossover_seconds`.
+- GPU tree heuristics (`jm.solve(tree_heuristics=True)`, opt-in). Once there
+  is an incumbent, every `tree_heuristic_every` (20) nodes, the node's LP
+  point is bulk rounded and, if that finds nothing better, the feasibility
+  jump runs from it (`tree_jump_iterations`, 3000 steps), within
+  `tree_heuristic_share` (5%) of the elapsed time; each call stops once it
+  has used the share left (at least 1 s). Before, the GPU
+  heuristics ran only at the root, until the first incumbent. Results
+  report `tree_heuristic_calls`, `tree_heuristic_finds` and
+  `tree_heuristic_seconds`.
+- `jm.feasibility_jump(cutoff=...)`: adds the row `c·x <= cutoff`, so the
+  jump looks only for points better than an incumbent. The objective row is
+  left out of the jump's one-move-per-row rule, so moves still batch.
+  `data=` reuses the device arrays between calls.
+- `node_lp_options` (`jm.solve`): `jl.solve` options for node LPs only, for
+  example `{"iterations_per_epoch": 64}`. They sit over `lp_options`, which
+  still applies to every LP, and over `node_lp_tolerance`. They reach serial
+  and batched node LPs and strong branching's child LPs. A key that batched
+  LPs (`jl.make_solver`) cannot take raises instead of being dropped. Fix:
+  batched search (`batch_size > 1`) ignored `node_lp_tolerance`, in node LPs
+  and strong branching alike; it now uses it.
 - Faster node LPs in batched search.
   - **Continuous batching** (`batch_epochs=10`). A batched node LP runs at
     most this many epochs per call. An unfinished one goes back to the

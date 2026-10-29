@@ -1403,6 +1403,8 @@ _CUT_MAX_PARALLELISM = 0.99
 # reserved for them (rows) beyond the root's cuts.
 _TREE_CUTS_PER_ROUND = 10
 _TREE_CUT_MIN_ROWS = 32
+# The least time one call of the tree heuristics (``tree_heuristics``) gets.
+_TREE_HEURISTIC_MIN_SECONDS = 1.0
 
 
 def _clean_cut(idx, coef, rhs, lower, upper):
@@ -3423,17 +3425,16 @@ def _jump_chunk(data, x, weights, key, iterations):
         # (noisy) score in every row it touches, so no two moving variables
         # share a row. Each row then changes by one variable's move, so the
         # scores add up exactly and every chosen move can be made at once.
+        # Rows that are not ``exclusive`` (the objective cutoff row, which
+        # touches nearly every variable) are left out of this test, so they
+        # do not cut the step to one move; their scores are then inexact.
         priority = jnp.where(
             good, score * (1.0 + 1e-6 * jax.random.uniform(k_noise, (n,))), -jnp.inf
         )
         row_best = jax.ops.segment_max(priority[cols], rows, num_segments=m)
+        top = (priority[cols] >= row_best[rows]) | ~data["exclusive"][rows]
         winner = good & (
-            jax.ops.segment_min(
-                (priority[cols] >= row_best[rows]).astype(jnp.int32),
-                cols,
-                num_segments=n,
-            )
-            > 0
+            jax.ops.segment_min(top.astype(jnp.int32), cols, num_segments=n) > 0
         )
 
         # A local minimum (no improving move): as HiGHS's Feasibility Jump,
@@ -3465,15 +3466,28 @@ def _jump_chunk(data, x, weights, key, iterations):
     return x, weights, key, steps, feasible
 
 
-def _jump_data(mip, lower, upper, tol):
+def _jump_data(mip, lower, upper, tol, cutoff=None):
     """The device arrays ``_jump_chunk`` reads: the MIP's rows (as given, no
     cuts) scaled to unit ∞-norm, with a per-row tolerance matching
-    ``MIP.violation``'s, and the box."""
-    A = sp.coo_matrix(mip.A)
+    ``MIP.violation``'s, and the box. With a ``cutoff``, the row
+    ``c·x <= cutoff`` (its nonzero ``c`` entries) is appended last, so a
+    point meets every row only when it also improves on the cutoff."""
+    A = sp.csr_matrix(mip.A)
+    row_lower, row_upper = mip.row_lower, mip.row_upper
+    exclusive = np.ones(A.shape[0], dtype=bool)
+    if cutoff is not None:
+        A = sp.vstack([A, sp.csr_matrix(np.asarray(mip.c, np.float64)[None, :])], format="csr")
+        A.eliminate_zeros()
+        row_lower = np.append(row_lower, -np.inf)
+        row_upper = np.append(row_upper, cutoff)
+        exclusive = np.append(exclusive, False)
     dtype = mip.lp.c.dtype
-    scale = np.abs(sp.csr_matrix(mip.A)).max(axis=1).toarray().ravel()
+    scale = np.abs(A).max(axis=1).toarray().ravel()
     scale = np.where(scale > 0, scale, 1.0)
     row_tol = 0.5 * tol * (1.0 + np.abs(mip.b).max(initial=0.0)) / scale
+    if cutoff is not None:
+        row_tol[-1] = 0.5 * tol * (1.0 + abs(cutoff)) / scale[-1]
+    A = A.tocoo()
 
     def put(v):
         return jax.device_put(np.asarray(v).astype(dtype))
@@ -3482,13 +3496,34 @@ def _jump_data(mip, lower, upper, tol):
         rows=jax.device_put(A.row.astype(np.int32)),
         cols=jax.device_put(A.col.astype(np.int32)),
         a=put(A.data / scale[A.row]),
-        row_lower=put(mip.row_lower / scale),
-        row_upper=put(mip.row_upper / scale),
+        row_lower=put(row_lower / scale),
+        row_upper=put(row_upper / scale),
         lower=put(lower),
         upper=put(upper),
         is_int=jax.device_put(mip.integrality),
         tol=put(row_tol),
+        exclusive=jax.device_put(exclusive),
+        # The objective row's scale and the tolerance, to move the cutoff
+        # (``_jump_with``).
+        cutoff_scale=float(scale[-1]) if cutoff is not None else 1.0,
+        feasibility_tolerance=float(tol),
     )
+
+
+def _jump_with(data, lower, upper, cutoff=None):
+    """``data`` from ``_jump_data`` with a new box and (when it has an
+    objective row) a new cutoff, without copying the rows again."""
+    dtype = data["lower"].dtype
+    new = dict(
+        data,
+        lower=jax.device_put(np.asarray(lower).astype(dtype)),
+        upper=jax.device_put(np.asarray(upper).astype(dtype)),
+    )
+    if cutoff is not None:
+        scale, tol = data["cutoff_scale"], data["feasibility_tolerance"]
+        new["row_upper"] = data["row_upper"].at[-1].set(cutoff / scale)
+        new["tol"] = data["tol"].at[-1].set(0.5 * tol * (1.0 + abs(cutoff)) / scale)
+    return new
 
 
 def feasibility_jump(
@@ -3501,6 +3536,8 @@ def feasibility_jump(
     deadline=None,
     seed=0,
     chunk=1000,
+    cutoff=None,
+    data=None,
 ):
     """
     Feasibility Jump (Luteberget & Sartor, 2023): an LP-free local search
@@ -3517,8 +3554,12 @@ def feasibility_jump(
     value) is checked between chunks.
 
     ``lower``/``upper`` default to ``mip``'s bounds. ``max_iterations``
-    defaults to ``max(10000, 20·(n + m))``. Returns ``(x, feasible, steps)``:
-    ``feasible`` means every row is met to ``tol`` (as ``MIP.violation``
+    defaults to ``max(10000, 20·(n + m))``. With a ``cutoff`` the search
+    also has the row ``c·x <= cutoff``, so it looks for a point better than
+    an incumbent. ``data`` (from ``_jump_data``, with the same ``cutoff``
+    or none, and the same box via ``_jump_with``) saves copying the rows to
+    the device again. Returns ``(x, feasible, steps)``: ``feasible`` means
+    every row (and the cutoff) is met to ``tol`` (as ``MIP.violation``
     measures it); the caller should still check the point.
     """
     lower = mip.lower if lower is None else np.asarray(lower, np.float64)
@@ -3529,7 +3570,9 @@ def feasibility_jump(
     x = np.clip(np.asarray(x0, np.float64), lower, upper)
     ints = mip.integrality
     x[ints] = np.clip(np.round(x[ints]), lower[ints], upper[ints])
-    data = _jump_data(mip, lower, upper, tol)
+    if data is None:
+        data = _jump_data(mip, lower, upper, tol, cutoff)
+    m = data["row_lower"].shape[0]  # with the objective row, if any
     dtype = mip.lp.c.dtype
     x = jax.device_put(x.astype(dtype))
     weights = jax.device_put(np.ones(m, dtype=dtype))
@@ -3905,6 +3948,14 @@ class _BranchAndBound:
         batch_epochs=10,
         children_backend="auto",
         batch_roundings=False,
+        node_lp_options=None,
+        tree_heuristics=False,
+        tree_heuristic_every=20,
+        tree_heuristic_share=0.05,
+        tree_jump_iterations=3000,
+        node_crossover=False,
+        node_crossover_every=1,
+        node_crossover_seconds=2.0,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
         self.settings = {
@@ -3955,6 +4006,10 @@ class _BranchAndBound:
         reserved = [key for key in _LP_RESERVED if key in lp_options]
         if reserved:
             raise ValueError(f"lp_options cannot set {', '.join(reserved)}")
+        node_lp_options = dict(node_lp_options or {})
+        reserved = [key for key in _LP_RESERVED if key in node_lp_options]
+        if reserved:
+            raise ValueError(f"node_lp_options cannot set {', '.join(reserved)}")
 
         self.original = mip  # the MIP as given: incumbents are checked on it
         self.device = _search_device(device, mip.A.nnz)
@@ -4068,6 +4123,37 @@ class _BranchAndBound:
         # ~1 s a batch on ns1830653, against ~55 ms a node for the classic
         # fix-and-propagate, which mostly runs only every few nodes.
         self.batch_roundings = bool(batch_roundings)
+        # GPU heuristics from node LP points once there is an incumbent
+        # (``tree_heuristics``): bulk rounding, then a feasibility jump with
+        # the objective cutoff row, every ``tree_heuristic_every`` nodes
+        # within ``tree_heuristic_share`` of the elapsed time.
+        if tree_heuristic_every < 1:
+            raise ValueError("tree_heuristic_every must be at least 1")
+        if tree_heuristic_share < 0:
+            raise ValueError("tree_heuristic_share must be non-negative")
+        self.use_tree_heuristics = bool(tree_heuristics)
+        self.tree_heuristic_every = int(tree_heuristic_every)
+        self.tree_heuristic_share = float(tree_heuristic_share)
+        self.tree_jump_iterations = int(tree_jump_iterations)
+        self.tree_heuristic_seen = set()  # (rounded integers, cutoff) tried
+        self.tree_heuristic_calls = 0
+        self.tree_heuristic_finds = 0
+        self.tree_heuristic_seconds = 0.0
+        self._tree_jump_data = None  # (cutoff-row jump data on the device)
+        # Crossover of node LP points to exact vertices with HiGHS
+        # (``node_crossover``), every ``node_crossover_every`` nodes, each
+        # call limited to ``node_crossover_seconds``.
+        if node_crossover_every < 1:
+            raise ValueError("node_crossover_every must be at least 1")
+        if node_crossover_seconds <= 0:
+            raise ValueError("node_crossover_seconds must be positive")
+        self.use_node_crossover = bool(node_crossover)
+        self.node_crossover_every = int(node_crossover_every)
+        self.node_crossover_limit = float(node_crossover_seconds)
+        self.node_crossovers = 0  # calls
+        self.node_crossover_vertices = 0  # calls that proved a vertex optimal
+        self.node_crossover_integral = 0  # vertices integral, PDHG point not
+        self.node_crossover_seconds = 0.0
         self._child_kernels = None  # (mip, _ChildKernels)
         self.deferring = False  # a batch is being evaluated
         self.deferred_branches = []
@@ -4121,7 +4207,8 @@ class _BranchAndBound:
             dual_gap_tolerance=lp_tolerance,
         )
         self.lp_kwargs.update(lp_options)
-        # Node LPs only (``node_lp_tolerance``; ``None``: ``lp_tolerance``).
+        # Node LPs only, over ``lp_kwargs``: ``node_lp_tolerance`` (``None``:
+        # ``lp_tolerance``), then ``node_lp_options``.
         self.node_lp_kwargs = (
             {}
             if node_lp_tolerance is None
@@ -4131,6 +4218,8 @@ class _BranchAndBound:
                 dual_gap_tolerance=node_lp_tolerance,
             )
         )
+        self.node_lp_options = node_lp_options
+        self.node_lp_kwargs.update(node_lp_options)
         self.reduced_cost_tol = lp_tolerance * (1.0 + np.linalg.norm(mip.c))
 
         self.is_int = mip.integrality
@@ -5291,6 +5380,26 @@ class _BranchAndBound:
                 self.learn(terms, lower, upper)
             return
         warm = (result["solution"], result["opt_state"])
+        if self.node_crossover_due():
+            # An exact vertex of the node LP: its point is integral far more
+            # often than a PDHG point, and its duals may raise the bound.
+            # Children still warm-start from the PDHG solution (``warm``).
+            if lp is None:
+                lp = self.node_lp(lower, upper)
+            vertex = self.cross_over_node(lp, result["solution"], x)
+            if vertex is not None:
+                x, converged = np.asarray(vertex.primal, np.float64), True
+                new_terms = self.dual_terms(vertex)
+                new_raw, new_rigorous = self.bound_over(new_terms, lower, upper)
+                if new_raw > raw:
+                    terms, raw, rigorous = new_terms, new_raw, new_rigorous
+                    bound = max(self.round_bound(raw), bound)
+                    self.active_bound = bound
+                if bound >= self.cutoff():
+                    self.close(bound, rigorous)
+                    if rigorous:
+                        self.learn(terms, lower, upper)
+                    return
 
         xi = x[self.is_int]
         fractional = np.zeros(x.shape[0], dtype=bool)
@@ -5337,6 +5446,11 @@ class _BranchAndBound:
         ):
             self.rins_pending = False
             self.rins(x, warm)
+            if bound >= self.cutoff():
+                self.close(bound, rigorous)
+                return
+        if self.tree_heuristics_due():
+            self.tree_heuristics(x, lower, upper, warm)
             if bound >= self.cutoff():
                 self.close(bound, rigorous)
                 return
@@ -5508,7 +5622,48 @@ class _BranchAndBound:
             "batch_requeues": self.batch_requeues,
             "batched_children": self.batched_children,
             "batched_roundings": self.batched_roundings,
+            "tree_heuristic_calls": self.tree_heuristic_calls,
+            "tree_heuristic_finds": self.tree_heuristic_finds,
+            "tree_heuristic_seconds": self.tree_heuristic_seconds,
+            "node_crossovers": self.node_crossovers,
+            "node_crossover_vertices": self.node_crossover_vertices,
+            "node_crossover_integral": self.node_crossover_integral,
+            "node_crossover_seconds": self.node_crossover_seconds,
         }
+
+    def node_crossover_due(self):
+        """Whether this node's LP point is crossed over (``node_crossover``,
+        every ``node_crossover_every`` nodes, time permitting)."""
+        return (
+            self.use_node_crossover
+            and self.nodes % self.node_crossover_every == 0
+            and not self.out_of_time()
+        )
+
+    def cross_over_node(self, lp, solution, x):
+        """Cross the node LP's PDHG ``solution`` over to an optimal vertex
+        with HiGHS (``jaddle_linear.crossover``), within
+        ``node_crossover_seconds`` and the time left. Returns the vertex's
+        ``SaddleState``, or ``None`` when HiGHS does not prove it optimal.
+        ``x`` (the PDHG point) only feeds the statistics."""
+        started = time.time()
+        limit = self.node_crossover_limit
+        if self.deadline is not None:
+            limit = min(limit, self.seconds_left())
+        crossed = jl.crossover(lp, solution, highs_options={"time_limit": limit})
+        self.node_crossovers += 1
+        self.node_crossover_seconds += time.time() - started
+        if not crossed["converged"]:
+            return None
+        self.node_crossover_vertices += 1
+        vertex = np.asarray(crossed["solution"].primal, np.float64)
+        ints = self.is_int
+
+        def integral(point):
+            return np.all(np.abs(point[ints] - np.round(point[ints])) <= self.int_tol)
+
+        self.node_crossover_integral += int(integral(vertex) and not integral(x))
+        return crossed["solution"]
 
     def root_vertex(self, lower, upper, solution):
         """Cross the root LP's point over to an optimal vertex with HiGHS
@@ -6086,6 +6241,8 @@ class _BranchAndBound:
             rins_seconds=0.0,
             rens_seconds=0.0,
             dive_every=0,
+            tree_heuristics=False,
+            node_crossover=False,
             batch_size=1,
             verbose=False,
         )
@@ -6264,6 +6421,76 @@ class _BranchAndBound:
         upper = np.where(agree, incumbent, self.base.upper)
         return self.sub_search(lower, upper, seconds, self.rins_nodes, warm)
 
+    def tree_heuristics_due(self):
+        """Whether the GPU tree heuristics run at this node: on, with an
+        incumbent to improve, every ``tree_heuristic_every`` nodes, and
+        within ``tree_heuristic_share`` of the elapsed time."""
+        return (
+            self.use_tree_heuristics
+            and self.incumbent is not None
+            and self.nodes % self.tree_heuristic_every == 0
+            and self.tree_heuristic_seconds
+            < self.tree_heuristic_share * (time.time() - self.start)
+            and not self.out_of_time()
+        )
+
+    def tree_heuristics(self, x, lower, upper, warm):
+        """The GPU heuristics from the node LP point ``x``, for a point
+        better than the incumbent: bulk rounding in the node box (with the
+        objective row at the cutoff, as ``bulk_round``), then, if that finds
+        nothing better, a feasibility jump in the root box with the row
+        ``c·x <= cutoff``. Skipped when the same rounding of ``x`` was tried
+        at the same cutoff. Finds are marked ``"B"`` and ``"J"``."""
+        cutoff = self.cutoff(box=False)
+        key = (np.round(x[self.is_int]).tobytes(), cutoff)
+        if key in self.tree_heuristic_seen:
+            return
+        self.tree_heuristic_seen.add(key)
+        started = time.time()
+        before = self.incumbent[0]
+        # Each call stops once it uses up the share left (at least
+        # _TREE_HEURISTIC_MIN_SECONDS); otherwise one bulk rounding of a large
+        # model can run on to the solve's deadline.
+        allowance = (
+            self.tree_heuristic_share * (started - self.start) - self.tree_heuristic_seconds
+        )
+        deadline = started + max(allowance, _TREE_HEURISTIC_MIN_SECONDS)
+        if self.deadline is not None:
+            deadline = min(deadline, self.deadline)
+        try:
+            if self.use_bulk_rounding:
+                points = self.bulk_round([x] * self.bulk_starts, lower, upper, deadline)
+                for point in points:
+                    if point is not None:
+                        self.try_incumbent(point, "B", warm)
+            if self.use_jump and self.incumbent[0] >= before and not self.out_of_time():
+                lo, up = self.root_lower, self.root_upper
+                if self._tree_jump_data is None:
+                    self._tree_jump_data = _jump_data(
+                        self.base, lo, up, self.feas_tol, cutoff
+                    )
+                data = _jump_with(self._tree_jump_data, lo, up, cutoff)
+                point, feasible, _ = feasibility_jump(
+                    self.base,
+                    x,
+                    lo,
+                    up,
+                    tol=self.feas_tol,
+                    max_iterations=self.tree_jump_iterations,
+                    deadline=deadline,
+                    seed=self.tree_heuristic_calls,
+                    cutoff=cutoff,
+                    data=data,
+                )
+                if feasible:
+                    self.try_incumbent(point, "J", warm)
+        finally:
+            self.tree_heuristic_calls += 1
+            self.tree_heuristic_finds += int(self.incumbent[0] < before)
+            elapsed = time.time() - started
+            self.tree_heuristic_seconds += elapsed
+            self.heuristic_seconds += elapsed
+
     def jump(self, start, lower, upper, warm, deadline, seed):
         """``feasibility_jump`` on the MIP as given from ``start``; a point it
         finds goes through ``try_incumbent`` (which re-solves continuous
@@ -6382,11 +6609,19 @@ class _BranchAndBound:
         if cached is None or cached[0] is not self.mip:
             import inspect
 
-            accepted = set(inspect.signature(jl.make_solver).parameters)
+            accepted = set(inspect.signature(jl.make_solver).parameters) - {"build_lp"}
+            unknown = sorted(set(self.node_lp_options) - accepted)
+            if unknown:
+                raise ValueError(
+                    f"node_lp_options {', '.join(unknown)} cannot be used by batched "
+                    "node LPs (jaddle_linear.make_solver)"
+                )
+            # Node LPs: ``lp_options`` (what make_solver takes), then the
+            # node layer (``node_lp_tolerance``, ``node_lp_options``).
             settings = {
                 key: value
-                for key, value in self.lp_kwargs.items()
-                if key in accepted and key != "build_lp"
+                for key, value in {**self.lp_kwargs, **self.node_lp_kwargs}.items()
+                if key in accepted
             }
             solve_fn = jl.make_solver(
                 self.mip.lp.with_values,
@@ -6862,6 +7097,13 @@ def solve(
     batch_epochs=10,
     children_backend="auto",
     batch_roundings=False,
+    tree_heuristics=False,
+    tree_heuristic_every=20,
+    tree_heuristic_share=0.05,
+    tree_jump_iterations=3000,
+    node_crossover=False,
+    node_crossover_every=1,
+    node_crossover_seconds=2.0,
     heuristic_seconds=None,
     conflicts=True,
     conflict_pool_size=2000,
@@ -6869,6 +7111,7 @@ def solve(
     presolve=False,
     highs_options=None,
     lp_options=None,
+    node_lp_options=None,
     verbose=False,
     log_every_seconds=1.0,
     device="auto",
@@ -7141,6 +7384,29 @@ def solve(
       (fractional, guided or pseudocost rule), propagate, re-solve the LP
       warm, up to ``dive_depth`` times; an integral end point is marked
       ``"D"``.
+    * **GPU tree heuristics** (``tree_heuristics``, off by default). Once
+      there is an incumbent, every ``tree_heuristic_every`` (20) nodes, the
+      node's LP point is bulk rounded (``bulk_starts`` starts, in the node
+      box, with the objective row at the cutoff), marked ``"B"``; if that
+      finds nothing better, ``feasibility_jump`` runs from it for up to
+      ``tree_jump_iterations`` (3000) steps in the root box with the row
+      ``c·x <= cutoff`` added, so it looks only for better points, marked
+      ``"J"``. They run while they have taken at most
+      ``tree_heuristic_share`` (0.05) of the elapsed time, each call stops
+      once it has used the share left (but gets at least 1 s), and they skip a
+      rounding of the LP point already tried at the same cutoff. A find
+      also triggers RINS at the next node.
+    * **Node crossover** (``node_crossover``, off by default). Every
+      ``node_crossover_every`` (1) nodes that the LP bound does not close,
+      HiGHS crosses the node LP's PDHG point over to an optimal vertex
+      (``jaddle_linear.crossover``, at most ``node_crossover_seconds`` (2)
+      a call, on the CPU). The vertex replaces the PDHG point for the
+      integrality test (an integral vertex becomes an incumbent, ``"T"``),
+      branching and the heuristics, and its duals' Lagrangian bound
+      replaces the node's when higher. A first-order point lies inside the
+      optimal face, so it is integral far less often than a vertex.
+      Children still warm-start from the PDHG solution. When HiGHS does not
+      prove the vertex optimal in time, the PDHG point is used.
     * **Objective-aware propagation.** Once there is a cutoff, the
       propagation inside fix-and-propagate and dives includes the row
       ``c·x <= cutoff``, so they reject roundings that cannot improve on the
@@ -7148,7 +7414,11 @@ def solve(
 
     ``lp_tolerance`` is the relative tolerance of every node LP (all three of
     ``solve()``'s tolerances); ``lp_options`` (a dict) passes any other
-    ``solve()`` option. Run in float64 (``jaddle_optimisers.configure_jax``)
+    ``solve()`` option to every LP the search solves (root, cut rounds,
+    heuristics, nodes). ``node_lp_options`` (a dict) applies to node LPs
+    only, over ``lp_options`` and ``node_lp_tolerance``: serial node solves,
+    batched ones (``jaddle_linear.make_solver`` options only; others raise)
+    and strong branching's child LPs. Run in float64 (``jaddle_optimisers.configure_jax``)
     for the default tolerances.
 
     ``presolve=True`` presolves with HiGHS, runs the branch and bound on the
@@ -7195,6 +7465,14 @@ def solve(
       before their LP was solved.
     * ``"lp_repairs"``, ``"lp_repairs_skipped"``: repair LPs solved for
       rounded points, and rounded points rejected without one.
+    * ``"tree_heuristic_calls"``, ``"tree_heuristic_finds"``,
+      ``"tree_heuristic_seconds"``: GPU tree heuristic calls
+      (``tree_heuristics``), those that improved the incumbent, and their time.
+    * ``"node_crossovers"``, ``"node_crossover_vertices"``,
+      ``"node_crossover_integral"``, ``"node_crossover_seconds"``: node
+      crossovers (``node_crossover``), those that proved a vertex optimal,
+      the vertices that were integral where the PDHG point was not, and
+      their time.
     * ``"coefficients_tightened"``: coefficients cut by coefficient
       tightening; ``"tree_cuts_added"``: cuts added in the tree.
     * ``"strong_branch_nodes"``, ``"strong_branch_lps"``,
@@ -7264,8 +7542,16 @@ def solve(
         batch_epochs=batch_epochs,
         children_backend=children_backend,
         batch_roundings=batch_roundings,
+        tree_heuristics=tree_heuristics,
+        tree_heuristic_every=tree_heuristic_every,
+        tree_heuristic_share=tree_heuristic_share,
+        tree_jump_iterations=tree_jump_iterations,
+        node_crossover=node_crossover,
+        node_crossover_every=node_crossover_every,
+        node_crossover_seconds=node_crossover_seconds,
         heuristic_seconds=heuristic_seconds,
         lp_options=lp_options,
+        node_lp_options=node_lp_options,
         verbose=verbose,
         log_every_seconds=log_every_seconds,
         start=start,

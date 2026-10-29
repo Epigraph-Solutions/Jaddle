@@ -711,13 +711,36 @@ columns are not supported.
   `c·x ≤ cutoff`, so it rejects roundings that cannot improve.
   *RINS* (`rins_seconds`) runs at the root, every `rins_every` nodes and
   after each new incumbent, within `heuristic_effort` of the run time;
-  LP-based *dives* (`dive_every`) are opt-in.
+  LP-based *dives* (`dive_every`) are opt-in. So are the *GPU tree
+  heuristics* (`tree_heuristics`): once there is an incumbent, every
+  `tree_heuristic_every` nodes they bulk round the node's LP point and, if
+  that finds nothing better, run the feasibility jump from it with the row
+  `c·x ≤ cutoff` added, so the jump looks only for better points. On an 8×40
+  generalised assignment problem a tree jump took the incumbent from 700
+  to 697 and proved it optimal in 28s, where the search without them hit
+  its 30s limit. On others they found nothing and cost up to 5s.
   Measured on lseu, p0201, p0282, flugpl, p0033 and bell5 (60s each):
   objective-aware propagation cut lseu from 473 to 437 nodes and p0282
   from 301 to 252; RENS cut p0282 to 141 nodes (16s, from 21s). Dives
   helped flugpl (302 → 204 nodes) but cost time elsewhere, and RINS found
   p0201's optimum at node 550 instead of 1,085 but doubled its run time
   (each Jaddle sub-search costs ~0.4s), so both stay off by default.
+- **Node crossover** (`node_crossover`, opt-in). A PDHG point lies inside
+  the LP's optimal face, so it is integral far less often than the vertex a
+  simplex solver would return: on `max Σx, Σx ≤ 1` over binaries PDHG gives
+  `1/n` everywhere. With `node_crossover=True`, every
+  `node_crossover_every` nodes the LP bound does not close, HiGHS crosses
+  the node's point over to an optimal vertex (`jl.crossover`, at most
+  `node_crossover_seconds` a call, on the CPU). The vertex then drives the
+  integrality test (an integral one is an incumbent, `T`, as in HiGHS's
+  "evaluate node"), branching and the heuristics, and its duals' bound
+  replaces the node's when higher. Children still warm-start from the PDHG
+  solution. On an 8×40 generalised assignment problem, 215 crossovers took
+  0.7s in all, and the search proved 697 optimal in 26s, where it had
+  stopped at 700 after 30s without them. There the gain came from the
+  vertices changing the bounds and branching choices (it found two `T`
+  incumbents, at nodes whose PDHG points were integral too), not from
+  vertices that were integral where the PDHG point was not.
 - **Presolve.** `presolve=True` runs HiGHS's MIP presolve, searches the
   reduced problem, and maps the incumbent back with HiGHS's postsolve.
 
@@ -740,6 +763,7 @@ reports `bound_rigorous=False`.
 | `lp_tolerance`, `lp_options` | `1e-6`, `None` | The node LPs' relative tolerances, and any other `jl.solve` option. |
 | `node_max_epochs`, `root_max_epochs` | `200`, `None` | Epoch budgets for a node LP and the root LP. |
 | `node_lp_tolerance` | `None` | Tolerance for node LPs only (`None`: `lp_tolerance`). Experimental: looser node LPs are cheaper but give rougher branching and pseudocost data. |
+| `node_lp_options` | `None` | Any other `jl.solve` option for node LPs only, over `lp_options` and `node_lp_tolerance`: serial and batched node LPs and strong branching's child LPs (batched ones take `jl.make_solver` options only; others raise). `lp_options` applies to every LP. |
 | `node_bound_stop` | `True` | Stop a node LP as soon as the Lagrangian bound of its duals closes the node against the cutoff (`jl.solve(bound_target=...)`, and `jl.make_solver(bound_stop=True)` for each member of a batch); infeasible nodes stop within a few epochs. |
 | `batch_epochs` | `10` | Batched search: the most epochs a node LP runs in one batch call; an unfinished node goes back to the queue, warm-started, until `node_max_epochs` in all, so one slow member cannot hold its batch (`None`: `node_max_epochs`). |
 | `children_backend`, `batch_roundings` | `"auto"`, `False` | Batched search: split all members at once on the device (`"auto"`: above 10,000 nonzeros; `"jax"`, `"numpy"`), and round the batch's tree heuristics as one bulk rounding (opt-in: slower than the classic one per node on ns1830653). |
@@ -762,6 +786,8 @@ reports `bound_rigorous=False`.
 | `probing`, `probing_seconds`, `probing_max_variables`, `probing_backend`, `probing_max_useless` | `True`, `None`, `None`, `"auto"`, `1000` | Root probing; its budget (`None`: 5% of `max_seconds` up to 30 s, 10 s without one); the most variables probed; `"numpy"`, `"jax"` or `"auto"` (JAX above 10,000 nonzeros); stop after this many variables in a row change nothing (`None`: never). |
 | `repair_share` | `0.2` | The most of the heuristic time left that one `repair` of a near-feasible jump may take, so later heuristics still run. |
 | `bulk_rounding`, `bulk_starts` | `True`, `4` | Bulk fix-and-propagate at the root and in the pump, and how many starts run side by side. |
+| `node_crossover`, `node_crossover_every`, `node_crossover_seconds` | `False`, `1`, `2.0` | Cross node LP points over to exact vertices with HiGHS (opt-in), every this many nodes, with this time limit per call; the vertex is used for the integrality test, branching and heuristics, and its duals for the bound. |
+| `tree_heuristics`, `tree_heuristic_every`, `tree_heuristic_share`, `tree_jump_iterations` | `False`, `20`, `0.05`, `3000` | GPU heuristics from node LP points once there is an incumbent (opt-in): bulk rounding, then a feasibility jump with the objective cutoff row, every this many nodes, while they have taken at most this share of the elapsed time, with this many jump steps per call. |
 | `heuristic_seconds` | `None` | Time for the root heuristics (`None`: 20% of `max_seconds`, or no time limit without one). |
 | `propagate` | `True` | Bound propagation at the root and at each child. |
 | `coefficient_tightening` | `True` | Shrink binaries' big-M coefficients at the root (see above). |
@@ -792,7 +818,12 @@ family: `gomory`, `cover`, `mir`), `root_bound_before_cuts`, `tree_cuts_added`, 
 `objective_step` (or `None`), `reduced_cost_tightenings`, `children_pruned`
 (children closed on their parent's duals), and `lp_repairs` / `lp_repairs_skipped`
 (repair LPs solved, and rounded points rejected without one), and
-`coefficients_tightened`. `"unresolved"` means the search
+`coefficients_tightened`, and `tree_heuristic_calls` / `tree_heuristic_finds` /
+`tree_heuristic_seconds` (GPU tree heuristic calls, those that improved the
+incumbent, and their time), and `node_crossovers` / `node_crossover_vertices` /
+`node_crossover_integral` / `node_crossover_seconds` (node crossovers, those
+that proved a vertex optimal, vertices integral where the PDHG point was
+not, and their time). `"unresolved"` means the search
 ended but some nodes had nothing left to branch on and could not be settled
 (their LP did not converge, or their integral point failed the feasibility
 check); their bounds are still in `bound`. With `presolve=True` it also has

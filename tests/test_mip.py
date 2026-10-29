@@ -1,5 +1,7 @@
 """Tests for the branch-and-bound MIP solver, jaddle.jaddle_mip."""
 
+import time
+
 import highspy
 import numpy as np
 import pytest
@@ -974,6 +976,208 @@ def test_feasibility_jump_in_the_search():
     )
     assert result["x"] is not None and mip.is_feasible(result["x"])
     assert result["history"][0]["source"] == "J"
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_feasibility_jump_with_a_cutoff_finds_only_better_points(seed):
+    mip = generalised_assignment(seed)
+    first, feasible, _ = jm.feasibility_jump(mip, np.zeros(mip.num_variables))
+    assert feasible
+    _, best = reference_point(mip)
+    worst = float(mip.c @ first)
+    assert worst > best + 1e-6  # the plain jump's point is not optimal
+    cutoff = 0.5 * (worst + best)
+    x, feasible, _ = jm.feasibility_jump(mip, lp_point(mip), cutoff=cutoff)
+    assert feasible and mip.is_feasible(x)
+    assert mip.c @ x <= cutoff + 1e-6 * (1 + abs(cutoff))
+
+
+def test_feasibility_jump_gives_up_below_the_optimum():
+    mip = generalised_assignment(0)
+    _, best = reference_point(mip)
+    _, feasible, steps = jm.feasibility_jump(
+        mip, lp_point(mip), cutoff=best - 1e-2 * (1 + abs(best)), max_iterations=2000
+    )
+    assert not feasible and steps == 2000
+
+
+def test_jump_data_with_a_moved_cutoff_matches_a_fresh_build():
+    mip = generalised_assignment(1)
+    start = lp_point(mip)
+    _, best = reference_point(mip)
+    old = jm._jump_data(mip, mip.lower, mip.upper, 1e-6, cutoff=best + 100.0)
+    moved = jm._jump_with(old, mip.lower, mip.upper, cutoff=best + 1.0)
+    reused = jm.feasibility_jump(mip, start, cutoff=best + 1.0, data=moved, seed=3)
+    fresh = jm.feasibility_jump(mip, start, cutoff=best + 1.0, seed=3)
+    np.testing.assert_array_equal(reused[0], fresh[0])
+    assert reused[1:] == fresh[1:]
+
+
+# %% GPU tree heuristics
+def tree_heuristic_options(**options):
+    """Tree heuristics at every node, with the other tree heuristics off."""
+    return dict(
+        dict(
+            tree_heuristics=True,
+            tree_heuristic_every=1,
+            tree_heuristic_share=1.0,
+            rins_seconds=0,
+            rens_seconds=0,
+            heuristic_every=0,
+        ),
+        **options,
+    )
+
+
+def test_tree_heuristics_in_the_search():
+    mip = generalised_assignment(2)
+    result = jm.solve(mip, **tree_heuristic_options())
+    assert_solved(result, mip, reference(mip))
+    assert result["tree_heuristic_calls"] > 0
+    assert result["tree_heuristic_seconds"] > 0
+    assert result["tree_heuristic_finds"] <= result["tree_heuristic_calls"]
+    off = jm.solve(mip, **tree_heuristic_options(tree_heuristics=False))
+    assert off["tree_heuristic_calls"] == 0 and off["tree_heuristic_finds"] == 0
+
+
+def test_tree_heuristics_need_an_incumbent_and_stay_out_of_sub_searches(monkeypatch):
+    calls = []
+    real = jm._BranchAndBound.tree_heuristics
+
+    def recorded(self, *args):
+        calls.append((self.incumbent is not None, np.isfinite(self.initial_cutoff)))
+        return real(self, *args)
+
+    monkeypatch.setattr(jm._BranchAndBound, "tree_heuristics", recorded)
+    mip = generalised_assignment(2)
+    result = jm.solve(
+        mip,
+        **tree_heuristic_options(rins_seconds=5, rins_every=5, rins_solver="jaddle"),
+    )
+    assert_solved(result, mip, reference(mip))
+    assert calls
+    assert all(has_incumbent for has_incumbent, _ in calls)
+    assert not any(in_sub_search for _, in_sub_search in calls)
+
+
+def test_tree_heuristics_skip_a_rounding_already_tried(monkeypatch):
+    mip = generalised_assignment(2)
+    search = search_for(mip, monkeypatch, **tree_heuristic_options())
+    x = lp_point(mip)
+    search.root_lower, search.root_upper = mip.lower.copy(), mip.upper.copy()
+    search.incumbent = (1e9, np.zeros(mip.num_variables))
+    search.use_jump = False
+    rounds = []
+    monkeypatch.setattr(search, "bulk_round", lambda *a, **k: rounds.append(1) or [])
+    search.tree_heuristics(x, mip.lower, mip.upper, None)
+    search.tree_heuristics(x, mip.lower, mip.upper, None)
+    assert len(rounds) == 1 and search.tree_heuristic_calls == 1
+
+
+def test_tree_heuristics_stop_at_their_share_not_the_solve_deadline(monkeypatch):
+    # One bulk rounding of a large model (fiball, 32k integers) ran on to
+    # the solve's deadline at the first node.
+    mip = generalised_assignment(2)
+    search = search_for(mip, monkeypatch, **tree_heuristic_options(max_seconds=3600))
+    x = lp_point(mip)
+    search.root_lower, search.root_upper = mip.lower.copy(), mip.upper.copy()
+    search.incumbent = (1e9, np.zeros(mip.num_variables))
+    search.use_jump = False
+    search.tree_heuristic_share = 0.05
+    search.start = time.time() - 100.0  # 100 s in: a 5 s share
+    search.tree_heuristic_seconds = 2.0  # 3 s of it left
+    deadlines = []
+    monkeypatch.setattr(
+        search, "bulk_round", lambda starts, lo, up, deadline: deadlines.append(deadline) or []
+    )
+    before = time.time()
+    search.tree_heuristics(x, mip.lower, mip.upper, None)
+    assert before + 2.9 <= deadlines[0] <= time.time() + 3.1
+    # With the share used up, a call still gets the minimum.
+    search.tree_heuristic_seconds = 10.0
+    search.tree_heuristics(x + 0.5, mip.lower, mip.upper, None)
+    assert deadlines[1] <= time.time() + jm._TREE_HEURISTIC_MIN_SECONDS + 0.1
+
+
+@pytest.mark.parametrize(
+    "options", [dict(tree_heuristic_every=0), dict(tree_heuristic_share=-0.1)]
+)
+def test_rejects_bad_tree_heuristic_options(options):
+    with pytest.raises(ValueError):
+        jm.solve(knapsack(), **options)
+
+
+# %% Node crossover
+def pick_one(n=6):
+    """Maximise the sum of n binaries, at most one of them 1: PDHG lands in
+    the middle of the optimal face (1/n each), every vertex is integral."""
+    lp = jl.LP(
+        c=-np.ones(n),
+        A_eq=sp.csc_matrix((0, n)),
+        b_eq=np.zeros(0),
+        A_ineq=sp.csc_matrix(np.ones((1, n))),
+        b_ineq=np.array([1.0]),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    return jm.MIP(lp, np.ones(n, bool))
+
+
+# Every heuristic off: only node LP points give incumbents.
+NO_HEURISTICS = dict(
+    heuristic_every=0,
+    fix_and_propagate=False,
+    feasibility_jump=False,
+    feasibility_pump=False,
+    bulk_rounding=False,
+    rens_seconds=0,
+    rins_seconds=0,
+    probing=False,
+    cuts=False,
+)
+
+
+def test_node_crossover_turns_a_face_point_into_an_integral_vertex():
+    mip = pick_one()
+    result = jm.solve(mip, node_crossover=True, **NO_HEURISTICS)
+    assert_solved(result, mip, reference(mip))
+    assert result["nodes"] == 1  # the root vertex is integral: no branching
+    assert [h["source"] for h in result["history"]] == ["T"]
+    assert result["node_crossovers"] == result["node_crossover_vertices"] == 1
+    assert result["node_crossover_integral"] == 1
+    off = jm.solve(mip, **NO_HEURISTICS)
+    assert off["nodes"] > 1 and off["node_crossovers"] == 0
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_node_crossover_in_the_search(batch_size):
+    mip = general_integer()
+    result = jm.solve(mip, node_crossover=True, batch_size=batch_size)
+    assert_solved(result, mip, reference(mip))
+    assert 0 < result["node_crossover_vertices"] <= result["node_crossovers"]
+    assert result["node_crossover_seconds"] > 0
+
+
+def test_node_crossover_every_and_failed_crossovers(monkeypatch):
+    mip = general_integer()
+    sparse = jm.solve(mip, node_crossover=True, node_crossover_every=1000)
+    assert_solved(sparse, mip, reference(mip))
+    assert sparse["node_crossovers"] <= 1  # only the node count 0 qualifies
+    # A crossover HiGHS cannot finish leaves the PDHG point in place.
+    monkeypatch.setattr(
+        jm.jl, "crossover", lambda lp, solution, highs_options=None: {"converged": False}
+    )
+    result = jm.solve(mip, node_crossover=True)
+    assert_solved(result, mip, reference(mip))
+    assert result["node_crossovers"] > 0 and result["node_crossover_vertices"] == 0
+
+
+@pytest.mark.parametrize(
+    "options", [dict(node_crossover_every=0), dict(node_crossover_seconds=0)]
+)
+def test_rejects_bad_node_crossover_options(options):
+    with pytest.raises(ValueError):
+        jm.solve(knapsack(), **options)
 
 
 # %% Repair
@@ -2634,3 +2838,64 @@ def test_infeasible_mip_is_still_infeasible_with_the_box_cutoff():
     )
     for batch_size in (1, 4):
         assert jm.solve(mip, batch_size=batch_size)["status"] == "infeasible"
+
+
+# %% Node LP options
+def test_node_lp_options_reach_node_lps_only(monkeypatch):
+    seen = {"node": [], "root": []}
+    solve_lp = jm._BranchAndBound.solve_lp
+    detect = jm._BranchAndBound.detect
+
+    def spy_solve_lp(self, lp, warm, max_epochs, **overrides):
+        seen["node"].append(dict(self.lp_kwargs, **overrides).get("iterations_per_epoch"))
+        return solve_lp(self, lp, warm, max_epochs, **overrides)
+
+    def spy_detect(self, lp, result, max_epochs):
+        seen["root"].append(self.lp_kwargs.get("iterations_per_epoch"))
+        return detect(self, lp, result, max_epochs)
+
+    monkeypatch.setattr(jm._BranchAndBound, "solve_lp", spy_solve_lp)
+    monkeypatch.setattr(jm._BranchAndBound, "detect", spy_detect)
+    mip = general_integer()
+    result = jm.solve(
+        mip, node_lp_options={"iterations_per_epoch": 64}, feasibility_pump=False,
+        gomory_cuts=False,
+    )
+    assert_solved(result, mip, reference(mip))
+    assert seen["node"] and all(value == 64 for value in seen["node"])
+    assert seen["root"] and all(value is None for value in seen["root"])
+
+
+def test_batched_node_lps_get_node_settings(monkeypatch):
+    import functools
+
+    calls = []
+    make_solver = jl.make_solver
+
+    @functools.wraps(make_solver)  # keeps the signature the check reads
+    def spy(build_lp, **kwargs):
+        calls.append(kwargs)
+        return make_solver(build_lp, **kwargs)
+
+    monkeypatch.setattr(jl, "make_solver", spy)
+    mip = general_integer()
+    result = jm.solve(
+        mip,
+        batch_size=4,
+        gomory_cuts=False,
+        lp_tolerance=1e-6,
+        node_lp_tolerance=3e-5,
+        node_lp_options={"iterations_per_epoch": 128},
+    )
+    assert_solved(result, mip, reference(mip))
+    assert calls
+    for kwargs in calls:
+        assert kwargs["iterations_per_epoch"] == 128
+        assert kwargs["primal_feasibility_tolerance"] == 3e-5
+
+
+def test_node_lp_options_are_checked():
+    with pytest.raises(ValueError, match="node_lp_options cannot set max_epochs"):
+        jm.solve(general_integer(), node_lp_options={"max_epochs": 5})
+    with pytest.raises(ValueError, match="not_an_option"):
+        jm.solve(general_integer(), batch_size=4, node_lp_options={"not_an_option": 1})
