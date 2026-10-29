@@ -4,6 +4,45 @@
 
 ### Added
 
+- Faster node LPs in batched search.
+  - **Continuous batching** (`batch_epochs=10`). A batched node LP runs at
+    most this many epochs per call. An unfinished one goes back to the
+    queue, warm-started, until `node_max_epochs` in all, so one slow member
+    no longer holds its batch: the share of member-epochs lost to lockstep
+    fell from 52% to about 30% on ns1830653.
+  - **Root-box cutoff.** No feasible point has `c·x` above the objective's
+    maximum over the root box, so the cutoff starts just above it (when
+    finite). Infeasible node LPs then stop on their bound before there is
+    an incumbent, where one used to run all 200 epochs and hold its batch
+    for 1.8 s. On ns1830653, 1,047 nodes stopped this way before the first
+    incumbent, and batches took 112 ms on average.
+  - Device time per node LP after an incumbent, `batch_size=16` before →
+    `batch_size=32` now: ~12 → ~6 ms. A batch of 32 costs little more than
+    one of 16 on a laptop GPU; 64 is no better per node.
+    `examples/mip/miplib.py` now batches 32. `batch_retries` is gone,
+    replaced by the epoch budget.
+- Early stopping for batched node LPs. `jl.make_solver(bound_stop=True)`'s
+  solve function takes a `bound_target`: a member stops (`stop_code` 4, not
+  converged) once its Lagrangian bound reaches the target, as
+  `solve(bound_target=...)` does. Under `vmap` the target can be one for the
+  batch or one per member. Batched tree search (`batch_size > 1`) passes
+  the node target, so `node_bound_stop` now works there too, and so does
+  strong branching's batch. Batched search also no longer builds a node LP
+  for every member (only for the rare `detect`), and puts unconverged
+  members back for another batch before a serial infeasibility solve. ns1830653, `batch_size=16`, GPU, 150 s: 8.1 → 27.9
+  nodes/s, with the device time per node down from ~92 ms to ~12 ms; the
+  host is now the larger share.
+- Device-side children for batched search (`children_backend="auto"`: on
+  above 10,000 nonzeros; `jm._ChildKernels`). The members of a batch are
+  split together. One jitted call builds both children of every member,
+  propagates them (`_propagate_jax`) and bounds them by the member's duals.
+  `branch()` then does only the conflict pool, pruning and the queue.
+  ns1830653, as above: 27.9 → 32.9 nodes/s, branching 8.4 → 2.7 ms a node,
+  bound after 150 s 13,619 → 14,463. Batching the tree's roundings into one
+  bulk rounding (`batch_roundings=True`) is opt-in: it took ~1 s a batch,
+  against ~55 ms a call for the classic fix-and-propagate.
+  `bulk_fix_and_propagate` takes `boxes=` (one per start), `pad_to=` and
+  `propagator=`.
 - Primal heuristics after cuOpt's GPU primal heuristics (Çördük et al.,
   2025).
   - **Root probing** (`probing=True`, `probing_seconds`,
@@ -14,7 +53,10 @@
     10,000 nonzeros, chunks of variables run in one vmapped JAX call.
     On misc07 it fixes 21 binaries, on p0201 6, and on fixnet6 it tightens
     483 bounds, each in under a second; it never changed the optimum on the
-    19 models checked.
+    19 models checked. It stops after `probing_max_useless=1000`
+    variables in a row that change nothing. On fiball, probing all
+    32,399 variables took 11 s for one tightened bound; it now stops
+    after 1,088 variables, in 0.9 s, with the same result.
   - **Bulk fix-and-propagate** (`bulk_rounding=True`, `bulk_starts=4`;
     `jm.bulk_fix_and_propagate`). It runs after the classic one at the root
     and in the pump, marked `"B"`. Bulks are √(free) variables in
@@ -27,6 +69,11 @@
     Each rounding the pump rejects gets a short feasibility jump, and a
     cycling pump continues from the jump's near miss. New result keys:
     `pump_jumps`, `pump_jump_finds`, `probing`.
+  - **`repair_share=0.2`.** `repair` of a near-feasible jump now gets at
+    most this share of the heuristic time left, instead of all of it. On
+    ns1830653 it used to take the whole budget, so the jump from the bounds
+    nearest zero never ran. Now that jump finds an incumbent (136,622) at
+    29 s of a 90 s heuristic budget, where before none was found.
   - `benchmarks/benchmark_primal.py` measures root-heuristic coverage and
     primal gap on MIPLIB 2017. It has not been run on the full set yet.
 - Reliability branching, opt-in (`branching="reliability"`,

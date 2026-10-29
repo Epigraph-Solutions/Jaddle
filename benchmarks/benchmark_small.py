@@ -154,9 +154,24 @@ def run_instance(name, path, args):
             batch_size=args.batch_size,
             tree_cuts=args.tree_cuts,
             max_cuts_per_round=1000,
-            feasibility_jump=False,
-            feasibility_pump=False,
-            fix_and_propagate=False,
+            # The settings of examples/mip/miplib.py. Precision stays float64:
+            # this script runs on the CPU, where float64 is as fast.
+            branching="pseudocost",
+            heuristic_every=5,
+            # Primal heuristics, after cuOpt's GPU heuristics. They stop at
+            # the first incumbent, so the budget is spent only on a miss.
+            heuristic_seconds=min(90.0, args.seconds),
+            probing=True,
+            fix_and_propagate=True,
+            bulk_rounding=True,
+            feasibility_jump=True,
+            feasibility_pump=True,
+            pump_jump_iterations=3000,
+            repair_share=0.2,
+            rens_seconds=10,
+            # RINS improves the incumbent in the tree.
+            rins_every=10,
+            heuristic_effort=0.3,
             lp_tolerance=1e-4,
             node_lp_tolerance=1e-4,
             device=None if args.device == "default" else args.device,

@@ -2900,6 +2900,7 @@ def make_solver(
     diag_adapt=True,
     diag_theta=0.5,
     diag_clamp=10.0,
+    bound_stop=False,
 ):
     """
     Build a pure-JAX solve function for a family of LPs.
@@ -2939,6 +2940,13 @@ def make_solver(
     which never comes on an infeasible LP: set a budget when that can happen.
     Batched members iterate in lockstep until the last one stops (finished
     members are frozen).
+
+    With ``bound_stop=True``, ``solve_fn(params, initial_solution=None,
+    bound_target=None)`` also stops once the Lagrangian bound of the reported
+    point reaches ``bound_target`` (as ``solve(bound_target=...)``;
+    ``stop_code`` 4, not converged; ``None`` never stops). It is traced, so
+    new targets reuse the jit, and under ``vmap`` it can be one value for the
+    batch or one per member.
     """
     k_lo, k_hi, adaptive_step, step_size, halpern = _check_settings(
         dual_residual,
@@ -2953,7 +2961,7 @@ def make_solver(
     float_dtype, compute_dtype = __profile_dtypes()
     n_epochs = _UNBOUNDED_EPOCHS if not max_epochs else int(max_epochs)
 
-    def solve_fn(params, initial_solution=None):
+    def solve_fn(params, initial_solution=None, bound_target=None):
         pattern, v = _build_padded(build_lp, params)
         n_eq = pattern.n_eq
         if scale:
@@ -3074,7 +3082,13 @@ def make_solver(
             diag_theta=diag_theta,
             diag_clamp=diag_clamp,
             adaptive_step=adaptive_step,
+            bound_stop=bool(bound_stop),
         )
+        if bound_stop and bound_target is not None:
+            carry = {
+                **carry,
+                "bound_target": jnp.asarray(bound_target, carry["bound_target"].dtype),
+            }
         carry = build_chunk(iterations_per_epoch)(carry, n_epochs)
 
         if report_best and average:
@@ -3095,7 +3109,8 @@ def make_solver(
         stop_code = carry["stop_code"]
         return SolveCoreResult(
             solution=output,
-            converged=stop_code > 0,
+            # A bound-target stop (4) is not convergence, as in ``solve()``.
+            converged=(stop_code > 0) & (stop_code != 4),
             stop_code=stop_code,
             epochs=carry["count"],
         )

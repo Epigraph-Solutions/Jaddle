@@ -2488,3 +2488,149 @@ def test_bulk_rounding_in_the_search():
         feasibility_jump=False, feasibility_pump=False,
     )
     assert off["x"] is None
+
+
+# %% Batched children and roundings on the device
+@pytest.mark.parametrize("make", [general_integer, facility_location, generalised_assignment])
+def test_child_kernels_match_the_host(make):
+    mip = make()
+    rng = np.random.default_rng(5)
+    propagator = jm.BoundPropagator(mip.A, mip.row_lower, mip.row_upper, mip.integrality)
+    size, n = 4, mip.num_variables
+    kernels = jm._ChildKernels(mip, True, 1e-9, size)
+    ints = np.flatnonzero(mip.integrality)
+    lower = np.tile(mip.lower, (size, 1))
+    upper = np.tile(mip.upper, (size, 1))
+    var = rng.choice(ints, size).astype(np.int32)
+    xv = np.array([rng.uniform(lower[i, j], min(upper[i, j], lower[i, j] + 3)) for i, j in enumerate(var)])
+    r = rng.standard_normal((size, n))
+    constant = rng.standard_normal(size)
+    out = kernels(lower, upper, var, xv, r, constant)
+    cont = ~mip.integrality
+    for i in range(size):
+        for side, down in enumerate((True, False)):
+            lo, up = lower[i].copy(), upper[i].copy()
+            if down:
+                up[var[i]] = min(up[var[i]], np.floor(xv[i]))
+            else:
+                lo[var[i]] = max(lo[var[i]], np.ceil(xv[i]))
+            crossed = lo[var[i]] > up[var[i]]
+            assert bool(out["crossed"][i, side]) == crossed
+            if crossed:
+                continue
+            new_lo, new_up, empty = propagator(lo, up)
+            assert bool(out["empty"][i, side]) == empty
+            if empty:
+                continue
+            np.testing.assert_allclose(out["lower"][i, side], new_lo, rtol=1e-9, atol=1e-9)
+            np.testing.assert_allclose(out["upper"][i, side], new_up, rtol=1e-9, atol=1e-9)
+            wlo = np.where(cont, new_lo - 1e-7 * (1 + np.abs(new_lo)), new_lo)
+            wup = np.where(cont, new_up + 1e-7 * (1 + np.abs(new_up)), new_up)
+            bound, rigorous = jm.box_bound(constant[i], r[i], wlo, wup, reduced_cost_tolerance=1e-9)
+            assert bool(out["rigorous"][i, side]) == rigorous
+            if np.isfinite(bound):
+                assert float(out["bound"][i, side]) == pytest.approx(bound, rel=1e-9, abs=1e-9)
+
+
+@pytest.mark.parametrize(
+    "make", [knapsack, general_integer, facility_location, generalised_assignment]
+)
+def test_batched_search_with_device_children(make):
+    mip = make()
+    result = jm.solve(mip, batch_size=4, gomory_cuts=False, children_backend="jax")
+    assert_solved(result, mip, reference(mip))
+    if make is general_integer:  # it always branches in batches
+        assert result["batched_children"] > 0
+
+
+def test_batched_tree_roundings():
+    mip = generalised_assignment(3)
+    result = jm.solve(
+        mip, batch_size=4, gomory_cuts=False, children_backend="jax", heuristic_every=1,
+        batch_roundings=True,
+    )
+    assert_solved(result, mip, reference(mip))
+    if result["batches"]:
+        assert result["batched_roundings"] > 0
+
+
+def test_children_backend_is_checked():
+    with pytest.raises(ValueError, match="children_backend"):
+        jm.solve(general_integer(), batch_size=4, children_backend="cuda")
+
+
+def test_bulk_fix_and_propagate_with_a_box_per_start():
+    mip = generalised_assignment(1)
+    x = np.asarray(jl.solve(mip.lp)["solution"].primal, np.float64)
+    boxes = []
+    for j in range(3):
+        lo, up = mip.lower.copy(), mip.upper.copy()
+        up[j] = 0.0  # each start forbids a different assignment
+        boxes.append((lo, up))
+    points = jm.bulk_fix_and_propagate(
+        [x] * 3, None, None, mip.integrality, mip.A, mip.row_lower, mip.row_upper,
+        boxes=boxes, pad_to=8,
+    )
+    assert len(points) == 3
+    for j, point in enumerate(points):
+        if point is not None:
+            assert mip.is_feasible(point) and point[j] == 0.0
+
+
+# %% Continuous batching and the root-box cutoff
+@pytest.mark.parametrize("make", [general_integer, facility_location, generalised_assignment])
+def test_continuous_batching_keeps_the_optimum(make):
+    # One epoch a call: almost every node LP goes back to the queue.
+    mip = make()
+    result = jm.solve(mip, batch_size=4, batch_epochs=1, gomory_cuts=False)
+    assert_solved(result, mip, reference(mip))
+    if make is general_integer:
+        assert result["batch_requeues"] > 0
+
+
+def test_batch_epochs_is_checked():
+    with pytest.raises(ValueError, match="batch_epochs"):
+        jm.solve(general_integer(), batch_size=4, batch_epochs=0)
+
+
+def test_box_cutoff_is_above_every_feasible_point():
+    for make in (knapsack, general_integer, generalised_assignment):
+        mip = make()
+        search = jm._BranchAndBound(mip, **jm_settings())
+        search.run()
+        ref = reference(mip)
+        assert np.isfinite(search.box_cutoff)
+        assert search.box_cutoff > mip.sign * ref - mip.offset
+
+
+def jm_settings():
+    import inspect
+    import time
+
+    defaults = {
+        key: value.default
+        for key, value in inspect.signature(jm.solve).parameters.items()
+        if value.default is not inspect.Parameter.empty
+    }
+    for key in ("max_seconds", "presolve", "highs_options", "precision"):
+        defaults.pop(key, None)
+    defaults.update(deadline=None, start=time.time())
+    return defaults
+
+
+def test_infeasible_mip_is_still_infeasible_with_the_box_cutoff():
+    # x1 + x2 = 1.5 over integers in [0, 3]: bounded, infeasible.
+    mip = jm.MIP(
+        jl.LP(
+            c=np.array([1.0, 2.0]),
+            A_eq=sp.csc_matrix(np.array([[1.0, 1.0]])),
+            b_eq=np.array([1.5]),
+            A_ineq=sp.csc_matrix((0, 2)),
+            b_ineq=np.zeros(0),
+            lower_bounds=np.zeros(2),
+            upper_bounds=np.full(2, 3.0),
+        ),
+        np.ones(2, bool),
+    )
+    for batch_size in (1, 4):
+        assert jm.solve(mip, batch_size=batch_size)["status"] == "infeasible"

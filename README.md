@@ -740,7 +740,9 @@ reports `bound_rigorous=False`.
 | `lp_tolerance`, `lp_options` | `1e-6`, `None` | The node LPs' relative tolerances, and any other `jl.solve` option. |
 | `node_max_epochs`, `root_max_epochs` | `200`, `None` | Epoch budgets for a node LP and the root LP. |
 | `node_lp_tolerance` | `None` | Tolerance for node LPs only (`None`: `lp_tolerance`). Experimental: looser node LPs are cheaper but give rougher branching and pseudocost data. |
-| `node_bound_stop` | `True` | Stop a node LP as soon as the Lagrangian bound of its duals closes the node against the cutoff (`jl.solve(bound_target=...)`); infeasible nodes stop within a few epochs. |
+| `node_bound_stop` | `True` | Stop a node LP as soon as the Lagrangian bound of its duals closes the node against the cutoff (`jl.solve(bound_target=...)`, and `jl.make_solver(bound_stop=True)` for each member of a batch); infeasible nodes stop within a few epochs. |
+| `batch_epochs` | `10` | Batched search: the most epochs a node LP runs in one batch call; an unfinished node goes back to the queue, warm-started, until `node_max_epochs` in all, so one slow member cannot hold its batch (`None`: `node_max_epochs`). |
+| `children_backend`, `batch_roundings` | `"auto"`, `False` | Batched search: split all members at once on the device (`"auto"`: above 10,000 nonzeros; `"jax"`, `"numpy"`), and round the batch's tree heuristics as one bulk rounding (opt-in: slower than the classic one per node on ns1830653). |
 | `heuristic_every` | `10` | Run rounding (then fix-and-propagate if it fails) every this many nodes (`0` = only on integral LP points). |
 | `fix_and_propagate`, `feasibility_jump`, `feasibility_pump` | `True`, `True`, `True` | The primal heuristics. |
 | `repair_max_epochs` | `20` | Epoch budget of the LP that repairs a rounded point's continuous variables (skipped for integers that already failed, or when propagation shows the fixed box infeasible). |
@@ -757,7 +759,8 @@ reports `bound_rigorous=False`.
 | `rins_solver`, `rins_nodes` | `"highs"`, `200` | Who searches the RENS and RINS sub-MIPs: `"highs"` (presolved by HiGHS, up to `rins_nodes` nodes, which adapts to success), `"jaddle"`, this branch and bound (reusing the compiled LP solver), or `"auto"` (Jaddle for MIPs with at most 10,000 nonzeros, HiGHS above). On lseu the Jaddle sub-searches take ~0.4s each against HiGHS's ~0.01s. |
 | `pump_iterations`, `pump_tolerance` | `30`, `1e-4` | The pump's LP solves and their tolerance. |
 | `pump_jump_iterations`, `pump_jump_share` | `3000`, `0.2` | Feasibility jump steps from each rounding the pump rejects (`0`: none), and the most of the pump's time the jumps may take. |
-| `probing`, `probing_seconds`, `probing_max_variables`, `probing_backend` | `True`, `None`, `None`, `"auto"` | Root probing; its budget (`None`: 5% of `max_seconds` up to 30 s, 10 s without one); the most variables probed; `"numpy"`, `"jax"` or `"auto"` (JAX above 10,000 nonzeros). |
+| `probing`, `probing_seconds`, `probing_max_variables`, `probing_backend`, `probing_max_useless` | `True`, `None`, `None`, `"auto"`, `1000` | Root probing; its budget (`None`: 5% of `max_seconds` up to 30 s, 10 s without one); the most variables probed; `"numpy"`, `"jax"` or `"auto"` (JAX above 10,000 nonzeros); stop after this many variables in a row change nothing (`None`: never). |
+| `repair_share` | `0.2` | The most of the heuristic time left that one `repair` of a near-feasible jump may take, so later heuristics still run. |
 | `bulk_rounding`, `bulk_starts` | `True`, `4` | Bulk fix-and-propagate at the root and in the pump, and how many starts run side by side. |
 | `heuristic_seconds` | `None` | Time for the root heuristics (`None`: 20% of `max_seconds`, or no time limit without one). |
 | `propagate` | `True` | Bound propagation at the root and at each child. |

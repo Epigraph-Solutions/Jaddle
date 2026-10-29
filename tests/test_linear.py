@@ -1660,3 +1660,32 @@ def test_bound_target_catches_an_infeasible_lp():
 def test_bound_target_needs_no_vertex_bias():
     with pytest.raises(ValueError, match="bound_target"):
         jl.solve(boxed_lp(), bound_target=0.0, vertex_bias=1e-6)
+
+
+def test_make_solver_bound_target_per_member():
+    # Batched: one member's target sits below its optimum (it stops, with a
+    # valid bound), the other's is infinite (it runs to the certificate).
+    lp = jl.to_jaddle_sparse(boxed_lp())
+    optimum = jl.solve(lp, **TIGHT)
+    z = float(np.asarray(lp.c) @ np.asarray(optimum["solution"].primal))
+    solve_fn = jl.make_solver(lp.with_values, max_epochs=2000, bound_stop=True, **TIGHT)
+    base = lp.values()
+    batch = jax.tree.map(lambda leaf: jnp.stack([leaf, leaf]), base)
+    targets = jnp.asarray([z - 0.05 * (1 + abs(z)), jnp.inf])
+    out = jax.jit(jax.vmap(solve_fn, in_axes=(0, None, 0)))(batch, None, targets)
+    codes = np.asarray(out.stop_code)
+    assert codes[0] == 4 and not bool(out.converged[0])
+    assert codes[1] == 1 and bool(out.converged[1])
+    assert int(out.epochs[0]) <= int(out.epochs[1])
+    stopped = jax.tree.map(lambda leaf: leaf[0], out.solution)
+    assert lagrangian_of(lp, stopped) >= float(targets[0]) - 1e-6 * (1 + abs(z))
+
+
+def test_make_solver_bound_target_off_by_default():
+    lp = jl.to_jaddle_sparse(boxed_lp(1))
+    plain = jax.jit(jl.make_solver(lp.with_values, **TIGHT))(lp.values())
+    stopping = jax.jit(jl.make_solver(lp.with_values, bound_stop=True, **TIGHT))(
+        lp.values(), None, jnp.inf
+    )
+    assert int(plain.stop_code) == int(stopping.stop_code) == 1
+    assert abs(int(plain.epochs) - int(stopping.epochs)) <= 1
