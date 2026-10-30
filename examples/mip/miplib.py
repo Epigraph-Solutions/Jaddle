@@ -25,7 +25,7 @@ import jaddle.jaddle_mip as jm
 # ## The instance
 
 # %%
-PROBLEM_NAME = "allcolor58"  # name of the MIPLIB problem (without .mps)
+PROBLEM_NAME = "academictimetablesmall"  # name of the MIPLIB problem (without .mps)
 PATH_TO_MPS = os.path.join(
     os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
 )
@@ -64,13 +64,17 @@ result = jm.solve(
     max_seconds=MAX_SECONDS,
     gomory_cuts=True,
     # Laptop GPUs run float64 at a small fraction of float32 speed.
-    precision="float32",
+    # The root LP and cut rounds run in float64; node LPs at node_precision.
+    precision="float64",
+    node_precision="float16",
     cut_round_epochs=10,
-    lp_tolerance=1e-3,
-    node_lp_tolerance=1e-3,
+    lp_tolerance=1e-8,
+    node_lp_tolerance=1e-2,
     # Any other jl.solve option for node LPs only (root and heuristic LPs
     # keep lp_options), e.g. check convergence every 64 iterations:
-    node_lp_options={"iterations_per_epoch": 64, "update_mode": "pdhg"},
+    node_lp_options={
+        "iterations_per_epoch": 64,
+    },
     max_cuts_per_round=1000,
     heuristic_every=5,
     # Primal heuristics, after cuOpt's GPU heuristics. On ns1830653 the
@@ -79,7 +83,9 @@ result = jm.solve(
     probing=True,  # root probing, batched in JAX on large models
     fix_and_propagate=False,  # classic fix-and-propagate, then...
     bulk_rounding=True,  # ...bulk fix-and-propagate from 4 starts at once
-    feasibility_jump=True,  # feasibility jump on the device
+    # Feasibility jump: incremental on the host with numba (jaddle[fast]),
+    # which then also spends leftover heuristic time improving the incumbent.
+    feasibility_jump=True,
     feasibility_pump=True,  # the pump, fused with short jumps
     pump_jump_iterations=3000,
     repair_share=0.2,  # cap repair so later jumps and the pump still run

@@ -931,28 +931,127 @@ def test_conflicts_off():
 
 
 # %% Feasibility jump
+NEEDS_NUMBA = pytest.mark.skipif(jm._numba_jump() is None, reason="needs numba")
+JUMP_BACKENDS = ["jax", pytest.param("numba", marks=NEEDS_NUMBA)]
+
+
+@pytest.mark.parametrize("backend", JUMP_BACKENDS)
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
-def test_feasibility_jump_assignment(seed):
+def test_feasibility_jump_assignment(seed, backend):
     mip = generalised_assignment(seed)
     for start in (np.zeros(mip.num_variables), lp_point(mip)):
-        x, feasible, steps = jm.feasibility_jump(mip, start)
+        x, feasible, steps = jm.feasibility_jump(mip, start, backend=backend)
         assert feasible and steps > 0
         assert mip.is_feasible(x)
         np.testing.assert_array_equal(x, np.round(x))
 
 
-def test_feasibility_jump_knapsack_and_mixed():
+@pytest.mark.parametrize("backend", JUMP_BACKENDS)
+def test_feasibility_jump_knapsack_and_mixed(backend):
     mip = knapsack()
-    x, feasible, _ = jm.feasibility_jump(mip, np.ones(mip.num_variables))
+    x, feasible, _ = jm.feasibility_jump(mip, np.ones(mip.num_variables), backend=backend)
     assert feasible and mip.is_feasible(x)
     # Facility location has continuous flows: the jump finds openings and
     # flows that meet every row.
     mip = facility_location()
-    x, feasible, _ = jm.feasibility_jump(mip, np.zeros(mip.num_variables))
+    x, feasible, _ = jm.feasibility_jump(mip, np.zeros(mip.num_variables), backend=backend)
     assert feasible and mip.is_feasible(x)
 
 
-def test_feasibility_jump_gives_up_on_infeasible():
+@NEEDS_NUMBA
+@pytest.mark.parametrize(
+    "make", [generalised_assignment, general_integer, facility_location, knapsack]
+)
+def test_numba_jump_scores_match_a_fresh_computation(make):
+    # Two-valued variables' scores are updated in place as rows change and
+    # weights grow; the rest are recomputed. Either way they must match a
+    # computation from scratch at the same point and weights.
+    from jaddle import _jump_numba
+
+    mip = make()
+    A, row_lower, row_upper, row_tol, _ = jm._jump_rows(mip, 1e-6)
+    C = A.tocsc()
+    rows = (A.indptr, A.indices, A.data, C.indptr, C.indices, C.data)
+    box = (row_lower, row_upper, row_tol, mip.lower, mip.upper, mip.integrality)
+    no_improve = (-1, 0.0, 0.0, np.empty(0))
+    x = np.clip(np.zeros(mip.num_variables), mip.lower, mip.upper)
+    w = np.ones(A.shape[0])
+    for moves in (1, 7, 50, 400):
+        done, feasible, target, score = _jump_numba.run(x, w, *rows, *box, moves, 3, *no_improve)
+        _, _, fresh_target, fresh_score = _jump_numba.run(
+            x.copy(), w.copy(), *rows, *box, 0, 3, *no_improve
+        )
+        # Equal up to rounding: continuous jump values come from activities
+        # updated in place, a few ulps from the fresh ones.
+        np.testing.assert_allclose(target, fresh_target, rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(score, fresh_score, rtol=1e-9, atol=1e-9)
+        if feasible:
+            break
+
+
+@NEEDS_NUMBA
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_improving_jump_finds_better_points(seed):
+    mip = generalised_assignment(seed)
+    first, feasible, _ = jm.feasibility_jump(mip, np.zeros(mip.num_variables), seed=seed)
+    assert feasible
+    x, feasible, _ = jm.feasibility_jump(
+        mip, np.zeros(mip.num_variables), seed=seed, improve=True, max_iterations=20_000
+    )
+    assert feasible and mip.is_feasible(x)
+    _, best = reference_point(mip)
+    assert best - 1e-6 <= mip.c @ x < mip.c @ first - 1e-6
+    # Below a cutoff: every point it returns meets it.
+    cutoff = 0.5 * (float(mip.c @ first) + best)
+    y, feasible, _ = jm.feasibility_jump(
+        mip, first, seed=seed, cutoff=cutoff, improve=True, max_iterations=20_000
+    )
+    assert feasible and mip.is_feasible(y)
+    assert mip.c @ y <= cutoff + 1e-6 * (1 + abs(cutoff))
+
+
+def test_improving_jump_needs_numba():
+    with pytest.raises(ValueError, match="improve"):
+        jm.feasibility_jump(knapsack(), np.zeros(15), improve=True, backend="jax")
+
+
+@NEEDS_NUMBA
+def test_root_improving_jump_in_the_search(monkeypatch):
+    calls = []
+    real = jm._BranchAndBound.improve_jump
+
+    def recorded(self, *args, **kwargs):
+        calls.append(self.incumbent[0])
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(jm._BranchAndBound, "improve_jump", recorded)
+    mip = generalised_assignment(2)
+    result = jm.solve(
+        mip, max_nodes=1, cuts=False, fix_and_propagate=False, bulk_rounding=False,
+        feasibility_pump=False, heuristic_seconds=2.0,
+    )
+    assert calls  # the jump's point, then the time left to improve on it
+    assert mip.is_feasible(result["x"])
+    assert result["objective"] <= mip.sign * (calls[0] + mip.offset) + 1e-9
+
+
+def test_jump_backend_is_checked():
+    with pytest.raises(ValueError, match="jump backend"):
+        jm.feasibility_jump(knapsack(), np.zeros(15), backend="cuda")
+    with pytest.raises(ValueError, match="jump backend"):
+        jm.solve(knapsack(), jump_backend="cuda")
+
+
+@NEEDS_NUMBA
+def test_numba_jump_takes_no_device_data():
+    mip = knapsack()
+    data = jm._jump_data(mip, mip.lower, mip.upper, 1e-6)
+    with pytest.raises(ValueError, match="device"):
+        jm.feasibility_jump(mip, np.zeros(15), data=data, backend="numba")
+
+
+@pytest.mark.parametrize("backend", JUMP_BACKENDS)
+def test_feasibility_jump_gives_up_on_infeasible(backend):
     n = 6
     lp = jl.LP(
         c=np.arange(n, dtype=float),
@@ -964,41 +1063,86 @@ def test_feasibility_jump_gives_up_on_infeasible():
         upper_bounds=np.ones(n),
     )
     _, feasible, steps = jm.feasibility_jump(
-        jm.MIP(lp, np.ones(n, bool)), np.zeros(n), max_iterations=2000
+        jm.MIP(lp, np.ones(n, bool)), np.zeros(n), max_iterations=2000, backend=backend
     )
     assert not feasible and steps == 2000
 
 
-def test_feasibility_jump_in_the_search():
+@pytest.mark.parametrize("backend", JUMP_BACKENDS)
+def test_feasibility_jump_in_the_search(backend):
     mip = generalised_assignment(2)
     result = jm.solve(
-        mip, max_nodes=1, cuts=False, fix_and_propagate=False, feasibility_pump=False
+        mip, max_nodes=1, cuts=False, fix_and_propagate=False, bulk_rounding=False,
+        feasibility_pump=False, jump_backend=backend,
     )
     assert result["x"] is not None and mip.is_feasible(result["x"])
     assert result["history"][0]["source"] == "J"
 
 
+@pytest.mark.parametrize("backend", JUMP_BACKENDS)
 @pytest.mark.parametrize("seed", [0, 1, 2])
-def test_feasibility_jump_with_a_cutoff_finds_only_better_points(seed):
+def test_feasibility_jump_with_a_cutoff_finds_only_better_points(seed, backend):
     mip = generalised_assignment(seed)
-    first, feasible, _ = jm.feasibility_jump(mip, np.zeros(mip.num_variables))
+    first, feasible, _ = jm.feasibility_jump(
+        mip, np.zeros(mip.num_variables), backend=backend
+    )
     assert feasible
     _, best = reference_point(mip)
     worst = float(mip.c @ first)
     assert worst > best + 1e-6  # the plain jump's point is not optimal
     cutoff = 0.5 * (worst + best)
-    x, feasible, _ = jm.feasibility_jump(mip, lp_point(mip), cutoff=cutoff)
+    x, feasible, _ = jm.feasibility_jump(mip, lp_point(mip), cutoff=cutoff, backend=backend)
     assert feasible and mip.is_feasible(x)
     assert mip.c @ x <= cutoff + 1e-6 * (1 + abs(cutoff))
 
 
-def test_feasibility_jump_gives_up_below_the_optimum():
+@pytest.mark.parametrize("backend", JUMP_BACKENDS)
+def test_feasibility_jump_gives_up_below_the_optimum(backend):
     mip = generalised_assignment(0)
     _, best = reference_point(mip)
     _, feasible, steps = jm.feasibility_jump(
-        mip, lp_point(mip), cutoff=best - 1e-2 * (1 + abs(best)), max_iterations=2000
+        mip, lp_point(mip), cutoff=best - 1e-2 * (1 + abs(best)), max_iterations=2000,
+        backend=backend,
     )
     assert not feasible and steps == 2000
+
+
+def test_root_bulk_rounding_runs_without_fix_and_propagate(monkeypatch):
+    # Bulk rounding used to run at the root only after the classic
+    # fix-and-propagate, so fix_and_propagate=False turned it off too.
+    calls = []
+    real = jm._BranchAndBound.bulk_round
+
+    def recorded(self, *args, **kwargs):
+        calls.append(1)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(jm._BranchAndBound, "bulk_round", recorded)
+    mip = generalised_assignment(2)
+    jm.solve(
+        mip, max_nodes=1, cuts=False, fix_and_propagate=False, feasibility_jump=False,
+        feasibility_pump=False,
+    )
+    assert calls
+
+
+def test_root_jump_starts_share_the_budget(monkeypatch):
+    # Each root jump start gets an equal share of the time left (one more
+    # share is kept for the pump), so the first cannot take all of it.
+    budgets = []
+
+    def recorded(self, start, lower, upper, warm, deadline, seed):
+        budgets.append(deadline - time.time())
+
+    monkeypatch.setattr(jm._BranchAndBound, "jump", recorded)
+    jm.solve(
+        generalised_assignment(2), max_nodes=1, cuts=False, fix_and_propagate=False,
+        bulk_rounding=False, feasibility_pump=True, pump_iterations=0,
+        heuristic_seconds=30.0,
+    )
+    assert len(budgets) == 2
+    assert 5.0 < budgets[0] < 10.5  # a third of 30 s
+    assert 14.0 < budgets[1] < 15.5  # half of the time left (the stub took none)
 
 
 def test_jump_data_with_a_moved_cutoff_matches_a_fresh_build():
@@ -1008,7 +1152,7 @@ def test_jump_data_with_a_moved_cutoff_matches_a_fresh_build():
     old = jm._jump_data(mip, mip.lower, mip.upper, 1e-6, cutoff=best + 100.0)
     moved = jm._jump_with(old, mip.lower, mip.upper, cutoff=best + 1.0)
     reused = jm.feasibility_jump(mip, start, cutoff=best + 1.0, data=moved, seed=3)
-    fresh = jm.feasibility_jump(mip, start, cutoff=best + 1.0, seed=3)
+    fresh = jm.feasibility_jump(mip, start, cutoff=best + 1.0, seed=3, backend="jax")
     np.testing.assert_array_equal(reused[0], fresh[0])
     assert reused[1:] == fresh[1:]
 
@@ -1303,7 +1447,7 @@ def test_root_rens_with_highs_finds_the_first_incumbent(make):
     mip = make()
     result = jm.solve(
         mip, gomory_cuts=True, feasibility_jump=False, fix_and_propagate=False,
-        feasibility_pump=False,
+        feasibility_pump=False, bulk_rounding=False,
     )
     assert_solved(result, mip, reference(mip))
     assert result["history"][0]["source"] == "E"  # RENS
@@ -2352,6 +2496,59 @@ def test_per_call_precision(make):
     assert jax.config.jax_enable_x64 and mip.lp.c.dtype == jnp.float64
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"batch_size": 4},
+        {"branching": "reliability"},
+        {"branching": "reliability", "strong_backend": "numpy"},
+        {"tree_cuts": True},
+    ],
+)
+def test_node_precision(monkeypatch, options):
+    seen = {"node": set(), "root": set()}
+    solve_lp = jm._BranchAndBound.solve_lp
+    detect = jm._BranchAndBound.detect
+
+    def spy_solve_lp(self, lp, warm, max_epochs, **overrides):
+        if "precision" in overrides:
+            seen["node"].add(str(lp.c.dtype))
+        return solve_lp(self, lp, warm, max_epochs, **overrides)
+
+    def spy_detect(self, lp, result, max_epochs):
+        seen["root"].add(str(lp.c.dtype))
+        return detect(self, lp, result, max_epochs)
+
+    monkeypatch.setattr(jm._BranchAndBound, "solve_lp", spy_solve_lp)
+    monkeypatch.setattr(jm._BranchAndBound, "detect", spy_detect)
+    mip = general_integer()
+    result = jm.solve(mip, precision="float64", node_precision="float32", **options)
+    assert_solved(result, mip, reference(mip))
+    assert seen["root"] == {"float64"}
+    if options.get("batch_size", 1) == 1:  # serial node LPs go through solve_lp
+        assert seen["node"] == {"float32"}
+
+
+def test_node_precision_above_the_search_precision():
+    import jax.numpy as jnp
+
+    mip = general_integer()
+    result = jm.solve(mip, precision="float32", node_precision="float64", batch_size=4)
+    assert_solved(result, mip, reference(mip))
+    assert mip.lp.c.dtype == jnp.float64
+
+
+def test_node_precision_through_node_lp_options():
+    mip = general_integer()
+    result = jm.solve(mip, node_lp_options={"precision": "float32"}, batch_size=4)
+    assert_solved(result, mip, reference(mip))
+    with pytest.raises(ValueError, match="disagree"):
+        jm.solve(mip, node_precision="float16", node_lp_options={"precision": "float32"})
+    with pytest.raises(ValueError, match="float8"):
+        jm.solve(mip, node_precision="float8")
+
+
 def test_lp_options_cannot_set_device_or_precision():
     for key, value in (("device", "cpu"), ("precision", "float32")):
         with pytest.raises(ValueError, match=key):
@@ -2392,6 +2589,7 @@ def no_heuristics():
         cuts=False,
         heuristic_every=0,
         fix_and_propagate=False,
+        bulk_rounding=False,
         feasibility_jump=False,
         feasibility_pump=False,
         rens_seconds=0.0,
@@ -2921,3 +3119,16 @@ def test_node_lp_options_are_checked():
         jm.solve(general_integer(), node_lp_options={"max_epochs": 5})
     with pytest.raises(ValueError, match="not_an_option"):
         jm.solve(general_integer(), batch_size=4, node_lp_options={"not_an_option": 1})
+
+
+@NEEDS_NUMBA
+def test_numba_jump_is_deterministic():
+    # Chunk sizes follow a fixed schedule, so a run depends only on its inputs.
+    mip = generalised_assignment(1)
+    start = np.zeros(mip.num_variables)
+    runs = [
+        jm.feasibility_jump(mip, start, seed=4, improve=True, max_iterations=50_000)
+        for _ in range(2)
+    ]
+    np.testing.assert_array_equal(runs[0][0], runs[1][0])
+    assert runs[0][1:] == runs[1][1:]

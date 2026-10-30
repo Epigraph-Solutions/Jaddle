@@ -3466,27 +3466,39 @@ def _jump_chunk(data, x, weights, key, iterations):
     return x, weights, key, steps, feasible
 
 
-def _jump_data(mip, lower, upper, tol, cutoff=None):
-    """The device arrays ``_jump_chunk`` reads: the MIP's rows (as given, no
-    cuts) scaled to unit ∞-norm, with a per-row tolerance matching
-    ``MIP.violation``'s, and the box. With a ``cutoff``, the row
-    ``c·x <= cutoff`` (its nonzero ``c`` entries) is appended last, so a
-    point meets every row only when it also improves on the cutoff."""
+def _jump_rows(mip, tol, cutoff=None):
+    """The rows the jump works on: the MIP's (as given, no cuts) scaled to
+    unit ∞-norm, with a per-row tolerance matching ``MIP.violation``'s. With
+    a ``cutoff``, the row ``c·x <= cutoff`` (its nonzero ``c`` entries) is
+    appended last, so a point meets every row only when it also improves on
+    the cutoff. Returns ``(A, row_lower, row_upper, row_tol, scale)``, all
+    scaled, with ``A`` in CSR."""
     A = sp.csr_matrix(mip.A)
     row_lower, row_upper = mip.row_lower, mip.row_upper
-    exclusive = np.ones(A.shape[0], dtype=bool)
     if cutoff is not None:
         A = sp.vstack([A, sp.csr_matrix(np.asarray(mip.c, np.float64)[None, :])], format="csr")
         A.eliminate_zeros()
         row_lower = np.append(row_lower, -np.inf)
         row_upper = np.append(row_upper, cutoff)
-        exclusive = np.append(exclusive, False)
-    dtype = mip.lp.c.dtype
     scale = np.abs(A).max(axis=1).toarray().ravel()
     scale = np.where(scale > 0, scale, 1.0)
     row_tol = 0.5 * tol * (1.0 + np.abs(mip.b).max(initial=0.0)) / scale
     if cutoff is not None:
-        row_tol[-1] = 0.5 * tol * (1.0 + abs(cutoff)) / scale[-1]
+        size = abs(cutoff) if np.isfinite(cutoff) else 0.0
+        row_tol[-1] = 0.5 * tol * (1.0 + size) / scale[-1]
+    A = sp.csr_matrix(A, dtype=np.float64, copy=True)
+    A.data = A.data / np.repeat(scale, np.diff(A.indptr))
+    return A, row_lower / scale, row_upper / scale, row_tol, scale
+
+
+def _jump_data(mip, lower, upper, tol, cutoff=None):
+    """The device arrays ``_jump_chunk`` reads: the rows of ``_jump_rows``
+    as COO entries, and the box."""
+    A, row_lower, row_upper, row_tol, scale = _jump_rows(mip, tol, cutoff)
+    exclusive = np.ones(A.shape[0], dtype=bool)
+    if cutoff is not None:
+        exclusive[-1] = False
+    dtype = mip.lp.c.dtype
     A = A.tocoo()
 
     def put(v):
@@ -3495,9 +3507,9 @@ def _jump_data(mip, lower, upper, tol, cutoff=None):
     return dict(
         rows=jax.device_put(A.row.astype(np.int32)),
         cols=jax.device_put(A.col.astype(np.int32)),
-        a=put(A.data / scale[A.row]),
-        row_lower=put(row_lower / scale),
-        row_upper=put(row_upper / scale),
+        a=put(A.data),
+        row_lower=put(row_lower),
+        row_upper=put(row_upper),
         lower=put(lower),
         upper=put(upper),
         is_int=jax.device_put(mip.integrality),
@@ -3526,6 +3538,102 @@ def _jump_with(data, lower, upper, cutoff=None):
     return new
 
 
+@functools.lru_cache(maxsize=None)
+def _numba_jump():
+    """``jaddle._jump_numba``, or ``None`` without numba."""
+    try:
+        from jaddle import _jump_numba
+    except ImportError:
+        return None
+    return _jump_numba
+
+
+def _jump_backend(backend, data=None):
+    """The feasibility jump backend for ``backend`` (``"auto"``, ``"numba"``
+    or ``"jax"``); device ``data`` means JAX."""
+    if backend not in ("auto", "numba", "jax"):
+        raise ValueError(f"jump backend must be 'auto', 'numba' or 'jax', not {backend!r}")
+    if backend == "auto":
+        return "jax" if data is not None or _numba_jump() is None else "numba"
+    if backend == "numba":
+        if data is not None:
+            raise ValueError("data (device arrays) is for the jax jump backend")
+        if _numba_jump() is None:
+            raise ImportError("the numba jump backend needs numba: pip install jaddle[fast]")
+    return backend
+
+
+_JUMP_CHUNK_MAX = 100_000  # moves per call of the numba jump
+
+
+def _feasibility_jump_host(
+    mip, x, lower, upper, tol, max_iterations, deadline, seed, cutoff,
+    improve=False, improve_step=None,
+):
+    """``feasibility_jump`` with the numba backend (``x`` already rounded
+    into the box). Runs in chunks of 1,000 moves, doubling up to
+    ``_JUMP_CHUNK_MAX`` (about 0.2 s on academictimetablesmall), with the
+    deadline checked between them; each chunk recomputes the activities, which
+    keeps rounding error from building up. With ``improve``, the search goes
+    on after each point it finds, for better ones (see ``feasibility_jump``),
+    and returns the best."""
+    fj = _numba_jump()
+    if improve and cutoff is None:
+        cutoff = np.inf  # an objective row to tighten once a point is found
+    A, row_lower, row_upper, row_tol, scale = _jump_rows(mip, tol, cutoff)
+    C = A.tocsc()
+    x = np.array(x, np.float64)
+    w = np.ones(A.shape[0])
+    lower = np.asarray(lower, np.float64)
+    upper = np.asarray(upper, np.float64)
+    is_int = np.asarray(mip.integrality, bool)
+    if improve:
+        # Each better point must improve by the objective step (objectives
+        # that are multiples of one), else by 1e-4 relative.
+        step = objective_step(mip.c, mip.integrality) if improve_step is None else improve_step
+        improvement = (
+            A.shape[0] - 1,
+            0.0 if step is None else float(step) / scale[-1],
+            1e-4 if step is None else 0.0,
+            np.empty_like(x),
+        )
+    else:
+        improvement = (-1, 0.0, 0.0, np.empty(0))
+    steps, size, chunk = 0, 1000, 0
+    best, best_count = x.copy(), np.inf
+    found_x = None
+    while steps < max_iterations:
+        if deadline is not None and time.time() >= deadline:
+            break
+        size = int(min(size, max_iterations - steps))
+        moves, found, _, _ = fj.run(
+            x, w,
+            A.indptr, A.indices, A.data, C.indptr, C.indices, C.data,
+            row_lower, row_upper, row_tol, lower, upper, is_int,
+            size, (seed * 1_000_003 + chunk) % 2**32,
+            *improvement,
+        )
+        steps += int(moves)
+        if found:
+            if not improve:
+                return x, True, steps
+            found_x = improvement[3].copy()
+            if moves < size:
+                break  # no better point can exist within the row's tolerance
+        elif found_x is None:
+            # Keep the near-miss with the fewest violated rows, for ``repair``.
+            count = _violated_rows(mip, x, tol).size
+            if count < best_count:
+                best, best_count = x.copy(), count
+        # A fixed schedule, not one timed to the clock, so a run depends
+        # only on its inputs (unless the deadline cuts it short).
+        size = min(2 * size, _JUMP_CHUNK_MAX)
+        chunk += 1
+    if found_x is not None:
+        return found_x, True, steps
+    return best, False, steps
+
+
 def feasibility_jump(
     mip,
     x0,
@@ -3538,10 +3646,36 @@ def feasibility_jump(
     chunk=1000,
     cutoff=None,
     data=None,
+    backend="auto",
+    improve=False,
+    improve_step=None,
 ):
     """
     Feasibility Jump (Luteberget & Sartor, 2023): an LP-free local search
     for a point that meets ``mip``'s rows, from ``x0``.
+
+    ``backend``: ``"numba"`` runs the incremental jump on the host
+    (``jaddle._jump_numba``; needs numba, ``pip install jaddle[fast]``). It
+    moves one variable a step and updates only what that variable's rows
+    touch, as HiGHS does, so a step costs the nonzeros of those rows. On
+    academictimetablesmall that is about 555 nonzeros of 230,000.
+    ``"jax"`` is the device version described below, where every step is
+    a few passes (and a sort) over all the nonzeros. ``"auto"`` (default)
+    picks numba when it is installed and ``data`` is not given. Under numba
+    ``steps`` counts single moves; under JAX each step may move many
+    variables.
+
+    ``improve`` (numba only): after each point it finds, the search asks
+    for a better one. The objective row ``c·x <= cutoff`` (added when
+    there is no ``cutoff``) drops below that point's objective by
+    ``improve_step`` (``None``: the objective step when objective values
+    are multiples of one, else 1e-4 relative). The moves then go on with
+    the weights as they are, until ``max_iterations`` or ``deadline``. It
+    returns the best point found. On academictimetablesmall, a loop of
+    separate cutoff jumps took the objective from 4,623 to 282 in 27 s,
+    mostly in rebuilding the rows each call; this does it within one call.
+
+    The device version:
 
     Each step looks, for every variable in a violated row, at the value that
     satisfies its most heavily weighted violated row exactly (integers
@@ -3565,11 +3699,22 @@ def feasibility_jump(
     lower = mip.lower if lower is None else np.asarray(lower, np.float64)
     upper = mip.upper if upper is None else np.asarray(upper, np.float64)
     n, m = mip.num_variables, mip.A.shape[0]
+    backend = _jump_backend(backend, data)
     if max_iterations is None:
-        max_iterations = max(10_000, 20 * (n + m))
+        if backend == "numba":
+            max_iterations = max(100_000, 50 * (n + m))  # single moves
+        else:
+            max_iterations = max(10_000, 20 * (n + m))
     x = np.clip(np.asarray(x0, np.float64), lower, upper)
     ints = mip.integrality
     x[ints] = np.clip(np.round(x[ints]), lower[ints], upper[ints])
+    if backend == "numba":
+        return _feasibility_jump_host(
+            mip, x, lower, upper, tol, max_iterations, deadline, seed, cutoff,
+            improve, improve_step,
+        )
+    if improve:
+        raise ValueError("improve needs the numba jump backend")
     if data is None:
         data = _jump_data(mip, lower, upper, tol, cutoff)
     m = data["row_lower"].shape[0]  # with the objective row, if any
@@ -3798,6 +3943,14 @@ def _propagation_search(propagator, hint, lower, upper, ints, free, budget, dead
 _SMALL_MIP_NNZ = 10_000
 
 
+def _numba_short_jump(mip):
+    """The default moves of the pump's and the tree's short jumps with the
+    numba backend: ``5·(n + m)``, at least 10,000. About 200,000 moves (half
+    a second) on academictimetablesmall, and milliseconds on small MIPs,
+    where a failing jump (one with an unreachable cutoff) must stay cheap."""
+    return max(10_000, 5 * (mip.num_variables + mip.A.shape[0]))
+
+
 def _search_device(device, nnz):
     """The JAX device for the search (``None``: JAX's default)."""
     if isinstance(device, str) and device == "auto":
@@ -3809,6 +3962,19 @@ def _search_device(device, nnz):
 
 # %%
 # Branch and bound
+def _cast_warm(warm, dtype):
+    """A warm start ``(solution, opt_state)`` with its float arrays in
+    ``dtype``, so an LP at one precision can start from another's point."""
+
+    def cast(leaf):
+        leaf = jnp.asarray(leaf)
+        if jnp.issubdtype(leaf.dtype, jnp.floating) and leaf.dtype != dtype:
+            return leaf.astype(dtype)
+        return leaf
+
+    return jax.tree.map(cast, warm)
+
+
 def _raw_of(child):
     """A strong child's unrounded bound."""
     return child.bound if child.raw is None else child.raw
@@ -3935,7 +4101,7 @@ class _BranchAndBound:
         strong_max_depth=None,
         strong_screen=32,
         strong_backend="jax",
-        pump_jump_iterations=3000,
+        pump_jump_iterations=None,
         pump_jump_share=0.2,
         probing=True,
         probing_seconds=None,
@@ -3952,10 +4118,12 @@ class _BranchAndBound:
         tree_heuristics=False,
         tree_heuristic_every=20,
         tree_heuristic_share=0.05,
-        tree_jump_iterations=3000,
+        tree_jump_iterations=None,
         node_crossover=False,
         node_crossover_every=1,
         node_crossover_seconds=2.0,
+        node_precision=None,
+        jump_backend="auto",
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
         self.settings = {
@@ -4007,9 +4175,22 @@ class _BranchAndBound:
         if reserved:
             raise ValueError(f"lp_options cannot set {', '.join(reserved)}")
         node_lp_options = dict(node_lp_options or {})
+        # ``node_lp_options["precision"]`` is another way to set ``node_precision``.
+        if "precision" in node_lp_options:
+            option = node_lp_options.pop("precision")
+            if node_precision is not None and option != node_precision:
+                raise ValueError(
+                    f"node_precision={node_precision!r} and "
+                    f"node_lp_options['precision']={option!r} disagree"
+                )
+            node_precision = option
         reserved = [key for key in _LP_RESERVED if key in node_lp_options]
         if reserved:
             raise ValueError(f"node_lp_options cannot set {', '.join(reserved)}")
+        # The precision profile of node LPs (``None``: the search's own).
+        self.node_precision = (
+            None if node_precision is None else jo._active_profile(node_precision)
+        )
 
         self.original = mip  # the MIP as given: incumbents are checked on it
         self.device = _search_device(device, mip.A.nnz)
@@ -4065,6 +4246,15 @@ class _BranchAndBound:
         self.root_bound_before_cuts = None
         self.use_fix_and_propagate = fix_and_propagate
         self.use_jump, self.jump_iterations = feasibility_jump, jump_iterations
+        # ``"numba"`` (the incremental host jump) or ``"jax"`` (the device
+        # one). A numba step is one move, so the short jumps of the pump and
+        # the tree get ``_numba_short_jump`` of them by default (``None``).
+        self.jump_backend = _jump_backend(jump_backend)
+        numba = self.jump_backend == "numba"
+        if pump_jump_iterations is None:
+            pump_jump_iterations = _numba_short_jump(mip) if numba else 3000
+        if tree_jump_iterations is None:
+            tree_jump_iterations = _numba_short_jump(mip) if numba else 3000
         self.use_repair = repair
         if not 0.0 <= float(repair_share) <= 1.0:
             raise ValueError(f"repair_share must be in [0, 1], not {repair_share!r}")
@@ -4220,6 +4410,8 @@ class _BranchAndBound:
         )
         self.node_lp_options = node_lp_options
         self.node_lp_kwargs.update(node_lp_options)
+        if self.node_precision is not None:
+            self.node_lp_kwargs["precision"] = self.node_precision
         self.reduced_cost_tol = lp_tolerance * (1.0 + np.linalg.norm(mip.c))
 
         self.is_int = mip.integrality
@@ -4284,6 +4476,14 @@ class _BranchAndBound:
         self.m_ineq = mip.A.shape[0] - mip.n_eq
         self.values = mip.lp.values()
         self.dtype = mip.lp.c.dtype
+        # The LP at the node LPs' precision (``node_precision``), cast once.
+        if self.node_precision is None:
+            self.node_dtype, self.node_mip_lp = self.dtype, mip.lp
+        else:
+            with self.node_settings():
+                self.node_dtype = _wide(jo.jaddle_dtype())
+                self.node_mip_lp = jl._cast_lp(mip.lp, self.node_dtype)
+        self.node_values = self.node_mip_lp.values()
         # The heuristics propagate even when the search does not.
         self.row_propagator = BoundPropagator(
             mip.A, mip.row_lower, mip.row_upper, self.is_int
@@ -4452,21 +4652,40 @@ class _BranchAndBound:
         )
 
     # -- LP solves -----------------------------------------------------------
+    def node_settings(self):
+        """The precision context of node LPs (``node_precision``)."""
+        return jo.local_settings(precision=self.node_precision)
+
     def node_lp(self, lower, upper):
+        """The LP over a box, at the search's precision (root, cut rounds,
+        heuristics, infeasibility checks)."""
+        return self._box_lp(self.mip.lp, self.values, self.dtype, lower, upper)
+
+    def tree_lp(self, lower, upper):
+        """The LP over a box, at the node LPs' precision (``node_precision``)."""
+        with self.node_settings():
+            return self._box_lp(
+                self.node_mip_lp, self.node_values, self.node_dtype, lower, upper
+            )
+
+    def _box_lp(self, lp, values, dtype, lower, upper):
         # Integer tightenings go into the LP; continuous ones only into the
         # Lagrangian bound, so rounding error in them cannot cut off the LP.
         lp_lower = np.where(self.is_int, lower, self.mip.lower)
         lp_upper = np.where(self.is_int, upper, self.mip.upper)
-        return self.mip.lp.with_values(
-            self.values._replace(
-                lower_bounds=jnp.asarray(lp_lower, self.dtype),
-                upper_bounds=jnp.asarray(lp_upper, self.dtype),
+        return lp.with_values(
+            values._replace(
+                lower_bounds=jnp.asarray(lp_lower, dtype),
+                upper_bounds=jnp.asarray(lp_upper, dtype),
             )
         )
 
     def solve_lp(self, lp, warm, max_epochs, **overrides):
         kwargs = dict(self.lp_kwargs, **overrides)
         if warm is not None:
+            # A warm start from an LP at another precision (root or node).
+            with jo.local_settings(precision=kwargs.get("precision")):
+                warm = _cast_warm(warm, _wide(lp.c.dtype))
             kwargs.update(initial_solution=warm[0], initial_opt_state=warm[1])
         result = jl.solve(
             lp, max_epochs=max_epochs, max_seconds=self.seconds_left(), **kwargs
@@ -4474,15 +4693,30 @@ class _BranchAndBound:
         self.lp_epochs += result["epochs"]
         return result
 
+    def solve_node_lp(self, lower, upper, warm, max_epochs):
+        """A node's LP over its box, at ``node_precision`` with the node
+        options (``node_lp_tolerance``, ``node_lp_options``) and, with
+        ``node_bound_stop``, the bound target."""
+        target = self.node_bound_target()
+        return self.solve_lp(
+            self.tree_lp(lower, upper), warm, max_epochs, **self.node_lp_kwargs,
+            **({} if target is None else {"bound_target": target}),
+        )
+
     def detect(self, lp, result, max_epochs):
         """``detect_infeasibility`` warm-started from a solve's last point."""
+        warm = (None, None)
+        if result is not None:
+            warm = _cast_warm(
+                (result["solution"], result["opt_state"]), _wide(lp.c.dtype)
+            )
         out = jl.detect_infeasibility(
             lp,
             tol=self.infeas_tol,
             max_epochs=max_epochs,
             max_seconds=self.seconds_left(),
-            initial_solution=None if result is None else result["solution"],
-            initial_opt_state=None if result is None else result["opt_state"],
+            initial_solution=warm[0],
+            initial_opt_state=warm[1],
             **self.lp_kwargs,
         )
         self.lp_epochs += out["epochs"]
@@ -4956,7 +5190,7 @@ class _BranchAndBound:
                 self.reduced_cost_tol,
                 screen,
                 self.strong_candidates,
-                self.dtype,
+                self.node_dtype,
             )
             self._strong_kernels = (self.mip, kernels)
         return self._strong_kernels[1]
@@ -5007,13 +5241,15 @@ class _BranchAndBound:
             np.float64(raw if np.isfinite(raw) else -1e300),
             np.float64(self.cutoff()),
         )
-        values = self.values._replace(
+        values = self.node_values._replace(
             lower_bounds=screened["lp_lower"], upper_bounds=screened["lp_upper"]
         )
         width = 2 * kernels.k
-        warm_starts = jax.tree.map(
-            lambda leaf: jnp.broadcast_to(leaf, (width,) + jnp.shape(leaf)), warm[0]
-        )
+        with self.node_settings():
+            warm_starts = jax.tree.map(
+                lambda leaf: jnp.broadcast_to(leaf, (width,) + jnp.shape(leaf)),
+                _cast_warm(warm[0], self.node_dtype),
+            )
         out = self.batched_solver(self.strong_epochs)(
             values, warm_starts, *self.bound_target_arg()
         )
@@ -5189,19 +5425,9 @@ class _BranchAndBound:
         if not boxes:
             return []
         if self.use_tree_cuts:
-            target = self.node_bound_target()
-            results = []
-            for lo, up in boxes:
-                results.append(
-                    self.solve_lp(
-                        self.node_lp(lo, up),
-                        warm,
-                        self.strong_epochs,
-                        **self.node_lp_kwargs,
-                        **({} if target is None else {"bound_target": target}),
-                    )
-                )
-            return results
+            return [
+                self.solve_node_lp(lo, up, warm, self.strong_epochs) for lo, up in boxes
+            ]
         # One batch shape for the whole search, so one compile.
         size = max(_next_power_of_two(2 * self.strong_candidates), len(boxes))
         results = self.solve_batch(
@@ -5356,7 +5582,7 @@ class _BranchAndBound:
             return
         if not result["converged"] and bound < self.cutoff() and not self.out_of_time():
             # An LP that will not converge is often infeasible.
-            if lp is None:  # batched search builds the LP only when needed
+            if lp is None:  # built only when needed
                 lp = self.node_lp(lower, upper)
             detection = self.detect(lp, result, self.node_max_epochs)
             if detection["status"] == "primal_infeasible":
@@ -6103,6 +6329,7 @@ class _BranchAndBound:
                     max_iterations=self.pump_jump_iterations,
                     deadline=None if not np.isfinite(deadline) else deadline,
                     seed=iteration,
+                    backend=self.jump_backend,
                 )
                 jump_seconds += time.time() - jumped
                 self.pump_jumps += 1
@@ -6136,13 +6363,16 @@ class _BranchAndBound:
 
             # Close to integral: let propagation finish the rounding.
             distance = np.abs(x - np.round(x))[ints].sum()
-            if self.use_fix_and_propagate and distance < 0.9 * best_distance:
+            if (
+                self.use_fix_and_propagate or self.use_bulk_rounding
+            ) and distance < 0.9 * best_distance:
                 best_distance = distance
-                candidate = fix_and_propagate(
-                    x, lower, upper, ints, self.row_propagator
-                )
-                if candidate is not None and self.try_incumbent(candidate, "F", warm):
-                    return True
+                if self.use_fix_and_propagate:
+                    candidate = fix_and_propagate(
+                        x, lower, upper, ints, self.row_propagator
+                    )
+                    if candidate is not None and self.try_incumbent(candidate, "F", warm):
+                        return True
                 if self.use_bulk_rounding:
                     for point in self.bulk_round(
                         [x] * self.bulk_starts, lower, upper, deadline, seed=iteration
@@ -6468,11 +6698,13 @@ class _BranchAndBound:
                         self.try_incumbent(point, "B", warm)
             if self.use_jump and self.incumbent[0] >= before and not self.out_of_time():
                 lo, up = self.root_lower, self.root_upper
-                if self._tree_jump_data is None:
-                    self._tree_jump_data = _jump_data(
-                        self.base, lo, up, self.feas_tol, cutoff
-                    )
-                data = _jump_with(self._tree_jump_data, lo, up, cutoff)
+                data = None  # the numba jump builds its rows each call (cheap)
+                if self.jump_backend == "jax":
+                    if self._tree_jump_data is None:
+                        self._tree_jump_data = _jump_data(
+                            self.base, lo, up, self.feas_tol, cutoff
+                        )
+                    data = _jump_with(self._tree_jump_data, lo, up, cutoff)
                 point, feasible, _ = feasibility_jump(
                     self.base,
                     x,
@@ -6484,6 +6716,10 @@ class _BranchAndBound:
                     seed=self.tree_heuristic_calls,
                     cutoff=cutoff,
                     data=data,
+                    backend=self.jump_backend,
+                    # With numba, it goes on below each point it finds.
+                    improve=self.jump_backend == "numba",
+                    improve_step=self.objective_step,
                 )
                 if feasible:
                     self.try_incumbent(point, "J", warm)
@@ -6493,6 +6729,31 @@ class _BranchAndBound:
             elapsed = time.time() - started
             self.tree_heuristic_seconds += elapsed
             self.heuristic_seconds += elapsed
+
+    def improve_jump(self, start, lower, upper, warm, deadline, seed):
+        """``feasibility_jump`` with ``improve`` (numba) from ``start``, below
+        the cutoff, until ``deadline``; its best point goes through
+        ``try_incumbent``. With a finite deadline and no ``jump_iterations``,
+        only the deadline stops it: it keeps finding better points."""
+        limit = self.jump_iterations
+        if limit is None and np.isfinite(deadline):
+            limit = np.iinfo(np.int64).max
+        x, feasible, _ = feasibility_jump(
+            self.base,
+            start,
+            lower,
+            upper,
+            tol=self.feas_tol,
+            max_iterations=limit,
+            deadline=None if not np.isfinite(deadline) else deadline,
+            seed=seed,
+            cutoff=self.cutoff(box=False),
+            backend="numba",
+            improve=True,
+            improve_step=self.objective_step,
+        )
+        if feasible:
+            self.try_incumbent(x, "J", warm)
 
     def jump(self, start, lower, upper, warm, deadline, seed):
         """``feasibility_jump`` on the MIP as given from ``start``; a point it
@@ -6507,6 +6768,7 @@ class _BranchAndBound:
             max_iterations=self.jump_iterations,
             deadline=None if not np.isfinite(deadline) else deadline,
             seed=seed,
+            backend=self.jump_backend,
         )
         if feasible:
             self.try_incumbent(x, "J", warm)
@@ -6549,19 +6811,36 @@ class _BranchAndBound:
             )
             if candidate is not None:
                 self.try_incumbent(candidate, "P", warm)
-            if self.use_bulk_rounding and self.incumbent is None:
-                # Several bulk roundings of the LP point at once: they
-                # succeed on other models than the classic one.
-                for point in self.bulk_round([x] * self.bulk_starts, lower, upper, deadline):
-                    if point is not None:
-                        self.try_incumbent(point, "B", warm)
+        # The stages after fix-and-propagate (bulk rounding, two jump starts,
+        # the pump) each get an equal share of the time left when they
+        # start, so a slow one cannot starve the rest. On
+        # academictimetablesmall, bulk rounding and before it the device
+        # jump from the LP point took the whole budget, though a jump from
+        # zero finds a point in under a second.
+        stages = [int(self.use_bulk_rounding) + 2 * int(self.use_jump) + int(self.use_pump)]
+
+        def stage_deadline():
+            now = time.time()
+            own = deadline
+            if np.isfinite(deadline) and stages[0] > 1:
+                own = now + (deadline - now) / stages[0]
+            stages[0] -= 1
+            return own
+
+        if self.use_bulk_rounding and self.incumbent is None:
+            # Several bulk roundings of the LP point at once: they succeed on
+            # other models than the classic one.
+            own = stage_deadline()
+            for point in self.bulk_round([x] * self.bulk_starts, lower, upper, own):
+                if point is not None:
+                    self.try_incumbent(point, "B", warm)
         if self.use_jump and self.incumbent is None:
             # From the rounded LP point, then from the bounds nearest zero.
-            nearest_zero = np.clip(np.zeros_like(x), lower, upper)
-            for start, seed in ((x, 0), (nearest_zero, 1)):
+            starts = ((x, 0), (np.clip(np.zeros_like(x), lower, upper), 1))
+            for start, seed in starts:
                 if self.incumbent is not None or time.time() >= deadline:
                     break
-                self.jump(start, lower, upper, warm, deadline, seed)
+                self.jump(start, lower, upper, warm, stage_deadline(), seed)
         if self.use_pump and self.incumbent is None:
             self.feasibility_pump(lower, upper, result, deadline)
             if (
@@ -6571,6 +6850,17 @@ class _BranchAndBound:
                 and time.time() < deadline
             ):
                 self.jump(self.pump_last, lower, upper, warm, deadline, seed=2)
+        if (
+            self.use_jump
+            and self.jump_backend == "numba"
+            and self.incumbent is not None
+            and time.time() < deadline
+        ):
+            # The time left goes to better points: a jump from the incumbent
+            # that goes on below each point it finds. On
+            # academictimetablesmall it takes a first point of about 5,600
+            # down to the hundreds within seconds.
+            self.improve_jump(self.incumbent[1], lower, upper, warm, deadline, seed=3)
         if self.incumbent is None and self.highs_seconds and not self.out_of_time():
             seconds = self.highs_seconds
             if self.deadline is not None:
@@ -6626,17 +6916,26 @@ class _BranchAndBound:
                 for key, value in {**self.lp_kwargs, **self.node_lp_kwargs}.items()
                 if key in accepted
             }
-            solve_fn = jl.make_solver(
-                self.mip.lp.with_values,
-                max_epochs=max_epochs,
-                bound_stop=self.node_bound_stop,
-                **settings,
-            )
+            # make_solver reads the precision profile when built and when
+            # traced, so both happen at ``node_precision``.
+            with self.node_settings():
+                solve_fn = jl.make_solver(
+                    self.node_mip_lp.with_values,
+                    max_epochs=max_epochs,
+                    bound_stop=self.node_bound_stop,
+                    **settings,
+                )
             axes = jl.LPValues(*([None] * len(jl.LPValues._fields)))._replace(
                 lower_bounds=0, upper_bounds=0
             )
             in_axes = (axes, 0, None) if self.node_bound_stop else (axes, 0)
-            cached = (self.mip, jax.jit(jax.vmap(solve_fn, in_axes=in_axes)))
+            jitted = jax.jit(jax.vmap(solve_fn, in_axes=in_axes))
+
+            def run(*args):
+                with self.node_settings():
+                    return jitted(*args)
+
+            cached = (self.mip, run)
             self._vmapped[max_epochs] = cached
         return cached[1]
 
@@ -6662,11 +6961,14 @@ class _BranchAndBound:
         solutions = list(solutions) + [solutions[-1]] * pad
         lp_lower = np.stack([np.where(self.is_int, lo, self.mip.lower) for lo, _ in boxes])
         lp_upper = np.stack([np.where(self.is_int, up, self.mip.upper) for _, up in boxes])
-        values = self.values._replace(
-            lower_bounds=jnp.asarray(lp_lower, self.dtype),
-            upper_bounds=jnp.asarray(lp_upper, self.dtype),
-        )
-        warm_starts = jax.tree.map(lambda *leaves: jnp.stack(leaves), *solutions)
+        with self.node_settings():
+            values = self.node_values._replace(
+                lower_bounds=jnp.asarray(lp_lower, self.node_dtype),
+                upper_bounds=jnp.asarray(lp_upper, self.node_dtype),
+            )
+            # Root and node points may differ in precision (``node_precision``).
+            solutions = [_cast_warm(s, self.node_dtype) for s in solutions]
+            warm_starts = jax.tree.map(lambda *leaves: jnp.stack(leaves), *solutions)
         # One transfer for the whole batch, then slices on the host.
         out = jax.device_get(
             self.batched_solver(max_epochs)(values, warm_starts, *self.bound_target_arg())
@@ -6948,6 +7250,7 @@ class _BranchAndBound:
         self.active_bound = self.round_bound(self.lp_bound(result["solution"], lower, upper)[0])
         if (
             self.use_fix_and_propagate
+            or self.use_bulk_rounding
             or self.use_jump
             or self.use_pump
             or self.highs_seconds
@@ -7016,12 +7319,7 @@ class _BranchAndBound:
                 if box is None:
                     continue
                 lower, upper = box
-                lp = self.node_lp(lower, upper)
-                target = self.node_bound_target()
-                result = self.solve_lp(
-                    lp, node.warm, self.node_max_epochs, **self.node_lp_kwargs,
-                    **({} if target is None else {"bound_target": target}),
-                )
+                result = self.solve_node_lp(lower, upper, node.warm, self.node_max_epochs)
                 self.bound_stops += result["stop_reason"] == "bound_target"
                 self.nodes += 1
                 if result["stop_reason"] == "interrupted":
@@ -7032,7 +7330,8 @@ class _BranchAndBound:
                     self.push(node)
                     status = "time_limit"
                     break
-                self.evaluate(node, lower, upper, lp, result)
+                # ``evaluate`` builds the LP at the search's precision if needed.
+                self.evaluate(node, lower, upper, None, result)
                 self.log(" ", None, node.depth)
         except KeyboardInterrupt:
             status = "interrupted"
@@ -7095,7 +7394,7 @@ def solve(
     feasibility_pump=True,
     pump_iterations=30,
     pump_tolerance=1e-4,
-    pump_jump_iterations=3000,
+    pump_jump_iterations=None,
     pump_jump_share=0.2,
     probing=True,
     probing_seconds=None,
@@ -7111,7 +7410,7 @@ def solve(
     tree_heuristics=False,
     tree_heuristic_every=20,
     tree_heuristic_share=0.05,
-    tree_jump_iterations=3000,
+    tree_jump_iterations=None,
     node_crossover=False,
     node_crossover_every=1,
     node_crossover_seconds=2.0,
@@ -7127,6 +7426,8 @@ def solve(
     log_every_seconds=1.0,
     device="auto",
     precision=None,
+    node_precision=None,
+    jump_backend="auto",
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -7280,7 +7581,15 @@ def solve(
       profile (see ``jaddle_optimisers.configure_jax``); ``None`` (default)
       keeps the global one. A ``MIP`` built at another precision is
       converted. Propagation, cuts and feasibility checks stay in float64
-      on the host either way.
+      on the host either way. ``node_precision`` (or
+      ``node_lp_options={"precision": ...}``) runs the node LPs at another
+      profile: serial and batched node solves and strong branching's child
+      LPs. The root LP, cut rounds, heuristic LPs and infeasibility checks
+      stay at ``precision``. Warm starts are cast between the two, and
+      node bounds stay valid at any precision (they are Lagrangian bounds,
+      computed in float64 from the node's duals). For example
+      ``precision="float64", node_precision="float32"`` gets an accurate
+      root and cheap nodes.
     * **Branching** (``branching``): ``"pseudocost"`` (default) scores each
       fractional variable by the product of its estimated down and up bound
       gains, learnt from the nodes solved so far (most fractional until
@@ -7337,19 +7646,34 @@ def solve(
       ``ProbingCache`` for bulk rounding.
     * **Primal heuristics.** After the root cuts, ``fix_and_propagate``
       (the function of that name) rounds the root LP point in chunks with
-      bound propagation after each; if that fails, ``bulk_fix_and_propagate``
-      (``bulk_rounding``) rounds it from ``bulk_starts`` starts side by side
+      bound propagation after each; if that fails (or is off),
+      ``bulk_fix_and_propagate`` (``bulk_rounding``, independent of
+      ``fix_and_propagate``) rounds it from ``bulk_starts`` starts side by side
       (cuOpt's bulk rounding: bulks of √(free) variables, two random
       roundings per bulk propagated together, the probing cache screening
       them first), marked ``"B"``. While there is still no incumbent,
       ``feasibility_jump`` (the function; an LP-free weighted local search
-      on the rows, on the device) runs for up to ``jump_iterations`` steps
-      from the rounded LP point and from the bounds nearest zero, then the
+      on the rows) runs for up to ``jump_iterations`` steps from the
+      rounded LP point and from the bounds nearest zero. Bulk rounding, the
+      two jump starts and the pump each get an equal share of the
+      heuristic time left when they start, so a slow one cannot starve the
+      rest. With numba, the time still left after an incumbent goes to an
+      improving jump from it (``feasibility_jump(improve=True)``: it goes
+      on below each point it finds), and the tree heuristics' jumps
+      improve the same way. ``jump_backend`` picks the jump: ``"numba"``, the
+      incremental one on the host (``pip install jaddle[fast]``), moves
+      one variable a step and updates only its rows, as HiGHS does;
+      ``"jax"`` makes every step a pass over all the nonzeros on the
+      device; ``"auto"`` (default) uses numba when it is installed. On
+      academictimetablesmall the numba jump finds a point in 0.1–1 s,
+      against 12 s to over 90 s on a laptop GPU. Then the
       objective feasibility pump (``feasibility_pump``) runs for up to
       ``pump_iterations`` warm-started LP solves at ``pump_tolerance``,
       followed by one more jump from the pump's last rounded point. The
       pump is fused with the jump (cuOpt's extended pump): each rounding
-      that is not feasible gets a jump of ``pump_jump_iterations`` steps,
+      that is not feasible gets a jump of ``pump_jump_iterations`` steps
+      (``None``: 3000 with JAX; with numba, whose steps are single moves,
+      ``5·(n + m)`` and at least 10,000),
       within ``pump_jump_share`` of the pump's time, and when the pump
       cycles the jump's near miss becomes its next rounding. They
       share ``heuristic_seconds`` (default: 20% of ``max_seconds``, or no
@@ -7400,7 +7724,8 @@ def solve(
       node's LP point is bulk rounded (``bulk_starts`` starts, in the node
       box, with the objective row at the cutoff), marked ``"B"``; if that
       finds nothing better, ``feasibility_jump`` runs from it for up to
-      ``tree_jump_iterations`` (3000) steps in the root box with the row
+      ``tree_jump_iterations`` steps (``None``: as ``pump_jump_iterations``)
+      in the root box with the row
       ``c·x <= cutoff`` added, so it looks only for better points, marked
       ``"J"``. They run while they have taken at most
       ``tree_heuristic_share`` (0.05) of the elapsed time, each call stops
@@ -7560,6 +7885,8 @@ def solve(
         node_crossover=node_crossover,
         node_crossover_every=node_crossover_every,
         node_crossover_seconds=node_crossover_seconds,
+        node_precision=node_precision,
+        jump_backend=jump_backend,
         heuristic_seconds=heuristic_seconds,
         lp_options=lp_options,
         node_lp_options=node_lp_options,

@@ -114,7 +114,8 @@ can be combined, for example `pip install "jaddle[cuda12,examples]"`:
 | `rag_examples` | `fastembed`, `snowballstemmer`, and `examples` | The retrieval (RAG) examples |
 | `benchmarks` | `mpax` | The benchmarks |
 | `cvxpy` | `cvxpy` | [Modelling with CVXPY](#modelling-with-cvxpy) |
-| `test` | `pytest`, `cvxpy` | Running the test suite |
+| `fast` | `numba` | The incremental feasibility jump in the MIP solver, much faster than the device one for finding first incumbents |
+| `test` | `pytest`, `cvxpy`, `numba` | Running the test suite |
 | `dev` | `examples`, `test`, `build`, `twine` | Development and packaging |
 
 Jaddle is developed on Linux, including WSL 2. Continuous integration tests

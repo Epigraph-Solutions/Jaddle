@@ -50,7 +50,10 @@ examples = ["matplotlib>=3.8", "scikit-learn>=1.5"]
 rag_examples = ["jaddle[examples]", "fastembed>=0.9", "snowballstemmer>=2.2"]
 benchmarks = ["mpax>=0.1"]
 cvxpy = ["cvxpy>=1.6"]
-test = ["pytest>=8", "cvxpy>=1.6"]
+# The incremental feasibility jump (jaddle._jump_numba), much faster than the
+# device one on the root heuristics.
+fast = ["numba>=0.61"]
+test = ["pytest>=8", "cvxpy>=1.6", "numba>=0.61"]
 dev = ["jaddle[examples,test]", "build", "twine"]
 
 [project.urls]

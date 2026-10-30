@@ -4,6 +4,38 @@
 
 ### Added
 
+- Incremental feasibility jump (`jaddle._jump_numba`, `pip install
+  jaddle[fast]` for numba). It moves one variable a step and updates only
+  that variable's rows: their activities, the in-place scores of their
+  two-valued variables, and the jump values of the rest. HiGHS does the
+  same. A step costs about the nonzeros of those rows, against a pass and
+  a sort over every nonzero for the device jump. On academictimetablesmall
+  (230,000 nonzeros) a move takes 1.5–3 µs, and 6 of 8 seeds find a
+  feasible point in 0.1–0.8 s from zero. The device jump took 12 s to over
+  90 s on a laptop GPU, and 85 ms a step on the CPU. `jm.feasibility_jump`
+  and `jm.solve` take `backend`/`jump_backend` (`"auto"`, `"numba"`,
+  `"jax"`); `"auto"` uses numba when it is installed. Under numba `steps`
+  counts single moves, so the pump's and the tree's short jumps
+  (`pump_jump_iterations`, `tree_jump_iterations`, now `None` by default)
+  get `5·(n + m)` moves, at least 10,000. With JAX they keep 3000 steps.
+- `jm.feasibility_jump(improve=True)` (numba): after each point it finds,
+  the objective row `c·x <= cutoff` drops below that point by
+  `improve_step` (the objective step, else 1e-4 relative), and the search
+  goes on with its weights. It returns the best point. `jm.solve` gives the
+  root heuristic time left after an incumbent to such a jump from it, and
+  the tree heuristics' jumps improve the same way. On
+  academictimetablesmall, with the example's settings (10 s of
+  heuristics), the first incumbent went from 5,611 (from HiGHS, at 28 s)
+  to 3,595 from Jaddle's jump at 11 s, then 1,509 at 14.5 s. Before, the
+  run was still at 5,153 after 180 s; HiGHS alone has 4,562 after 120 s.
+
+- `node_precision` (`jm.solve`, or `node_lp_options={"precision": ...}`):
+  node LPs run at their own precision profile, apart from `precision`.
+  Serial and batched node solves and strong branching's child LPs use it.
+  The root LP, cut rounds, heuristic LPs and infeasibility checks stay at
+  `precision`. Warm starts are cast between the two. For example,
+  `precision="float64", node_precision="float32"` gives an accurate root
+  and cheaper nodes.
 - Node crossover (`jm.solve(node_crossover=True)`, opt-in). Every
   `node_crossover_every` (1) nodes the LP bound does not close, HiGHS
   crosses the node LP's PDHG point over to an optimal vertex
@@ -361,6 +393,15 @@
   and eta in at least float32, whatever the dtype of the problem's data.
 
 ### Fixed
+
+- Root bulk rounding (`bulk_rounding`) ran only after the classic
+  fix-and-propagate, so `fix_and_propagate=False` silently turned it off,
+  at the root and in the feasibility pump. It now runs on its own.
+- One slow root heuristic could take the whole heuristic budget. On
+  academictimetablesmall, the device jump from the LP point (and, once it
+  ran again, bulk rounding) did, though a jump from zero finds a point in
+  under a second. Bulk rounding, the two jump starts and the pump now each
+  get an equal share of the time left when they start.
 
 - `jm.solve`'s progress log no longer shows the bound falling. Nodes held
   outside the queue were left out of the global bound, so it read too high:
