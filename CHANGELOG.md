@@ -4,6 +4,33 @@
 
 ### Added
 
+- Root strong-branching sweep in `jm.solve` (`root_strong_candidates`,
+  `"auto"` = `strong_candidates`; `root_strong_epochs`, default
+  `strong_epochs`). Before the root branches, the fractional integers with
+  the largest `jm.branching_impact(mip) · f(1 − f)` (column length times
+  `1 + |cⱼ|/c̄`) get both child LPs in one vmapped call. That seeds their
+  pseudocosts, so `branching="pseudocost"` no longer starts most-fractional
+  among variables that cannot move the bound. Reliability branching also
+  ranks its unreliable candidates by score times impact. On buildingenergy,
+  branching on the one fractional sizing variable (35,000 rows) takes the
+  LP bound from 33,246 to the optimum, 33,283.8; the 8,000 fractional
+  hourly integers (3 rows) each gain about 0. The sweep (8 candidates, 50
+  epochs) ranks it first by a wide margin, in 28 s on a laptop GPU. Child
+  bounds that are not rigorous only score; they neither raise nor close.
+- `root_crossover` in `jm.solve` (`"auto"`: when the PDHG root bound is not
+  rigorous). The root LP is crossed over to an exact vertex (reusing RENS's
+  crossover), and its duals bound the root and drive root reduced-cost
+  fixing. Root fixing now also runs once before the root branches, with
+  the root heuristics' incumbent. Reduced costs at the vertex that point at
+  an infinite bound and are round-off (at most `1e-9·(1 + max|c|)`) are
+  zeroed. On buildingenergy the crossover takes 2 s and gives a rigorous
+  33,246.2 (HiGHS's LP optimum), where the PDHG bound dropped 8,209
+  reduced costs and gave 33,247.9, above the LP optimum. Reduced-cost
+  fixing had been skipped for want of a rigorous bound; with exact duals,
+  the RENS incumbent fixes the two dearest sizing variables to 0. Node
+  crossovers (`node_crossover`) clean their vertices the same way, and
+  their rigorous bound now wins over a PDHG bound that is not.
+
 - `parallel_heuristics=True` in `jm.solve` runs the CPU heuristics on
   background threads while the main thread keeps the device busy with
   node LPs. HiGHS's RENS, RINS and incumbent search share one thread, one

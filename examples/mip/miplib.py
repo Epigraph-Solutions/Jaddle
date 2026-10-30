@@ -73,6 +73,9 @@ print(
 result = jm.solve(
     PATH_TO_MPS,
     # Reliability branching spent over half the run strong-branching here.
+    # The root still strong-branches its highest-impact candidates once
+    # (root_strong_candidates), which seeds the pseudocosts: on
+    # buildingenergy that finds the sizing variable holding the root gap.
     branching="pseudocost",
     # node_crossover=True,
     presolve=True,
@@ -80,11 +83,11 @@ result = jm.solve(
     gomory_cuts=True,
     # Laptop GPUs run float64 at a small fraction of float32 speed.
     # The root LP and cut rounds run in float64; node LPs at node_precision.
-    precision="float32",
+    precision="float64",
     node_precision="float32",
-    node_crossover=True,
+    node_crossover=False,
     cut_round_epochs=10,
-    lp_tolerance=1e-4,
+    lp_tolerance=1e-6,
     node_lp_tolerance=1e-3,
     # Any other jl.solve option for node LPs only (root and heuristic LPs
     # keep lp_options), e.g. check convergence every 64 iterations:
@@ -127,10 +130,10 @@ result = jm.solve(
     # On a GPU: 32 node LPs per device call, at most 10 epochs each a call
     # (unfinished ones go back to the queue). On ns1830653 that halves the
     # device time per node against 16. Tree cuts are off when batching.
-    batch_size=32,
+    batch_size=1,
     batch_epochs=10,
     cuts=False,
-    tree_cuts=False,
+    tree_cuts=True,
     verbose=True,
     log_every_seconds=10,
     device="gpu",

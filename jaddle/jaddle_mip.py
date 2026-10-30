@@ -1356,6 +1356,27 @@ def reduced_cost_tightening(r, bound, cutoff, lower, upper, integrality):
     return lower, upper, True
 
 
+def branching_impact(mip):
+    """
+    A prior on how much branching on each integer variable can move the
+    bound, for picking strong-branching candidates before any pseudocost is
+    known: its column length (the rows a change to it reaches) times
+    ``1 + |cⱼ|/c̄``, with ``c̄`` the mean nonzero ``|c|``. Zero for
+    continuous variables, at least 1 for integers.
+
+    On buildingenergy the 7 integer sizing variables (all the integer cost,
+    3,700–35,000 rows each) score 10⁴–10⁵ and the 26,280 hourly integers
+    (3 rows, no cost) score 3. At the root, branching on the one fractional
+    sizing variable raises the LP bound to the optimum (+37.6 up, +93.8
+    down); branching on an hourly integer moves it by about 0.
+    """
+    c = np.abs(np.asarray(mip.c, np.float64))
+    scale = c[c > 0].mean() if np.any(c > 0) else 1.0
+    length = np.diff(sp.csc_matrix(mip.A).indptr).astype(np.float64)
+    impact = np.maximum(length, 1.0) * (1.0 + c / scale)
+    return np.where(mip.integrality, impact, 0.0)
+
+
 def objective_step(c, integrality):
     """
     The largest ``g`` with ``cᵀx`` a multiple of ``g`` at every ``x`` with
@@ -1404,6 +1425,9 @@ _CUT_MAX_PARALLELISM = 0.99
 # reserved for them (rows) beyond the root's cuts.
 _TREE_CUTS_PER_ROUND = 10
 _TREE_CUT_MIN_ROWS = 32
+# Reduced costs at an exact (crossover) vertex this small, relative to
+# 1 + max|c|, are round-off (``root_exact_terms``).
+_EXACT_DUAL_ROUNDOFF = 1e-9
 # The least time one call of the tree heuristics (``tree_heuristics``) gets.
 _TREE_HEURISTIC_MIN_SECONDS = 1.0
 
@@ -4218,6 +4242,9 @@ class _BranchAndBound:
         strong_max_depth=None,
         strong_screen=32,
         strong_backend="jax",
+        root_strong_candidates="auto",
+        root_strong_epochs=None,
+        root_crossover="auto",
         pump_jump_iterations=None,
         pump_jump_share=0.2,
         probing=True,
@@ -4286,6 +4313,27 @@ class _BranchAndBound:
         self.strong_branch_lps = 0
         self.strong_branch_seconds = 0.0
         self.strong_fixings = 0
+        # The root sweep (``root_strong_candidates``): strong branching at
+        # the root on the candidates with the largest ``impact``, which seeds
+        # the pseudocosts. Off for most-fractional branching.
+        if root_strong_candidates == "auto":
+            root_strong_candidates = self.strong_candidates
+        if branching == "most_fractional":
+            root_strong_candidates = 0
+        self.root_strong_candidates = max(int(root_strong_candidates), 0)
+        self.root_strong_epochs = (
+            self.strong_epochs if root_strong_epochs is None else int(root_strong_epochs)
+        )
+        self.root_strong_lps = 0
+        self.root_strong_seconds = 0.0
+        if root_crossover not in ("auto", True, False):
+            raise ValueError(
+                f"root_crossover must be 'auto', True or False, not {root_crossover!r}"
+            )
+        self.root_crossover = root_crossover
+        self.root_crossover_used = False
+        # The last root crossover: (the MIP it was for, its SaddleState).
+        self.root_vertex_state = None
         if node_selection not in ("hybrid", "best_first", "depth_first"):
             raise ValueError(f"unknown node selection {node_selection!r}")
         lp_options = dict(lp_options or {})
@@ -4556,6 +4604,7 @@ class _BranchAndBound:
         self.lp_repairs_skipped = 0
         self.propagate = propagate
         self.set_mip(mip)
+        self.impact = branching_impact(mip)
 
         self.incumbent = None  # (min-form value, x)
         self.closed_floor = np.inf  # least bound of the nodes closed so far
@@ -4582,6 +4631,7 @@ class _BranchAndBound:
         # The root's Lagrangian terms, for reduced-cost fixing of the root box
         # when the incumbent improves, and the incumbent last used for it.
         self.root_terms = None
+        self.root_terms_rigorous = False
         self.root_fixed_at = None
         self.reduced_cost_tightenings = 0
         self.children_pruned = 0
@@ -4871,6 +4921,18 @@ class _BranchAndBound:
             A_T=self.A_T,
         )
 
+    def vertex_terms(self, vertex, lower, upper):
+        """``dual_terms`` of an exact vertex (a crossover HiGHS proved
+        optimal). Its reduced costs that point at an infinite bound of the
+        box are round-off in ``c + Aᵀy`` (on buildingenergy 14,432 of them,
+        at most 1.8e-11), which would make the bound drop them and lose its
+        rigour: they are zeroed, as a simplex solver does."""
+        constant, r = self.dual_terms(vertex)
+        roundoff = (((r > 0) & ~np.isfinite(lower)) | ((r < 0) & ~np.isfinite(upper))) & (
+            np.abs(r) <= _EXACT_DUAL_ROUNDOFF * (1.0 + np.abs(self.mip.c).max(initial=0.0))
+        )
+        return constant, np.where(roundoff, 0.0, r)
+
     def bound_over(self, terms, lower, upper):
         """The Lagrangian bound of ``terms`` over a propagated box, widened a
         little on continuous variables against rounding error."""
@@ -4924,6 +4986,13 @@ class _BranchAndBound:
         )
         if infeasible:
             return False
+        if self.verbose and lower is not self.root_lower:
+            changed = (lower != self.root_lower) | (upper != self.root_upper)
+            fixed = changed & (lower == upper) & self.is_int
+            print(
+                f"Root reduced-cost fixing: {int(np.count_nonzero(changed))} bounds "
+                f"tightened ({int(np.count_nonzero(fixed))} integers fixed)"
+            )
         self.root_lower, self.root_upper = lower, upper
         return True
 
@@ -5238,7 +5307,9 @@ class _BranchAndBound:
             )
             if unreliable.size == 0:
                 return candidates[np.argmax(score)], None, lower, upper, bound
-            chosen = unreliable[np.argsort(-score[unreliable], kind="stable")]
+            # High-impact variables first (``branching_impact``).
+            priority = score[unreliable] * self.impact[candidates[unreliable]]
+            chosen = unreliable[np.argsort(-priority, kind="stable")]
             chosen = candidates[chosen[: self.strong_candidates]]
             self.strong_branch_nodes += 1
             try:
@@ -5249,6 +5320,39 @@ class _BranchAndBound:
                 self.strong_branch_seconds += time.time() - started
             solved = set(chosen.tolist())
 
+        applied = self.apply_strong(
+            children, solved, candidates, score, est_down, est_up, x, lower, upper,
+            bound, raw,
+        )
+        if applied is None:
+            return None
+        lower, upper, strong_bound, results = applied
+        best = int(np.argmax(score))
+        if not np.isfinite(score[best]):
+            # Every candidate was fixed: solve the node again in its box.
+            self.push(
+                _Node(strong_bound, node.depth, self.compress(lower, upper), warm, None)
+            )
+            return None
+        var = candidates[best]
+        return var, results.get(var), lower, upper, strong_bound
+
+    def apply_strong(
+        self, children, solved, candidates, score, est_down, est_up, x, lower, upper,
+        bound, raw,
+    ):
+        """
+        Use strong-branching ``children`` (``{var: (down, up)}`` of
+        ``_StrongChild``) at a node: a candidate with both children closed
+        closes the node, one with one child closed is fixed to its other
+        side, and the node's bound rises to the best lesser child bound.
+        ``score`` (over ``candidates``) is updated in place: the children's
+        gains for the solved candidates (``solved``), the screened gains
+        (at least the pseudocost estimates) for the others, and ``-inf``
+        for fixed candidates and those left outside the tightened box.
+        Returns ``(lower, upper, bound, {var: {down: child}})``, or
+        ``None`` when the node is closed.
+        """
         lower, upper = lower.copy(), upper.copy()
         strong_bound, fixed = bound, False
         results = {}
@@ -5296,15 +5400,58 @@ class _BranchAndBound:
                 x[candidates] < upper[candidates]
             )
             score[~inside] = -np.inf
-        best = int(np.argmax(score))
-        if not np.isfinite(score[best]):
-            # Every candidate was fixed: solve the node again in its box.
-            self.push(
-                _Node(strong_bound, node.depth, self.compress(lower, upper), warm, None)
+        return lower, upper, strong_bound, results
+
+    def root_sweep(self, x, candidates, lower, upper, warm, terms, bound, raw):
+        """
+        Strong branching at the root on the ``root_strong_candidates``
+        fractional integers with the largest ``impact · f(1 − f)``
+        (``branching_impact``; ``f`` is the fractional part), for
+        ``root_strong_epochs``, in one vmapped call (``strong_branch``). It
+        seeds their pseudocosts, so pseudocost branching sees which
+        variables move the bound before it has branched on them; otherwise
+        it starts most fractional and keeps to low-impact variables whose
+        gains are all about zero. ``candidates`` is a mask of the branchable
+        integers. Returns ``(lower, upper, bound, children)`` as
+        ``apply_strong`` does (``children``: ``{var: {down: child}}``), or
+        ``None`` when the root is closed.
+        """
+        cand = np.flatnonzero(candidates)
+        if cand.size == 0 or self.out_of_time():
+            return lower, upper, bound, {}
+        if raw is None or not np.isfinite(raw):
+            raw = bound
+        f = x[cand] - np.floor(x[cand])
+        prior = self.impact[cand] * f * (1.0 - f)
+        chosen = cand[np.argsort(-prior, kind="stable")[: self.root_strong_candidates]]
+        started = time.time()
+        lps = self.strong_branch_lps
+        epochs, self.strong_epochs = self.strong_epochs, self.root_strong_epochs
+        try:
+            children = self.strong_branch(
+                chosen, x, lower, upper, warm, terms, bound, raw, trust=False
             )
-            return None
-        var = candidates[best]
-        return var, results.get(var), lower, upper, strong_bound
+        finally:
+            self.strong_epochs = epochs
+            self.root_strong_seconds += time.time() - started
+            self.root_strong_lps += self.strong_branch_lps - lps
+            self.strong_branch_lps = lps
+        est_down, est_up = self.pseudocost_estimates(x, cand)
+        score = np.maximum(est_down, 1e-6) * np.maximum(est_up, 1e-6)
+        fixings = self.strong_fixings
+        applied = self.apply_strong(
+            children, set(chosen.tolist()), cand, score, est_down, est_up, x, lower,
+            upper, bound, raw,
+        )
+        if self.verbose:
+            line = (
+                f"Root strong branching: {chosen.size} candidates, "
+                f"{self.root_strong_lps} LPs, {self.strong_fixings - fixings} fixed"
+            )
+            if applied is not None:
+                line += f", bound {self.model_value(applied[2]):.6e}"
+            print(line + f", {self.root_strong_seconds:.1f}s")
+        return applied
 
     def strong_kernels(self):
         """The device kernels for the current LP, built once per shape."""
@@ -5344,9 +5491,10 @@ class _BranchAndBound:
         size = kernels.screen_size
         est_down, est_up = self.pseudocost_estimates(x, candidates)
         if candidates.size > size:
-            # The unreliable first, then by pseudocost score.
+            # The unreliable first, then by pseudocost score times impact
+            # (``branching_impact``), so high-impact variables get screened.
             score = np.maximum(est_down, 1e-6) * np.maximum(est_up, 1e-6)
-            keep = np.lexsort((-score, ~unreliable))[:size]
+            keep = np.lexsort((-score * self.impact[candidates], ~unreliable))[:size]
             candidates, unreliable = candidates[keep], unreliable[keep]
             est_down, est_up = est_down[keep], est_up[keep]
         count = candidates.size
@@ -5476,7 +5624,9 @@ class _BranchAndBound:
                 children[var][side] = _StrongChild(child_bound, closed, solution, child_raw)
         return {var: tuple(sides) for var, sides in children.items()}, solved
 
-    def strong_branch(self, variables, x, lower, upper, warm, terms, bound, raw=None):
+    def strong_branch(
+        self, variables, x, lower, upper, warm, terms, bound, raw=None, trust=True
+    ):
         """
         Both children of each variable in ``variables``, as
         ``{var: (down, up)}`` of ``_StrongChild``. A child is closed when
@@ -5487,7 +5637,12 @@ class _BranchAndBound:
         got). Each child LP also records a pseudocost observation: its
         bound gain over the parent per unit of change, which a truncated LP
         underestimates a little. Gains are measured between unrounded
-        bounds, from ``raw`` (the node's; ``None``: ``bound``).
+        bounds, from ``raw`` (the node's; ``None``: ``bound``). With
+        ``trust=False`` a child LP's bound that is not rigorous (it dropped
+        reduced costs at infinite bounds) still scores the variable and
+        records its pseudocost, but neither raises the child's bound nor
+        closes it: on buildingenergy such bounds after 50–200 epochs passed
+        the child's true LP bound by up to 5.5.
         """
         if raw is None:
             raw = bound
@@ -5534,17 +5689,20 @@ class _BranchAndBound:
             child_terms = self.dual_terms(solution)
             child_raw, rigorous = self.bound_over(child_terms, lo, up)
             child_raw = max(child_raw, pre_raw)
+            score_raw = child_raw  # for the score and pseudocost either way
+            if not (rigorous or trust):
+                child_raw = pre_raw
             child_bound = max(self.round_bound(child_raw), pre)
             if child_bound > pre:
                 self.bound_rigorous &= rigorous
             distance = x[var] - math.floor(x[var]) if down else math.ceil(x[var]) - x[var]
-            if distance > 0 and np.isfinite(child_raw):
-                self.record_gain(var, down, (child_raw - raw) / distance)
+            if distance > 0 and np.isfinite(score_raw):
+                self.record_gain(var, down, (score_raw - raw) / distance)
             closed = child_bound >= cutoff
             if closed and rigorous:
                 self.learn(child_terms, lo, up)
             children[var][down] = _StrongChild(
-                child_bound, closed, None if closed else solution, child_raw
+                child_bound, closed, None if closed else solution, score_raw
             )
         return {var: (sides[True], sides[False]) for var, sides in children.items()}
 
@@ -5559,7 +5717,7 @@ class _BranchAndBound:
                 self.solve_node_lp(lo, up, warm, self.strong_epochs) for lo, up in boxes
             ]
         # One batch shape for the whole search, so one compile.
-        size = max(_next_power_of_two(2 * self.strong_candidates), len(boxes))
+        size = _next_power_of_two(max(2 * self.strong_candidates, len(boxes)))
         results = self.solve_batch(
             boxes, [warm[0]] * len(boxes), [warm[1]] * len(boxes),
             self.strong_epochs, size,
@@ -5726,8 +5884,18 @@ class _BranchAndBound:
                 terms, raw, rigorous = new_terms, new_raw, new_rigorous
                 bound = max(self.round_bound(raw), bound)
                 self.active_bound = bound
-        if node.depth == 0 and node.branch is None:
+        root = node.depth == 0 and node.branch is None
+        if root and self.root_terms is not None and self.root_terms_rigorous:
+            # Exact duals from a root crossover (``root_exact_terms``): a
+            # rigorous bound, which reduced-cost fixing and proofs need.
+            exact_raw, _ = self.bound_over(self.root_terms, lower, upper)
+            if not rigorous or exact_raw >= raw:
+                terms, raw, rigorous = self.root_terms, exact_raw, True
+                bound = max(self.round_bound(raw), node.bound)
+                self.active_bound = bound
+        if root and not self.root_terms_rigorous:
             self.root_terms = terms
+            self.root_terms_rigorous = rigorous and np.isfinite(raw)
         converged = result["converged"]
         x = np.asarray(result["solution"].primal, np.float64)
         value = float(self.mip.c @ x) if converged else None
@@ -5748,11 +5916,14 @@ class _BranchAndBound:
             vertex = self.cross_over_node(lp, result["solution"], x)
             if vertex is not None:
                 x, converged = np.asarray(vertex.primal, np.float64), True
-                new_terms = self.dual_terms(vertex)
+                new_terms = self.vertex_terms(vertex, lower, upper)
                 new_raw, new_rigorous = self.bound_over(new_terms, lower, upper)
-                if new_raw > raw:
+                # A rigorous bound wins over one that dropped reduced costs,
+                # which can overshoot the LP's optimum.
+                exact = new_rigorous and not rigorous and np.isfinite(new_raw)
+                if new_raw > raw or exact:
                     terms, raw, rigorous = new_terms, new_raw, new_rigorous
-                    bound = max(self.round_bound(raw), bound)
+                    bound = max(self.round_bound(raw), node.bound)
                     self.active_bound = bound
                 if bound >= self.cutoff():
                     self.close(bound, rigorous)
@@ -5835,12 +6006,30 @@ class _BranchAndBound:
             return
         else:
             candidates = fractional
+        root_children = {}
+        if root and self.root_strong_candidates:
+            swept = self.root_sweep(x, candidates, lower, upper, warm, terms, bound, raw)
+            if swept is None:  # the sweep closed the root
+                return
+            lower, upper, bound, root_children = swept
+            self.active_bound = bound
+            inside = candidates & (x > lower) & (x < upper)
+            if not inside.any():
+                # The sweep fixed every candidate: solve the root again.
+                self.push(
+                    _Node(bound, node.depth, self.compress(lower, upper), warm, None)
+                )
+                return
+            candidates = inside
         choice = self.choose_branch(
             node, x, candidates, lower, upper, warm, terms, bound, pending, raw
         )
         if choice is None:  # strong branching closed or requeued the node
             return
         var, strong, lower, upper, bound = choice
+        if strong is None and var in root_children:
+            # The sweep's children: their bounds and warm starts.
+            strong = root_children[var]
         self.active_bound = bound
         if (
             self.use_tree_cuts
@@ -5983,6 +6172,9 @@ class _BranchAndBound:
             "strong_branch_lps": self.strong_branch_lps,
             "strong_branch_seconds": self.strong_branch_seconds,
             "strong_fixings": self.strong_fixings,
+            "root_strong_lps": self.root_strong_lps,
+            "root_strong_seconds": self.root_strong_seconds,
+            "root_crossover": self.root_crossover_used,
             "pump_jumps": self.pump_jumps,
             "pump_jump_finds": self.pump_jump_finds,
             "probing": dict(self.probing_stats),
@@ -6045,7 +6237,49 @@ class _BranchAndBound:
         )
         if not crossed["converged"] or crossed["basis"] is None:
             return None, None
+        # Its exact duals, for ``root_exact_terms`` (while the rows stay).
+        self.root_vertex_state = (self.mip, crossed["solution"])
         return np.asarray(crossed["solution"].primal, np.float64), crossed["basis"]
+
+    def root_exact_terms(self, lower, upper, result):
+        """
+        The root's Lagrangian terms for reduced-cost fixing of the root box
+        (``tighten_root``). PDHG duals solved to a loose tolerance leave tiny
+        wrong-sign reduced costs on variables with an infinite bound; the
+        bound then drops them and is not rigorous, and reduced-cost fixing
+        and dual proofs need a rigorous one. With ``root_crossover``
+        (``"auto"``: only then), the root LP is crossed over to an exact
+        vertex (``root_vertex``, reusing RENS's crossover when the rows are
+        the same), whose duals give a rigorous bound. On buildingenergy
+        (145,000 variables with no upper bound) the crossover takes 2 s and
+        gives 33,246.215, HiGHS's LP optimum, where the PDHG bound (which
+        dropped 8,209 reduced costs) gave 33,247.9, above it; with an
+        incumbent, the exact duals also fix the two dearest sizing variables
+        to zero.
+        """
+        terms = self.dual_terms(result["solution"])
+        bound, rigorous = self.bound_over(terms, lower, upper)
+        self.root_terms = terms
+        self.root_terms_rigorous = rigorous and np.isfinite(bound)
+        if self.root_terms_rigorous or not self.root_crossover or self.out_of_time():
+            return
+        state = self.root_vertex_state
+        if state is None or state[0] is not self.mip:
+            self.root_vertex(lower, upper, result["solution"])
+            state = self.root_vertex_state
+        if state is None or state[0] is not self.mip:
+            return  # HiGHS did not prove a vertex optimal in time
+        exact = self.vertex_terms(state[1], lower, upper)
+        exact_bound, exact_rigorous = self.bound_over(exact, lower, upper)
+        if exact_rigorous and np.isfinite(exact_bound):
+            self.root_terms, self.root_terms_rigorous = exact, True
+            self.root_crossover_used = True
+            if self.verbose:
+                print(
+                    f"Root crossover: exact duals, bound "
+                    f"{self.model_value(exact_bound):.6e}, "
+                    f"{time.time() - self.start:.1f}s"
+                )
 
     def cut_loop(self, lower, upper, result):
         """Rounds of root cuts: separate at the LP point, append the cuts,
@@ -6738,6 +6972,9 @@ class _BranchAndBound:
             # Strong branching would spend the sub-MIP's short budget.
             settings["branching"] = "pseudocost"
         settings["probing"] = False
+        # Nor the root sweep or crossover (the sub-MIP has no incumbent to fix with).
+        settings["root_strong_candidates"] = 0
+        settings["root_crossover"] = False
         search = _BranchAndBound(sub_mip, **settings)
         if warm is not None:
             m_ineq = base.A.shape[0] - base.n_eq
@@ -7561,6 +7798,16 @@ class _BranchAndBound:
         ):
             self.rins_pending = False
             self.rins(root_x, root_warm)
+        # Root reduced-cost fixing from the root heuristics' incumbent, so
+        # the root sweep and the first children work in the fixed box.
+        self.root_exact_terms(lower, upper, result)
+        if not self.tighten_root():
+            self.close_all()
+            self.active_bound = np.inf
+            return self.result("optimal")
+        if self.root_lower is not lower:
+            lower, upper = self.root_lower, self.root_upper
+            lp = None  # rebuilt over the fixed box if ``evaluate`` needs it
         if self.verbose:
             print(
                 f"  {'Nodes':>8} {'Open':>8} {'Depth':>6} {'Bound':>13} "
@@ -7654,6 +7901,9 @@ def solve(
     strong_max_depth=None,
     strong_screen=32,
     strong_backend="jax",
+    root_strong_candidates="auto",
+    root_strong_epochs=None,
+    root_crossover="auto",
     tree_cuts=False,
     tree_cut_every=10,
     fix_and_propagate=True,
@@ -7818,7 +8068,17 @@ def solve(
       closed without an LP solve. The same terms drive reduced-cost fixing
       (``reduced_cost_tightening``): once there is an incumbent, each node
       tightens the integer bounds its children inherit, and the root box is
-      tightened with the root's duals whenever the incumbent improves.
+      tightened with the root's duals whenever the incumbent improves
+      (first just before the root branches, with the root heuristics'
+      incumbent). That needs a rigorous root bound. PDHG duals at a loose
+      tolerance leave tiny wrong-sign reduced costs on variables with an
+      infinite bound, which the bound drops. With ``root_crossover``
+      (``"auto"``: only then; ``True``/``False``) the root LP is crossed over
+      to an exact vertex (reusing RENS's crossover), and its duals are used
+      instead. On buildingenergy that takes 2 s and gives a rigorous 33,246.2,
+      HiGHS's LP optimum; the PDHG bound gave 33,247.9, above it. Node
+      crossovers (``node_crossover``) likewise prefer the vertex's rigorous
+      bound.
       Since that bound holds at any duals, a node LP stops as soon as it
       closes the node (``node_bound_stop``, on by default:
       ``jl.solve(bound_target=...)`` checks it every epoch). An infeasible
@@ -7876,7 +8136,20 @@ def solve(
       fractional variable by the product of its estimated down and up bound
       gains, learnt from the nodes solved so far (most fractional until
       there are any); ``"most_fractional"`` picks the variable nearest
-      ½. ``"reliability"`` is pseudocost branching that first
+      ½. With either pseudocost rule, the root first strong-branches its
+      ``root_strong_candidates`` (``"auto"``: ``strong_candidates``; ``0``
+      turns it off) fractional integers with the largest
+      ``branching_impact · f(1 − f)`` (column length times relative cost) for
+      ``root_strong_epochs`` (``None``: ``strong_epochs``), in one vmapped
+      call. This seeds their pseudocosts, so the search sees which variables
+      move the bound before it has branched on them. On buildingenergy one
+      fractional sizing variable (35,000 rows) holds the whole root gap,
+      while the 8,000 fractional hourly integers (3 rows each) gain about 0:
+      pseudocost branching without the sweep picks the hourly ones, and the
+      bound stalls. The sweep's child bounds that are not rigorous (dropped
+      reduced costs) score the variables but neither raise nor close
+      anything. ``"reliability"`` also ranks its unreliable candidates by
+      score times impact. ``"reliability"`` is pseudocost branching that first
       strong-branches the variables whose pseudocosts are unreliable
       (fewer than ``reliability_threshold`` observations in a direction).
       With ``strong_backend="jax"`` (the default) it runs on the device,
@@ -8119,7 +8392,10 @@ def solve(
     * ``"strong_branch_nodes"``, ``"strong_branch_lps"``,
       ``"strong_branch_seconds"``, ``"strong_fixings"``: nodes that
       strong-branched, the child LPs they solved, the time taken and the
-      variables fixed because one child was closed.
+      variables fixed because one child was closed; ``"root_strong_lps"``,
+      ``"root_strong_seconds"``: the root sweep's child LPs and time
+      (``root_strong_candidates``); ``"root_crossover"``: whether the root
+      bound and reduced-cost fixing used exact crossover duals.
     * ``"cuts"``: the number of cuts in the final LP, by family
       (``"gomory"``, ``"cover"``, ``"mir"``, ``"flowcover"``); ``"root_bound_before_cuts"``: the root bound
       before them (``None`` when no cut round ran).
@@ -8214,6 +8490,9 @@ def solve(
         strong_max_depth=strong_max_depth,
         strong_screen=strong_screen,
         strong_backend=strong_backend,
+        root_strong_candidates=root_strong_candidates,
+        root_strong_epochs=root_strong_epochs,
+        root_crossover=root_crossover,
     )
     with jo.local_settings(precision=precision):
         if presolve:

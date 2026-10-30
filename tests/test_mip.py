@@ -94,7 +94,7 @@ def reference(mip):
     return mip.sign * (result.fun + mip.offset)
 
 
-def assert_solved(result, mip, ref, rel=1e-4):
+def assert_solved(result, mip, ref, rel=1e-4, rigorous=True):
     assert result["status"] == "optimal" and result["converged"]
     assert abs(result["objective"] - ref) <= rel * (1 + abs(ref))
     assert mip.is_feasible(result["x"])
@@ -104,7 +104,8 @@ def assert_solved(result, mip, ref, rel=1e-4):
         assert result["bound"] >= ref - slack
     else:
         assert result["bound"] <= ref + slack
-    assert result["bound_rigorous"]
+    if rigorous:
+        assert result["bound_rigorous"]
 
 
 def write_mps(mip, path):
@@ -1498,7 +1499,9 @@ def test_rins_in_the_search():
 )
 def test_batched_search_matches_reference(make):
     mip = make()
-    result = jm.solve(mip, batch_size=4, gomory_cuts=False)
+    # Without heuristics: with an incumbent from them, root reduced-cost
+    # fixing can close the search before it branches.
+    result = jm.solve(mip, batch_size=4, gomory_cuts=False, **no_heuristics())
     assert_solved(result, mip, reference(mip))
     assert result["batches"] > 0
 
@@ -1506,7 +1509,8 @@ def test_batched_search_matches_reference(make):
 def test_batch_larger_than_the_tree():
     # Far more slots than open nodes: every batch is padded.
     mip = facility_location()
-    result = jm.solve(mip, batch_size=64, gomory_cuts=False)
+    # Without heuristics, so root reduced-cost fixing cannot end it at the root.
+    result = jm.solve(mip, batch_size=64, gomory_cuts=False, **no_heuristics())
     assert_solved(result, mip, reference(mip))
     assert 0 < result["batches"] <= result["nodes"]
 
@@ -2716,6 +2720,151 @@ def test_strong_branching_with_a_small_screen():
         mip, branching="reliability", strong_screen=2, strong_candidates=2
     )
     assert_solved(result, mip, reference(mip))
+
+
+# %% Root sweep and root crossover
+def sizing(periods=8, seed=3):
+    """
+    Buildingenergy in miniature: two technologies, each with an integer
+    size ``N_k`` (units bought, the only integer cost: 40 and 400 a unit)
+    and an integer count ``n_kt`` of units running each period, with
+    ``n_kt <= N_k`` and output ``n_kt <= x_kt <= 5 n_kt``; demand
+    ``Σ_k x_kt + s_t >= d_t`` is met by output (1 a unit) or bought in (10 a
+    unit). No variable has an upper bound, so node bounds from PDHG duals
+    are not rigorous (``assert_solved(rigorous=False)``). Branching on the
+    cheap size moves the bound; the counts ``n_kt`` hardly do. Variables: ``N`` (2),
+    then ``n``, ``x`` (2·periods each, technology-major), then ``s``.
+    """
+    rng = np.random.default_rng(seed)
+    d = rng.uniform(3.0, 23.0, periods)
+    T, K = periods, 2
+    n_var = K + 2 * K * T + T
+
+    def N(k):
+        return k
+
+    def n_(k, t):
+        return K + k * T + t
+
+    def x_(k, t):
+        return K + K * T + k * T + t
+
+    def s_(t):
+        return K + 2 * K * T + t
+
+    rows, b = [], []
+    for k in range(K):
+        for t in range(T):
+            rows.append({n_(k, t): 1.0, N(k): -1.0}); b.append(0.0)
+            rows.append({n_(k, t): 1.0, x_(k, t): -1.0}); b.append(0.0)
+            rows.append({x_(k, t): 1.0, n_(k, t): -5.0}); b.append(0.0)
+    for t in range(T):
+        rows.append({x_(0, t): -1.0, x_(1, t): -1.0, s_(t): -1.0}); b.append(-d[t])
+    A = sp.lil_matrix((len(rows), n_var))
+    for i, row in enumerate(rows):
+        for j, v in row.items():
+            A[i, j] = v
+    c = np.zeros(n_var)
+    c[N(0)], c[N(1)] = 40.0, 400.0
+    c[K + K * T : K + 2 * K * T] = 1.0
+    c[K + 2 * K * T :] = 10.0
+    A_eq, b_eq = no_rows(n_var)
+    lp = jl.LP(
+        c=c,
+        A_eq=A_eq,
+        b_eq=b_eq,
+        A_ineq=sp.csc_matrix(A),
+        b_ineq=np.array(b),
+        lower_bounds=np.zeros(n_var),
+        upper_bounds=np.full(n_var, np.inf),
+    )
+    integrality = np.zeros(n_var, bool)
+    integrality[: K + K * T] = True
+    return jm.MIP(lp, integrality)
+
+
+def test_branching_impact_ranks_sizes_first():
+    mip = sizing()
+    impact = jm.branching_impact(mip)
+    counts = impact[2:18]
+    assert impact[0] > counts.max() and impact[1] > counts.max()
+    assert np.all(impact[~mip.integrality] == 0.0)
+
+
+def root_branches(monkeypatch):
+    """The variable each depth-0 split is on, recorded."""
+    calls = []
+    real = jm._BranchAndBound.branch
+
+    def recorded(self, node, lower, upper, x, var, *args, **kwargs):
+        if node.depth == 0:
+            calls.append(int(var))
+        return real(self, node, lower, upper, x, var, *args, **kwargs)
+
+    monkeypatch.setattr(jm._BranchAndBound, "branch", recorded)
+    return calls
+
+
+@pytest.mark.parametrize("branching", ["pseudocost", "reliability"])
+def test_root_sweep_branches_on_the_size(monkeypatch, branching):
+    mip = sizing()
+    calls = root_branches(monkeypatch)
+    result = jm.solve(mip, branching=branching, **no_heuristics())
+    assert_solved(result, mip, reference(mip), rigorous=False)
+    assert result["root_strong_lps"] > 0
+    assert calls and calls[0] == 0  # the cheap technology's size
+
+
+def test_root_sweep_off():
+    mip = sizing()
+    result = jm.solve(mip, root_strong_candidates=0, **no_heuristics())
+    assert_solved(result, mip, reference(mip), rigorous=False)
+    assert result["root_strong_lps"] == 0
+    assert jm.solve(mip, branching="most_fractional")["root_strong_lps"] == 0
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_root_sweep_solves_to_the_reference(batch_size):
+    for make in (knapsack, general_integer, facility_location):
+        mip = make()
+        result = jm.solve(mip, batch_size=batch_size)
+        assert_solved(result, mip, reference(mip))
+
+
+@pytest.mark.parametrize("crossover", [True, False])
+def test_root_crossover_makes_reduced_cost_fixing_rigorous(monkeypatch, crossover):
+    # PDHG duals at a loose tolerance leave tiny wrong-sign reduced costs on
+    # variables with no upper bound: the root bound drops them and is not
+    # rigorous, so reduced-cost fixing cannot use it. The crossover's exact
+    # duals can: with an optimal incumbent, the dear size goes to 0.
+    mip = sizing()
+    search = search_for(mip, monkeypatch, root_crossover=crossover, **no_heuristics())
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    search.root_lower, search.root_upper = lower, upper
+    result = search.solve_lp(search.node_lp(lower, upper), None, 5000)
+    pdhg = result["solution"]
+    real = search.dual_terms
+
+    def noisy(solution):
+        constant, r = real(solution)
+        if solution is pdhg:
+            r = r.copy()
+            r[-1] = -1e-9  # a bought-in s_t, with no upper bound
+        return constant, r
+
+    search.dual_terms = noisy
+    search.root_exact_terms(lower, upper, result)
+    assert search.root_terms_rigorous == crossover
+    assert search.root_crossover_used == crossover
+    x, value = reference_point(mip)
+    search.incumbent = (value, x)
+    assert search.tighten_root()
+    if crossover:
+        assert search.reduced_cost_tightenings > 0
+        assert search.root_upper[1] == 0.0  # the dear size
+        assert lower[1] <= x[1] <= search.root_upper[1]  # the optimum stays
+    else:
+        assert search.reduced_cost_tightenings == 0
 
 
 @pytest.mark.parametrize(
