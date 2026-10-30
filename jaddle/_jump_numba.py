@@ -133,7 +133,7 @@ def _set_member(k, member, items, pos, count):
     return count
 
 
-@nb.njit(cache=True)
+@nb.njit(cache=True, nogil=True)
 def run(
     x, w,
     row_ptr, row_col, row_val, col_ptr, col_row, col_val,

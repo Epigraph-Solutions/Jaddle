@@ -35,6 +35,7 @@ import heapq
 import itertools
 import math
 import os
+import threading
 import time
 
 import jax
@@ -3568,7 +3569,7 @@ _JUMP_CHUNK_MAX = 100_000  # moves per call of the numba jump
 
 def _feasibility_jump_host(
     mip, x, lower, upper, tol, max_iterations, deadline, seed, cutoff,
-    improve=False, improve_step=None,
+    improve=False, improve_step=None, stop=None,
 ):
     """``feasibility_jump`` with the numba backend (``x`` already rounded
     into the box). Runs in chunks of 1,000 moves, doubling up to
@@ -3576,7 +3577,8 @@ def _feasibility_jump_host(
     deadline checked between them; each chunk recomputes the activities, which
     keeps rounding error from building up. With ``improve``, the search goes
     on after each point it finds, for better ones (see ``feasibility_jump``),
-    and returns the best."""
+    and returns the best. ``stop`` (a ``threading.Event``) ends it between
+    chunks too."""
     fj = _numba_jump()
     if improve and cutoff is None:
         cutoff = np.inf  # an objective row to tighten once a point is found
@@ -3604,6 +3606,8 @@ def _feasibility_jump_host(
     found_x = None
     while steps < max_iterations:
         if deadline is not None and time.time() >= deadline:
+            break
+        if stop is not None and stop.is_set():
             break
         size = int(min(size, max_iterations - steps))
         moves, found, _, _ = fj.run(
@@ -3649,6 +3653,7 @@ def feasibility_jump(
     backend="auto",
     improve=False,
     improve_step=None,
+    stop=None,
 ):
     """
     Feasibility Jump (Luteberget & Sartor, 2023): an LP-free local search
@@ -3674,6 +3679,8 @@ def feasibility_jump(
     returns the best point found. On academictimetablesmall, a loop of
     separate cutoff jumps took the objective from 4,623 to 282 in 27 s,
     mostly in rebuilding the rows each call; this does it within one call.
+    ``stop`` (numba only, a ``threading.Event``) ends the search early when
+    set, as the deadline does.
 
     The device version:
 
@@ -3711,7 +3718,7 @@ def feasibility_jump(
     if backend == "numba":
         return _feasibility_jump_host(
             mip, x, lower, upper, tol, max_iterations, deadline, seed, cutoff,
-            improve, improve_step,
+            improve, improve_step, stop,
         )
     if improve:
         raise ValueError("improve needs the numba jump backend")
@@ -3741,20 +3748,42 @@ def feasibility_jump(
     return best, False, steps
 
 
-def highs_incumbent(mip, max_seconds=30.0):
+def _interrupt_on(highs, stop):
+    """Make the ``highspy.Highs`` ``highs`` stop at its next interrupt check
+    once ``stop`` (a ``threading.Event``, or ``None``) is set. The checks
+    are callbacks into Python, made about as often as HiGHS checks its time
+    limit; HiGHS stops within about a second of ``stop``."""
+    if stop is None:
+        return
+
+    def check(event):
+        if stop.is_set():
+            event.interrupt()
+
+    highs.cbSimplexInterrupt += check
+    highs.cbIpmInterrupt += check
+    highs.cbMipInterrupt += check
+
+
+def highs_incumbent(mip, max_seconds=30.0, model=None, stop=None):
     """The best feasible point of ``mip`` that HiGHS's MIP solver finds
     within ``max_seconds`` (or its optimum, if it gets there first). Returns
     it in ``mip``'s variables, or ``None``. HiGHS's first solution is
     usually a trivial one from its own feasibility jump (133808 on
     ns1830653, against 36622 from its root sub-MIP a few seconds later), so
     it runs for the whole budget. This hands the search to HiGHS; ``solve``
-    uses it only when asked (``highs_incumbent_seconds``)."""
+    uses it only when asked (``highs_incumbent_seconds``). ``model`` (a
+    ``highspy.HighsLp`` of ``mip``, as ``to_highs`` or ``hh.jaddle_lp_to_highs``
+    make) saves building it, which reads ``mip``'s JAX arrays; ``stop`` (a
+    ``threading.Event``) interrupts HiGHS, which then returns its best
+    point so far."""
     import highspy
 
     highs = highspy.Highs()
     highs.setOptionValue("output_flag", False)
     highs.setOptionValue("time_limit", float(max_seconds))
-    highs.passModel(to_highs(mip))
+    highs.passModel(to_highs(mip) if model is None else model)
+    _interrupt_on(highs, stop)
     highs.run()
     if highs.getInfo().primal_solution_status != 2:  # kSolutionStatusFeasible
         return None
@@ -3762,7 +3791,8 @@ def highs_incumbent(mip, max_seconds=30.0):
 
 
 def highs_submip(
-    mip, lower, upper, cutoff=None, max_seconds=5.0, max_nodes=None, start=None
+    mip, lower, upper, cutoff=None, max_seconds=5.0, max_nodes=None, start=None,
+    model=None, stop=None,
 ):
     """
     The sub-MIP of ``mip`` over the box ``[lower, upper]`` solved by HiGHS,
@@ -3773,13 +3803,22 @@ def highs_submip(
     offset) is passed as HiGHS's ``objective_bound``, so only better points
     come back; a dense cutoff row would get in presolve's way. ``start``,
     if given (an incumbent for RINS), is offered to HiGHS as a starting
-    solution. Returns the best point found, or ``None``.
+    solution. ``model`` (``hh.jaddle_lp_to_highs`` of ``mip``, built once)
+    saves rebuilding it each call; it is not changed. ``stop`` (a
+    ``threading.Event``) interrupts HiGHS. Returns the best point found, or
+    ``None``.
     """
     import highspy
 
-    model = hh.jaddle_lp_to_highs(mip.lp, mip.integrality)
-    model.col_lower_ = np.asarray(lower, np.float64)
-    model.col_upper_ = np.asarray(upper, np.float64)
+    lower = np.asarray(lower, np.float64)
+    upper = np.asarray(upper, np.float64)
+    if model is None:
+        model = hh.jaddle_lp_to_highs(mip.lp, mip.integrality)
+        model.col_lower_ = lower
+        model.col_upper_ = upper
+        prebuilt = False
+    else:
+        prebuilt = True
     highs = highspy.Highs()
     highs.setOptionValue("output_flag", False)
     highs.setOptionValue("time_limit", float(max(max_seconds, 1e-3)))
@@ -3789,6 +3828,11 @@ def highs_submip(
     if finite_cutoff:
         highs.setOptionValue("objective_bound", float(cutoff))
     highs.passModel(model)
+    if prebuilt:
+        # The shared model keeps its own bounds; this copy gets the box.
+        n = lower.size
+        highs.changeColsBounds(n, np.arange(n, dtype=np.int32), lower, upper)
+    _interrupt_on(highs, stop)
     if start is not None:
         solution = highspy.HighsSolution()
         solution.col_value = list(np.asarray(start, np.float64))
@@ -4032,6 +4076,79 @@ _LP_RESERVED = (
 )
 
 
+# With ``parallel_heuristics``, the improving jump runs in slices of this
+# many seconds, each from the incumbent of its time (see
+# ``_BranchAndBound.schedule_improve_jump``).
+_JUMP_SLICE_SECONDS = 5.0
+
+
+class _HeuristicWorkers:
+    """Background threads for the CPU heuristics (``parallel_heuristics``),
+    so they run while the main thread keeps the device busy with node LPs.
+
+    There are two lanes, each one thread running one job at a time, in the
+    order given: ``"highs"`` for HiGHS (RENS, RINS, the incumbent search;
+    HiGHS shares one task scheduler between its instances, so they run one
+    after another) and ``"jump"`` for the numba feasibility jump. A job is a
+    function of NumPy arrays and HiGHS models only, never of JAX arrays:
+    JAX's precision settings are per thread, and the search may be inside
+    ``local_settings``. Both HiGHS and numba release the GIL while they
+    work. The search collects finished jobs with ``finished`` and checks
+    their points itself."""
+
+    LANES = ("highs", "jump")
+
+    def __init__(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.pools = {
+            lane: ThreadPoolExecutor(1, thread_name_prefix=f"jaddle-{lane}")
+            for lane in self.LANES
+        }
+        self.jobs = {lane: [] for lane in self.LANES}
+        self.stop = threading.Event()  # set when the search ends
+
+    def idle(self, lane):
+        """Whether ``lane`` has no job running or waiting."""
+        return not self.jobs[lane]
+
+    def submit(self, lane, kind, fn, *args, info=None, **kwargs):
+        """Queue ``fn(*args, stop=..., **kwargs)`` on ``lane``. ``kind`` and
+        ``info`` come back with its result."""
+
+        def job():
+            started = time.time()
+            out = fn(*args, stop=self.stop, **kwargs)
+            return out, time.time() - started
+
+        self.jobs[lane].append((kind, self.pools[lane].submit(job), info))
+
+    def finished(self):
+        """The jobs done since the last call, as ``(kind, result, seconds,
+        info)`` in the order they were queued per lane (``seconds``: the
+        job's own run time). A job that raised re-raises here, on the main
+        thread."""
+        out = []
+        for lane in self.LANES:
+            jobs = self.jobs[lane]
+            while jobs and jobs[0][1].done():
+                kind, future, info = jobs.pop(0)
+                result, seconds = future.result()
+                out.append((kind, result, seconds, info))
+        return out
+
+    def shutdown(self):
+        """Stop every job (HiGHS within about a second, the jump within a
+        chunk) and wait for the threads. Results not yet collected are
+        dropped."""
+        self.stop.set()
+        for lane in self.LANES:
+            for _, future, _ in self.jobs[lane]:
+                future.cancel()
+            self.pools[lane].shutdown(wait=True)
+            self.jobs[lane] = []
+
+
 class _BranchAndBound:
     def __init__(
         self,
@@ -4124,6 +4241,7 @@ class _BranchAndBound:
         node_crossover_seconds=2.0,
         node_precision=None,
         jump_backend="auto",
+        parallel_heuristics=False,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
         self.settings = {
@@ -4251,6 +4369,18 @@ class _BranchAndBound:
         # the tree get ``_numba_short_jump`` of them by default (``None``).
         self.jump_backend = _jump_backend(jump_backend)
         numba = self.jump_backend == "numba"
+        # CPU heuristics on background threads (``_HeuristicWorkers``); their
+        # threads start with the first job.
+        self.workers = _HeuristicWorkers() if parallel_heuristics else None
+        self.worker_jobs = 0
+        self.worker_seconds = 0.0
+        self.worker_finds = 0
+        self.host_highs_model = None  # built on first use, by highs_model()
+        self.jump_slices = 0
+        # The incumbent value the last improving-jump slice started from, and
+        # the slices' box and warm start (the root's, once it has one).
+        self.jump_slice_from = None
+        self.jump_box = None
         if pump_jump_iterations is None:
             pump_jump_iterations = _numba_short_jump(mip) if numba else 3000
         if tree_jump_iterations is None:
@@ -5756,6 +5886,8 @@ class _BranchAndBound:
         )
 
     def result(self, status):
+        # Background points that are in already (the rest are dropped).
+        self.collect_heuristics(schedule=False)
         bound = self.global_bound()
         if status == "optimal":
             # The search ended: proven unless a node closed without proof
@@ -5841,6 +5973,12 @@ class _BranchAndBound:
             "bound_stops": self.bound_stops,
             "submip_calls": self.submip_calls,
             "submip_seconds": self.submip_seconds,
+            "parallel_heuristics": {
+                "jobs": self.worker_jobs,
+                "seconds": self.worker_seconds,
+                "improvements": self.worker_finds,
+                "jump_slices": self.jump_slices,
+            },
             "strong_branch_nodes": self.strong_branch_nodes,
             "strong_branch_lps": self.strong_branch_lps,
             "strong_branch_seconds": self.strong_branch_seconds,
@@ -6388,6 +6526,9 @@ class _BranchAndBound:
         (``rins_nodes``) doubles after a call that improves the incumbent
         and halves after one that does not, within [50, 2000], as HiGHS
         adapts its own sub-MIP effort."""
+        if self.parallel_highs():
+            self.queue_rins(x, warm)
+            return
         started = time.time()
         seconds = self.rins_seconds
         if self.deadline is not None:
@@ -6411,15 +6552,18 @@ class _BranchAndBound:
 
     def submip_budget_left(self):
         """Whether RINS is within ``heuristic_effort`` of the elapsed time
-        (never with ``heuristic_effort=0``)."""
+        (never with ``heuristic_effort=0``). In the background
+        (``parallel_heuristics``) it takes no time from the tree, so only
+        ``heuristic_effort=0`` stops it."""
+        if self.parallel_highs():
+            return self.heuristic_effort > 0
         return self.submip_seconds < self.heuristic_effort * (time.time() - self.start)
 
-    def highs_rins_search(self, x, seconds, min_fixed=0.3):
-        """RINS with HiGHS (``highs_submip``): the integers on which the
-        incumbent and ``x`` agree are fixed, the incumbent is HiGHS's start
-        and this search's cutoff its objective bound. Skipped (``None``)
-        when fewer than ``min_fixed`` of the integers agree or the same
-        neighbourhood was searched at the same cutoff."""
+    def rins_box(self, x, seconds, min_fixed=0.3):
+        """RINS's neighbourhood for HiGHS: the integers on which the
+        incumbent and ``x`` agree are fixed there. ``None`` when ``seconds``
+        is not positive, fewer than ``min_fixed`` of the integers agree, or
+        the same neighbourhood was searched at the same cutoff."""
         ints = self.is_int
         incumbent = self.incumbent[1]
         agree = ints & (np.abs(np.asarray(x, np.float64) - incumbent) <= self.int_tol)
@@ -6432,10 +6576,120 @@ class _BranchAndBound:
         self.rins_seen.add(key)
         lower = np.where(agree, incumbent, self.base.lower)
         upper = np.where(agree, incumbent, self.base.upper)
+        return lower, upper
+
+    def highs_rins_search(self, x, seconds, min_fixed=0.3):
+        """RINS with HiGHS (``highs_submip``) in ``rins_box``'s
+        neighbourhood: the incumbent is HiGHS's start and this search's
+        cutoff its objective bound. ``None`` when ``rins_box`` skips it."""
+        box = self.rins_box(x, seconds, min_fixed)
+        if box is None:
+            return None
         return highs_submip(
-            self.base, lower, upper, cutoff=self.cutoff(), max_seconds=seconds,
-            max_nodes=self.rins_nodes, start=incumbent,
+            self.base, *box, cutoff=self.cutoff(), max_seconds=seconds,
+            max_nodes=self.rins_nodes, start=self.incumbent[1],
         )
+
+    def highs_model(self):
+        """``self.base`` as a ``highspy.HighsLp`` (``hh.jaddle_lp_to_highs``),
+        built once, here on the main thread (it reads JAX arrays), for the
+        background HiGHS jobs."""
+        cached = self.host_highs_model
+        if cached is None or cached[0] is not self.base:
+            model = hh.jaddle_lp_to_highs(self.base.lp, self.base.integrality)
+            cached = self.host_highs_model = (self.base, model)
+        return cached[1]
+
+    def parallel_highs(self):
+        """Whether RINS and RENS run on the background HiGHS lane."""
+        return self.workers is not None and self.rins_solver == "highs"
+
+    def queue_rins(self, x, warm):
+        """RINS around the incumbent and ``x`` on the background HiGHS lane.
+        With the lane busy it waits (``rins_pending``) for the next node."""
+        if not self.workers.idle("highs"):
+            self.rins_pending = True
+            return
+        seconds = self.rins_seconds
+        if self.deadline is not None:
+            seconds = min(seconds, self.deadline - time.time())
+        box = self.rins_box(x, seconds)
+        if box is None:
+            return
+        self.workers.submit(
+            "highs", "rins", highs_submip, self.base, *box,
+            cutoff=self.cutoff(), max_seconds=seconds, max_nodes=self.rins_nodes,
+            start=self.incumbent[1].copy(), model=self.highs_model(), info=warm,
+        )
+
+    def schedule_improve_jump(self):
+        """With ``parallel_heuristics`` and the numba jump: an improving
+        jump (``improve_jump``) of ``_JUMP_SLICE_SECONDS`` from the
+        incumbent, on the background jump lane when it is idle. A slice that
+        finds nothing better is not repeated until the incumbent changes
+        (by the tree, RINS or anything else)."""
+        if (
+            self.workers is None
+            or not self.use_jump
+            or self.jump_backend != "numba"
+            or self.incumbent is None
+            or not self.workers.idle("jump")
+            or self.out_of_time()
+        ):
+            return
+        value, x = self.incumbent
+        if self.jump_slice_from is not None and value >= self.jump_slice_from:
+            return
+        seconds = _JUMP_SLICE_SECONDS
+        if self.deadline is not None:
+            seconds = min(seconds, self.deadline - time.time())
+        if seconds <= 0:
+            return
+        self.jump_slice_from = value
+        lower, upper, warm = self.jump_box or (self.base.lower, self.base.upper, None)
+        limit = self.jump_iterations
+        if limit is None:
+            limit = np.iinfo(np.int64).max
+        self.jump_slices += 1
+        self.workers.submit(
+            "jump", "jump", feasibility_jump, self.base, x.copy(), lower, upper,
+            tol=self.feas_tol, max_iterations=limit,
+            deadline=time.time() + seconds, seed=2 + self.jump_slices,
+            cutoff=self.cutoff(box=False), backend="numba", improve=True,
+            improve_step=self.objective_step, info=warm,
+        )
+
+    def collect_heuristics(self, schedule=True):
+        """Check the points of finished background jobs
+        (``parallel_heuristics``) with ``try_incumbent``, marked as their
+        serial versions are, then queue the next improving-jump slice
+        (unless ``schedule`` is false)."""
+        if self.workers is None:
+            return
+        for kind, found, seconds, warm in self.workers.finished():
+            before = None if self.incumbent is None else self.incumbent[0]
+            self.worker_jobs += 1
+            self.worker_seconds += seconds
+            if kind == "jump":
+                x, feasible, _ = found
+                if feasible:
+                    self.try_incumbent(x, "J", warm)
+            elif found is not None:
+                self.try_incumbent(found, {"rins": "N", "rens": "E", "highs": "X"}[kind], warm)
+            improved = self.incumbent is not None and (
+                before is None or self.incumbent[0] < before
+            )
+            self.worker_finds += improved
+            if kind in ("rins", "rens"):
+                self.submip_calls += 1
+                self.submip_seconds += seconds
+            if kind == "rins":
+                self.rins_calls += 1
+                self.rins_nodes = int(
+                    min(2000, max(50, self.rins_nodes * (2 if improved else 0.5)))
+                )
+        if schedule:
+            self.schedule_improve_jump()
 
     def sub_search(self, lower, upper, seconds, nodes, warm=None):
         """
@@ -6478,6 +6732,7 @@ class _BranchAndBound:
             node_crossover=False,
             batch_size=1,
             verbose=False,
+            parallel_heuristics=False,
         )
         if settings["branching"] == "reliability":
             # Strong branching would spend the sub-MIP's short budget.
@@ -6519,6 +6774,16 @@ class _BranchAndBound:
         if self.deadline is not None:
             seconds = min(seconds, self.deadline - started)
         if seconds <= 0:
+            return
+        if self.parallel_highs():
+            cutoff = self.cutoff()
+            self.workers.submit(
+                "highs", "rens", highs_submip, self.base, sub_lower, sub_upper,
+                cutoff=cutoff if np.isfinite(cutoff) else None,
+                max_seconds=seconds, max_nodes=self.rens_nodes,
+                model=self.highs_model(), info=warm,
+            )
+            self.heuristic_seconds += time.time() - started
             return
         if self.rins_solver == "highs":
             cutoff = self.cutoff()
@@ -6850,7 +7115,11 @@ class _BranchAndBound:
                 and time.time() < deadline
             ):
                 self.jump(self.pump_last, lower, upper, warm, deadline, seed=2)
-        if (
+        # The box and warm start of the background improving jump.
+        self.jump_box = (lower.copy(), upper.copy(), warm)
+        if self.workers is not None:
+            self.schedule_improve_jump()
+        elif (
             self.use_jump
             and self.jump_backend == "numba"
             and self.incumbent is not None
@@ -6865,9 +7134,15 @@ class _BranchAndBound:
             seconds = self.highs_seconds
             if self.deadline is not None:
                 seconds = min(seconds, self.deadline - time.time())
-            found = highs_incumbent(self.base, max_seconds=seconds)
-            if found is not None:
-                self.try_incumbent(found, "X", warm)
+            if self.workers is not None:
+                self.workers.submit(
+                    "highs", "highs", highs_incumbent, self.base,
+                    max_seconds=seconds, model=self.highs_model(), info=warm,
+                )
+            else:
+                found = highs_incumbent(self.base, max_seconds=seconds)
+                if found is not None:
+                    self.try_incumbent(found, "X", warm)
         self.heuristic_seconds += time.time() - started
         if self.verbose:
             print(
@@ -7115,11 +7390,16 @@ class _BranchAndBound:
             self.branch(**item, precomputed=row)
 
     def run(self):
-        """The search, on ``self.device`` when one is set."""
-        if self.device is None:
-            return self._run()
-        with jax.default_device(self.device):
-            return self._run()
+        """The search, on ``self.device`` when one is set. Background
+        heuristics (``parallel_heuristics``) stop when it returns."""
+        try:
+            if self.device is None:
+                return self._run()
+            with jax.default_device(self.device):
+                return self._run()
+        finally:
+            if self.workers is not None:
+                self.workers.shutdown()
 
     def _run(self):
         mip = self.mip
@@ -7291,6 +7571,7 @@ class _BranchAndBound:
         status = "optimal"
         try:
             while self.open or self.plunge_node is not None:
+                self.collect_heuristics()
                 if self.out_of_time():
                     status = "time_limit"
                     break
@@ -7428,6 +7709,7 @@ def solve(
     precision=None,
     node_precision=None,
     jump_backend="auto",
+    parallel_heuristics=False,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -7714,6 +7996,24 @@ def solve(
       25,808 after 60s. With HiGHS solving it, Jaddle reaches vpm2's
       optimum in 12s (never within 60s before) and pp08a's within 1% in
       4.6s (30s before).
+    * **Background heuristics** (``parallel_heuristics``, off by default).
+      The heuristics that run on the CPU run on background threads, beside
+      the node LPs, instead of between them: HiGHS's RENS and RINS (with
+      ``rins_solver="highs"``) and its incumbent search
+      (``highs_incumbent_seconds``) on one thread, one job at a time, and
+      the numba improving jump on another. The search hands a job over
+      when it is due and its thread is free (a RINS call that finds the
+      thread busy waits for the next node) and checks the points of
+      finished jobs between nodes, marked as above. The improving jump runs
+      in slices of 5 s, each from the incumbent of its time; a slice that
+      finds nothing better is not repeated until the incumbent changes.
+      RINS then takes no time from the tree, so ``heuristic_effort`` no
+      longer limits it (``0`` still turns it off). The device heuristics
+      (bulk rounding, the pump, the tree heuristics) stay on the main
+      thread, as they would share the device with the node LPs anyway. The
+      jobs use HiGHS and NumPy only, never JAX, and stop within about a
+      second when the search ends. A run then depends on timing, so it is
+      no longer repeatable; leave it off for that.
     * **Dives** (``dive_every``, off by default). LP-based dives at the
       root and every ``dive_every`` nodes: round a fractional integer
       (fractional, guided or pseudocost rule), propagate, re-solve the LP
@@ -7804,6 +8104,11 @@ def solve(
     * ``"tree_heuristic_calls"``, ``"tree_heuristic_finds"``,
       ``"tree_heuristic_seconds"``: GPU tree heuristic calls
       (``tree_heuristics``), those that improved the incumbent, and their time.
+    * ``"parallel_heuristics"``: the background jobs
+      (``parallel_heuristics``) collected (``"jobs"``), their run time
+      (``"seconds"``, beside the search's own), those whose point improved
+      the incumbent (``"improvements"``) and the improving-jump slices
+      started (``"jump_slices"``).
     * ``"node_crossovers"``, ``"node_crossover_vertices"``,
       ``"node_crossover_integral"``, ``"node_crossover_seconds"``: node
       crossovers (``node_crossover``), those that proved a vertex optimal,
@@ -7887,6 +8192,7 @@ def solve(
         node_crossover_seconds=node_crossover_seconds,
         node_precision=node_precision,
         jump_backend=jump_backend,
+        parallel_heuristics=parallel_heuristics,
         heuristic_seconds=heuristic_seconds,
         lp_options=lp_options,
         node_lp_options=node_lp_options,

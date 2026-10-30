@@ -5,8 +5,14 @@
 # problem with a time limit. The incumbent is mapped back to the original
 # variables with HiGHS's postsolve.
 #
-# The MPS files are not shipped with Jaddle. Download them from the
-# [MIPLIB website](https://miplib.zib.de/) into `data/` at the repo root.
+# Pass the model file on the command line: any MPS file (or another format
+# HiGHS reads, such as `.lp`), e.g.
+#
+#     python examples/mip/miplib.py path/to/model.mps
+#
+# A bare name with no such file, such as `academictimetablesmall`, is looked
+# up as `data/<name>.mps` at the repo root. The MIPLIB files are not shipped
+# with Jaddle; download them from the [MIPLIB website](https://miplib.zib.de/).
 #
 # Jaddle's branch and bound is deliberately simple, so on most MIPLIB
 # instances it will not close the gap. Expect a valid bound and, usually, an
@@ -14,6 +20,7 @@
 
 # %%
 import os
+import sys
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -25,10 +32,16 @@ import jaddle.jaddle_mip as jm
 # ## The instance
 
 # %%
-PROBLEM_NAME = "academictimetablesmall"  # name of the MIPLIB problem (without .mps)
-PATH_TO_MPS = os.path.join(
-    os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
-)
+if len(sys.argv) < 2:
+    sys.exit(f"usage: python {sys.argv[0]} <model.mps | MIPLIB name in data/>")
+PATH_TO_MPS = sys.argv[1]
+if not os.path.exists(PATH_TO_MPS):
+    PATH_TO_MPS = os.path.join(
+        os.path.dirname(__file__), "..", "..", "data", f"{PATH_TO_MPS}.mps"
+    )
+    if not os.path.exists(PATH_TO_MPS):
+        sys.exit(f"no such file: {sys.argv[1]} (nor {os.path.normpath(PATH_TO_MPS)})")
+PROBLEM_NAME = os.path.basename(PATH_TO_MPS).split(".")[0]
 MAX_SECONDS = 36000
 
 mip = jm.load(PATH_TO_MPS)
@@ -40,19 +53,21 @@ print(
 # %% [markdown]
 # ## Branch and bound
 # `presolve=True` works on HiGHS's reduced MIP and postsolves the incumbent.
-# Jaddle's own primal heuristics look for the first incumbent:
+# Every primal heuristic is on, Jaddle's and HiGHS's:
 # - root probing;
 # - fix-and-propagate, classic and bulk (several starts at once);
-# - the feasibility jump;
-# - the feasibility pump, with a short jump from each rounding it rejects.
+# - the feasibility jump, then an improving jump from each incumbent;
+# - the feasibility pump, with a short jump from each rounding it rejects;
+# - HiGHS: RENS at the root, RINS in the tree, and its own MIP search for
+#   an incumbent if all of the above fail;
+# - in the tree: LP dives, and GPU bulk rounding and jumps from node points.
 #
-# The log marks their incumbents `P`, `B`, `J`, `F` and `R` (repair), and
-# RINS's `N`. Only Jaddle's heuristics run here: RENS and RINS search their
-# sub-MIPs with Jaddle's own branch and bound (`rins_solver="jaddle"`), and
-# HiGHS supplies no incumbent. HiGHS still presolves the model, but finds no
-# solutions. With HiGHS searching the RINS sub-MIPs instead (the default),
-# ns1830653 went from 131,808 to 36,808 within 10 s of the first point in a
-# 5-minute test (best known: 20,622). Jaddle's sub-search is slower there.
+# The log marks their incumbents `P` (fix-and-propagate), `B` (bulk), `J`
+# (jump), `F` (pump), `R` (repair), `E` (RENS), `N` (RINS), `X` (HiGHS) and
+# `D` (dive). With `parallel_heuristics=True` the CPU ones (HiGHS and the
+# numba improving jump) run on background threads beside the node LPs. With
+# HiGHS searching the RINS sub-MIPs, ns1830653 went from 131,808 to 36,808
+# within 10 s of the first point in a 5-minute test (best known: 20,622).
 
 # %%
 result = jm.solve(
@@ -65,16 +80,15 @@ result = jm.solve(
     gomory_cuts=True,
     # Laptop GPUs run float64 at a small fraction of float32 speed.
     # The root LP and cut rounds run in float64; node LPs at node_precision.
-    precision="float64",
-    node_precision="float16",
+    precision="float32",
+    node_precision="float32",
+    node_crossover=True,
     cut_round_epochs=10,
-    lp_tolerance=1e-8,
-    node_lp_tolerance=1e-2,
+    lp_tolerance=1e-4,
+    node_lp_tolerance=1e-3,
     # Any other jl.solve option for node LPs only (root and heuristic LPs
     # keep lp_options), e.g. check convergence every 64 iterations:
-    node_lp_options={
-        "iterations_per_epoch": 64,
-    },
+    node_lp_options={"iterations_per_epoch": 64},
     max_cuts_per_round=1000,
     heuristic_every=5,
     # Primal heuristics, after cuOpt's GPU heuristics. On ns1830653 the
@@ -89,10 +103,10 @@ result = jm.solve(
     feasibility_pump=True,  # the pump, fused with short jumps
     pump_jump_iterations=3000,
     repair_share=0.2,  # cap repair so later jumps and the pump still run
-    # Jaddle's heuristics only, no HiGHS: RENS and RINS search their sub-MIPs
-    # with Jaddle's own branch and bound, and HiGHS never supplies an
-    # incumbent. (With rins_solver="jaddle", rens_seconds=None runs RENS only
-    # on MIPs with at most 10,000 nonzeros.)
+    # HiGHS searches the RENS and RINS sub-MIPs ("jaddle": Jaddle's own branch
+    # and bound, slower on large MIPs). RENS gets 10% of max_seconds, up to
+    # 30 s. HiGHS's own MIP search runs for up to 10 s only if no other
+    # heuristic finds an incumbent.
     rins_solver="highs",
     highs_incumbent_seconds=10,
     rens_seconds=None,
@@ -100,6 +114,11 @@ result = jm.solve(
     # to 30% of the run.
     rins_every=5,
     heuristic_effort=0.3,
+    # HiGHS's RENS/RINS and the numba improving jump on background threads,
+    # beside the node LPs (runs are then not repeatable).
+    parallel_heuristics=True,
+    # LP dives every 50 nodes (and at the root): round, propagate, re-solve.
+    dive_every=50,
     # GPU heuristics from node LP points once there is an incumbent: bulk
     # rounding, then a feasibility jump that looks only for better points.
     tree_heuristics=True,
@@ -111,7 +130,7 @@ result = jm.solve(
     batch_size=32,
     batch_epochs=10,
     cuts=False,
-    tree_cuts=True,
+    tree_cuts=False,
     verbose=True,
     log_every_seconds=10,
     device="gpu",

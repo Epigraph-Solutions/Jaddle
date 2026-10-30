@@ -4,6 +4,19 @@
 
 ### Added
 
+- `parallel_heuristics=True` in `jm.solve` runs the CPU heuristics on
+  background threads while the main thread keeps the device busy with
+  node LPs. HiGHS's RENS, RINS and incumbent search share one thread, one
+  job at a time; the numba improving jump has another and runs in 5 s
+  slices, each from the incumbent of its time. The search checks finished
+  jobs' points between nodes. Background RINS takes no time from the
+  tree, so `heuristic_effort` no longer limits it. Runs then depend on
+  timing, so it is off by default. On academictimetablesmall with the
+  example's settings (120 s, `batch_size=1`), the incumbent reached 1,071
+  against 1,683–2,502 serially, at the same node rate. The result reports
+  the jobs under `"parallel_heuristics"`. `highs_submip` and
+  `highs_incumbent` take a prebuilt HiGHS `model` and a `stop` event, and
+  `feasibility_jump` takes `stop` (numba).
 - Incremental feasibility jump (`jaddle._jump_numba`, `pip install
   jaddle[fast]` for numba). It moves one variable a step and updates only
   that variable's rows: their activities, the in-place scores of their
@@ -394,6 +407,18 @@
 
 ### Fixed
 
+- A warm start's step state (`initial_opt_state`) from a solve in another
+  update mode, or from an LP with other rows, crashed `solve`. That happened
+  in the MIP search with `update_mode="halpern"` in `node_lp_options` only
+  ("not enough values to unpack"), or in `lp_options` with cut rounds
+  (shape mismatch). Halpern now anchors at the warm start when the state
+  has no usable anchor, and the other modes ignore the anchor.
+- With `node_precision` below float64 and batched nodes, repairing a node's
+  rounding by an LP could fail with "lax.add requires arguments to have the
+  same dtypes, got int32, int64". JAX reused a 32-bit copy of the LP's sort
+  permutation from the node LPs in a float64 context. The permutations are
+  now int32 (when the LP has under 2^31 nonzeros), which reads the same at
+  every precision.
 - Root bulk rounding (`bulk_rounding`) ran only after the classic
   fix-and-propagate, so `fix_and_propagate=False` silently turned it off,
   at the root and in the feasibility pump. It now runs on its own.

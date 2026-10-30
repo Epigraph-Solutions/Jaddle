@@ -1171,7 +1171,22 @@ def _device_solver(
         k_init = jnp.clip(norm_c / norm_b, k_lo, k_hi)
 
     if initial_opt_state is not None:
-        opt_state = initial_opt_state
+        # The state may come from a solve in the other update mode (as when
+        # a MIP's node LPs use halpern and its root LP does not), or from an
+        # LP with other rows (a MIP's cut rounds). Halpern then anchors at
+        # the warm start; the other modes drop the anchor.
+        opt_state = tuple(initial_opt_state)[:2]
+        if halpern:
+            anchor = initial_solution
+            if len(initial_opt_state) > 2:
+                same_shape = jax.tree.map(
+                    lambda a, b: jnp.shape(a) == jnp.shape(b),
+                    tuple(initial_opt_state[2]),
+                    tuple(initial_solution),
+                )
+                if all(jax.tree.leaves(same_shape)):
+                    anchor = initial_opt_state[2]
+            opt_state = opt_state + (anchor,)
     else:
         # Step-size state (k, eta); halpern also carries the anchor z_0
         # (cycle-start iterate), seeded from the initial solution and reset at

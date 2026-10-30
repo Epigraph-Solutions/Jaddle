@@ -2549,6 +2549,43 @@ def test_node_precision_through_node_lp_options():
         jm.solve(mip, node_precision="float8")
 
 
+def test_lp_repair_after_lower_precision_batched_nodes():
+    # Batched node LPs at float16 used the LP's sort permutations with 64-bit
+    # off; repairing a node's rounding at float64 then failed in JAX's
+    # indexing ("lax.add requires arguments to have the same dtypes").
+    mip = facility_location()
+    result = jm.solve(
+        mip,
+        precision="float64",
+        node_precision="float16",
+        batch_size=32,
+        fix_and_propagate=False,
+        heuristic_every=5,
+        cuts=False,
+    )
+    assert_solved(result, mip, reference(mip))
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"node_lp_options": {"update_mode": "halpern"}},
+        {"lp_options": {"update_mode": "halpern"}},
+        {
+            "lp_options": {"update_mode": "halpern"},
+            "node_lp_options": {"update_mode": "pdhg"},
+        },
+    ],
+)
+def test_root_and_node_lps_in_different_update_modes(options):
+    # Halpern's step state carries an anchor point that the other modes do
+    # not, and cut rounds change the LP's rows under it. Node LPs warm-started
+    # from the root (or cut rounds from an earlier round) used to fail.
+    mip = general_integer()
+    result = jm.solve(mip, batch_size=1, tree_cuts=True, **options)
+    assert_solved(result, mip, reference(mip))
+
+
 def test_lp_options_cannot_set_device_or_precision():
     for key, value in (("device", "cpu"), ("precision", "float32")):
         with pytest.raises(ValueError, match=key):
@@ -3132,3 +3169,109 @@ def test_numba_jump_is_deterministic():
     ]
     np.testing.assert_array_equal(runs[0][0], runs[1][0])
     assert runs[0][1:] == runs[1][1:]
+
+
+# %% Background heuristics (parallel_heuristics)
+@pytest.mark.parametrize(
+    "make", [knapsack, general_integer, facility_location, generalised_assignment]
+)
+def test_parallel_heuristics_match_reference(make):
+    mip = make()
+    result = jm.solve(
+        mip, parallel_heuristics=True, highs_incumbent_seconds=2.0, rins_every=2
+    )
+    assert_solved(result, mip, reference(mip))
+    stats = result["parallel_heuristics"]
+    assert set(stats) == {"jobs", "seconds", "improvements", "jump_slices"}
+
+
+def test_background_workers_run_jobs_in_order_and_stop():
+    import threading
+
+    workers = jm._HeuristicWorkers()
+    seen = []
+
+    def job(value, stop):
+        seen.append(value)
+        return value * 2
+
+    def waits(stop):
+        return stop.wait(30.0)  # until shutdown sets stop
+
+    try:
+        assert workers.idle("highs")
+        workers.submit("highs", "a", job, 1, info="first")
+        workers.submit("highs", "b", job, 2)
+        assert not workers.idle("highs")
+        done = []
+        deadline = time.time() + 10
+        while len(done) < 2 and time.time() < deadline:
+            done += workers.finished()
+        assert [(kind, out, info) for kind, out, _, info in done] == [
+            ("a", 2, "first"),
+            ("b", 4, None),
+        ]
+        assert seen == [1, 2] and workers.idle("highs")
+        workers.submit("jump", "wait", waits)
+    finally:
+        started = time.time()
+        workers.shutdown()
+    assert time.time() - started < 5.0  # the waiting job saw stop
+    assert workers.idle("jump")
+    assert isinstance(workers.stop, threading.Event) and workers.stop.is_set()
+
+
+def test_background_job_errors_reach_the_search():
+    workers = jm._HeuristicWorkers()
+
+    def fails(stop):
+        raise RuntimeError("boom")
+
+    try:
+        workers.submit("highs", "x", fails)
+        with pytest.raises(RuntimeError, match="boom"):
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                workers.finished()
+    finally:
+        workers.shutdown()
+
+
+def test_highs_submip_with_a_prebuilt_model():
+    from jaddle import highs_helpers as hh
+
+    mip = general_integer()
+    model = hh.jaddle_lp_to_highs(mip.lp, mip.integrality)
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    upper[0] = lower[0] = np.clip(0.0, mip.lower[0], mip.upper[0])
+    plain = jm.highs_submip(mip, lower, upper, max_seconds=10.0)
+    shared = jm.highs_submip(mip, lower, upper, max_seconds=10.0, model=model)
+    assert plain is not None and shared is not None
+    assert mip.c @ shared == pytest.approx(mip.c @ plain)
+    assert shared[0] == lower[0]
+    # The shared model keeps its own bounds.
+    np.testing.assert_array_equal(np.asarray(model.col_upper_), mip.upper)
+
+
+def test_highs_stops_when_asked():
+    import threading
+
+    stop = threading.Event()
+    stop.set()
+    mip = generalised_assignment(1)
+    started = time.time()
+    jm.highs_incumbent(mip, max_seconds=60.0, stop=stop)
+    assert time.time() - started < 10.0
+
+
+@NEEDS_NUMBA
+def test_numba_jump_stops_when_asked():
+    import threading
+
+    stop = threading.Event()
+    stop.set()
+    mip = generalised_assignment(1)
+    _, _, steps = jm.feasibility_jump(
+        mip, np.zeros(mip.num_variables), improve=True, stop=stop
+    )
+    assert steps == 0

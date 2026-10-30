@@ -159,6 +159,11 @@ def _row_major_order(rows, cols, shape):
         (np.arange(rows.size, dtype=np.int64), (rows, cols)), shape=shape
     )
     perm.sort_indices()
+    # int32 when it fits: JAX can reuse an index array's device copy across
+    # 64-bit on/off contexts, and an int64 one first used with 64-bit off
+    # (node_precision below float64) then fails with 64-bit on.
+    if rows.size <= np.iinfo(np.int32).max:
+        return perm.data.astype(np.int32)
     return perm.data
 
 
