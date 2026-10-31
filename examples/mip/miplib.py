@@ -55,6 +55,9 @@ print(
 # `presolve=True` works on HiGHS's reduced MIP and postsolves the incumbent.
 # Every primal heuristic is on, Jaddle's and HiGHS's:
 # - root probing;
+# - round and repair: LP points rounded up, to nearest and down, with
+#   HiGHS solving the continuous rest exactly (at the root, the root's
+#   strong children and every few nodes);
 # - fix-and-propagate, classic and bulk (several starts at once);
 # - the feasibility jump, then an improving jump from each incumbent;
 # - the feasibility pump, with a short jump from each rounding it rejects;
@@ -62,10 +65,12 @@ print(
 #   an incumbent if all of the above fail;
 # - in the tree: LP dives, and GPU bulk rounding and jumps from node points.
 #
-# The log marks their incumbents `P` (fix-and-propagate), `B` (bulk), `J`
-# (jump), `F` (pump), `R` (repair), `E` (RENS), `N` (RINS), `X` (HiGHS) and
-# `D` (dive). With `parallel_heuristics=True` the CPU ones (HiGHS and the
-# numba improving jump) run on background threads beside the node LPs. With
+# The log marks their incumbents `U` (round and repair), `P`
+# (fix-and-propagate), `B` (bulk), `J` (jump), `F` (pump), `R` (repair), `E`
+# (RENS), `N` (RINS), `X` (HiGHS) and `D` (dive). With
+# `parallel_heuristics=True` the CPU ones (HiGHS, round and repair in the
+# tree, and the numba improving jump) run on background threads beside the
+# node LPs. With
 # HiGHS searching the RINS sub-MIPs, ns1830653 went from 131,808 to 36,808
 # within 10 s of the first point in a 5-minute test (best known: 20,622).
 
@@ -85,9 +90,10 @@ result = jm.solve(
     # The root LP and cut rounds run in float64; node LPs at node_precision.
     precision="float64",
     node_precision="float32",
+    root_crossover=False,
     node_crossover=False,
     cut_round_epochs=10,
-    lp_tolerance=1e-6,
+    lp_tolerance=1e-4,
     node_lp_tolerance=1e-3,
     # Any other jl.solve option for node LPs only (root and heuristic LPs
     # keep lp_options), e.g. check convergence every 64 iterations:

@@ -4,6 +4,30 @@
 
 ### Added
 
+- Round and repair in `jm.solve` (`round_repair=True`, `round_repair_every`,
+  `round_repair_seconds`), marked `U`. An LP point's integers are rounded
+  up, to nearest and down (`jm.integer_roundings`, snapping near-integral
+  PDHG values by `100·lp_tolerance` first), and HiGHS solves the rest with
+  them fixed (`jm.highs_round_repair`: presolve leaves an exact LP over the
+  continuous variables), keeping only improving points. It runs on the
+  root LP (its exact vertex first, when the root is crossed over), on the
+  LP points of the root's strong children of its branching variable, and
+  every `round_repair_every` nodes (default `heuristic_every`). In the tree
+  it runs on the background HiGHS lane with `parallel_heuristics`, else
+  within `heuristic_effort`. On buildingenergy's presolved model, rounding
+  up and repairing gives 33,325 from the root vertex in 0.6 s, and 33,285.6
+  from the sizing variable's up child (optimum 33,283.85). RENS gave 33,747
+  after 190 s. Rounding to nearest, as `try_incumbent` does, gives 33,688
+  there, and its PDHG repair (`repair_max_epochs=20`) is far from converged
+  on a 145,000-variable LP.
+- Mixed-integer LPs through CVXPY: `JaddleSolver` is now `MIP_CAPABLE`, and
+  a problem with `integer=True` or `boolean=True` variables is solved by
+  `jm.solve` (options of `problem.solve` pass through; `tol` sets
+  `lp_tolerance`). Boolean columns get their 0/1 bounds, budget stops give
+  `USER_LIMIT` with the incumbent, and `extra_stats` holds the bound and
+  gap. No duals. Mixed-integer QPs, and mixed-integer problems on
+  `jcv.solve(qp_route=False)`, raise `SolverError`. New example
+  `examples/mip/cvxpy_facility_location.py`.
 - Root strong-branching sweep in `jm.solve` (`root_strong_candidates`,
   `"auto"` = `strong_candidates`; `root_strong_epochs`, default
   `strong_epochs`). Before the root branches, the fractional integers with

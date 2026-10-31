@@ -1279,6 +1279,7 @@ NO_HEURISTICS = dict(
     rins_seconds=0,
     probing=False,
     cuts=False,
+    round_repair=False,
 )
 
 
@@ -1448,7 +1449,7 @@ def test_root_rens_with_highs_finds_the_first_incumbent(make):
     mip = make()
     result = jm.solve(
         mip, gomory_cuts=True, feasibility_jump=False, fix_and_propagate=False,
-        feasibility_pump=False, bulk_rounding=False,
+        feasibility_pump=False, bulk_rounding=False, round_repair=False,
     )
     assert_solved(result, mip, reference(mip))
     assert result["history"][0]["source"] == "E"  # RENS
@@ -2457,6 +2458,24 @@ def test_rens_returns_only_better_points(monkeypatch):
         assert search.incumbent[0] < cutoff
 
 
+def test_dive_stops_at_its_deadline(monkeypatch):
+    # Dives re-solve the LP at every step; past their deadline they stop.
+    mip = general_integer()
+    search = search_for(mip, monkeypatch, **no_heuristics())
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    search.root_lower, search.root_upper = lower, upper
+    result = search.solve_lp(search.node_lp(lower, upper), None, 2000)
+    x = np.asarray(result["solution"].primal, np.float64)
+    assert np.any(np.abs(x - np.round(x)) > 1e-3)  # a dive has work to do
+    calls = count_lp_solves(monkeypatch)
+    warm = (result["solution"], result["opt_state"])
+    search.dive(x, lower, upper, warm, rule="fractional", deadline=time.time() - 1.0)
+    assert calls == []
+    search.dive(x, lower, upper, warm, rule="fractional")  # the default budget
+    assert len(calls) > 0
+    assert search.dive_seconds() > 0
+
+
 @pytest.mark.parametrize("rule", ["fractional", "guided", "pseudocost"])
 def test_dive_finds_feasible_points_or_nothing(rule, monkeypatch):
     mip = generalised_assignment(2)
@@ -2635,6 +2654,7 @@ def no_heuristics():
         feasibility_pump=False,
         rens_seconds=0.0,
         rins_seconds=0.0,
+        round_repair=False,
     )
 
 
@@ -2867,6 +2887,79 @@ def test_root_crossover_makes_reduced_cost_fixing_rigorous(monkeypatch, crossove
         assert search.reduced_cost_tightenings == 0
 
 
+# %% Round and repair
+def test_rounding_up_repairs_best_on_sizing():
+    # Unit counts for continuous output: rounding them up is what the
+    # continuous variables can repair (as on buildingenergy).
+    mip = sizing()
+    x = np.asarray(jl.solve(mip.lp)["solution"].primal)
+    roundings = jm.integer_roundings(x, mip.integrality, mip.lower, mip.upper, 1e-3)
+    assert 2 <= len(roundings) <= 3
+    values = []
+    for rounding in roundings:
+        point = jm.highs_round_repair(mip, x, mip.lower, mip.upper, roundings=[rounding])
+        if point is not None:
+            assert mip.is_feasible(point)
+            assert np.array_equal(point[mip.integrality], rounding)
+        values.append(np.inf if point is None else mip.c @ point)
+    assert np.isfinite(values[0]) and values[0] == min(values)
+    best = jm.highs_round_repair(mip, x, mip.lower, mip.upper, snap=1e-3)
+    assert mip.c @ best == pytest.approx(values[0])
+    # A cutoff below every rounding leaves nothing.
+    assert jm.highs_round_repair(mip, x, mip.lower, mip.upper, cutoff=0.0) is None
+
+
+def test_integer_roundings_snap():
+    ints = np.array([True, True, False])
+    lower, upper = np.zeros(3), np.full(3, 10.0)
+    x = np.array([2.0004, 3.4, 0.7])
+    roundings = jm.integer_roundings(x, ints, lower, upper, snap=1e-3)
+    # Up, then nearest (the same as down here, so dropped).
+    assert [r.tolist() for r in roundings] == [[2.0, 4.0], [2.0, 3.0]]
+    # Without snapping the noise rounds 2.0004 up.
+    assert jm.integer_roundings(x, ints, lower, upper, snap=0.0)[0].tolist() == [3.0, 4.0]
+    # Roundings stay in the box.
+    capped = jm.integer_roundings(x, ints, lower, np.array([10.0, 3.0, 10.0]), 1e-3)
+    assert capped[0].tolist() == [2.0, 3.0]
+
+
+def test_round_repair_in_the_search():
+    mip = sizing()
+    result = jm.solve(mip, **dict(no_heuristics(), round_repair=True))
+    assert_solved(result, mip, reference(mip), rigorous=False)
+    assert "U" in [entry["source"] for entry in result["history"]]
+    assert result["round_repair_calls"] > 0 and result["round_repair_finds"] > 0
+    off = jm.solve(mip, **no_heuristics())
+    assert off["round_repair_calls"] == 0
+    assert "U" not in [entry["source"] for entry in off["history"]]
+    assert result["nodes"] < off["nodes"]
+
+
+def test_round_repair_in_the_background():
+    mip = sizing()
+    result = jm.solve(
+        mip, **dict(no_heuristics(), round_repair=True, round_repair_every=1),
+        parallel_heuristics=True,
+    )
+    assert_solved(result, mip, reference(mip), rigorous=False)
+    assert result["round_repair_calls"] > 0
+
+
+def test_round_repair_is_off_in_sub_searches(monkeypatch):
+    seen = []
+    real = jm._BranchAndBound.__init__
+
+    def recording(self, mip, **settings):
+        seen.append(settings.get("round_repair"))
+        real(self, mip, **settings)
+
+    monkeypatch.setattr(jm._BranchAndBound, "__init__", recording)
+    mip = facility_location()
+    jm.solve(mip, rins_solver="jaddle", rens_seconds=2.0)
+    assert seen[0] is True and len(seen) > 1  # RENS ran a sub-search
+    assert all(flag is False for flag in seen[1:])
+
+
 @pytest.mark.parametrize(
     "make", [knapsack, general_integer, facility_location, generalised_assignment]
 )
@@ -2947,6 +3040,7 @@ def test_fused_pump_finds_points():
         jump_iterations=1,
         rens_seconds=0.0,
         rins_seconds=0.0,
+        round_repair=False,
     )
     fused = jm.solve(mip, **settings)
     assert fused["x"] is not None and mip.is_feasible(fused["x"])

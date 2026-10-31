@@ -3871,6 +3871,69 @@ def highs_submip(
     return x
 
 
+def integer_roundings(x, integrality, lower, upper, snap=1e-6):
+    """
+    Up to three roundings of ``x``'s integers, in the order ``highs_round_repair``
+    tries them: up (``ceil(x − snap)``), nearest and down
+    (``floor(x + snap)``), each within ``[lower, upper]``, duplicates
+    dropped. ``snap`` puts values within it of an integer on that integer
+    first, so the noise of a PDHG point does not round them away. Returns a
+    list of arrays over the integer variables.
+    """
+    xi = np.asarray(x, np.float64)[integrality]
+    lo = np.asarray(lower, np.float64)[integrality]
+    up = np.asarray(upper, np.float64)[integrality]
+    out, seen = [], set()
+    for values in (np.ceil(xi - snap), np.round(xi), np.floor(xi + snap)):
+        values = np.clip(values, lo, up)
+        key = values.tobytes()
+        if key not in seen:
+            seen.add(key)
+            out.append(values)
+    return out
+
+
+def highs_round_repair(
+    mip, x, lower, upper, cutoff=None, max_seconds=10.0, snap=1e-6, roundings=None,
+    model=None, stop=None,
+):
+    """
+    Round and repair: round ``x``'s integers (``integer_roundings``: up,
+    nearest, down), fix them, and let HiGHS solve the rest exactly
+    (``highs_submip`` with every integer fixed: its presolve leaves an LP over
+    the continuous variables). ``roundings`` (arrays over the integers) are
+    tried instead when given. ``cutoff`` keeps only better points; the
+    roundings share ``max_seconds``. Returns the best point, or ``None``.
+
+    Rounding up suits integers that count units which continuous variables
+    then use, as on buildingenergy (``n ≤ x ≤ 5n``, ``n ≤ N``): from the
+    root LP vertex, rounding up and repairing gives 33,325 in 0.6 s, against
+    33,747 from RENS after 190 s (optimum 33,283.85); from the up child of
+    the sizing variable, 33,285.6. Rounding to nearest there gives 33,688,
+    and down 34,210.
+    """
+    ints = mip.integrality
+    if roundings is None:
+        roundings = integer_roundings(x, ints, lower, upper, snap)
+    deadline = time.time() + max_seconds
+    best, best_value = None, cutoff
+    for k, values in enumerate(roundings):
+        left = deadline - time.time()
+        if left <= 0 or (stop is not None and stop.is_set()):
+            break
+        fixed_lower = np.asarray(mip.lower, np.float64).copy()
+        fixed_upper = np.asarray(mip.upper, np.float64).copy()
+        fixed_lower[ints] = values
+        fixed_upper[ints] = values
+        point = highs_submip(
+            mip, fixed_lower, fixed_upper, cutoff=best_value,
+            max_seconds=left / (len(roundings) - k), model=model, stop=stop,
+        )
+        if point is not None:
+            best, best_value = point, float(mip.c @ point)
+    return best
+
+
 def highs_rins(mip, incumbent, x_lp, cutoff, max_seconds=5.0, min_fixed=0.3):
     """
     RINS (relaxation induced neighbourhood search) with HiGHS as the sub-MIP
@@ -4245,6 +4308,9 @@ class _BranchAndBound:
         root_strong_candidates="auto",
         root_strong_epochs=None,
         root_crossover="auto",
+        round_repair=True,
+        round_repair_every=None,
+        round_repair_seconds=10.0,
         pump_jump_iterations=None,
         pump_jump_share=0.2,
         probing=True,
@@ -4334,6 +4400,21 @@ class _BranchAndBound:
         self.root_crossover_used = False
         # The last root crossover: (the MIP it was for, its SaddleState).
         self.root_vertex_state = None
+        # Round and repair (``round_repair``): roundings of LP points whose
+        # integers HiGHS fixes, solving the rest exactly.
+        self.use_round_repair = bool(round_repair)
+        self.round_repair_every = (
+            heuristic_every if round_repair_every is None else int(round_repair_every)
+        )
+        self.round_repair_limit = float(round_repair_seconds)
+        self.round_repair_calls = 0
+        self.round_repair_finds = 0
+        self.round_repair_seconds = 0.0
+        self.round_repair_seen = set()  # integer parts already tried
+        # Snapping for PDHG points (vertices are exact): their noise is about
+        # the LP tolerance, which would round near-integral values away.
+        tolerances = [lp_tolerance] + ([node_lp_tolerance] if node_lp_tolerance else [])
+        self.round_snap = min(0.1, max(10 * integrality_tolerance, 100 * max(tolerances)))
         if node_selection not in ("hybrid", "best_first", "depth_first"):
             raise ValueError(f"unknown node selection {node_selection!r}")
         lp_options = dict(lp_options or {})
@@ -5967,6 +6048,11 @@ class _BranchAndBound:
             if bound >= self.cutoff():
                 self.close(bound, rigorous)
                 return
+        if not root and self.round_repair_due():
+            self.round_repair(x, lower, upper, warm, background=self.workers is not None)
+            if bound >= self.cutoff():
+                self.close(bound, rigorous)
+                return
         if (
             self.rins_seconds
             and self.incumbent is not None
@@ -6030,6 +6116,22 @@ class _BranchAndBound:
         if strong is None and var in root_children:
             # The sweep's children: their bounds and warm starts.
             strong = root_children[var]
+        if root and strong is not None and self.use_round_repair:
+            # Round and repair from the branching variable's child LPs, up
+            # first: on buildingenergy the sizing variable's up child rounds
+            # up to within 0.005% of the optimum.
+            for down in (False, True):
+                solution = strong[down].solution
+                if solution is None:
+                    continue
+                if callable(solution):
+                    solution = solution()
+                self.round_repair(
+                    np.asarray(solution.primal, np.float64), lower, upper, warm
+                )
+            if bound >= self.cutoff():
+                self.close(bound, rigorous)
+                return
         self.active_bound = bound
         if (
             self.use_tree_cuts
@@ -6175,6 +6277,9 @@ class _BranchAndBound:
             "root_strong_lps": self.root_strong_lps,
             "root_strong_seconds": self.root_strong_seconds,
             "root_crossover": self.root_crossover_used,
+            "round_repair_calls": self.round_repair_calls,
+            "round_repair_finds": self.round_repair_finds,
+            "round_repair_seconds": self.round_repair_seconds,
             "pump_jumps": self.pump_jumps,
             "pump_jump_finds": self.pump_jump_finds,
             "probing": dict(self.probing_stats),
@@ -6240,6 +6345,14 @@ class _BranchAndBound:
         # Its exact duals, for ``root_exact_terms`` (while the rows stay).
         self.root_vertex_state = (self.mip, crossed["solution"])
         return np.asarray(crossed["solution"].primal, np.float64), crossed["basis"]
+
+    def current_root_vertex(self):
+        """The primal point of the last root crossover if it was for the
+        current rows (``self.mip``), else ``None``."""
+        state = self.root_vertex_state
+        if state is None or state[0] is not self.mip:
+            return None
+        return np.asarray(state[1].primal, np.float64)
 
     def root_exact_terms(self, lower, upper, result):
         """
@@ -6824,6 +6937,85 @@ class _BranchAndBound:
             max_nodes=self.rins_nodes, start=self.incumbent[1],
         )
 
+    def round_repair(self, x, lower, upper, warm, snap=None, background=False):
+        """
+        Round and repair from the LP point ``x`` (``highs_round_repair``):
+        its roundings up, to nearest and down within ``[lower, upper]``, less
+        those already tried and those whose fixed box propagation shows
+        infeasible, each repaired exactly by HiGHS within
+        ``round_repair_seconds`` in all. ``snap`` (``None``: the PDHG
+        snapping, ``round_snap``) for exact vertices is ``int_tol``. With
+        ``background`` (and ``parallel_heuristics``) it runs on the HiGHS
+        lane when that is idle (skipped otherwise), and ``collect_heuristics``
+        checks its point; else here. Points are marked ``"U"``.
+        """
+        if not self.use_round_repair or self.out_of_time():
+            return
+        if snap is None:
+            snap = self.round_snap
+        lower = np.asarray(lower, np.float64)
+        upper = np.asarray(upper, np.float64)
+        if background and not (self.workers is not None and self.workers.idle("highs")):
+            return
+        roundings = []
+        for values in integer_roundings(x, self.is_int, lower, upper, snap):
+            key = values.tobytes()
+            if key in self.round_repair_seen:
+                continue
+            # Every rounding gets tried once: a failed or worse one stays so,
+            # as the cutoff only falls.
+            self.round_repair_seen.add(key)
+            fixed_lower = np.where(self.is_int, 0.0, self.mip.lower)
+            fixed_upper = np.where(self.is_int, 0.0, self.mip.upper)
+            fixed_lower[self.is_int] = values
+            fixed_upper[self.is_int] = values
+            if self.row_propagator(fixed_lower, fixed_upper)[2]:
+                continue
+            roundings.append(values)
+        if not roundings:
+            return
+        seconds = self.round_repair_limit
+        if self.deadline is not None:
+            seconds = min(seconds, self.seconds_left())
+        cutoff = self.cutoff()
+        cutoff = cutoff if np.isfinite(cutoff) else None
+        self.round_repair_calls += 1
+        if background and self.workers is not None:
+            self.workers.submit(
+                "highs", "round", highs_round_repair, self.base, x, lower, upper,
+                cutoff=cutoff, max_seconds=seconds, roundings=roundings,
+                model=self.highs_model(), info=warm,
+            )
+            return
+        started = time.time()
+        before = None if self.incumbent is None else self.incumbent[0]
+        found = highs_round_repair(
+            self.base, x, lower, upper, cutoff=cutoff, max_seconds=seconds,
+            roundings=roundings, model=self.highs_model(),
+        )
+        if found is not None:
+            self.try_incumbent(found, "U", warm)
+        self.round_repair_finds += self.incumbent is not None and (
+            before is None or self.incumbent[0] < before
+        )
+        elapsed = time.time() - started
+        self.round_repair_seconds += elapsed
+        self.heuristic_seconds += elapsed
+
+    def round_repair_due(self):
+        """Whether a tree node gets round and repair: every
+        ``round_repair_every`` nodes, while it has taken at most
+        ``heuristic_effort`` of the elapsed time (on the background lane it
+        takes none from the tree)."""
+        if not (self.use_round_repair and self.round_repair_every):
+            return False
+        if self.nodes % self.round_repair_every != 0:
+            return False
+        if self.workers is not None:
+            return True
+        elapsed = time.time() - self.start
+        return self.round_repair_seconds <= self.heuristic_effort * elapsed
+
     def highs_model(self):
         """``self.base`` as a ``highspy.HighsLp`` (``hh.jaddle_lp_to_highs``),
         built once, here on the main thread (it reads JAX arrays), for the
@@ -6909,11 +7101,15 @@ class _BranchAndBound:
                 if feasible:
                     self.try_incumbent(x, "J", warm)
             elif found is not None:
-                self.try_incumbent(found, {"rins": "N", "rens": "E", "highs": "X"}[kind], warm)
+                source = {"rins": "N", "rens": "E", "highs": "X", "round": "U"}[kind]
+                self.try_incumbent(found, source, warm)
             improved = self.incumbent is not None and (
                 before is None or self.incumbent[0] < before
             )
             self.worker_finds += improved
+            if kind == "round":
+                self.round_repair_finds += improved
+                self.round_repair_seconds += seconds
             if kind in ("rins", "rens"):
                 self.submip_calls += 1
                 self.submip_seconds += seconds
@@ -6975,6 +7171,7 @@ class _BranchAndBound:
         # Nor the root sweep or crossover (the sub-MIP has no incumbent to fix with).
         settings["root_strong_candidates"] = 0
         settings["root_crossover"] = False
+        settings["round_repair"] = False
         search = _BranchAndBound(sub_mip, **settings)
         if warm is not None:
             m_ineq = base.A.shape[0] - base.n_eq
@@ -7036,7 +7233,19 @@ class _BranchAndBound:
             self.try_incumbent(found, "E", warm)
         self.heuristic_seconds += time.time() - started
 
-    def dive(self, x, lower, upper, warm, rule=None):
+    def dive_seconds(self):
+        """The time a dive may take: the heuristic budget
+        (``heuristic_seconds``; ``None``: 20% of ``max_seconds``, as the root
+        heuristics get). On buildingenergy, two root dives without a limit
+        took 4.5 minutes of 50-epoch re-solves of a 145,000-variable LP,
+        fixing one of 8,000 fractional integers a step."""
+        if self.heuristic_budget is not None:
+            return float(self.heuristic_budget)
+        if self.deadline is not None:
+            return 0.2 * (self.deadline - self.start)
+        return np.inf
+
+    def dive(self, x, lower, upper, warm, rule=None, deadline=None):
         """
         An LP-based dive from a node's LP point ``x`` in its box: round one
         fractional integer (chosen by ``rule``), propagate (objective-aware,
@@ -7048,9 +7257,11 @@ class _BranchAndBound:
         variable, to its nearer integer), ``"guided"`` (towards the
         incumbent, the variable closest to it first) or ``"pseudocost"``
         (the cheaper direction by pseudocost); ``None`` rotates through
-        them.
+        them. It stops at ``deadline`` (``None``: ``dive_seconds`` from now).
         """
         started = time.time()
+        if deadline is None:
+            deadline = started + self.dive_seconds()
         ints = self.is_int
         if rule is None:
             rules = ["fractional", "pseudocost"] + (
@@ -7113,6 +7324,8 @@ class _BranchAndBound:
                 else:
                     return
                 lower, upper = lo, hi
+                if time.time() >= deadline:
+                    return
                 result = self.solve_lp(self.node_lp(lower, upper), warm, epochs)
                 if result["stop_reason"] in ("interrupted", "time_limit"):
                     return
@@ -7765,6 +7978,33 @@ class _BranchAndBound:
             self.close(bound, rigorous)
             return self.result("time_limit")
         self.active_bound = self.round_bound(self.lp_bound(result["solution"], lower, upper)[0])
+        if self.use_round_repair and not self.out_of_time():
+            # Round and repair first, from an exact vertex when the root is
+            # crossed over anyway (RENS, ``root_crossover``): the later
+            # heuristics, RENS and RINS then start with a cutoff.
+            started = time.time()
+            vertex = self.current_root_vertex()
+            if vertex is None and self.root_crossover is not False:
+                self.root_vertex(lower, upper, result["solution"])
+                vertex = self.current_root_vertex()
+            if vertex is not None:
+                self.round_repair(
+                    vertex, lower, upper, (result["solution"], result["opt_state"]),
+                    snap=self.int_tol,
+                )
+            self.round_repair(
+                np.asarray(result["solution"].primal, np.float64), lower, upper,
+                (result["solution"], result["opt_state"]),
+            )
+            if self.verbose:
+                print(
+                    f"Round and repair: {time.time() - started:.1f}s, "
+                    + (
+                        f"incumbent {self.model_value(self.incumbent[0]):.6e}"
+                        if self.incumbent is not None
+                        else "no incumbent"
+                    )
+                )
         if (
             self.use_fix_and_propagate
             or self.use_bulk_rounding
@@ -7780,6 +8020,8 @@ class _BranchAndBound:
             # root: far more of it is integral than of a PDHG point. The cut
             # loop keeps its last one; otherwise cross over now (HiGHS).
             vertex = self.root_vertex_x
+            if vertex is None:
+                vertex = self.current_root_vertex()  # round and repair's
             if vertex is None and self.rins_solver == "highs":
                 vertex, _ = self.root_vertex(lower, upper, result["solution"])
             if vertex is not None:
@@ -7787,9 +8029,21 @@ class _BranchAndBound:
             else:
                 self.rens(root_x, lower, upper, root_warm)
         if self.dive_every and not self.out_of_time():
-            self.dive(root_x, lower, upper, root_warm, rule="fractional")
-            if self.incumbent is not None:
-                self.dive(root_x, lower, upper, root_warm, rule="guided")
+            # The root dives share one heuristic budget.
+            started = time.time()
+            deadline = started + self.dive_seconds()
+            self.dive(root_x, lower, upper, root_warm, rule="fractional", deadline=deadline)
+            if self.incumbent is not None and time.time() < deadline:
+                self.dive(root_x, lower, upper, root_warm, rule="guided", deadline=deadline)
+            if self.verbose:
+                print(
+                    f"Root dives: {time.time() - started:.1f}s, "
+                    + (
+                        f"incumbent {self.model_value(self.incumbent[0]):.6e}"
+                        if self.incumbent is not None
+                        else "no incumbent"
+                    )
+                )
         if (
             self.rins_seconds
             and self.incumbent is not None
@@ -7904,6 +8158,9 @@ def solve(
     root_strong_candidates="auto",
     root_strong_epochs=None,
     root_crossover="auto",
+    round_repair=True,
+    round_repair_every=None,
+    round_repair_seconds=10.0,
     tree_cuts=False,
     tree_cut_every=10,
     fix_and_propagate=True,
@@ -8256,6 +8513,23 @@ def solve(
       halves after one that does not (within 50–2000), and RINS calls stop
       while they have taken more than ``heuristic_effort`` (0.1) of the
       elapsed time (``heuristic_effort=0``: no RINS).
+    * **Round and repair** (``round_repair``, on by default). The root LP
+      point (first its exact vertex, when the root is crossed over for RENS
+      or ``root_crossover``), the LP points of the root's two strong
+      children of the variable it branches on, and every
+      ``round_repair_every`` (``None``: ``heuristic_every``) node's LP
+      point have their integers rounded up, to nearest and down
+      (``integer_roundings``; near-integral PDHG values are snapped first,
+      by ``100 · lp_tolerance``). Each rounding is fixed, and HiGHS solves
+      the rest exactly (``highs_round_repair``), for up to
+      ``round_repair_seconds`` (10) a call, marked ``"U"``. In the tree it
+      runs on the background HiGHS lane with ``parallel_heuristics`` (when
+      idle), else within ``heuristic_effort``. Rounding up suits integers
+      that count units for continuous variables: on buildingenergy it
+      gives 33,325 from the root vertex in 0.6 s and 33,285.6 from the
+      sizing variable's up child, against 33,747 from RENS after 190 s
+      (optimum 33,283.85). The PDHG repair of ``try_incumbent``
+      (``repair_max_epochs``) is far from converged on such large LPs.
     * **RENS** (``rens_seconds``; ``None``, the default, gives 10% of
       ``max_seconds`` up to 30s, or 10s without a time limit; with
       ``rins_solver="jaddle"``, 5s for MIPs with at most 10,000 nonzeros,
@@ -8363,7 +8637,8 @@ def solve(
     * ``"history"``: one dict per new incumbent (``seconds``, ``nodes``,
       ``objective``, ``bound``, ``source``: ``"H"`` rounding, ``"P"``
       fix-and-propagate, ``"J"`` feasibility jump, ``"R"`` repair, ``"F"``
-      feasibility pump, ``"X"`` HiGHS (``highs_incumbent_seconds``), ``"N"``
+      feasibility pump, ``"U"`` round and repair, ``"X"`` HiGHS
+      (``highs_incumbent_seconds``), ``"N"``
       RINS (``rins_seconds``) or ``"T"`` tree);
       ``"heuristic_seconds"``: time spent in the two heuristics.
     * ``"batches"``: batched node solves (``batch_size > 1``).
@@ -8395,7 +8670,10 @@ def solve(
       variables fixed because one child was closed; ``"root_strong_lps"``,
       ``"root_strong_seconds"``: the root sweep's child LPs and time
       (``root_strong_candidates``); ``"root_crossover"``: whether the root
-      bound and reduced-cost fixing used exact crossover duals.
+      bound and reduced-cost fixing used exact crossover duals;
+      ``"round_repair_calls"``, ``"round_repair_finds"``,
+      ``"round_repair_seconds"``: round and repair (``round_repair``) calls,
+      those that improved the incumbent, and their time.
     * ``"cuts"``: the number of cuts in the final LP, by family
       (``"gomory"``, ``"cover"``, ``"mir"``, ``"flowcover"``); ``"root_bound_before_cuts"``: the root bound
       before them (``None`` when no cut round ran).
@@ -8493,6 +8771,9 @@ def solve(
         root_strong_candidates=root_strong_candidates,
         root_strong_epochs=root_strong_epochs,
         root_crossover=root_crossover,
+        round_repair=round_repair,
+        round_repair_every=round_repair_every,
+        round_repair_seconds=round_repair_seconds,
     )
     with jo.local_settings(precision=precision):
         if presolve:

@@ -334,3 +334,123 @@ def test_channel_capacity():
 def test_unsupported(build):
     with pytest.raises(NotImplementedError):
         jcv.compile_problem(build(cp.Variable(3)))
+
+
+# %%
+# Mixed-integer LPs: JaddleSolver's branch and bound, checked against HiGHS
+
+
+def highs_value(problem):
+    problem.solve(solver=cp.HIGHS)
+    assert problem.status == cp.OPTIMAL
+    return problem.value
+
+
+def assert_integral(*variables):
+    for v in variables:
+        np.testing.assert_allclose(v.value, np.round(v.value), atol=1e-6)
+
+
+def mip_knapsack(seed=0, n=15):
+    rng = np.random.default_rng(seed)
+    w = rng.integers(5, 30, n).astype(float)
+    v = w + rng.integers(0, 10, n)
+    x = cp.Variable(n, boolean=True)
+    return cp.Problem(cp.Maximize(v @ x), [w @ x <= w.sum() / 3]), x
+
+
+def test_mip_binary_knapsack():
+    problem, x = mip_knapsack()
+    ref = highs_value(problem)
+    problem.solve(solver=jcv.JaddleSolver())
+    assert problem.status == cp.OPTIMAL
+    assert problem.value == pytest.approx(ref, rel=1e-6)
+    assert_integral(x)
+    # No bounds were declared: the 0/1 range comes from boolean=True.
+    assert x.value.min() > -1e-6 and x.value.max() < 1 + 1e-6
+    # The bound is of CVXPY's minimisation form: a Maximize is negated.
+    stats = problem.solver_stats.extra_stats
+    assert -stats["bound"] == pytest.approx(ref, rel=1e-4)
+
+
+def test_mip_general_integers_with_equalities():
+    rng = np.random.default_rng(1)
+    n, x0 = 8, rng.integers(0, 5, 8).astype(float)
+    A_eq = rng.integers(-3, 4, (2, n)).astype(float)
+    A_ineq = rng.integers(-3, 4, (6, n)).astype(float)
+    x = cp.Variable(n, integer=True, bounds=[0, 8])
+    problem = cp.Problem(
+        cp.Minimize(rng.standard_normal(n) @ x + 3),
+        [A_eq @ x == A_eq @ x0, A_ineq @ x <= A_ineq @ x0 + rng.integers(0, 4, 6)],
+    )
+    ref = highs_value(problem)
+    problem.solve(solver=jcv.JaddleSolver())
+    assert problem.status == cp.OPTIMAL
+    assert problem.value == pytest.approx(ref, abs=1e-6 * (1 + abs(ref)))
+    assert_integral(x)
+
+
+def test_mip_mixed_binary_and_continuous():
+    # Capacitated facility location: binary openings, continuous flows.
+    rng = np.random.default_rng(2)
+    n_fac, n_cust = 4, 8
+    fixed = rng.uniform(20, 40, n_fac)
+    capacity = rng.uniform(30, 50, n_fac)
+    demand = rng.uniform(5, 15, n_cust)
+    cost = rng.uniform(1, 5, (n_fac, n_cust))
+    open_ = cp.Variable(n_fac, boolean=True)
+    flow = cp.Variable((n_fac, n_cust), nonneg=True)
+    constraints = [
+        cp.sum(flow, axis=0) == demand,
+        cp.sum(flow, axis=1) <= cp.multiply(capacity, open_),
+    ]
+    problem = cp.Problem(
+        cp.Minimize(fixed @ open_ + cp.sum(cp.multiply(cost, flow))), constraints
+    )
+    ref = highs_value(problem)
+    problem.solve(solver=jcv.JaddleSolver(), mip_rel_gap=1e-7)
+    assert problem.status == cp.OPTIMAL
+    assert problem.value == pytest.approx(ref, rel=1e-6)
+    assert_integral(open_)
+    assert constraints[0].dual_value is None
+
+
+def test_mip_infeasible():
+    y = cp.Variable(3, integer=True)
+    problem = cp.Problem(cp.Minimize(cp.sum(y)), [y >= 0.5, cp.sum(y) <= 2])
+    problem.solve(solver=jcv.JaddleSolver())
+    assert problem.status == cp.INFEASIBLE
+
+
+@pytest.mark.filterwarnings("ignore:Solution may be inaccurate")
+def test_mip_node_limit():
+    problem, x = mip_knapsack(seed=3, n=40)
+    problem.solve(solver=jcv.JaddleSolver(), max_nodes=1, cuts=False)
+    stats = problem.solver_stats.extra_stats
+    assert stats["status"] in ("node_limit", "optimal")
+    if stats["status"] == "node_limit":
+        assert problem.status == cp.USER_LIMIT
+    assert "bound" in stats and "gap" in stats
+    if stats["x"] is not None:
+        assert_integral(x)
+
+
+def test_mip_quadratic_objective_raises():
+    y = cp.Variable(3, integer=True)
+    problem = cp.Problem(cp.Minimize(cp.sum_squares(y)), [y >= 0.5])
+    with pytest.raises(cp.error.SolverError, match="mixed-integer LPs only"):
+        problem.solve(solver=jcv.JaddleSolver())
+
+
+def test_mip_compiled_route_raises():
+    problem, _ = mip_knapsack()
+    with pytest.raises(cp.error.SolverError, match="mixed-integer"):
+        jcv.solve(problem, qp_route=False)
+
+
+def test_mip_solve_routes_to_branch_and_bound():
+    problem, _ = mip_knapsack()
+    ref = highs_value(problem)
+    jcv.solve(problem)
+    assert problem.status == cp.OPTIMAL
+    assert problem.value == pytest.approx(ref, rel=1e-6)

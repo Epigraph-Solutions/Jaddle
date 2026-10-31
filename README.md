@@ -1073,6 +1073,11 @@ w = cp.Variable(p)
 lasso = cp.Problem(cp.Minimize(cp.sum_squares(X @ w - y) + cp.norm1(w)))
 lasso.solve(solver=jcv.JaddleSolver(), tol=1e-6)
 
+# A mixed-integer LP: the same solver, by branch and bound.
+pick = cp.Variable(n, boolean=True)
+knapsack = cp.Problem(cp.Maximize(value @ pick), [weight @ pick <= budget])
+knapsack.solve(solver=jcv.JaddleSolver(), max_seconds=60)
+
 # Second-order and PSD cones: Jaddle as a CVXPY conic solver.
 risk_limited = cp.Problem(cp.Maximize(mu @ w), [cp.sum(w) == 1, cp.norm(F.T @ w) <= 0.2])
 risk_limited.solve(solver=jcv.JaddleConicSolver(), tol=1e-6)
@@ -1090,6 +1095,17 @@ Jaddle, HiGHS postsolve; `presolve=False` skips it), and a QP through
 tolerance on the original problem is reported as `"optimal_inaccurate"`.
 [`examples/lp/cvxpy_transport.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/lp/cvxpy_transport.py)
 is a small worked LP.
+
+A mixed-integer LP (variables declared `integer=True` or `boolean=True`)
+goes to [the mixed-integer solver](#the-mixed-integer-solver), which is
+highly experimental. The keyword arguments of `problem.solve` go to
+`jm.solve` (`max_seconds`, `mip_rel_gap`, ...), and `tol` sets its
+`lp_tolerance`. A time or node limit gives `"user_limit"` with the best point
+found. Branch and bound gives no duals, so every `dual_value` is `None`;
+`extra_stats` has the proven `bound` (of CVXPY's minimisation form) and the
+`gap`. A mixed-integer QP raises `SolverError`.
+[`examples/mip/cvxpy_facility_location.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/mip/cvxpy_facility_location.py)
+is a worked example.
 
 **`JaddleConicSolver`** is a CVXPY conic solver for problems CVXPY can put in
 the form `min cᵀx  s.t.  Ax + s = b`, with `s` in a product of zero,

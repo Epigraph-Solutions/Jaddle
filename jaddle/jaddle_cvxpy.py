@@ -9,7 +9,8 @@ Three routes, all returning results the CVXPY way (``prob.status``,
   ``min ½xᵀPx + qᵀx  s.t.  Ax = b, Fx <= g, lower <= x <= upper``. An LP
   (``P = 0``) goes through ``jaddle_linear.solve_with_presolve`` (HiGHS
   presolve, then Jaddle, then HiGHS postsolve), a QP through
-  ``jaddle_convex.quadratic_program``.
+  ``jaddle_convex.quadratic_program``. A mixed-integer LP (``integer=True``
+  or ``boolean=True`` variables) goes through ``jaddle_mip.solve``.
 * ``JaddleConicSolver`` is a CVXPY conic solver for problems with
   second-order, PSD and exponential cones (so ``log``, ``log_det``,
   ``log_sum_exp``, ...): ``prob.solve(solver=JaddleConicSolver())``.
@@ -201,9 +202,24 @@ class JaddleSolver(_EqualByType, QpSolver):
 
     ``prob.solver_stats.extra_stats`` is Jaddle's result dict (certificate,
     epochs, stop reason, presolve sizes).
+
+    A mixed-integer LP (variables declared ``integer=True`` or
+    ``boolean=True``) is solved by ``jaddle_mip.solve``, Jaddle's branch and
+    bound, which is highly experimental: check its answers against an
+    established MIP solver. The keyword arguments of ``prob.solve`` go to
+    ``jaddle_mip.solve`` (``max_seconds``, ``mip_rel_gap``, ...), and ``tol``
+    sets its ``lp_tolerance``. The status is ``OPTIMAL`` when the gap closes,
+    ``USER_LIMIT`` when a time or node limit stops the search (with the best
+    point, if any) and ``OPTIMAL_INACCURATE`` when the search ends with an
+    incumbent but the gap open. There are no duals (``dual_value`` is
+    ``None``), and ``extra_stats`` holds ``gap``, ``nodes`` and the proven
+    ``bound``, the latter for CVXPY's minimisation form (negated for a
+    ``Maximize``, objective constant excluded). A mixed-integer QP raises ``SolverError``. Run in float64
+    (``jaddle_optimisers.configure_jax("float64")``) for the default
+    tolerances.
     """
 
-    MIP_CAPABLE = False
+    MIP_CAPABLE = True
     BOUNDED_VARIABLES = True
 
     def name(self):
@@ -231,6 +247,17 @@ class JaddleSolver(_EqualByType, QpSolver):
             b_ineq=np.asarray(data[s.G], dtype=np.float64),
         )
         is_lp = P.nnz == 0 or not np.any(P.data)
+
+        if data.get(s.BOOL_IDX) or data.get(s.INT_IDX):
+            if not is_lp:
+                raise cp.error.SolverError(
+                    "JADDLE solves mixed-integer LPs only; this problem has a"
+                    " quadratic objective."
+                )
+            return _solve_mip(
+                q, problem, lower, upper, data[s.BOOL_IDX], data[s.INT_IDX],
+                verbose, solver_opts,
+            )
 
         initial = None
         cached = None if solver_cache is None else solver_cache.get(self.name())
@@ -290,6 +317,8 @@ class JaddleSolver(_EqualByType, QpSolver):
         return result
 
     def invert(self, results, inverse_data):
+        if results.get("mip"):
+            return _invert_mip(self, results, inverse_data)
         status = _status(results)
         attr = {
             s.SOLVE_TIME: results.get("solve_seconds", results["wall_seconds"]),
@@ -318,6 +347,84 @@ class JaddleSolver(_EqualByType, QpSolver):
 
     def cite(self, data):
         return ""
+
+
+_MIP_LIMITS = ("time_limit", "node_limit", "interrupted")
+
+
+def _solve_mip(q, problem, lower, upper, bool_idx, int_idx, verbose, solver_opts):
+    """``JaddleSolver``'s route for a mixed-integer LP: ``jaddle_mip.solve``
+    on CVXPY's QP data (a minimisation, offset excluded)."""
+    import jaddle.jaddle_mip as jm
+
+    options = dict(solver_opts)
+    tol = options.pop("tol", None)
+    if tol is not None:
+        options.setdefault("lp_tolerance", tol)
+    options["verbose"] = verbose
+
+    n = q.shape[0]
+    integrality = np.zeros(n, dtype=bool)
+    integrality[list(bool_idx)] = True
+    integrality[list(int_idx)] = True
+    # CVXPY leaves a boolean variable's 0/1 range to the solver.
+    bool_idx = np.asarray(bool_idx, dtype=int)
+    lower, upper = lower.copy(), upper.copy()
+    lower[bool_idx] = np.maximum(lower[bool_idx], 0.0)
+    upper[bool_idx] = np.minimum(upper[bool_idx], 1.0)
+
+    lp = LP(
+        q,
+        problem["A_eq"],
+        problem["b_eq"],
+        problem["A_ineq"],
+        problem["b_ineq"],
+        lower,
+        upper,
+    )
+    start = time.time()
+    result = jm.solve(jm.MIP(lp, integrality), **options)
+    result["wall_seconds"] = time.time() - start
+    result["mip"] = True
+    if result["x"] is not None:
+        result["objective"] = float(q @ result["x"])
+    return result
+
+
+def _mip_status(result):
+    """The CVXPY status of a ``jaddle_mip.solve`` result. A budget stop or an
+    unresolved search with an incumbent still returns its point."""
+    status, found = result["status"], result["x"] is not None
+    if status == "optimal":
+        return s.OPTIMAL
+    if status == "infeasible":
+        return s.INFEASIBLE
+    if status == "unbounded_or_infeasible":
+        return s.INFEASIBLE_OR_UNBOUNDED
+    if status in _MIP_LIMITS:
+        return s.USER_LIMIT
+    if status == "unresolved" and found:
+        return s.OPTIMAL_INACCURATE
+    return s.SOLVER_ERROR
+
+
+def _invert_mip(solver, results, inverse_data):
+    status = _mip_status(results)
+    attr = {
+        s.SOLVE_TIME: results.get("seconds", results["wall_seconds"]),
+        s.NUM_ITERS: results.get("nodes"),
+        s.EXTRA_STATS: results,
+    }
+    if status not in s.SOLUTION_PRESENT or results["x"] is None:
+        return failure_solution(status, attr)
+    # Branch and bound gives no duals: constraint.dual_value stays None.
+    return Solution(
+        status,
+        results["objective"] + inverse_data[s.OFFSET],
+        {solver.VAR_ID: np.asarray(results["x"], dtype=np.float64)},
+        {},
+        attr,
+    )
 
 
 # %%
@@ -1304,7 +1411,16 @@ def solve(
     Status: ``"optimal"`` when the solve certified, ``"user_limit"`` when a
     budget (``max_epochs``, ``max_seconds``) stopped it, with the point
     returned; ``problem.solver_stats.extra_stats`` holds Jaddle's result.
+
+    A mixed-integer LP goes to ``JaddleSolver``'s branch and bound; the
+    compiled route has no integer variables, so a mixed-integer problem with
+    ``qp_route=False``, or one that is not an LP, raises ``SolverError``.
     """
+    if problem.is_mixed_integer() and not (qp_route and problem.is_qp()):
+        raise cp.error.SolverError(
+            "Jaddle solves mixed-integer problems only as LPs, through"
+            " JaddleSolver (qp_route=True)."
+        )
     if qp_route and problem.is_qp():
         return problem.solve(solver=JaddleSolver(), **options)
     compiled = compile_problem(

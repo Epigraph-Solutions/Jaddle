@@ -86,6 +86,7 @@ near the optimum). It takes about 50 seconds on a CPU.
 | Example | What it shows | Extra dependencies |
 |---|---|---|
 | [`facility_location.py`](mip/facility_location.py) | Capacitated facility location: binary site openings and continuous shipments, built as a `jm.MIP` from NumPy/SciPy arrays and solved with `jm.solve`. Prints the progress log, the sites opened and their loads, and checks the cost against HiGHS through `jm.to_highs`. | — |
+| [`cvxpy_facility_location.py`](mip/cvxpy_facility_location.py) | The same facility-location model written in CVXPY, with `boolean=True` openings, solved with `jcv.JaddleSolver` (which hands mixed-integer LPs to `jm.solve`) and checked against CVXPY's HiGHS interface. | `cvxpy` |
 | [`miplib.py`](mip/miplib.py) | Load a MIPLIB instance with its integrality, run branch and bound on HiGHS's presolved MIP with a time limit, postsolve the incumbent, and compare with HiGHS's branch and cut under the same limit. | a MIPLIB `.mps` file |
 
 The MIPLIB example reads `data/<PROBLEM_NAME>.mps` (default `ns1830653`,
