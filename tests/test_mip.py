@@ -1519,8 +1519,11 @@ def test_batch_larger_than_the_tree():
 def test_batched_search_limits_and_infeasibility():
     mip = general_integer(n=12, m_ineq=8)
     ref = reference(mip)
-    result = jm.solve(mip, batch_size=4, max_nodes=6)
-    assert result["status"] == "node_limit" and result["nodes"] <= 6
+    # The root and one batch cut short by the limit. At 6 nodes a quick
+    # incumbent could close the gap (10 nodes prove it), so a fast runner
+    # reported "optimal".
+    result = jm.solve(mip, batch_size=4, max_nodes=3)
+    assert result["status"] == "node_limit" and result["nodes"] <= 3
     assert result["bound"] <= ref + 1e-6 * (1 + abs(ref))
 
     n = 6
@@ -3030,13 +3033,16 @@ def test_jax_box_bound_matches_numpy():
 
 # %% Fused feasibility pump
 def test_fused_pump_finds_points():
-    # No fix-and-propagate and (almost) no root jumps, so the pump, with
-    # jumps from its roundings, finds the first point.
+    # No fix-and-propagate, bulk rounding or (almost) root jumps, so the pump,
+    # with jumps from its roundings, finds the first point. Bulk rounding
+    # runs to a time share, so whether it beat the pump ("B") was down to
+    # the runner.
     mip = generalised_assignment(2)
     settings = dict(
         max_nodes=1,
         cuts=False,
         fix_and_propagate=False,
+        bulk_rounding=False,
         jump_iterations=1,
         rens_seconds=0.0,
         rins_seconds=0.0,

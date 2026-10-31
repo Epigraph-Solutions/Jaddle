@@ -323,7 +323,9 @@ def test_optimal_value_gradient_and_batch():
     z, (grad_c, grad_r) = jax.value_and_grad(jl.make_optimal_value(build, **TIGHT))(
         (c, r)
     )
-    norm = jnp.linalg.norm(c)
+    # A float, not a JAX array: pytest>=9.2's approx reads ``expected.flat``,
+    # which JAX arrays raise on.
+    norm = float(jnp.linalg.norm(c))
     assert z == pytest.approx(-r * norm, rel=1e-6)
     np.testing.assert_allclose(grad_c, -r * c / norm, atol=1e-6)
     assert grad_r == pytest.approx(-norm, rel=1e-6)
