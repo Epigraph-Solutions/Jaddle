@@ -8,9 +8,11 @@
 # Pass the model file on the command line: any MPS file (or another format
 # HiGHS reads, such as `.lp`), e.g.
 #
-#     python examples/mip/miplib.py path/to/model.mps
+#     python examples/mip/miplib.py path/to/model.mps [--device cpu|gpu|tpu|auto]
 #
-# A bare name with no such file, such as `academictimetablesmall`, is looked
+# `--device` picks where Jaddle's search runs (default `cpu`; `auto` puts
+# MIPs with at most 10,000 nonzeros on the CPU and the rest on JAX's default
+# device). A bare name with no such file, such as `academictimetablesmall`, is looked
 # up as `data/<name>.mps` at the repo root. The MIPLIB files are not shipped
 # with Jaddle; download them from the [MIPLIB website](https://miplib.zib.de/).
 #
@@ -19,6 +21,7 @@
 # incumbent from Jaddle's own primal heuristics.
 
 # %%
+import argparse
 import os
 import sys
 
@@ -32,15 +35,25 @@ import jaddle.jaddle_mip as jm
 # ## The instance
 
 # %%
-if len(sys.argv) < 2:
-    sys.exit(f"usage: python {sys.argv[0]} <model.mps | MIPLIB name in data/>")
-PATH_TO_MPS = sys.argv[1]
+parser = argparse.ArgumentParser(
+    description="Jaddle branch and bound on a MIPLIB instance"
+)
+parser.add_argument("model", help="model file (.mps, .lp, ...) or MIPLIB name in data/")
+parser.add_argument(
+    "--device",
+    choices=("cpu", "gpu", "tpu", "auto"),
+    default="cpu",
+    help="device for Jaddle's search (default: cpu)",
+)
+args = parser.parse_args()
+DEVICE = args.device
+PATH_TO_MPS = args.model
 if not os.path.exists(PATH_TO_MPS):
     PATH_TO_MPS = os.path.join(
         os.path.dirname(__file__), "..", "..", "data", f"{PATH_TO_MPS}.mps"
     )
     if not os.path.exists(PATH_TO_MPS):
-        sys.exit(f"no such file: {sys.argv[1]} (nor {os.path.normpath(PATH_TO_MPS)})")
+        sys.exit(f"no such file: {args.model} (nor {os.path.normpath(PATH_TO_MPS)})")
 PROBLEM_NAME = os.path.basename(PATH_TO_MPS).split(".")[0]
 MAX_SECONDS = 36000
 
@@ -92,7 +105,13 @@ result = jm.solve(
     max_seconds=MAX_SECONDS,
     verbose=True,
     log_every_seconds=10,
-    device="gpu",
+    device=DEVICE,
+    cuts=False,
+    tree_cuts=True,
+    batch_size=1,
+    node_lp_tolerance=1e-6,
+    node_crossover=True,
+    node_precision="float64",
 )
 print(f"Status: {result['status']}")
 print(f"Bound: {result['bound']:.6g}")
@@ -107,6 +126,9 @@ if result["x"] is not None:
 # %%
 highs = highspy.Highs()
 highs.setOptionValue("output_flag", True)
+highs.setOptionValue("solver", "pdlp")
+highs.setOptionValue("parallel", "on")
+highs.setOptionValue("threads", 12)
 highs.setOptionValue("time_limit", float(MAX_SECONDS))
 highs.readModel(PATH_TO_MPS)
 highs.run()

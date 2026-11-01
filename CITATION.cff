@@ -11,8 +11,8 @@ abstract: >-
 authors:
   - family-names: "van Rooyen"
     given-names: "Brendan"
-version: 0.2.2
-date-released: 2026-10-18
+version: 0.3.0
+date-released: 2026-11-01
 license: MIT
 repository-code: "https://github.com/BrendanVR/Jaddle"
 url: "https://github.com/BrendanVR/Jaddle"
