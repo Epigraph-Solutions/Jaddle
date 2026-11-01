@@ -8130,25 +8130,25 @@ def solve(
     node_selection="hybrid",
     integrality_tolerance=1e-5,
     feasibility_tolerance=1e-6,
-    lp_tolerance=1e-6,
+    lp_tolerance=1e-4,
     node_max_epochs=200,
     root_max_epochs=None,
     infeasibility_tolerance=1e-8,
-    heuristic_every=10,
+    heuristic_every=5,
     propagate=True,
     coefficient_tightening=True,
     cuts=True,
     cut_rounds=None,
-    max_cuts_per_round=100,
+    max_cuts_per_round=10,
     cut_min_progress=None,
-    cut_round_epochs=20,
-    gomory_cuts="auto",
+    cut_round_epochs=10,
+    gomory_cuts=True,
     aggregate_integers="auto",
     flow_covers=True,
     separation_backend="jax",
     node_bound_stop=True,
     node_lp_tolerance=None,
-    heuristic_effort=0.1,
+    heuristic_effort=0.3,
     reliability_threshold=4,
     strong_candidates=8,
     strong_epochs=50,
@@ -8157,32 +8157,32 @@ def solve(
     strong_backend="jax",
     root_strong_candidates="auto",
     root_strong_epochs=None,
-    root_crossover="auto",
+    root_crossover=False,
     round_repair=True,
     round_repair_every=None,
     round_repair_seconds=10.0,
     tree_cuts=False,
     tree_cut_every=10,
-    fix_and_propagate=True,
+    fix_and_propagate=False,
     feasibility_jump=True,
     jump_iterations=None,
     repair=True,
     repair_max_epochs=20,
-    highs_incumbent_seconds=0.0,
+    highs_incumbent_seconds=10.0,
     rins_seconds=None,
-    rins_every=50,
+    rins_every=5,
     rins_solver="highs",
     rins_nodes=200,
     rens_seconds=None,
     rens_nodes=500,
-    dive_every=0,
+    dive_every=50,
     dive_depth=20,
     plunge_depth=8,
-    batch_size=1,
+    batch_size=32,
     feasibility_pump=True,
     pump_iterations=30,
     pump_tolerance=1e-4,
-    pump_jump_iterations=None,
+    pump_jump_iterations=3000,
     pump_jump_share=0.2,
     probing=True,
     probing_seconds=None,
@@ -8195,14 +8195,14 @@ def solve(
     batch_epochs=10,
     children_backend="auto",
     batch_roundings=False,
-    tree_heuristics=False,
-    tree_heuristic_every=20,
+    tree_heuristics=True,
+    tree_heuristic_every=10,
     tree_heuristic_share=0.05,
     tree_jump_iterations=None,
     node_crossover=False,
     node_crossover_every=1,
     node_crossover_seconds=2.0,
-    heuristic_seconds=None,
+    heuristic_seconds=10.0,
     conflicts=True,
     conflict_pool_size=2000,
     conflict_max_nnz=None,
@@ -8213,10 +8213,10 @@ def solve(
     verbose=False,
     log_every_seconds=1.0,
     device="auto",
-    precision=None,
-    node_precision=None,
+    precision="float64",
+    node_precision="float32",
     jump_backend="auto",
-    parallel_heuristics=False,
+    parallel_heuristics=True,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -8242,9 +8242,9 @@ def solve(
       as given.
     * **Root cuts** (``cuts``). Up to ``cut_rounds`` rounds (default: 40
       with Gomory cuts on, else 5) of
-      Gomory mixed-integer cuts (``gomory_cuts``; ``"auto"``, the default,
-      turns them on for MIPs with at most 10,000 nonzeros, whose crossovers
-      take milliseconds), knapsack
+      Gomory mixed-integer cuts (``gomory_cuts``, on by default; ``"auto"``
+      turns them on only for MIPs with at most 10,000 nonzeros, whose
+      crossovers take milliseconds), knapsack
       cover cuts (``cover_cut``) and c-MIR cuts on single rows and on
       aggregations of up to three (``mir_cut``). With Gomory cuts on, each
       round first crosses the root LP point over to an optimal vertex
@@ -8284,7 +8284,7 @@ def solve(
       stop when the bound gains less than ``cut_min_progress`` (relative)
       over the last three rounds (default 1e-3 with the 40-round setting,
       else 1e-4). Each round's re-solve stops after ``cut_round_epochs``
-      (default 20): separation needs only a reasonable point and the
+      (default 10): separation needs only a reasonable point and the
       Lagrangian bound holds at any duals; the root is solved to convergence
       once the rounds end. On lseu that cuts the root from 17s to 7s (bound
       1,091 → 1,095).
@@ -8311,7 +8311,7 @@ def solve(
       nonzeros keep one shape and the LP solver is not recompiled (the
       compiled solver takes the sparsity pattern as data). Serial search
       only: the batched solver captures the pattern, so ``batch_size > 1``
-      turns tree cuts off.
+      (the default) turns tree cuts off; pass ``batch_size=1`` with them.
     * **Nodes.** Each child is warm-started from its parent's primal-dual
       point and step-size state; with the compiled solver cached, a small
       node takes milliseconds. A node is pruned when its Lagrangian bound
@@ -8330,7 +8330,7 @@ def solve(
       incumbent). That needs a rigorous root bound. PDHG duals at a loose
       tolerance leave tiny wrong-sign reduced costs on variables with an
       infinite bound, which the bound drops. With ``root_crossover``
-      (``"auto"``: only then; ``True``/``False``) the root LP is crossed over
+      (off by default; ``"auto"``: only then; ``True``: always) the root LP is crossed over
       to an exact vertex (reusing RENS's crossover), and its duals are used
       instead. On buildingenergy that takes 2 s and gives a rigorous 33,246.2,
       HiGHS's LP optimum; the PDHG bound gave 33,247.9, above it. Node
@@ -8369,16 +8369,17 @@ def solve(
       and warm starts, jitted once. The nodes are then evaluated in order on
       the host exactly as in the serial search. Members run in lockstep, so
       a node that will not converge holds its batch to ``node_max_epochs``.
-      Worth it on a GPU; on a CPU the members run one after another.
+      Worth it on a GPU; on a CPU the members run one after another. The
+      default is 32 (``1``: the serial search).
     * **Device** (``device``). ``"auto"`` (default) runs MIPs with at
       most 10,000 nonzeros on the CPU: their node LPs are latency-bound
       on an accelerator (flugpl: 3s on the CPU, 18s on a GPU).
       ``"cpu"``, ``"gpu"``, ``"tpu"`` or a ``jax.Device`` pick one;
       ``None`` keeps JAX's default device.
-    * **Precision** (``precision``). ``"float64"``, ``"float32"`` or
-      ``"float16"`` runs the whole search, node LPs included, at that
-      profile (see ``jaddle_optimisers.configure_jax``); ``None`` (default)
-      keeps the global one. A ``MIP`` built at another precision is
+    * **Precision** (``precision``). ``"float64"`` (default), ``"float32"``
+      or ``"float16"`` runs the whole search, node LPs included, at that
+      profile (see ``jaddle_optimisers.configure_jax``); ``None`` keeps the
+      global one. A ``MIP`` built at another precision is
       converted. Propagation, cuts and feasibility checks stay in float64
       on the host either way. ``node_precision`` (or
       ``node_lp_options={"precision": ...}``) runs the node LPs at another
@@ -8386,9 +8387,10 @@ def solve(
       LPs. The root LP, cut rounds, heuristic LPs and infeasibility checks
       stay at ``precision``. Warm starts are cast between the two, and
       node bounds stay valid at any precision (they are Lagrangian bounds,
-      computed in float64 from the node's duals). For example
-      ``precision="float64", node_precision="float32"`` gets an accurate
-      root and cheap nodes.
+      computed in float64 from the node's duals). The defaults,
+      ``precision="float64", node_precision="float32"``, get an accurate
+      root and cheap nodes; ``node_precision=None`` keeps the node LPs at
+      ``precision``.
     * **Branching** (``branching``): ``"pseudocost"`` (default) scores each
       fractional variable by the product of its estimated down and up bound
       gains, learnt from the nodes solved so far (most fractional until
@@ -8457,7 +8459,7 @@ def solve(
       JAX call (``probing_backend``). What each side implies is kept as a
       ``ProbingCache`` for bulk rounding.
     * **Primal heuristics.** After the root cuts, ``fix_and_propagate``
-      (the function of that name) rounds the root LP point in chunks with
+      (off by default; the function of that name) rounds the root LP point in chunks with
       bound propagation after each; if that fails (or is off),
       ``bulk_fix_and_propagate`` (``bulk_rounding``, independent of
       ``fix_and_propagate``) rounds it from ``bulk_starts`` starts side by side
@@ -8484,12 +8486,12 @@ def solve(
       followed by one more jump from the pump's last rounded point. The
       pump is fused with the jump (cuOpt's extended pump): each rounding
       that is not feasible gets a jump of ``pump_jump_iterations`` steps
-      (``None``: 3000 with JAX; with numba, whose steps are single moves,
-      ``5·(n + m)`` and at least 10,000),
+      (default 3000; ``None``: 3000 with JAX; with numba, whose steps are
+      single moves, ``5·(n + m)`` and at least 10,000),
       within ``pump_jump_share`` of the pump's time, and when the pump
       cycles the jump's near miss becomes its next rounding. They
-      share ``heuristic_seconds`` (default: 20% of ``max_seconds``, or no
-      time limit without one). In the tree, fix-and-propagate also runs at
+      share ``heuristic_seconds`` (default 10; ``None``: 20% of
+      ``max_seconds``, or no time limit without one). In the tree, fix-and-propagate also runs at
       every ``heuristic_every``-th node where plain rounding fails. Their
       incumbents are marked ``"P"``, ``"J"`` and ``"F"`` in the log and
       history. A jump that ends near-feasible is handed to ``repair`` (a
@@ -8497,8 +8499,8 @@ def solve(
       violated rows), marked ``"R"``, for at most ``repair_share`` of the
       heuristic time left. ``highs_incumbent_seconds > 0`` asks
       HiGHS (``highs_incumbent``) for its best incumbent within that many
-      seconds when all of these fail, marked ``"X"``; it is off by default, so the search stays
-      Jaddle's own. RINS (``rins_seconds``; ``None``, the default, gives
+      seconds when all of these fail, marked ``"X"`` (default 10;
+      ``0`` keeps the search Jaddle's own). RINS (``rins_seconds``; ``None``, the default, gives
       5s a call) runs once at the root and every ``rins_every`` nodes once
       there is an incumbent, and after each new incumbent from another
       source: the integers on which the incumbent and the node's LP point
@@ -8511,7 +8513,7 @@ def solve(
       ``"auto"`` picks Jaddle for MIPs with at most 10,000 nonzeros.
       ``rins_nodes`` doubles after a call that improves the incumbent and
       halves after one that does not (within 50–2000), and RINS calls stop
-      while they have taken more than ``heuristic_effort`` (0.1) of the
+      while they have taken more than ``heuristic_effort`` (0.3) of the
       elapsed time (``heuristic_effort=0``: no RINS).
     * **Round and repair** (``round_repair``, on by default). The root LP
       point (first its exact vertex, when the root is crossed over for RENS
@@ -8543,7 +8545,7 @@ def solve(
       25,808 after 60s. With HiGHS solving it, Jaddle reaches vpm2's
       optimum in 12s (never within 60s before) and pp08a's within 1% in
       4.6s (30s before).
-    * **Background heuristics** (``parallel_heuristics``, off by default).
+    * **Background heuristics** (``parallel_heuristics``, on by default).
       The heuristics that run on the CPU run on background threads, beside
       the node LPs, instead of between them: HiGHS's RENS and RINS (with
       ``rins_solver="highs"``) and its incumbent search
@@ -8560,14 +8562,14 @@ def solve(
       thread, as they would share the device with the node LPs anyway. The
       jobs use HiGHS and NumPy only, never JAX, and stop within about a
       second when the search ends. A run then depends on timing, so it is
-      no longer repeatable; leave it off for that.
-    * **Dives** (``dive_every``, off by default). LP-based dives at the
-      root and every ``dive_every`` nodes: round a fractional integer
+      no longer repeatable; turn it off for that.
+    * **Dives** (``dive_every``; default 50, ``0``: off). LP-based dives
+      at the root and every ``dive_every`` nodes: round a fractional integer
       (fractional, guided or pseudocost rule), propagate, re-solve the LP
       warm, up to ``dive_depth`` times; an integral end point is marked
       ``"D"``.
-    * **GPU tree heuristics** (``tree_heuristics``, off by default). Once
-      there is an incumbent, every ``tree_heuristic_every`` (20) nodes, the
+    * **GPU tree heuristics** (``tree_heuristics``, on by default). Once
+      there is an incumbent, every ``tree_heuristic_every`` (10) nodes, the
       node's LP point is bulk rounded (``bulk_starts`` starts, in the node
       box, with the objective row at the cutoff), marked ``"B"``; if that
       finds nothing better, ``feasibility_jump`` runs from it for up to
@@ -8601,8 +8603,12 @@ def solve(
     heuristics, nodes). ``node_lp_options`` (a dict) applies to node LPs
     only, over ``lp_options`` and ``node_lp_tolerance``: serial node solves,
     batched ones (``jaddle_linear.make_solver`` options only; others raise)
-    and strong branching's child LPs. Run in float64 (``jaddle_optimisers.configure_jax``)
-    for the default tolerances.
+    and strong branching's child LPs. Node LPs solve to ``node_lp_tolerance``
+    (``None``, the default: ``lp_tolerance``, by default 1e-4; at 1e-3 with
+    float32 node LPs, small MIPs can end ``"unresolved"``) and check
+    convergence every 64 iterations (``node_lp_options=None`` means
+    ``{"iterations_per_epoch": 64}`` unless ``lp_options`` sets it; ``{}``:
+    ``jaddle_linear.solve``'s 256).
 
     ``presolve=True`` presolves with HiGHS, runs the branch and bound on the
     reduced MIP, and maps the incumbent back with HiGHS's postsolve. The
@@ -8680,6 +8686,12 @@ def solve(
     """
     start = time.time()
     deadline = None if max_seconds is None else start + max_seconds
+    if node_lp_options is None:
+        # Node LPs check convergence every 64 iterations (jl.solve: 256),
+        # unless lp_options sets it for every LP.
+        node_lp_options = (
+            {} if "iterations_per_epoch" in (lp_options or {}) else {"iterations_per_epoch": 64}
+        )
     settings = dict(
         mip_rel_gap=mip_rel_gap,
         mip_abs_gap=mip_abs_gap,

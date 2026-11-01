@@ -416,6 +416,23 @@
 
 ### Changed
 
+- `jm.solve`'s defaults are now the settings of `examples/mip/miplib.py`,
+  tuned for large MIPs on a GPU: `precision="float64"`,
+  `node_precision="float32"`, `lp_tolerance=1e-4`,
+  `node_lp_options={"iterations_per_epoch": 64}` (when `None`, unless
+  `lp_options` sets it), `batch_size=32`, `gomory_cuts=True`,
+  `root_crossover=False`, `cut_round_epochs=10`, `max_cuts_per_round=10`,
+  `heuristic_every=5`, `heuristic_seconds=10`, `fix_and_propagate=False`,
+  `pump_jump_iterations=3000`, `highs_incumbent_seconds=10`, `rins_every=5`,
+  `heuristic_effort=0.3`, `parallel_heuristics=True`, `dive_every=50`,
+  `tree_heuristics=True` and `tree_heuristic_every=10`. Runs are no longer
+  repeatable by default (pass `parallel_heuristics=False`), batching turns
+  tree cuts off (pass `batch_size=1` with `tree_cuts=True`), and the first
+  solve compiles the batched float32 node solver. `node_lp_tolerance` stays
+  `None` (`lp_tolerance`): at 1e-3 with float32 node LPs, small MIPs with
+  general integers ended `"unresolved"`. `miplib.py` and
+  `benchmarks/benchmark_small.py` now rely on the defaults; the tests pin
+  the previous ones (`tests/test_mip.py`'s `PINNED`).
 - `jm.solve` root Gomory cuts. `gomory_cuts` takes `max_nnz` (`"auto"`, the
   old cap of `max(n // 2, min(n, 100))` nonzeros, or `None` for no cap), and
   the root cut loop uses `None`: the cap rejected 197 of 198 GMI cuts at the

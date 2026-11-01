@@ -604,7 +604,7 @@ columns are not supported.
   nodes' bounds and warm starts, compiled once, since the node LPs differ
   only in their bounds. The nodes are then evaluated in order on the host
   as in the serial search. Members run in lockstep, so one slow node holds
-  its batch to `node_max_epochs`.
+  its batch to `node_max_epochs`. The default is 32 nodes a call.
 - **Warm-started nodes.** Each child starts from its parent's primal–dual
   point and step-size state. The node LPs share their shapes and solver
   settings, so the compiled solver is reused and a small node takes a few
@@ -712,7 +712,7 @@ columns are not supported.
   `c·x ≤ cutoff`, so it rejects roundings that cannot improve.
   *RINS* (`rins_seconds`) runs at the root, every `rins_every` nodes and
   after each new incumbent, within `heuristic_effort` of the run time;
-  LP-based *dives* (`dive_every`) are opt-in. So are the *GPU tree
+  LP-based *dives* run every `dive_every` nodes, and the *GPU tree
   heuristics* (`tree_heuristics`): once there is an incumbent, every
   `tree_heuristic_every` nodes they bulk round the node's LP point and, if
   that finds nothing better, run the feasibility jump from it with the row
@@ -725,7 +725,9 @@ columns are not supported.
   from 301 to 252; RENS cut p0282 to 141 nodes (16s, from 21s). Dives
   helped flugpl (302 → 204 nodes) but cost time elsewhere, and RINS found
   p0201's optimum at node 550 instead of 1,085 but doubled its run time
-  (each Jaddle sub-search costs ~0.4s), so both stay off by default.
+  (each Jaddle sub-search costs ~0.4s). The defaults are tuned for large
+  MIPs on a GPU (`examples/mip/miplib.py`), where both pay off; RINS runs
+  on HiGHS, on a background thread (`parallel_heuristics`).
 - **Node crossover** (`node_crossover`, opt-in). A PDHG point lies inside
   the LP's optimal face, so it is integral far less often than the vertex a
   simplex solver would return: on `max Σx, Σx ≤ 1` over binaries PDHG gives
@@ -761,26 +763,28 @@ reports `bound_rigorous=False`.
 | `strong_screen`, `strong_backend` | `32`, `"jax"` | Candidates whose children are propagated and bounded on the device before the child LPs are picked; `"jax"` runs strong branching as one device pipeline, `"numpy"` on the host. |
 | `integrality_tolerance` | `1e-5` | How close to an integer an LP value must be to count as integral. |
 | `feasibility_tolerance` | `1e-6` | Largest row violation (relative to `1 + ‖b‖∞`) and bound violation an incumbent may have. |
-| `lp_tolerance`, `lp_options` | `1e-6`, `None` | The node LPs' relative tolerances, and any other `jl.solve` option. |
+| `lp_tolerance`, `lp_options` | `1e-4`, `None` | The node LPs' relative tolerances, and any other `jl.solve` option. |
 | `node_max_epochs`, `root_max_epochs` | `200`, `None` | Epoch budgets for a node LP and the root LP. |
 | `node_lp_tolerance` | `None` | Tolerance for node LPs only (`None`: `lp_tolerance`). Experimental: looser node LPs are cheaper but give rougher branching and pseudocost data. |
-| `node_lp_options` | `None` | Any other `jl.solve` option for node LPs only, over `lp_options` and `node_lp_tolerance`: serial and batched node LPs and strong branching's child LPs (batched ones take `jl.make_solver` options only; others raise). `lp_options` applies to every LP. |
+| `node_lp_options` | `None` | Any other `jl.solve` option for node LPs only (`None`: `{"iterations_per_epoch": 64}`, unless `lp_options` sets it; `{}`: `jl.solve`'s 256), over `lp_options` and `node_lp_tolerance`: serial and batched node LPs and strong branching's child LPs (batched ones take `jl.make_solver` options only; others raise). `lp_options` applies to every LP. |
 | `node_bound_stop` | `True` | Stop a node LP as soon as the Lagrangian bound of its duals closes the node against the cutoff (`jl.solve(bound_target=...)`, and `jl.make_solver(bound_stop=True)` for each member of a batch); infeasible nodes stop within a few epochs. |
 | `batch_epochs` | `10` | Batched search: the most epochs a node LP runs in one batch call; an unfinished node goes back to the queue, warm-started, until `node_max_epochs` in all, so one slow member cannot hold its batch (`None`: `node_max_epochs`). |
 | `children_backend`, `batch_roundings` | `"auto"`, `False` | Batched search: split all members at once on the device (`"auto"`: above 10,000 nonzeros; `"jax"`, `"numpy"`), and round the batch's tree heuristics as one bulk rounding (opt-in: slower than the classic one per node on ns1830653). |
-| `heuristic_every` | `10` | Run rounding (then fix-and-propagate if it fails) every this many nodes (`0` = only on integral LP points). |
-| `fix_and_propagate`, `feasibility_jump`, `feasibility_pump` | `True`, `True`, `True` | The primal heuristics. |
+| `heuristic_every` | `5` | Run rounding (then fix-and-propagate if it fails) every this many nodes (`0` = only on integral LP points). |
+| `fix_and_propagate`, `feasibility_jump`, `feasibility_pump` | `False`, `True`, `True` | The primal heuristics (classic fix-and-propagate is off; bulk rounding runs instead). |
 | `repair_max_epochs` | `20` | Epoch budget of the LP that repairs a rounded point's continuous variables (skipped for integers that already failed, or when propagation shows the fixed box infeasible). |
 | `jump_iterations` | `None` | Feasibility jump steps per start (`None`: `max(10000, 20·(n + m))`). |
 | `plunge_depth` | `8` | Steps a plunge follows a best-bound node's children (`0`: pure best-bound). |
 | `device` | `"auto"` | `"auto"` runs MIPs with at most 10,000 nonzeros on the CPU (their node LPs are latency-bound on a GPU: flugpl takes 3s on the CPU, 18s on a GPU); `"cpu"`/`"gpu"`/`"tpu"` or a `jax.Device` pick one, `None` keeps JAX's default. |
-| `precision` | `None` | `"float64"`, `"float32"` or `"float16"` for the whole search, node LPs included (`None` keeps the global profile). |
-| `batch_size` | `1` | Open nodes solved together in one `vmap`-ed device call (try 8–32 on a GPU). |
-| `highs_incumbent_seconds` | `0` | If set, HiGHS supplies its best incumbent within this many seconds when Jaddle's heuristics find none (off by default). |
-| `rins_seconds`, `rins_every` | `None`, `50` | RINS at the root, every `rins_every` nodes and after each new incumbent (`None`: 5s a call; `0`: off). |
-| `heuristic_effort` | `0.1` | The share of the elapsed time RINS may take; calls stop while they have used more (`0`: no RINS). |
+| `precision` | `"float64"` | `"float64"`, `"float32"` or `"float16"` for the whole search, node LPs included (`None` keeps the global profile). |
+| `node_precision` | `"float32"` | The node LPs' profile (serial, batched and strong branching's child LPs); the root LP, cut rounds and heuristic LPs stay at `precision`. Laptop GPUs run float64 at a small fraction of float32 speed (`None`: `precision`). |
+| `batch_size` | `32` | Open nodes solved together in one `vmap`-ed device call (`1`: the serial search, needed for tree cuts). |
+| `highs_incumbent_seconds` | `10` | HiGHS supplies its best incumbent within this many seconds when Jaddle's heuristics find none (`0`: off). |
+| `rins_seconds`, `rins_every` | `None`, `5` | RINS at the root, every `rins_every` nodes and after each new incumbent (`None`: 5s a call; `0`: off). |
+| `heuristic_effort` | `0.3` | The share of the elapsed time RINS may take; calls stop while they have used more (`0`: no RINS). |
+| `parallel_heuristics` | `True` | Run the CPU heuristics (HiGHS's RENS, RINS and incumbent search, round and repair in the tree, the numba improving jump) on background threads beside the node LPs. Runs then depend on timing; `False` makes them repeatable. |
 | `rens_seconds`, `rens_nodes` | `None`, `500` | RENS at the root (`None`: 10% of `max_seconds` up to 30s, 10s without a limit; with `rins_solver="jaddle"`, 5s for small MIPs, else off). |
-| `dive_every`, `dive_depth` | `0`, `20` | LP-based dives every this many nodes and at the root (`0`: off), and their depth. |
+| `dive_every`, `dive_depth` | `50`, `20` | LP-based dives every this many nodes and at the root (`0`: off), and their depth. |
 | `rins_solver`, `rins_nodes` | `"highs"`, `200` | Who searches the RENS and RINS sub-MIPs: `"highs"` (presolved by HiGHS, up to `rins_nodes` nodes, which adapts to success), `"jaddle"`, this branch and bound (reusing the compiled LP solver), or `"auto"` (Jaddle for MIPs with at most 10,000 nonzeros, HiGHS above). On lseu the Jaddle sub-searches take ~0.4s each against HiGHS's ~0.01s. |
 | `pump_iterations`, `pump_tolerance` | `30`, `1e-4` | The pump's LP solves and their tolerance. |
 | `pump_jump_iterations`, `pump_jump_share` | `3000`, `0.2` | Feasibility jump steps from each rounding the pump rejects (`0`: none), and the most of the pump's time the jumps may take. |
@@ -788,14 +792,15 @@ reports `bound_rigorous=False`.
 | `repair_share` | `0.2` | The most of the heuristic time left that one `repair` of a near-feasible jump may take, so later heuristics still run. |
 | `bulk_rounding`, `bulk_starts` | `True`, `4` | Bulk fix-and-propagate at the root and in the pump, and how many starts run side by side. |
 | `node_crossover`, `node_crossover_every`, `node_crossover_seconds` | `False`, `1`, `2.0` | Cross node LP points over to exact vertices with HiGHS (opt-in), every this many nodes, with this time limit per call; the vertex is used for the integrality test, branching and heuristics, and its duals for the bound. |
-| `tree_heuristics`, `tree_heuristic_every`, `tree_heuristic_share`, `tree_jump_iterations` | `False`, `20`, `0.05`, `3000` | GPU heuristics from node LP points once there is an incumbent (opt-in): bulk rounding, then a feasibility jump with the objective cutoff row, every this many nodes, while they have taken at most this share of the elapsed time, with this many jump steps per call. |
-| `heuristic_seconds` | `None` | Time for the root heuristics (`None`: 20% of `max_seconds`, or no time limit without one). |
+| `tree_heuristics`, `tree_heuristic_every`, `tree_heuristic_share`, `tree_jump_iterations` | `True`, `10`, `0.05`, `3000` | GPU heuristics from node LP points once there is an incumbent: bulk rounding, then a feasibility jump with the objective cutoff row, every this many nodes, while they have taken at most this share of the elapsed time, with this many jump steps per call. |
+| `heuristic_seconds` | `10` | Time for the root heuristics (`None`: 20% of `max_seconds`, or no time limit without one). |
 | `propagate` | `True` | Bound propagation at the root and at each child. |
 | `coefficient_tightening` | `True` | Shrink binaries' big-M coefficients at the root (see above). |
 | `cuts`, `cut_rounds` | `True`, `None` | Root cuts, and the most rounds of them (`None`: 40 with Gomory cuts on, else 5). |
-| `max_cuts_per_round`, `cut_min_progress` | `100`, `None` | Cuts added per round, and the relative bound gain below which the rounds stop. |
-| `cut_round_epochs` | `20` | Epoch budget of each cut round's root re-solve (`None`: to convergence); the root is converged once the rounds end. |
-| `gomory_cuts` | `"auto"` | Gomory mixed-integer cuts from a crossover basis at each root round (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
+| `max_cuts_per_round`, `cut_min_progress` | `10`, `None` | Cuts added per round, and the relative bound gain below which the rounds stop. |
+| `cut_round_epochs` | `10` | Epoch budget of each cut round's root re-solve (`None`: to convergence); the root is converged once the rounds end. |
+| `gomory_cuts` | `True` | Gomory mixed-integer cuts from a crossover basis at each root round (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
+| `root_crossover` | `False` | Cross the root LP over to an exact vertex for rigorous reduced-cost tightening duals (`"auto"`: only when that tightening runs; `True`: always). |
 | `separation_backend` | `"jax"` | Run the c-MIR and flow cover searches batched in JAX (float64), or `"numpy"` for the per-row reference searches. |
 | `flow_covers` | `True` | Flow cover cuts from rows with continuous variables, over their variable bounds (`y <= u·z`). |
 | `aggregate_integers` | `"auto"` | Aggregate rows through integer variables too, up to five rows, for MIR and cover cuts (`"auto"`: on for MIPs with at most 10,000 nonzeros). |

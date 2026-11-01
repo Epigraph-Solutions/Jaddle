@@ -52,94 +52,44 @@ print(
 
 # %% [markdown]
 # ## Branch and bound
+# `jm.solve`'s defaults are tuned for this kind of run: large MIPs on a GPU.
 # `presolve=True` works on HiGHS's reduced MIP and postsolves the incumbent.
-# Every primal heuristic is on, Jaddle's and HiGHS's:
+# Every primal heuristic is on by default, Jaddle's and HiGHS's:
 # - root probing;
 # - round and repair: LP points rounded up, to nearest and down, with
 #   HiGHS solving the continuous rest exactly (at the root, the root's
 #   strong children and every few nodes);
-# - fix-and-propagate, classic and bulk (several starts at once);
+# - bulk fix-and-propagate (several starts at once; the classic one is off);
 # - the feasibility jump, then an improving jump from each incumbent;
 # - the feasibility pump, with a short jump from each rounding it rejects;
-# - HiGHS: RENS at the root, RINS in the tree, and its own MIP search for
-#   an incumbent if all of the above fail;
-# - in the tree: LP dives, and GPU bulk rounding and jumps from node points.
+# - HiGHS: RENS at the root, RINS in the tree (every 5 nodes, up to 30% of
+#   the run), and its own MIP search for an incumbent if all of the above
+#   fail;
+# - in the tree: LP dives every 50 nodes, and GPU bulk rounding and jumps
+#   from node points every 10.
 #
 # The log marks their incumbents `U` (round and repair), `P`
 # (fix-and-propagate), `B` (bulk), `J` (jump), `F` (pump), `R` (repair), `E`
-# (RENS), `N` (RINS), `X` (HiGHS) and `D` (dive). With
-# `parallel_heuristics=True` the CPU ones (HiGHS, round and repair in the
-# tree, and the numba improving jump) run on background threads beside the
-# node LPs. With
-# HiGHS searching the RINS sub-MIPs, ns1830653 went from 131,808 to 36,808
-# within 10 s of the first point in a 5-minute test (best known: 20,622).
+# (RENS), `N` (RINS), `X` (HiGHS) and `D` (dive). The CPU ones (HiGHS, round
+# and repair in the tree, and the numba improving jump) run on background
+# threads beside the node LPs (`parallel_heuristics`), so runs are not
+# repeatable. With HiGHS searching the RINS sub-MIPs, ns1830653 went from
+# 131,808 to 36,808 within 10 s of the first point in a 5-minute test (best
+# known: 20,622).
+#
+# The other defaults: pseudocost branching (reliability branching spent over
+# half the run strong-branching here; the root still strong-branches its
+# highest-impact candidates once, which on buildingenergy finds the sizing
+# variable holding the root gap); the root LP and cut rounds in float64 and
+# node LPs in float32 (laptop GPUs run float64 at a small fraction of
+# float32 speed); 32 node LPs per device call (on ns1830653 that halves the
+# device time per node against 16; tree cuts are off when batching).
 
 # %%
 result = jm.solve(
     PATH_TO_MPS,
-    # Reliability branching spent over half the run strong-branching here.
-    # The root still strong-branches its highest-impact candidates once
-    # (root_strong_candidates), which seeds the pseudocosts: on
-    # buildingenergy that finds the sizing variable holding the root gap.
-    branching="pseudocost",
-    # node_crossover=True,
     presolve=True,
     max_seconds=MAX_SECONDS,
-    gomory_cuts=True,
-    # Laptop GPUs run float64 at a small fraction of float32 speed.
-    # The root LP and cut rounds run in float64; node LPs at node_precision.
-    precision="float64",
-    node_precision="float32",
-    root_crossover=False,
-    node_crossover=False,
-    cut_round_epochs=10,
-    lp_tolerance=1e-4,
-    node_lp_tolerance=1e-3,
-    # Any other jl.solve option for node LPs only (root and heuristic LPs
-    # keep lp_options), e.g. check convergence every 64 iterations:
-    node_lp_options={"iterations_per_epoch": 64},
-    max_cuts_per_round=1000,
-    heuristic_every=5,
-    # Primal heuristics, after cuOpt's GPU heuristics. On ns1830653 the
-    # pump finds the first point at about 70 s, so 20 s was too short.
-    heuristic_seconds=10,
-    probing=True,  # root probing, batched in JAX on large models
-    fix_and_propagate=False,  # classic fix-and-propagate, then...
-    bulk_rounding=True,  # ...bulk fix-and-propagate from 4 starts at once
-    # Feasibility jump: incremental on the host with numba (jaddle[fast]),
-    # which then also spends leftover heuristic time improving the incumbent.
-    feasibility_jump=True,
-    feasibility_pump=True,  # the pump, fused with short jumps
-    pump_jump_iterations=3000,
-    repair_share=0.2,  # cap repair so later jumps and the pump still run
-    # HiGHS searches the RENS and RINS sub-MIPs ("jaddle": Jaddle's own branch
-    # and bound, slower on large MIPs). RENS gets 10% of max_seconds, up to
-    # 30 s. HiGHS's own MIP search runs for up to 10 s only if no other
-    # heuristic finds an incumbent.
-    rins_solver="highs",
-    highs_incumbent_seconds=10,
-    rens_seconds=None,
-    # RINS improves the incumbent in the tree: run it often, and let it use up
-    # to 30% of the run.
-    rins_every=5,
-    heuristic_effort=0.3,
-    # HiGHS's RENS/RINS and the numba improving jump on background threads,
-    # beside the node LPs (runs are then not repeatable).
-    parallel_heuristics=True,
-    # LP dives every 50 nodes (and at the root): round, propagate, re-solve.
-    dive_every=50,
-    # GPU heuristics from node LP points once there is an incumbent: bulk
-    # rounding, then a feasibility jump that looks only for better points.
-    tree_heuristics=True,
-    tree_heuristic_every=10,
-    tree_heuristic_share=0.05,
-    # On a GPU: 32 node LPs per device call, at most 10 epochs each a call
-    # (unfinished ones go back to the queue). On ns1830653 that halves the
-    # device time per node against 16. Tree cuts are off when batching.
-    batch_size=1,
-    batch_epochs=10,
-    cuts=False,
-    tree_cuts=True,
     verbose=True,
     log_every_seconds=10,
     device="gpu",

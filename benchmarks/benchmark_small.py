@@ -147,55 +147,18 @@ def run_instance(name, path, args):
             integers=mip.num_integers,
             rows=mip.A.shape[0],
         )
-        # The settings of examples/mip/miplib.py, except those set by this
-        # script's flags (presolve, time limit, batch size, tree cuts, device,
-        # verbose). batch_size defaults to 1 here: miplib.py's 32 is for a GPU,
-        # and this script runs JAX on the CPU.
+        # jm.solve's defaults, except those set by this script's flags
+        # (presolve, time limit, batch size, tree cuts, device, verbose).
+        options = {} if args.batch_size is None else {"batch_size": args.batch_size}
         result = jm.solve(
             path if args.presolve else mip,
             presolve=args.presolve,
             max_seconds=args.seconds,
-            batch_size=args.batch_size,
-            batch_epochs=10,
             tree_cuts=args.tree_cuts,
-            branching="pseudocost",
-            node_crossover=True,
-            gomory_cuts=True,
-            precision="float64",
-            cut_round_epochs=10,
-            max_cuts_per_round=1000,
-            lp_tolerance=1e-3,
-            node_lp_tolerance=1e-6,
-            # Any other jl.solve option for node LPs only (root and heuristic
-            # LPs keep lp_options), e.g. check convergence every 64 iterations.
-            node_lp_options={"iterations_per_epoch": 64},
-            heuristic_every=5,
-            # Primal heuristics, after cuOpt's GPU heuristics. They stop at
-            # the first incumbent, so the budget is spent only on a miss.
-            heuristic_seconds=min(50.0, args.seconds),
-            probing=True,  # root probing
-            fix_and_propagate=False,  # classic fix-and-propagate, then...
-            bulk_rounding=True,  # ...bulk fix-and-propagate from 4 starts at once
-            feasibility_jump=True,
-            feasibility_pump=True,  # the pump, fused with short jumps
-            pump_jump_iterations=3000,
-            repair_share=0.2,  # cap repair so later jumps and the pump still run
-            # Jaddle's heuristics only, no HiGHS: RENS and RINS search their
-            # sub-MIPs with Jaddle's own branch and bound. rens_seconds=None
-            # runs RENS on MIPs with at most 10,000 nonzeros.
-            rins_solver="jaddle",
-            highs_incumbent_seconds=0.0,
-            rens_seconds=None,
-            # RINS improves the incumbent in the tree.
-            rins_every=10,
-            heuristic_effort=0.3,
-            # GPU heuristics from node LP points once there is an incumbent.
-            tree_heuristics=True,
-            tree_heuristic_every=20,
-            tree_heuristic_share=0.05,
             device=None if args.device == "default" else args.device,
             verbose=args.verbose,
             log_every_seconds=10,
+            **options,
         )
         row.update(
             {
@@ -266,13 +229,17 @@ def main():
     parser.add_argument("instances", nargs="*", help="names to run (default: all)")
     parser.add_argument("--seconds", type=float, default=120.0, help="time limit each")
     parser.add_argument("--presolve", action="store_true", help="HiGHS presolve first")
-    parser.add_argument("--batch-size", type=int, default=1, help="jm.solve batch_size")
+    parser.add_argument(
+        "--batch-size", type=int, default=None, help="jm.solve batch_size (default: its 32)"
+    )
     parser.add_argument(
         "--device",
         default="auto",
         help="jm.solve device: auto (CPU when small), cpu, gpu, or default (JAX's)",
     )
-    parser.add_argument("--tree-cuts", action="store_true", help="branch and cut")
+    parser.add_argument(
+        "--tree-cuts", action="store_true", help="branch and cut (with --batch-size 1)"
+    )
     parser.add_argument("--verbose", action="store_true", help="jm.solve progress log")
     parser.add_argument("--out", default=RESULTS, help="CSV path")
     args = parser.parse_args()
