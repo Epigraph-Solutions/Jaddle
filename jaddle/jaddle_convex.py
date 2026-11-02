@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 from optax.projections import projection_non_negative, projection_box
 import optax
-from typing import NamedTuple
+from typing import Any, NamedTuple
 import copy
 import time
 from jaddle.jaddle_basic_types import JaddleCP, SaddleState, _dot, _wide
@@ -129,13 +129,23 @@ def _gradient_scaled(cp, x0, probes):
     own (or the generic ``_kkt_residuals``) at the unscaled point, so the
     convergence test keeps the original problem's units."""
     x0 = projection_box(x0, cp.lower_bounds, cp.upper_bounds)
-    m_eq = jax.eval_shape(cp.constraints_eq, x0).shape[0]
     # A CP from ``load_cp`` carries its scales as an exported function: its
     # own callables have no forward mode or batching, which the scales need.
     scales_fn = getattr(cp, "gradient_scales", None)
     if scales_fn is None:
         scales_fn = lambda x: _gradient_scales(cp, x, probes)
     sigma, e = jax.jit(scales_fn)(x0)
+    return _gradient_scaled_from(cp, sigma, e)
+
+
+def _gradient_scaled_from(cp, sigma, e):
+    """``_gradient_scaled`` with the scales ``sigma`` (objective) and ``e``
+    (constraint rows, stacked ``[eq; ineq]``) already computed."""
+    x = jax.ShapeDtypeStruct(
+        jnp.shape(cp.lower_bounds),
+        jnp.result_type(float, jnp.asarray(cp.lower_bounds).dtype),
+    )
+    m_eq = jax.eval_shape(cp.constraints_eq, x).shape[0]
     e_eq, e_ineq = e[:m_eq], e[m_eq:]
 
     def from_scaled(state):
@@ -209,6 +219,29 @@ def _init_k_slot(k, eta, state, update_mode):
     return (k, eta, zeros, zeros2, jnp.asarray(False))
 
 
+class GradientOracle(NamedTuple):
+    """A stochastic estimate of a problem's Lagrangian map, for the epoch loop
+    (``jaddle_stochastic`` builds one).
+
+    ``draw(key)`` returns a sample (any pytree, e.g. minibatch indices);
+    ``lagrangian_map(x, sample)`` returns unbiased estimates
+    ``(objective, constraints_ineq, constraints_eq)`` of the full problem's at
+    ``x``, and ``constraints(x, sample)`` just the last two. Every gradient
+    evaluation within one iteration uses one sample."""
+
+    draw: Any
+    lagrangian_map: Any
+    constraints: Any
+
+
+class _SampleContext(NamedTuple):
+    # One iteration's sample, and with SVRG the constant correction
+    # F(z̃) - F_s(z̃) at the epoch's anchor z̃ (the primal partial and the raw,
+    # un-negated constraint residuals).
+    sample: Any
+    correction: Any
+
+
 def _make_epoch_fn(
     cp: JaddleCP,
     optimiser,
@@ -218,6 +251,9 @@ def _make_epoch_fn(
     k_scaling=False,
     adaptive_step=False,
     diag=False,
+    oracle=None,
+    svrg=False,
+    step_decay=None,
 ):
     # Returns `run_epoch(max_iter, start_iter, state, average_state, opt_state,
     # total_weight)`, which runs one epoch of `max_iter` iterations and returns
@@ -245,6 +281,20 @@ def _make_epoch_fn(
     # search below; alternating (theta = 0) is not contractive in the last
     # iterate, so its guarantees are for the average, and the line search only
     # keeps its step within the local Lipschitz bound.
+    #
+    # With an `oracle` (a GradientOracle) the gradients are stochastic:
+    # run_epoch then also takes `stoch=(key, offset)`, and iteration i (the
+    # restart-shifted index) draws its sample from fold_in(key, i + offset),
+    # i + offset being the global, never-reset iteration count. `cp` is still
+    # the full problem; with `svrg` each epoch evaluates its exact Lagrangian
+    # map at the epoch's start point z̃ and every gradient becomes
+    # F_s(z) - F_s(z̃) + F(z̃). `step_decay(global_i)` (a factor in (0, 1])
+    # shrinks each update but not its exploration ("explore aggressively,
+    # update conservatively", Hsieh et al. 2020): the adaptive schemes move
+    # that fraction of the way to the line-searched point, whose step, trial
+    # and Lipschitz test are unchanged (so eta does not grow to undo it); the
+    # fixed-step extragradient scales its corrector gradient, and alternating
+    # both of its gradients.
     if adaptive_step and not k_scaling:
         raise ValueError("adaptive_eta requires k_scaling (primal weight k)")
     diag_on = bool(diag)
@@ -270,7 +320,13 @@ def _make_epoch_fn(
     # variants lets the alternating/extragradient schemes pay for only the half
     # they actually consume.
 
-    def constraints(primal):
+    def constraints(primal, ctx=None):
+        if ctx is not None:
+            res_ineq, res_eq = oracle.constraints(primal, ctx.sample)
+            if ctx.correction is not None:
+                res_ineq = res_ineq + ctx.correction.dual_ineq
+                res_eq = res_eq + ctx.correction.dual_eq
+            return res_ineq, res_eq
         return (cp.constraints_ineq(primal), cp.constraints_eq(primal))
 
     def lagrangian_map(primal):
@@ -287,36 +343,81 @@ def _make_epoch_fn(
             cp.constraints_eq(primal),
         )
 
-    def grad_primal_only(state):
+    def raw_saddle(state, ctx=None):
+        # (primal partial, constraint residuals) in one fused VJP: of the full
+        # map, or (ctx) of the sampled one plus the SVRG correction.
+        one = jnp.ones((), state.primal.dtype)
+        fn = lagrangian_map
+        if ctx is not None:
+            fn = lambda x: oracle.lagrangian_map(x, ctx.sample)
+        (_, res_ineq, res_eq), vjp_fn = jax.vjp(fn, state.primal)
+        (primal_grad,) = vjp_fn((one, state.dual_ineq, state.dual_eq))
+        if ctx is not None and ctx.correction is not None:
+            primal_grad = primal_grad + ctx.correction.primal
+            res_ineq = res_ineq + ctx.correction.dual_ineq
+            res_eq = res_eq + ctx.correction.dual_eq
+        return SaddleState(primal=primal_grad, dual_ineq=res_ineq, dual_eq=res_eq)
+
+    def grad_primal_only(state, ctx=None):
         # Primal partial only: grad(obj) + Jᵀ·dual, via one fused VJP. The
         # objective/residual outputs are produced by the VJP's forward pass and
         # discarded here.
+        if ctx is not None:
+            return raw_saddle(state, ctx).primal
         one = jnp.ones((), state.primal.dtype)
         _, vjp_fn = jax.vjp(lagrangian_map, state.primal)
         (primal_grad,) = vjp_fn((one, state.dual_ineq, state.dual_eq))
         return primal_grad
 
-    def grad_dual_only(state):
+    def grad_dual_only(state, ctx=None):
         # Dual partials only: the (negated) constraint residuals. A plain
         # forward eval — no objective gradient, no VJP.
-        res_ineq, res_eq = constraints(state.primal)
+        res_ineq, res_eq = constraints(state.primal, ctx)
         return -res_ineq, -res_eq
 
-    def grad(state):
+    def grad(state, ctx=None):
         # Full saddle gradient in a single reverse pass: one fused VJP over
         # (objective, constraints_ineq, constraints_eq) seeded with
         # (1.0, dual_ineq, dual_eq). The forward pass yields the objective value
         # (discarded) and the residuals (reused for the dual partials), so the
         # whole saddle gradient costs one VJP instead of grad(obj) + a separate
         # constraints VJP.
-        one = jnp.ones((), state.primal.dtype)
-        (_, res_ineq, res_eq), vjp_fn = jax.vjp(lagrangian_map, state.primal)
-        (primal_grad,) = vjp_fn((one, state.dual_ineq, state.dual_eq))
+        raw = raw_saddle(state, ctx)
         return SaddleState(
-            primal=primal_grad,
-            dual_ineq=-res_ineq,
-            dual_eq=-res_eq,
+            primal=raw.primal,
+            dual_ineq=-raw.dual_ineq,
+            dual_eq=-raw.dual_eq,
         )
+
+    def make_ctx(stoch, i, anchor):
+        # The iteration's sample context (None without an oracle) and its
+        # step-decay factor (None without a decay).
+        if oracle is None:
+            return None, None
+        key, offset = stoch
+        global_i = i + offset
+        sample = oracle.draw(jax.random.fold_in(key, global_i))
+        correction = None
+        if svrg:
+            z_anchor, F_anchor = anchor
+            F_s = raw_saddle(z_anchor, _SampleContext(sample, None))
+            correction = jax.tree.map(lambda a, b: a - b, F_anchor, F_s)
+        factor = None if step_decay is None else step_decay(global_i)
+        return _SampleContext(sample, correction), factor
+
+    def damp(new, old, factor):
+        # old + factor * (new - old): a convex combination, so it stays
+        # feasible.
+        if factor is None:
+            return new
+        return jax.tree.map(
+            lambda a, b: b + jnp.asarray(factor, a.dtype) * (a - b), new, old
+        )
+
+    def decay_grad(g, factor):
+        if factor is None:
+            return g
+        return jax.tree.map(lambda a: a * jnp.asarray(factor, a.dtype), g)
 
     def opt_update(gradient, opt_state, state):
         return optimiser.update(gradient, opt_state, state)
@@ -372,11 +473,16 @@ def _make_epoch_fn(
         total_weight,
         diag=None,
         accum=None,
+        stoch=None,
     ):
         if diag_on:
             t, s = diag
             m_eq = state.dual_eq.shape[0]
             s_eq, s_ineq = s[:m_eq], s[m_eq:]
+
+        # SVRG anchor: the epoch's start point and the full problem's raw
+        # saddle map there (one exact pass per epoch).
+        anchor = (state, raw_saddle(state)) if (oracle is not None and svrg) else None
 
         # --- Adaptive extragradient step (Malitsky-Tam line search) ---
         # Mirrors the linear solver's adaptive extragradient path. Each
@@ -493,7 +599,13 @@ def _make_epoch_fn(
                     ) = carry[:8]
                     ip1 = jnp.asarray(i + 1, eta.dtype)
                     k = k0
-                    F = grad(state)
+                    ctx, factor = make_ctx(stoch, i, anchor)
+                    F = grad(state, ctx)
+                    if ctx is not None:
+                        # The carried F_prev was drawn on the previous
+                        # sample: re-evaluate it on this one, so that L_hat
+                        # measures a single sampled operator.
+                        F_prev = grad(z_prev, ctx)
 
                     # Validate the step z_prev -> state, taken at step eta.
                     dg2 = _gnorm2(
@@ -547,7 +659,8 @@ def _make_epoch_fn(
                             primal=x_new,
                             dual_ineq=base.dual_ineq,
                             dual_eq=base.dual_eq,
-                        )
+                        ),
+                        ctx,
                     )
                     if update_mode == "pdhg":
                         gd_ineq = 2.0 * gd_ineq - F_base.dual_ineq
@@ -556,8 +669,10 @@ def _make_epoch_fn(
                         base.dual_ineq - sigma_ineq * gd_ineq
                     )
                     dual_eq = base.dual_eq - sigma_eq * gd_eq
-                    cand = SaddleState(
-                        primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq
+                    cand = damp(
+                        SaddleState(primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq),
+                        base,
+                        factor,
                     )
                     out = (
                         i + 1,
@@ -614,7 +729,7 @@ def _make_epoch_fn(
                 opt_state = (inner0, (k0, eta, z_prev, F_prev, valid))
                 return (i, state, average_state, opt_state, total_weight) + out[8:]
 
-            def _trial(eta, state, k, g):
+            def _trial(eta, state, k, g, ctx):
                 tau = eta / k
                 sigma_eq = sigma_ineq = eta * k
                 if diag_on:
@@ -626,7 +741,7 @@ def _make_epoch_fn(
                 )
                 yh_eq = state.dual_eq - sigma_eq * g.dual_eq
                 state_half = SaddleState(primal=xh, dual_ineq=yh_ineq, dual_eq=yh_eq)
-                g_half = grad(state_half)
+                g_half = grad(state_half, ctx)
                 # Corrector from the ORIGINAL state using the look-ahead grad.
                 x_new = projection_primal(state.primal - tau * g_half.primal)
                 dual_ineq = projection_non_negative(
@@ -656,11 +771,13 @@ def _make_epoch_fn(
                 i, state, average_state, opt_state, total_weight = carry[:5]
                 opt_state, k, eta = unpack_k(opt_state)
                 ip1 = jnp.asarray(i + 1, eta.dtype)
+                ctx, factor = make_ctx(stoch, i, anchor)
 
-                g = grad(state)
+                g = grad(state, ctx)
                 new_state, eta_next, accept = _line_search(
-                    lambda eta_t: _trial(eta_t, state, k, g), eta, ip1, state
+                    lambda eta_t: _trial(eta_t, state, k, g, ctx), eta, ip1, state
                 )
+                new_state = damp(new_state, state, factor)
                 opt_state = pack_k(opt_state, k, eta_next)
                 average_state, total_weight = _accumulate(
                     i, new_state, average_state, total_weight, accept
@@ -701,13 +818,14 @@ def _make_epoch_fn(
             ) = carry
 
             opt_state, k = unpack_k(opt_state)
+            ctx, factor = make_ctx(stoch, i, anchor)
 
             if update_mode == "alternating":
                 # Only the primal half of the start gradient and the dual
                 # half of the post-primal gradient are ever consumed, so
                 # compute just those: a VJP+obj-grad for the primal, and a
                 # plain residual eval for the dual (no VJP, no obj grad).
-                grad_primal_start = grad_primal_only(state)
+                grad_primal_start = decay_grad(grad_primal_only(state, ctx), factor)
                 if k_scaling:
                     grad_primal_start = grad_primal_start / k
 
@@ -729,7 +847,7 @@ def _make_epoch_fn(
                     dual_eq=state.dual_eq,
                 )
 
-                dual_ineq_g, dual_eq_g = grad_dual_only(state)
+                dual_ineq_g, dual_eq_g = decay_grad(grad_dual_only(state, ctx), factor)
                 if k_scaling:
                     dual_ineq_g = dual_ineq_g * k
                     dual_eq_g = dual_eq_g * k
@@ -753,7 +871,7 @@ def _make_epoch_fn(
             else:
                 # extragradient
                 # --- Look-ahead gradient ---
-                g = grad(state)
+                g = grad(state, ctx)
 
                 scaled_g = scale_by_k(g, k) if k_scaling else g
                 la_updates, _ = opt_update(scaled_g, opt_state, state)
@@ -765,7 +883,7 @@ def _make_epoch_fn(
                 )
 
                 # Corrector: gradient at look-ahead point, applied from original state
-                g_half = grad(state_half)
+                g_half = decay_grad(grad(state_half, ctx), factor)
                 scaled_g_half = scale_by_k(g_half, k) if k_scaling else g_half
                 corr_updates, opt_state = opt_update(scaled_g_half, opt_state, state)
                 state = optax.apply_updates(state, corr_updates)
@@ -891,6 +1009,10 @@ def _device_solver(
     diag_adapt=False,
     diag_theta=0.5,
     diag_clamp=10.0,
+    oracle=None,
+    key=None,
+    svrg=False,
+    step_decay=None,
 ):
     """The device side of ``solve()`` for one problem: the jitted epoch loop
     (iterations, metrics, convergence test, restarts and the primal weight)
@@ -900,6 +1022,11 @@ def _device_solver(
     Returns ``(build_chunk, carry)``: ``build_chunk(ipe)`` gives the jitted
     ``run_chunk(carry, n_epochs)`` for an epoch length, and ``carry`` is the
     initial loop state.
+
+    With a ``GradientOracle`` the iterations use its stochastic gradients
+    (sampled from the PRNG ``key``, with ``svrg`` variance reduction and
+    ``step_decay`` damping, see ``_make_epoch_fn``), while ``cp``, the full
+    problem, still drives the metrics, the convergence test and the restarts.
     """
     # The diagonal is learned over a restart cycle and changed only at a
     # restart, and only the adaptive line search measures in its metric, so
@@ -1108,6 +1235,9 @@ def _device_solver(
             k_scaling,
             adaptive_step,
             diag=diag_adapt,
+            oracle=oracle,
+            svrg=svrg,
+            step_decay=step_decay,
         )
         ipe_after_restart = max(
             iterations_per_epoch_min, int(ipe * iterations_per_epoch_decay)
@@ -1126,6 +1256,13 @@ def _device_solver(
                 c["opt"],
                 c["total_weight"],
                 **(dict(diag=diag, accum=accum) if diag_adapt else {}),
+                # The shifted index plus the restart offset is the global
+                # iteration count, which keys the samples.
+                **(
+                    dict(stoch=(c["key"], c["restart_i_offset"]))
+                    if oracle is not None
+                    else {}
+                ),
             )
             if diag_adapt:
                 *epoch_out, accum = epoch_out
@@ -1263,6 +1400,7 @@ def _device_solver(
                     n_evt = n_evt + restarted
 
             new = dict(
+                key=c["key"],
                 state=state,
                 avg=avg,
                 used_avg=used_avg,
@@ -1308,6 +1446,7 @@ def _device_solver(
 
     carry = _strong(
         dict(
+            key=key if oracle is not None else None,
             state=initial_solution,
             # No average buffer when averaging is off (saves a state-sized copy).
             avg=initial_solution if average else None,
@@ -1355,6 +1494,182 @@ def _device_solver(
         )
     )
     return _build_chunk, carry
+
+
+def _run_host_loop(
+    build_chunk,
+    carry,
+    *,
+    iterations_per_epoch,
+    precompile,
+    verbose,
+    max_epochs,
+    max_seconds,
+    solve_entry_time,
+    obj_scale,
+    k_scaling,
+    diag_adapt,
+    average,
+    from_scaled,
+    objective,
+):
+    """The host side of ``solve()``: runs ``_device_solver``'s chunks of epochs
+    until the convergence test passes or a budget (``max_epochs``,
+    ``max_seconds`` from ``solve_entry_time``) or Ctrl-C stops it, prints the
+    verbose log (objective divided by ``obj_scale``), and returns ``solve()``'s
+    result dict, with the solution mapped back by ``from_scaled`` (if set)."""
+
+    def _epochs_arg(n):
+        # Same type on every call, so the (possibly AOT-compiled) chunk accepts it.
+        return jnp.asarray(n, carry["count"].dtype)
+
+    chunk_fns = {}
+    current_ipe = int(iterations_per_epoch)
+    if precompile:
+        # Compile the first chunk function ahead of time, so the first epoch
+        # doesn't pay its compile inside the timed measurement.
+        chunk_fns[current_ipe] = (
+            build_chunk(current_ipe).lower(carry, _epochs_arg(1)).compile()
+        )
+
+    # With no logging and no budgets there is nothing for the host to do between
+    # epochs, so the whole solve is one call: the loop only returns once the
+    # convergence test passes (or a restart changes iterations_per_epoch, whose
+    # new scan length needs a new compile).
+    single_call = not verbose and not max_epochs and max_seconds is None
+    chunk_epochs = _UNBOUNDED_EPOCHS if single_call else 1
+    seconds_per_epoch = None
+    count = 0
+    done = False
+    restarts_printed = 0
+    is_converged = True
+    stop_reason = "certificate"
+
+    def print_chunk_log(host, epoch_time):
+        nonlocal restarts_printed
+        entries = [(int(r[0]), 0, r) for r in host["log"][: int(host["n_log"])]]
+        entries += [(int(r[0]), 1, r) for r in host["evt"][: int(host["n_evt"])]]
+        for epoch_no, kind, r in sorted(entries, key=lambda e: e[:2]):
+            if kind == 0:
+                print(
+                    f"|Epoch {epoch_no}|"
+                    f"|Obj{float(r[1]) / obj_scale:.2e}|"
+                    f"|PGN {float(r[2]):.2e}|"
+                    f"|CS {float(r[3]):.2e}|"
+                    f"|PFR {float(r[4]):.2e}|"
+                    f"|Time {epoch_time:.2f}s|"
+                )
+                print("----------------------------------------------")
+                continue
+            restarts_printed += 1
+            reason = "sufficient-progress" if r[1] == 0 else "cycle-cap"
+            which = "avg" if r[3] else "iterate"
+            k_msg = f", k={float(r[4]):.3e}" if k_scaling else ""
+            if diag_adapt:
+                k_msg += f", t-spread=1e{float(r[7]):.2f}, s-spread=1e{float(r[8]):.2f}"
+            print(
+                f"Restart {restarts_printed} at epoch {epoch_no} "
+                f"({reason}, merit={float(r[2]):.2e} "
+                f"[{which}], next cap={float(r[5]):.0f} epochs, "
+                f"iters/epoch={int(r[6])}{k_msg})"
+            )
+            print("----------------------------------------------")
+
+    start_time = time.time()
+
+    try:
+        while True:
+            if done:
+                break
+            if max_epochs and count >= max_epochs:
+                is_converged = False
+                stop_reason = "max_epochs"
+                if verbose:
+                    print(f"Reached maximum epochs: {max_epochs}. Stopping.")
+                    print("----------------------------------------------")
+                break
+            if max_seconds is not None:
+                if time.time() - solve_entry_time >= max_seconds:
+                    is_converged = False
+                    stop_reason = "time_limit"
+                    if verbose:
+                        print(f"Reached time limit: {max_seconds}s. Stopping.")
+                        print("----------------------------------------------")
+                    break
+
+            n_epochs = chunk_epochs
+            if max_epochs:
+                n_epochs = min(n_epochs, max_epochs - count)
+            if max_seconds is not None and seconds_per_epoch:
+                remaining = max_seconds - (time.time() - solve_entry_time)
+                n_epochs = min(n_epochs, max(1, int(remaining / seconds_per_epoch)))
+
+            run_chunk = chunk_fns.get(current_ipe)
+            if run_chunk is None:
+                run_chunk = chunk_fns[current_ipe] = build_chunk(current_ipe)
+
+            chunk_start = time.time()
+            new_carry = run_chunk(carry, _epochs_arg(n_epochs))
+            keys = ["count", "done", "ipe"]
+            if verbose:
+                keys += ["log", "n_log", "evt", "n_evt"]
+            # The one host/device synchronisation per chunk.
+            host = jax.device_get({k: new_carry[k] for k in keys})
+            carry = new_carry
+            chunk_seconds = time.time() - chunk_start
+
+            epochs_run = max(int(host["count"]) - count, 1)
+            count = int(host["count"])
+            done = bool(host["done"])
+            current_ipe = int(host["ipe"])
+            if single_call:
+                continue
+            seconds_per_epoch = chunk_seconds / epochs_run
+
+            if verbose:
+                print_chunk_log(host, seconds_per_epoch)
+                zero = jnp.zeros_like(carry["n_log"])
+                carry = {**carry, "n_log": zero, "n_evt": zero}
+
+            # Size the next chunk to take about _CHUNK_TARGET_SECONDS, growing
+            # by at most 8x per chunk.
+            chunk_epochs = int(
+                min(
+                    max(1.0, _CHUNK_TARGET_SECONDS / seconds_per_epoch),
+                    8 * epochs_run,
+                )
+            )
+    except KeyboardInterrupt:
+        # `carry` still holds the last completed chunk (it is not donated).
+        is_converged = False
+        stop_reason = "interrupted"
+        count = int(carry["count"])
+        print("KeyboardInterrupt received. Returning current solution.")
+        print("----------------------------------------------")
+
+    opt_state = carry["opt"]
+    output = _reported_point(carry, average)
+    if from_scaled is not None:
+        output = from_scaled(output)
+
+    output = jax.block_until_ready(output)
+    end_time = time.time()
+    if verbose:
+        print(f"Time to solution: {end_time - start_time:.2f} seconds")
+        print("----------------------------------------------")
+        print(f"Epochs to solution: {count}")
+        print("----------------------------------------------")
+        print(f"Objective: {objective(output.primal):.5e}")
+        print("----------------------------------------------")
+
+    return {
+        "solution": output,
+        "converged": is_converged,
+        "stop_reason": stop_reason,
+        "opt_state": opt_state,
+        "solve_seconds": end_time - start_time,
+        "epochs": count,
+    }
 
 
 @jo._with_local_settings
@@ -1694,157 +2009,23 @@ def solve(
         diag_clamp=diag_clamp,
     )
 
-    def _epochs_arg(n):
-        # Same type on every call, so the (possibly AOT-compiled) chunk accepts it.
-        return jnp.asarray(n, carry["count"].dtype)
-
-    chunk_fns = {}
-    current_ipe = int(iterations_per_epoch)
-    if precompile:
-        # Compile the first chunk function ahead of time, so the first epoch
-        # doesn't pay its compile inside the timed measurement.
-        chunk_fns[current_ipe] = (
-            _build_chunk(current_ipe).lower(carry, _epochs_arg(1)).compile()
-        )
-
-    # With no logging and no budgets there is nothing for the host to do between
-    # epochs, so the whole solve is one call: the loop only returns once the
-    # convergence test passes (or a restart changes iterations_per_epoch, whose
-    # new scan length needs a new compile).
-    single_call = not verbose and not max_epochs and max_seconds is None
-    chunk_epochs = _UNBOUNDED_EPOCHS if single_call else 1
-    seconds_per_epoch = None
-    count = 0
-    done = False
-    restarts_printed = 0
-    is_converged = True
-    stop_reason = "certificate"
-
-    def print_chunk_log(host, epoch_time):
-        nonlocal restarts_printed
-        entries = [(int(r[0]), 0, r) for r in host["log"][: int(host["n_log"])]]
-        entries += [(int(r[0]), 1, r) for r in host["evt"][: int(host["n_evt"])]]
-        for epoch_no, kind, r in sorted(entries, key=lambda e: e[:2]):
-            if kind == 0:
-                print(
-                    f"|Epoch {epoch_no}|"
-                    f"|Obj{float(r[1]) / obj_scale:.2e}|"
-                    f"|PGN {float(r[2]):.2e}|"
-                    f"|CS {float(r[3]):.2e}|"
-                    f"|PFR {float(r[4]):.2e}|"
-                    f"|Time {epoch_time:.2f}s|"
-                )
-                print("----------------------------------------------")
-                continue
-            restarts_printed += 1
-            reason = "sufficient-progress" if r[1] == 0 else "cycle-cap"
-            which = "avg" if r[3] else "iterate"
-            k_msg = f", k={float(r[4]):.3e}" if k_scaling else ""
-            if diag_adapt:
-                k_msg += f", t-spread=1e{float(r[7]):.2f}, s-spread=1e{float(r[8]):.2f}"
-            print(
-                f"Restart {restarts_printed} at epoch {epoch_no} "
-                f"({reason}, merit={float(r[2]):.2e} "
-                f"[{which}], next cap={float(r[5]):.0f} epochs, "
-                f"iters/epoch={int(r[6])}{k_msg})"
-            )
-            print("----------------------------------------------")
-
-    start_time = time.time()
-
-    try:
-        while True:
-            if done:
-                break
-            if max_epochs and count >= max_epochs:
-                is_converged = False
-                stop_reason = "max_epochs"
-                if verbose:
-                    print(f"Reached maximum epochs: {max_epochs}. Stopping.")
-                    print("----------------------------------------------")
-                break
-            if max_seconds is not None:
-                if time.time() - solve_entry_time >= max_seconds:
-                    is_converged = False
-                    stop_reason = "time_limit"
-                    if verbose:
-                        print(f"Reached time limit: {max_seconds}s. Stopping.")
-                        print("----------------------------------------------")
-                    break
-
-            n_epochs = chunk_epochs
-            if max_epochs:
-                n_epochs = min(n_epochs, max_epochs - count)
-            if max_seconds is not None and seconds_per_epoch:
-                remaining = max_seconds - (time.time() - solve_entry_time)
-                n_epochs = min(n_epochs, max(1, int(remaining / seconds_per_epoch)))
-
-            run_chunk = chunk_fns.get(current_ipe)
-            if run_chunk is None:
-                run_chunk = chunk_fns[current_ipe] = _build_chunk(current_ipe)
-
-            chunk_start = time.time()
-            new_carry = run_chunk(carry, _epochs_arg(n_epochs))
-            keys = ["count", "done", "ipe"]
-            if verbose:
-                keys += ["log", "n_log", "evt", "n_evt"]
-            # The one host/device synchronisation per chunk.
-            host = jax.device_get({k: new_carry[k] for k in keys})
-            carry = new_carry
-            chunk_seconds = time.time() - chunk_start
-
-            epochs_run = max(int(host["count"]) - count, 1)
-            count = int(host["count"])
-            done = bool(host["done"])
-            current_ipe = int(host["ipe"])
-            if single_call:
-                continue
-            seconds_per_epoch = chunk_seconds / epochs_run
-
-            if verbose:
-                print_chunk_log(host, seconds_per_epoch)
-                zero = jnp.zeros_like(carry["n_log"])
-                carry = {**carry, "n_log": zero, "n_evt": zero}
-
-            # Size the next chunk to take about _CHUNK_TARGET_SECONDS, growing
-            # by at most 8x per chunk.
-            chunk_epochs = int(
-                min(
-                    max(1.0, _CHUNK_TARGET_SECONDS / seconds_per_epoch),
-                    8 * epochs_run,
-                )
-            )
-    except KeyboardInterrupt:
-        # `carry` still holds the last completed chunk (it is not donated).
-        is_converged = False
-        stop_reason = "interrupted"
-        count = int(carry["count"])
-        print("KeyboardInterrupt received. Returning current solution.")
-        print("----------------------------------------------")
-
-    opt_state = carry["opt"]
-    output = _reported_point(carry, average)
-    if from_scaled is not None:
-        output = from_scaled(output)
-
-    output = jax.block_until_ready(output)
-    end_time = time.time()
-    if verbose:
-        print(f"Time to solution: {end_time - start_time:.2f} seconds")
-        print("----------------------------------------------")
-        print(f"Epochs to solution: {count}")
-        print("----------------------------------------------")
-        print(f"Objective: {cp.objective(output.primal):.5e}")
-        print("----------------------------------------------")
-
-    return {
-        "solution": output,
-        "converged": is_converged,
-        "stop_reason": stop_reason,
-        "opt_state": opt_state,
-        "solve_seconds": end_time - start_time,
-        "epochs": count,
-    }
+    return _run_host_loop(
+        _build_chunk,
+        carry,
+        iterations_per_epoch=iterations_per_epoch,
+        precompile=precompile,
+        verbose=verbose,
+        max_epochs=max_epochs,
+        max_seconds=max_seconds,
+        solve_entry_time=solve_entry_time,
+        obj_scale=obj_scale,
+        k_scaling=k_scaling,
+        # The restart log has the diagonal's columns only when it is learned.
+        diag_adapt=bool(diag_adapt and adaptive_step and restarts),
+        average=average,
+        from_scaled=from_scaled,
+        objective=cp.objective,
+    )
 
 
 # %%

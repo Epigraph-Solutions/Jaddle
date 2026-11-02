@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `jaddle.jaddle_stochastic`: stochastic saddle-point optimisation for
+  convex problems whose objective and constraints are means over data.
+  `JaddleCPStochastic` takes each term as a per-example function
+  `fn(x, example)` with its data (a pytree with a leading example axis),
+  plus optional deterministic parts (`*_det`). `js.solve` runs
+  `jc.solve`'s algorithms on minibatch gradients of the Lagrangian
+  (`batch_size`; every gradient within one iteration shares its minibatch),
+  with SVRG variance reduction by default (`variance_reduction="svrg"`: an
+  exact pass per epoch anchors the estimates). `variance_reduction=None`
+  gives plain stochastic gradients, with a `step_decay` that shrinks the
+  updates but not their exploration. The convergence test, restart merits,
+  primal-weight initialisation and gradient scales use the full problem
+  (`JaddleCPStochastic.full_cp`, `eval_chunk_size` for data that does not
+  fit in one pass), so `"certificate"` certifies the full problem. The
+  default `update_mode` is `"extragradient"`: `"alternating"` and `"pdhg"`
+  are not contractive and can diverge when constraints are sampled. On
+  fairness-constrained logistic regression with 200,000 examples, it
+  certifies at 1e-5 in 1.3 s on CPU, where `jc.solve` takes 2.7 s.
+- `jc.GradientOracle`: the hook through which `jc.solve`'s epoch loop takes
+  stochastic gradients.
+
+### Fixed
+
+- `jc.solve(verbose=True)` no longer fails with an index error when a
+  restart is logged with `diag_adapt=True` but the adaptive step off.
+
 ## 0.3.0
 
 ### Added

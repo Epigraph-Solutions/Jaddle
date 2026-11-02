@@ -9,6 +9,9 @@ Jaddle. They are grouped by solver:
 - [`conic/`](conic/): second-order cone, semidefinite and exponential cone programs, solved with
   `jaddle.jaddle_linear` on cone-constrained variables
 - [`cp/`](cp/): general convex programs, solved with `jaddle.jaddle_convex`
+- [`stochastic/`](stochastic/): convex programs whose objective and
+  constraints are means over a large dataset, solved from minibatches with
+  `jaddle.jaddle_stochastic`
 
 Every example is written in the "percent" cell format (`# %%` / `# %% [markdown]`).
 You can run it as a plain script, or step through it cell by cell in VS Code's
@@ -186,6 +189,18 @@ The first two examples use `jc.solve(cp)` with its default settings, so they
 are a good starting template: replace the objective and constraint functions
 with your own. `kernel_svm.py` is the template for a problem you can write
 down as matrices.
+
+## Stochastic convex programs (`stochastic/`)
+
+A `JaddleCPStochastic` describes a convex program whose objective and
+constraints are means over data: each term is a function of the variables and
+one example, plus the data, and optional deterministic parts. `js.solve`
+estimates the Lagrangian's gradient from a minibatch each iteration (with SVRG
+variance reduction by default), and tests convergence on the full problem.
+
+| Example | What it shows | Extra dependencies |
+|---|---|---|
+| [`fair_logistic_regression.py`](stochastic/fair_logistic_regression.py) | The fairness-constrained logistic regression of `cp/`, on a million applicants. Writes the log-loss and the covariance constraint per applicant, solves with and without the constraint from batches of 1,024, and checks the model and the price of fairness against `jc.solve` on `full_cp()`. On a laptop CPU the constrained solve takes about 4 s, against about 15 s for `jc.solve`. | — |
 
 ## Precision
 
