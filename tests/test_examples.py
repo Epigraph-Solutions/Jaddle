@@ -36,6 +36,7 @@ def has(module):
         ("cp/cvxpy_channel_capacity.py", ["cvxpy"]),
         ("cp/cvxpy_robust_kalman.py", ["cvxpy", "matplotlib"]),
         ("stochastic/fair_logistic_regression.py", []),
+        ("stochastic/risk_constrained_kelly.py", []),
         ("conic/cvxpy_portfolio.py", ["cvxpy"]),
         ("conic/cvxpy_maxcut.py", ["cvxpy"]),
         ("conic/cvxpy_kelly.py", ["cvxpy"]),

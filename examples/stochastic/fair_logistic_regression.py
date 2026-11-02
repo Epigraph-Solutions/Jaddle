@@ -10,8 +10,8 @@
 #
 # Convergence is tested on the full problem, so a `"certificate"` stop means
 # the same thing as for `jc.solve`. The example is written for a GPU. On a
-# CPU the stochastic solves take about 10 s each, but the `jc.solve` check
-# takes over 2 minutes.
+# CPU the stochastic solves take about 2 s each, but the `jc.solve` check
+# takes over 20 seconds.
 
 # %%
 import os

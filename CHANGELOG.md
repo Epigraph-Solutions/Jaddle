@@ -59,6 +59,11 @@
   (990 skills, 10 weak proxies) for 200,000 applicants, and solves the
   unconstrained model as well as the fair one. On a laptop GPU each
   stochastic solve takes 2–7 s (compilation included) and `jc.solve` 22 s.
+- `examples/stochastic/risk_constrained_kelly.py`: risk-constrained Kelly
+  betting over 2,000,000 scenarios with rare crashes, from minibatches. The
+  drawdown limit holds out of sample, where fits to 1,000 scenarios break
+  it. On a CPU the stochastic solves take 2.5 s and 6.5 s and `jc.solve`
+  40 s.
 
 ## 0.3.0
 
