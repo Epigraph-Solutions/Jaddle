@@ -200,7 +200,7 @@ variance reduction by default), and tests convergence on the full problem.
 
 | Example | What it shows | Extra dependencies |
 |---|---|---|
-| [`fair_logistic_regression.py`](stochastic/fair_logistic_regression.py) | The fairness-constrained logistic regression of `cp/`, on a million applicants. Writes the log-loss and the covariance constraint per applicant, solves with and without the constraint from batches of 1,024, and checks the model and the price of fairness against `jc.solve` on `full_cp()`. On a laptop CPU the constrained solve takes about 4 s, against about 15 s for `jc.solve`. | — |
+| [`fair_logistic_regression.py`](stochastic/fair_logistic_regression.py) | The fairness-constrained logistic regression of `cp/`, on 200,000 applicants with 1,000 features each (1.6 GB in float64). Writes the log-loss and the covariance constraint per applicant, solves with and without the constraint from batches of 1,280, and checks the model and the price of fairness against `jc.solve` on `full_cp()`. On an RTX 5070 Ti laptop GPU each stochastic solve takes 2–7 s, compilation included, against about 22 s for `jc.solve`. On a CPU the stochastic solves take about 10 s each and `jc.solve` about 2½ minutes. | a GPU (recommended) |
 
 ## Precision
 

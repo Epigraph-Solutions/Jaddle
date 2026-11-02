@@ -73,6 +73,56 @@ def _kkt_residuals(cp, state):
     return objective_value, primal_grad_norm, constraint_bound, complementarity_slack
 
 
+class _Consts(NamedTuple):
+    """Arrays a problem's functions read when they are traced (a dataset, say),
+    for the solver to pass to its compiled programs as arguments: captured by
+    a closure, ``jit`` would embed them in the program as constants, which
+    copies them and, for a large dataset, can exceed device memory or the
+    compilation cache's 2 GiB limit. ``values`` are the arrays, and
+    ``bind(v)`` is a context manager under which the functions read ``v``
+    (a program's traced arguments, while it compiles) in their place."""
+
+    bind: Any
+    values: Any
+
+
+def _jit_bound(fn, consts):
+    """``jax.jit(fn)``, with ``consts`` (a ``_Consts`` or ``None``) passed as
+    an argument instead of captured."""
+    if consts is None:
+        return jax.jit(fn)
+
+    @jax.jit
+    def bound(values, *args):
+        with consts.bind(values):
+            return fn(*args)
+
+    return lambda *args: bound(consts.values, *args)
+
+
+class _BoundChunk:
+    """A jitted ``run_chunk(carry, n_epochs, values)`` called as
+    ``run_chunk(carry, n_epochs)``, ``lower(...).compile()`` included, with
+    ``values`` (a ``_Consts``'s arrays) supplied as an argument."""
+
+    def __init__(self, fn, values):
+        self._fn, self._values = fn, values
+
+    def __call__(self, carry, n_epochs):
+        return self._fn(carry, n_epochs, self._values)
+
+    def lower(self, carry, n_epochs):
+        lowered = self._fn.lower(carry, n_epochs, self._values)
+        values = self._values
+
+        class _Lowered:
+            def compile(self):
+                compiled = lowered.compile()
+                return lambda c, n: compiled(c, n, values)
+
+        return _Lowered()
+
+
 # gradient_scaling clamps every scale factor to [1/clip, clip].
 _GRADIENT_SCALING_CLIP = 1e4
 
@@ -119,7 +169,7 @@ def _gradient_scales(cp, x0, probes):
     return scale(_dot(grad_f, grad_f)), scale(row_norm2)
 
 
-def _gradient_scaled(cp, x0, probes):
+def _gradient_scaled(cp, x0, probes, consts=None):
     """``cp`` with its objective and constraint rows rescaled by
     ``_gradient_scales`` at ``x0`` (the variables are untouched). Returns
     ``(scaled_cp, to_scaled, from_scaled, sigma)``: the two maps convert a
@@ -127,14 +177,15 @@ def _gradient_scaled(cp, x0, probes):
     ``σf + Σ λ̃_i e_i g_i = σ (f + Σ (e_i λ̃_i / σ) g_i)`` gives
     ``λ_i = e_i λ̃_i / σ``. The scaled problem's ``residuals`` evaluate ``cp``'s
     own (or the generic ``_kkt_residuals``) at the unscaled point, so the
-    convergence test keeps the original problem's units."""
+    convergence test keeps the original problem's units. ``consts`` (a
+    ``_Consts``) is passed to the scales' program as an argument."""
     x0 = projection_box(x0, cp.lower_bounds, cp.upper_bounds)
     # A CP from ``load_cp`` carries its scales as an exported function: its
     # own callables have no forward mode or batching, which the scales need.
     scales_fn = getattr(cp, "gradient_scales", None)
     if scales_fn is None:
         scales_fn = lambda x: _gradient_scales(cp, x, probes)
-    sigma, e = jax.jit(scales_fn)(x0)
+    sigma, e = _jit_bound(scales_fn, consts)(x0)
     return _gradient_scaled_from(cp, sigma, e)
 
 
@@ -1013,6 +1064,7 @@ def _device_solver(
     key=None,
     svrg=False,
     step_decay=None,
+    consts=None,
 ):
     """The device side of ``solve()`` for one problem: the jitted epoch loop
     (iterations, metrics, convergence test, restarts and the primal weight)
@@ -1027,6 +1079,10 @@ def _device_solver(
     (sampled from the PRNG ``key``, with ``svrg`` variance reduction and
     ``step_decay`` damping, see ``_make_epoch_fn``), while ``cp``, the full
     problem, still drives the metrics, the convergence test and the restarts.
+
+    ``consts`` (a ``_Consts``: arrays ``cp``'s and ``oracle``'s functions
+    read when traced) is passed to the compiled programs as an argument
+    instead of embedded in them.
     """
     # The diagonal is learned over a restart cycle and changed only at a
     # restart, and only the adaptive line search measures in its metric, so
@@ -1051,7 +1107,6 @@ def _device_solver(
 
     has_dual_bound = cp.dual_bound is not None
 
-    @jax.jit
     def compute_epoch_metrics(average_state):
         (
             objective_value,
@@ -1083,6 +1138,11 @@ def _device_solver(
             duality_gap,
             dual_gap_is_finite,
         )
+
+    # Its own program, except with consts: then it is traced only inside
+    # run_chunk, where they are bound to run_chunk's arguments.
+    if consts is None:
+        compute_epoch_metrics = jax.jit(compute_epoch_metrics)
 
     def check_convergence(
         primal_grad_norm,
@@ -1117,7 +1177,7 @@ def _device_solver(
             b = jnp.concatenate([cp.constraints_eq(x), cp.constraints_ineq(x)])
             return c, b
 
-        c, b = jax.jit(_k_init_fn)(zero)
+        c, b = _jit_bound(_k_init_fn, consts)(zero)
         norm_c2 = _dot(c, c)
         norm_b2 = _dot(b, b)
         # Kept on the device (no float()) so this runs under jit / vmap. As in
@@ -1430,7 +1490,6 @@ def _device_solver(
                 lambda n, o: jnp.asarray(n).astype(jnp.asarray(o).dtype), new, c
             )
 
-        @jax.jit
         def run_chunk(c, n_epochs):
             end = c["count"] + n_epochs
 
@@ -1442,7 +1501,15 @@ def _device_solver(
 
             return jax.lax.while_loop(cond, epoch, c)
 
-        return run_chunk
+        if consts is None:
+            return jax.jit(run_chunk)
+
+        @jax.jit
+        def run_chunk_bound(c, n_epochs, values):
+            with consts.bind(values):
+                return run_chunk(c, n_epochs)
+
+        return _BoundChunk(run_chunk_bound, consts.values)
 
     carry = _strong(
         dict(
@@ -1966,12 +2033,15 @@ def solve(
         print("====Starting Solve====")
         print("----------------------------------------------")
 
+    # A problem whose functions read a dataset (``JaddleCPStochastic.full_cp``)
+    # names it, so the compiled programs take it as an argument.
+    consts = getattr(cp, "_consts", None)
     solve_cp, from_scaled, obj_scale = cp, None, 1.0
     if gradient_scaling:
         if initial_solution is None:
             initial_solution = cp.initial_solution()
         solve_cp, to_scaled, from_scaled, sigma = _gradient_scaled(
-            cp, initial_solution.primal, gradient_scaling_probes
+            cp, initial_solution.primal, gradient_scaling_probes, consts
         )
         initial_solution = to_scaled(initial_solution)
         obj_scale = float(sigma)
@@ -2007,6 +2077,7 @@ def solve(
         diag_adapt=diag_adapt,
         diag_theta=diag_theta,
         diag_clamp=diag_clamp,
+        consts=consts,
     )
 
     return _run_host_loop(

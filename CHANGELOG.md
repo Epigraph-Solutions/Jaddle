@@ -24,11 +24,41 @@
   certifies at 1e-5 in 1.3 s on CPU, where `jc.solve` takes 2.7 s.
 - `jc.GradientOracle`: the hook through which `jc.solve`'s epoch loop takes
   stochastic gradients.
+- `jm.solve` clique cuts (`clique_cuts=True`, family `"clique"`).
+  `jm.ConflictGraph` builds a conflict graph on the binaries once from the
+  rows over the root box (two literals conflict when a row cannot hold with
+  both at 1), storing each row's clique and its other conflicts as edges.
+  Root and tree rounds grow cliques greedily from the LP point's positive
+  literals and lift them with literals at zero. On bab5 the graph takes
+  0.2 s; on exact LPs the clique cuts alone take the root bound from
+  −115,370 to −113,411 in 56 cuts, and they add about 1,000 to it alongside
+  the other families.
+
+### Changed
+
+- `jm.solve`'s `max_cuts_per_round` default is 100 (was 10). With 10 a
+  round, the strongest cover cuts took every slot on bab5 and no Gomory cut
+  got in. With clique cuts, 100 takes bab5's root bound from −113,254 to
+  −111,358 (357 s instead of 47 s) and ns1830653's from 10,621 to 11,622,
+  HiGHS's root bound (22 s instead of 12 s). The tests already pinned 100.
 
 ### Fixed
 
 - `jc.solve(verbose=True)` no longer fails with an index error when a
   restart is logged with `diag_adapt=True` but the adaptive step off.
+- `js.solve`, and `jc.solve` on `JaddleCPStochastic.full_cp()`, pass the
+  data to their compiled programs as an argument. Before, every program
+  embedded it as a constant, so a 1.6 GB dataset (200,000 × 1,000) built a
+  3.2 GB program, overran the compilation cache's 2 GiB limit and the GPU's
+  memory, and took 79 s to solve instead of under 7 s. Terms given the same
+  array now also share one device copy of it, rather than one each.
+
+### Examples
+
+- `examples/stochastic/fair_logistic_regression.py` now has 1,000 features
+  (990 skills, 10 weak proxies) for 200,000 applicants, and solves the
+  unconstrained model as well as the fair one. On a laptop GPU each
+  stochastic solve takes 2–7 s (compilation included) and `jc.solve` 22 s.
 
 ## 0.3.0
 

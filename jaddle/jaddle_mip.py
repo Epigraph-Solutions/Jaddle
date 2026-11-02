@@ -2724,6 +2724,181 @@ def gomory_cuts(
     return cuts
 
 
+# Clique cuts (``ConflictGraph``): conflicts a row may add beyond the clique
+# it stores, literals that start a clique search per round, and adjacency
+# checks spent lifting one clique.
+_CLIQUE_MAX_EXTRA_EDGES = 10_000
+_CLIQUE_MAX_STARTS = 2000
+_CLIQUE_LIFT_CHECKS = 20_000
+_CLIQUE_ROUND_CHECKS = 1_000_000  # and in one round, over all its cliques
+
+
+class ConflictGraph:
+    """
+    Conflicts between binary literals: pairs that are never both 1 in a
+    point of the rows within the box ``lower <= x <= upper``. Literal ``2j``
+    is ``x_j`` and ``2j + 1`` is ``1 − x_j``, for the binaries of the box.
+
+    A row ``a·x <= b`` of any of ``mips`` (an equality row in both senses)
+    puts two literals in conflict when raising both from the row's least
+    activity over the box (``x_j`` to 1 when ``a_j > 0``, to 0 when
+    ``a_j < 0``) passes ``b``: ``|a_p| + |a_q| > b − minact``. With the
+    terms sorted by ``|a_j|``, the longest prefix whose last two terms
+    conflict is a clique (every pair in it conflicts) and is stored as one;
+    the other conflicts, of a prefix term with a later one, are stored as
+    edges, at most ``_CLIQUE_MAX_EXTRA_EDGES`` per row (leaving conflicts
+    out only weakens the cuts). Rows with an unbounded least activity give
+    none.
+
+    ``cuts(x)`` separates clique cuts ``Σ_{l in C} l <= 1``. ``num_edges``
+    counts the stored conflicts, a pair once for each row that gives it.
+    """
+
+    def __init__(self, mips, lower, upper, tol=1e-6):
+        lower = np.asarray(lower, np.float64)
+        upper = np.asarray(upper, np.float64)
+        self.n = lower.size
+        cliques = {}  # sorted literal tuple -> None, in insertion order
+        extra = collections.defaultdict(set)
+        for mip in mips:
+            self._add_rows(mip, lower, upper, tol, cliques, extra)
+        self.cliques = [np.array(c, np.int64) for c in cliques]
+        literal_cliques = collections.defaultdict(set)
+        for k, clique in enumerate(cliques):
+            for literal in clique:
+                literal_cliques[literal].add(k)
+        self.literal_cliques = dict(literal_cliques)
+        self.extra = dict(extra)
+        self.num_edges = sum(len(c) * (len(c) - 1) // 2 for c in cliques) + sum(
+            len(e) for e in extra.values()
+        ) // 2
+
+    def __len__(self):
+        return len(self.cliques)
+
+    @staticmethod
+    def _add_rows(mip, lower, upper, tol, cliques, extra):
+        A = sp.csr_matrix(mip.A)
+        b = np.asarray(mip.b, np.float64)
+        m = A.shape[0]
+        if m == 0 or A.nnz == 0:
+            return
+        is_binary = np.asarray(mip.integrality) & (lower == 0.0) & (upper == 1.0)
+        rows = np.repeat(np.arange(m), np.diff(A.indptr))
+        a, cols = A.data, A.indices
+        with np.errstate(invalid="ignore"):
+            low = np.where(a > 0, a * lower[cols], a * upper[cols])
+            high = np.where(a > 0, a * upper[cols], a * lower[cols])
+        low[a == 0] = 0.0
+        high[a == 0] = 0.0
+        min_act = np.bincount(rows, low, minlength=m)
+        max_act = np.bincount(rows, high, minlength=m)
+        # The largest binary |a_j| of each row screens out rows with no
+        # conflict: two terms can pass the slack only if twice it does.
+        biggest = np.zeros(m)
+        np.maximum.at(biggest, rows, np.where(is_binary[cols], np.abs(a), 0.0))
+        senses = [(1.0, b - min_act, b)]
+        if mip.n_eq:
+            eq = np.arange(m) < mip.n_eq
+            senses.append((-1.0, np.where(eq, max_act - b, np.inf), -b))
+        for sign, slack, rhs in senses:
+            threshold = slack + tol * (1.0 + np.abs(rhs))
+            with np.errstate(invalid="ignore"):
+                live = np.isfinite(slack) & (slack >= -tol) & (2.0 * biggest > threshold)
+            for r in np.flatnonzero(live):
+                start, end = A.indptr[r], A.indptr[r + 1]
+                idx, coef = cols[start:end], sign * a[start:end]
+                keep = is_binary[idx] & (coef != 0.0)
+                idx, coef = idx[keep], coef[keep]
+                cost = np.abs(coef)
+                literal = np.where(coef > 0, 2 * idx, 2 * idx + 1)
+                order = np.argsort(-cost, kind="stable")
+                cost, literal = cost[order], literal[order]
+                limit = threshold[r]
+                k = 1 + int(np.count_nonzero(cost[:-1] + cost[1:] > limit))
+                if k < 2:
+                    continue
+                cliques.setdefault(tuple(sorted(literal[:k].tolist())), None)
+                budget = _CLIQUE_MAX_EXTRA_EDGES
+                for p in range(k):
+                    if k >= cost.size or cost[p] + cost[k] <= limit or budget <= 0:
+                        break
+                    later = k + int(np.count_nonzero(cost[k:] > limit - cost[p]))
+                    for q in literal[k:later][:budget].tolist():
+                        extra[int(literal[p])].add(q)
+                        extra[q].add(int(literal[p]))
+                    budget -= later - k
+
+    def adjacent(self, u, v):
+        """Whether literals ``u`` and ``v`` conflict."""
+        if v in self.extra.get(u, ()):
+            return True
+        cu, cv = self.literal_cliques.get(u), self.literal_cliques.get(v)
+        return cu is not None and cv is not None and not cu.isdisjoint(cv)
+
+    def neighbours(self, u):
+        """The literals in conflict with ``u``."""
+        out = set(self.extra.get(u, ()))
+        for k in self.literal_cliques.get(u, ()):
+            out.update(self.cliques[k].tolist())
+        out.discard(u)
+        return out
+
+    def cuts(self, x, max_cuts=200, min_violation=1e-6):
+        """Clique cuts violated by ``x``, as ``("clique", idx, coef, rhs)``.
+        From each literal with a positive value (largest first, at most
+        ``_CLIQUE_MAX_STARTS``), a clique grows greedily through its
+        neighbours with positive values, largest first; a violated one is
+        then lifted with neighbours at zero (at most
+        ``_CLIQUE_LIFT_CHECKS`` adjacency checks, ``_CLIQUE_ROUND_CHECKS``
+        over the call), which keeps the cut violated and makes it stronger.
+        A clique grown before from another start is not lifted again."""
+        x = np.asarray(x, np.float64)
+        value = np.empty(2 * self.n)
+        value[0::2] = x
+        value[1::2] = 1.0 - x
+        in_graph = np.zeros(2 * self.n, bool)
+        in_graph[list(self.literal_cliques)] = True
+        in_graph[list(self.extra)] = True
+        starts = np.flatnonzero(in_graph & (value > 1e-9))
+        starts = starts[np.argsort(-value[starts], kind="stable")][:_CLIQUE_MAX_STARTS]
+        seen, cuts = set(), []
+        round_checks = _CLIQUE_ROUND_CHECKS
+        for s in starts.tolist():
+            neighbours = self.neighbours(s)
+            positive = sorted(
+                (l for l in neighbours if value[l] > 1e-9), key=lambda l: (-value[l], l)
+            )
+            clique = [s]
+            for l in positive:
+                if all(self.adjacent(l, c) for c in clique):
+                    clique.append(l)
+            if value[clique].sum() <= 1.0 + min_violation:
+                continue
+            key = frozenset(clique)
+            if key in seen:
+                continue
+            seen.add(key)
+            checks = min(_CLIQUE_LIFT_CHECKS, round_checks)
+            for l in sorted(neighbours - key):
+                if checks <= 0:
+                    break
+                if value[l] > 1e-9:
+                    continue
+                checks -= len(clique)
+                if all(self.adjacent(l, c) for c in clique):
+                    clique.append(l)
+            round_checks -= min(_CLIQUE_LIFT_CHECKS, round_checks) - max(checks, 0)
+            literals = np.array(sorted(clique), np.int64)
+            idx = literals // 2
+            coef = np.where(literals % 2 == 0, 1.0, -1.0)
+            rhs = 1.0 - float(np.count_nonzero(literals % 2))
+            cuts.append(("clique", idx, coef, rhs))
+            if len(cuts) >= max_cuts:
+                break
+        return cuts
+
+
 class CutSeparator:
     """Cover and c-MIR separation from the rows of a ``MIP`` over bounds that
     hold for every feasible point (the root's, after propagation)."""
@@ -2731,9 +2906,12 @@ class CutSeparator:
     def __init__(
         self, mip, lower, upper, aggregate_integers=False,
         max_aggregation=_CUT_MAX_AGGREGATION, flow_covers=True, backend="jax",
-        min_batch=_SEPARATION_MIN_BATCH,
+        min_batch=_SEPARATION_MIN_BATCH, conflict_graph=None,
     ):
         self.flow_covers = flow_covers  # also flow cover cuts (``flow_cover_cut``)
+        # Also clique cuts from this ``ConflictGraph`` (built over bounds no
+        # looser than ``lower``/``upper``).
+        self.conflict_graph = conflict_graph
         if backend not in ("jax", "numpy"):
             raise ValueError(f"backend must be 'jax' or 'numpy', not {backend!r}")
         # ``backend``: batched JAX searches, or the per-row numpy ones (the
@@ -2819,7 +2997,7 @@ class CutSeparator:
                 else None
                 for idx, a, b in bases
             ]
-        cuts = []
+        cuts = [] if self.conflict_graph is None else self.conflict_graph.cuts(x)
         position = 0
         for covers, path in jobs:
             cuts += covers
@@ -4295,6 +4473,7 @@ class _BranchAndBound:
         conflict_pool_size=2000,
         conflict_max_nnz=None,
         flow_covers=True,
+        clique_cuts=True,
         separation_backend="jax",
         node_bound_stop=True,
         node_lp_tolerance=None,
@@ -4476,6 +4655,10 @@ class _BranchAndBound:
         # Global cuts in the tree need one sparsity pattern per compiled
         # solver; the batched solver captures it, so they are serial only.
         self.use_flow_covers = bool(flow_covers)
+        # Clique cuts (``clique_cuts``): one conflict graph over the root
+        # box, built at the first separation and kept for the tree rounds.
+        self.use_clique_cuts = bool(clique_cuts)
+        self.conflict_graph = None
         if separation_backend not in ("jax", "numpy"):
             raise ValueError(
                 f"separation_backend must be 'jax' or 'numpy', not {separation_backend!r}"
@@ -6202,6 +6385,7 @@ class _BranchAndBound:
                     f"Cuts: {len(families)} in the LP ({families.count('cover')} "
                     f"cover, {families.count('mir')} MIR, "
                     f"{families.count('flowcover')} flow cover, "
+                    f"{families.count('clique')} clique, "
                     f"{families.count('gomory')} Gomory)"
                 )
                 if self.use_tree_cuts:
@@ -6241,7 +6425,7 @@ class _BranchAndBound:
             "history": self.history,
             "cuts": {
                 family: sum(cut["family"] == family for cut in self.cut_list)
-                for family in ("gomory", "cover", "mir", "flowcover")
+                for family in ("gomory", "cover", "mir", "flowcover", "clique")
             },
             "root_bound_before_cuts": None
             if self.root_bound_before_cuts is None
@@ -6519,7 +6703,8 @@ class _BranchAndBound:
                     f"Cut round {round_number}: {len(found)} new, "
                     f"{families.count('gomory')} Gomory + "
                     f"{families.count('cover')} cover + {families.count('mir')} "
-                    f"MIR + {families.count('flowcover')} flow cover in the LP, bound {self.model_value(new_bound):.6e}, "
+                    f"MIR + {families.count('flowcover')} flow cover + "
+                    f"{families.count('clique')} clique in the LP, bound {self.model_value(new_bound):.6e}, "
                     f"{time.time() - self.start:.1f}s"
                 )
             bound = max(bound, new_bound)
@@ -6579,7 +6764,24 @@ class _BranchAndBound:
         return detection["result"]
 
     def separator(self, mip, lower, upper):
-        """A ``CutSeparator`` with this search's aggregation settings."""
+        """A ``CutSeparator`` with this search's aggregation settings. The
+        one for the searched rows (``self.base``) also separates clique
+        cuts (``clique_cuts``) from the conflict graph of the searched and
+        the given rows over this box, built on the first call; the box only
+        tightens after that (the root box), so its conflicts stay valid."""
+        graph = None
+        if self.use_clique_cuts and mip is self.base:
+            if self.conflict_graph is None:
+                started = time.time()
+                mips = [self.base] + ([self.original] if self.original is not self.base else [])
+                self.conflict_graph = ConflictGraph(mips, lower, upper)
+                if self.verbose and len(self.conflict_graph):
+                    print(
+                        f"Conflict graph: {len(self.conflict_graph)} cliques, "
+                        f"{self.conflict_graph.num_edges} conflicts, "
+                        f"{time.time() - started:.1f}s"
+                    )
+            graph = self.conflict_graph if len(self.conflict_graph) else None
         return CutSeparator(
             mip,
             lower,
@@ -6588,6 +6790,7 @@ class _BranchAndBound:
             max_aggregation=4 if self.aggregate_integers else _CUT_MAX_AGGREGATION,
             flow_covers=self.use_flow_covers,
             backend=self.separation_backend,
+            conflict_graph=graph,
         )
 
     def reserve_tree_cuts(self, result):
@@ -6710,7 +6913,8 @@ class _BranchAndBound:
             print(
                 f"C {self.nodes:8d} {len(self.open):8d}   cuts +{placed} "
                 f"({families.count('cover')} cover, {families.count('mir')} MIR, "
-                f"{families.count('flowcover')} flow cover)"
+                f"{families.count('flowcover')} flow cover, "
+                f"{families.count('clique')} clique)"
                 + (f", {len(replaced)} replacing idle cuts" if replaced else "")
                 + f", pool {len(self.cut_list)}/{max_rows}"
             )
@@ -8139,12 +8343,13 @@ def solve(
     coefficient_tightening=True,
     cuts=True,
     cut_rounds=None,
-    max_cuts_per_round=10,
+    max_cuts_per_round=100,
     cut_min_progress=None,
     cut_round_epochs=10,
     gomory_cuts=True,
     aggregate_integers="auto",
     flow_covers=True,
+    clique_cuts=True,
     separation_backend="jax",
     node_bound_stop=True,
     node_lp_tolerance=None,
@@ -8273,9 +8478,12 @@ def solve(
       they are separated from the rows as given as well as the tightened
       rows, since the original knapsacks can give stronger covers. A
       round keeps at most
-      ``max_cuts_per_round`` cuts with efficacy (distance cut off) at least
-      1e-4 that are not near-parallel, retires cuts that are slack, and
-      re-solves the LP warm. With Gomory cuts on, a cut is slack when its
+      ``max_cuts_per_round`` cuts (default 100) with efficacy (distance cut
+      off) at least 1e-4 that are not near-parallel, retires cuts that are
+      slack, and re-solves the LP warm. With 10 a round, the strongest
+      covers took every slot on bab5 and no Gomory cut got in: 100 takes
+      its root bound (with clique cuts) from −113,254 to −111,358, and
+      ns1830653's from 10,621 to 11,622, HiGHS's root bound. With Gomory cuts on, a cut is slack when its
       row is basic in the round's crossover basis, and it goes at once:
       GMI cuts are dense (hundreds of nonzeros on ns1830653), so they are
       allowed at the root (``gomory_cuts(max_nnz=None)``) but leave as soon
@@ -8301,6 +8509,16 @@ def solve(
       searches (``"numpy"``) up to rounding in near-ties. Per round that is
       2.4× faster on fixnet6 and 4× on vpm2; the first calls compile a few
       shapes (one or two seconds, then cached on disk).
+      Clique cuts (``clique_cuts``, on by default; family ``"clique"``)
+      come from a conflict graph on the binaries (``ConflictGraph``), built
+      once from the rows over the root box: two literals (``x_j`` or
+      ``1 − x_j``) conflict when a row cannot hold with both at 1. Each
+      round grows cliques greedily from the literals the LP point puts
+      above zero, and lifts the violated ones with literals at zero; the
+      cut is ``Σ literals <= 1``. On bab5 the graph takes 0.2 s, and with
+      exact LPs the clique cuts alone take the root bound from −115,370 to
+      −113,411 in 56 cuts; with the other families they add about 1,000
+      to the bound after 20 rounds.
     * **Tree cuts** (``tree_cuts``, off by default). Every
       ``tree_cut_every`` nodes, cover and MIR cuts are separated at the
       node's LP point over the root box (so they are valid everywhere),
@@ -8770,6 +8988,7 @@ def solve(
         conflict_pool_size=conflict_pool_size,
         conflict_max_nnz=conflict_max_nnz,
         flow_covers=flow_covers,
+        clique_cuts=clique_cuts,
         separation_backend=separation_backend,
         node_bound_stop=node_bound_stop,
         node_lp_tolerance=node_lp_tolerance,
@@ -8837,7 +9056,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "lp_epochs": 0,
             "seconds": time.time() - start,
             "history": [],
-            "cuts": {"gomory": 0, "cover": 0, "mir": 0, "flowcover": 0},
+            "cuts": {"gomory": 0, "cover": 0, "mir": 0, "flowcover": 0, "clique": 0},
             "root_bound_before_cuts": None,
             "heuristic_seconds": 0.0,
             "batches": 0,

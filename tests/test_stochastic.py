@@ -220,6 +220,60 @@ def test_eval_chunk_size_and_precision():
     assert result["solution"].primal.dtype == jnp.float32
 
 
+def test_shared_data_is_converted_once():
+    # The objective and the constraints are given the same dict: one device
+    # copy of each array, also after a precision cast.
+    scp = fair_logistic(n=500)
+    obj, con = scp._data()["objective"], scp._data()["constraints_ineq"]
+    assert obj["X"] is con["X"] and obj["s"] is con["s"]
+    cast = scp._with_data(lambda a: a.astype(jnp.float32))._data()
+    assert cast["objective"]["X"] is cast["constraints_ineq"]["X"]
+
+
+def _captured_constant_warnings(fn):
+    """The 'constants were captured' warnings JAX gives while ``fn`` runs,
+    with the threshold lowered below the test data's size."""
+    import warnings
+
+    old = jax.config.jax_captured_constants_warn_bytes
+    jax.config.update("jax_captured_constants_warn_bytes", 50_000)
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fn()
+    finally:
+        jax.config.update("jax_captured_constants_warn_bytes", old)
+    return [w for w in caught if "constants were captured" in str(w.message)]
+
+
+def test_data_is_passed_to_the_compiled_programs():
+    # A dataset closed over by the problem's functions would be embedded in
+    # every compiled program as a constant (copied, and for a large dataset
+    # beyond device memory or the compilation cache's 2 GiB limit). The
+    # solvers pass it as an argument instead. X is 4000 x 5 (160 kB).
+    scp = fair_logistic()
+    X = jnp.asarray(scp._terms["objective"][1]["X"])
+    m = X.shape[1] + 1
+
+    # Control: a hand-written JaddleCP closing over X does warn.
+    closed = jc.JaddleCP(
+        num_variables=m,
+        objective=lambda p: jnp.mean(jax.nn.softplus(X @ p[:-1] + p[-1])),
+        constraints_eq=lambda p: jnp.zeros(0),
+        constraints_ineq=lambda p: jnp.zeros(0),
+        lower_bounds=jnp.full(m, -jnp.inf),
+        upper_bounds=jnp.full(m, jnp.inf),
+    )
+    assert _captured_constant_warnings(lambda: jc.solve(closed, max_epochs=2))
+
+    assert not _captured_constant_warnings(
+        lambda: solve(scp, max_epochs=2, verbose=True)
+    )
+    assert not _captured_constant_warnings(
+        lambda: jc.solve(scp.full_cp(), max_epochs=2)
+    )
+
+
 def test_seed_reproducibility():
     scp = simplex_least_squares(n=500)
     settings = dict(max_epochs=3, iterations_per_epoch=20)

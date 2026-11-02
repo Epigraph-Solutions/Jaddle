@@ -101,17 +101,16 @@ print(
 # %%
 result = jm.solve(
     PATH_TO_MPS,
+    branching="reliability",
     presolve=True,
     max_seconds=MAX_SECONDS,
     verbose=True,
     log_every_seconds=10,
     device=DEVICE,
-    cuts=False,
-    tree_cuts=True,
     batch_size=1,
+    tree_cuts=True,
     node_lp_tolerance=1e-6,
     node_crossover=True,
-    node_precision="float64",
 )
 print(f"Status: {result['status']}")
 print(f"Bound: {result['bound']:.6g}")

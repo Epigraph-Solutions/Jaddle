@@ -627,7 +627,7 @@ def test_cuts_strengthen_the_root():
         assert_solved(result, mip, ref)
     # MIR or flow cover cuts (on these fixed-charge rows flow covers often win).
     assert with_cuts["cuts"]["mir"] + with_cuts["cuts"]["flowcover"] > 0
-    assert without["cuts"] == {"gomory": 0, "cover": 0, "mir": 0, "flowcover": 0}
+    assert without["cuts"] == {"gomory": 0, "cover": 0, "mir": 0, "flowcover": 0, "clique": 0}
     assert without["root_bound_before_cuts"] is None
     # The cuts close part of the root gap and the tree is no larger.
     root = with_cuts["root_bound_before_cuts"]
@@ -2482,6 +2482,118 @@ def test_flow_covers_in_the_search():
     assert result["cuts"]["flowcover"] >= 0
     # Pure integer rows get none.
     assert solve(knapsack(), max_nodes=1)["cuts"]["flowcover"] == 0
+
+
+def random_binary_rows(seed, n=10, m_eq=1, m_ineq=6):
+    """A pure binary MIP with ±1..3 rows that a random point satisfies."""
+    rng = np.random.default_rng(seed)
+    x0 = rng.integers(0, 2, n).astype(float)
+    A_eq = rng.integers(-2, 3, (m_eq, n)).astype(float)
+    A_ineq = rng.integers(-3, 4, (m_ineq, n)).astype(float)
+    lp = jl.LP(
+        c=rng.standard_normal(n),
+        A_eq=sp.csc_matrix(A_eq),
+        b_eq=A_eq @ x0,
+        A_ineq=sp.csc_matrix(A_ineq),
+        b_ineq=A_ineq @ x0 + rng.integers(0, 3, m_ineq),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    return jm.MIP(lp, np.ones(n, bool))
+
+
+def binary_points(mip):
+    """Every feasible point of a small pure binary MIP."""
+    n = mip.num_variables
+    grid = ((np.arange(2**n)[:, None] >> np.arange(n)) & 1).astype(float)
+    return np.array([x for x in grid if mip.is_feasible(x)])
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_conflict_graph_conflicts_hold_at_every_feasible_point(seed):
+    mip = random_binary_rows(seed)
+    graph = jm.ConflictGraph([mip], mip.lower, mip.upper)
+    points = binary_points(mip)
+    assert len(points)
+    literals = np.stack([points, 1 - points], axis=2).reshape(len(points), -1)
+    # Literal 2j is x_j and 2j + 1 is 1 - x_j.
+    assert np.array_equal(literals[:, 0::2], points)
+    conflicts = 0
+    for u in range(2 * mip.num_variables):
+        for v in range(u + 1, 2 * mip.num_variables):
+            if graph.adjacent(u, v):
+                conflicts += 1
+                assert graph.adjacent(v, u) and v in graph.neighbours(u)
+                assert not np.any((literals[:, u] == 1) & (literals[:, v] == 1))
+    # ``num_edges`` counts a pair once per row that gives it.
+    assert conflicts <= graph.num_edges
+    # And it holds every conflict of a single row: raising both literals
+    # from the row's least activity passes its right-hand side.
+    A, b = mip.A.toarray(), mip.b
+    rows = [(A[r], b[r]) for r in range(len(b))] + [(-A[r], -b[r]) for r in range(mip.n_eq)]
+    for a, rhs in rows:
+        least = np.minimum(a, 0).sum()
+        cost = np.zeros(2 * mip.num_variables)
+        cost[0::2] = np.maximum(a, 0)
+        cost[1::2] = np.maximum(-a, 0)
+        for u in range(2 * mip.num_variables):
+            for v in range(u + 1, 2 * mip.num_variables):
+                if u // 2 != v // 2 and least + cost[u] + cost[v] > rhs + 1e-6:
+                    assert graph.adjacent(u, v)
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_clique_cuts_are_valid(seed):
+    mip = random_binary_rows(seed)
+    graph = jm.ConflictGraph([mip], mip.lower, mip.upper)
+    points = binary_points(mip)
+    rng = np.random.default_rng(seed)
+    for _ in range(5):
+        x = rng.uniform(0, 1, mip.num_variables)
+        for family, idx, coef, rhs in graph.cuts(x):
+            assert family == "clique"
+            assert coef @ x[idx] > rhs
+            assert np.all(points[:, idx] @ coef <= rhs + 1e-12)
+
+
+def odd_cliques(k=5):
+    """max Σx over the edges of a complete graph on k nodes (x_i + x_j <= 1):
+    the LP optimum is k/2 at x = 1/2, the MIP's 1."""
+    pairs = [(i, j) for i in range(k) for j in range(i + 1, k)]
+    A = np.zeros((len(pairs), k))
+    for r, (i, j) in enumerate(pairs):
+        A[r, [i, j]] = 1.0
+    A_eq, b_eq = no_rows(k)
+    lp = jl.LP(
+        c=-np.ones(k), A_eq=A_eq, b_eq=b_eq, A_ineq=sp.csc_matrix(A),
+        b_ineq=np.ones(len(pairs)), lower_bounds=np.zeros(k), upper_bounds=np.ones(k),
+    )
+    return jm.MIP(lp, np.ones(k, bool))
+
+
+def test_clique_cut_from_edge_rows_and_in_the_search():
+    mip = odd_cliques()
+    graph = jm.ConflictGraph([mip], mip.lower, mip.upper)
+    cuts = graph.cuts(np.full(5, 0.5))
+    # The five edge rows give one clique on all five nodes: Σx <= 1.
+    assert len(cuts) == 1
+    _, idx, coef, rhs = cuts[0]
+    assert list(idx) == list(range(5)) and np.all(coef == 1.0) and rhs == 1.0
+    # x0 + x1 + y <= 1.5 with continuous y: y >= 0.6 makes x0 and x1
+    # conflict; with y unbounded below the row gives no conflicts.
+    for y_lower, conflict in ((0.6, True), (-0.6, False), (-np.inf, False)):
+        lp = jl.LP(
+            c=np.zeros(3), A_eq=sp.csc_matrix((0, 3)), b_eq=np.zeros(0),
+            A_ineq=sp.csc_matrix([[1.0, 1.0, 1.0]]), b_ineq=np.array([1.5]),
+            lower_bounds=np.array([0.0, 0.0, y_lower]), upper_bounds=np.array([1.0, 1.0, 2.0]),
+        )
+        row = jm.MIP(lp, np.array([True, True, False]))
+        graph = jm.ConflictGraph([row], row.lower, row.upper)
+        assert graph.adjacent(0, 2) == conflict
+    result = solve(mip)
+    assert_solved(result, mip, reference(mip))
+    assert result["cuts"]["clique"] >= 1
+    assert solve(mip, clique_cuts=False)["cuts"]["clique"] == 0
 
 
 # %% Incumbent heuristics: RENS, dives, objective-aware propagation

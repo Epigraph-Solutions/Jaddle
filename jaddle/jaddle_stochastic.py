@@ -7,6 +7,7 @@ Lagrangian's gradient, while the convergence test, the restart merits and the
 reported residuals are computed on the full problem.
 """
 
+import contextlib
 import copy
 import math
 import time
@@ -39,6 +40,20 @@ def _num_examples(data, name):
     if n == 0:
         raise ValueError(f"{name}_data has no examples")
     return n
+
+
+def _map_shared(fn, trees):
+    """``fn`` applied to every leaf of each tree in ``trees``, once per
+    distinct leaf: an array shared by several terms' data (the same object)
+    stays shared, rather than being copied once per term."""
+    done = {}
+
+    def once(leaf):
+        if id(leaf) not in done:
+            done[id(leaf)] = (leaf, fn(leaf))  # keep leaf alive: ids stay unique
+        return done[id(leaf)][1]
+
+    return [None if t is None else jax.tree.map(once, t) for t in trees]
 
 
 def _gather(data, idx):
@@ -102,17 +117,19 @@ class JaddleCPStochastic:
                 constraints_ineq_det,
             ),
         )
-        # name -> (per-example fn or None, data or None, det fn or None)
-        self._terms = {}
-        self._num_examples = {}
         for name, (fn, data, det) in given.items():
             if (fn is None) != (data is None):
                 raise ValueError(
                     f"{name} and {name}_data must be given together "
                     "(use {name}_det for a part without data)"
                 )
+        # One device copy of an array several terms share.
+        converted = _map_shared(jnp.asarray, [d for _, d, _ in given.values()])
+        # name -> (per-example fn or None, data or None, det fn or None)
+        self._terms = {}
+        self._num_examples = {}
+        for (name, (fn, _, det)), data in zip(given.items(), converted):
             if data is not None:
-                data = jax.tree.map(jnp.asarray, data)
                 self._num_examples[name] = _num_examples(data, name)
             self._terms[name] = (fn, data, det)
         if not self._num_examples:
@@ -127,13 +144,43 @@ class JaddleCPStochastic:
         return dict(self._num_examples)
 
     def _with_data(self, fn):
-        """A copy with ``fn`` applied to every data leaf."""
+        """A copy with ``fn`` applied to every data leaf (once per leaf the
+        terms share)."""
         out = copy.copy(self)
+        mapped = _map_shared(fn, [data for _, data, _ in self._terms.values()])
         out._terms = {
-            name: (f, None if data is None else jax.tree.map(fn, data), det)
-            for name, (f, data, det) in self._terms.items()
+            name: (f, data, det)
+            for (name, (f, _, det)), data in zip(self._terms.items(), mapped)
         }
         return out
+
+    def _data(self):
+        """Each term's data, by term name (terms with data only)."""
+        return {
+            name: data
+            for name, (_, data, _) in self._terms.items()
+            if data is not None
+        }
+
+    @contextlib.contextmanager
+    def _bound(self, values):
+        """Within it, this problem's functions (``full_cp``'s and
+        ``oracle``'s, which read the data when called) read ``values``, a
+        ``_data()``-shaped dict, in place of the data. The solvers bind their
+        compiled programs' arguments, so the data is passed to them rather
+        than embedded as constants."""
+        terms = self._terms
+        self._terms = {
+            name: (fn, values[name] if data is not None else None, det)
+            for name, (fn, data, det) in terms.items()
+        }
+        try:
+            yield
+        finally:
+            self._terms = terms
+
+    def _consts(self):
+        return jc._Consts(bind=self._bound, values=self._data())
 
     # --- evaluation ---------------------------------------------------------
 
@@ -197,7 +244,7 @@ class JaddleCPStochastic:
                 name, x, lambda fn, data: mean(fn, data, x)
             )
 
-        return JaddleCP(
+        cp = JaddleCP(
             num_variables=self.num_variables,
             objective=term("objective"),
             constraints_eq=term("constraints_eq"),
@@ -207,6 +254,9 @@ class JaddleCPStochastic:
             dual_bound=self.dual_bound,
             residuals=self.residuals,
         )
+        # For jaddle_convex.solve: pass the data to its compiled programs.
+        cp._consts = self._consts()
+        return cp
 
     def oracle(self, batch_size):
         """A ``jaddle_convex.GradientOracle`` of minibatch estimates: each
@@ -463,6 +513,8 @@ def solve(
 
     full = scp.full_cp(eval_chunk_size)
     oracle = scp.oracle(batch_size)
+    # The data goes to the compiled programs as an argument, not a constant.
+    consts = scp._consts()
     if initial_solution is None:
         initial_solution = full.initial_solution()
 
@@ -471,8 +523,8 @@ def solve(
         x0 = projection_box(
             initial_solution.primal, full.lower_bounds, full.upper_bounds
         )
-        sigma, e = jax.jit(
-            lambda x: jc._gradient_scales(full, x, gradient_scaling_probes)
+        sigma, e = jc._jit_bound(
+            lambda x: jc._gradient_scales(full, x, gradient_scaling_probes), consts
         )(x0)
         solve_cp, to_scaled, from_scaled, _ = jc._gradient_scaled_from(full, sigma, e)
         m_eq = scp.num_eq_constraints()
@@ -518,6 +570,7 @@ def solve(
         key=jax.random.PRNGKey(seed),
         svrg=svrg,
         step_decay=None if step_decay is None else decay_fn,
+        consts=consts,
     )
     return jc._run_host_loop(
         build_chunk,
