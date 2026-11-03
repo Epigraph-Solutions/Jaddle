@@ -4,6 +4,97 @@
 
 ### Added
 
+- Three ways for `jm.solve` to raise the bound with the incumbent, all
+  off by default until compared on large MIPs:
+  - `cutoff_probing` (the most candidates per incumbent; with
+    `node_lp_solver="highs"`, within `cutoff_probing_share`, default 0.1,
+    of the elapsed time): exact LPs for the integers that root
+    reduced-cost fixing only just fails to fix. Each is moved one unit off
+    the bound its reduced cost favours, and HiGHS's dual simplex solves
+    that child from the root basis. If the child is infeasible or its
+    bound reaches the cutoff, the integer is fixed in the root box (the
+    fixings count towards restarts), and the child's dual proof joins the
+    conflict pool.
+  - `root_redcost_propagation`: the root's reduced-cost row joins the
+    conflict pool (`ConflictPool.set_global`) and propagates at every node
+    with the current cutoff. A node that has moved variables off their
+    bounds has used up part of the room, which can fix others before its
+    LP.
+  - `global_redcost_fixing`: reduced-cost fixing of the root box with every
+    node LP's and probing child's duals, not only the root's.
+
+  New results: `cutoff_probing_lps`, `cutoff_probing_fixed`,
+  `cutoff_probing_seconds`, `global_redcost_fixed`.
+- Settings for the growth of the root cut pool in `jm.solve`. The defaults
+  keep the current behaviour.
+  - `simplex_cut_age=10`: the number of rounds in a row a cut may stay
+    slack in the simplex rounds (until now fixed at 10).
+  - `max_cut_rows=None`: a cap on the cut rows in the root LP. A round
+    that would pass it drops the kept cuts that have been slack longest
+    (never a binding one), then takes fewer new cuts.
+  - `gomory_candidates=None`: the number of tableau rows a round tries
+    for Gomory cuts (until now always `2 × max_cuts_per_round`).
+
+  On bab5 (20 rounds, `max_cuts_per_round=500`), slack cuts kept for 10
+  rounds grew the LP to about 3,300 cut rows, 2,400 of them zero-half
+  cuts, and a round slowed from about 5 s to 35 s.
+- Restarts in `jm.solve` (`restarts=5`, the most; `0` turns them off).
+  Once reduced-cost fixing of the root box has fixed 2.5% of the integers
+  free at the start of a round (at the root, after its heuristics) or 10%
+  (in the tree), the search starts again from that box, as HiGHS does:
+  coefficient tightening, probing, the root LP, the cut rounds and the
+  root's heuristics are redone over the smaller box; the incumbent,
+  pseudocosts, conflict pool and symmetry rows carry over, the cuts that
+  were tight or had a dual at their last solve join the searched MIP's
+  rows (so the new root starts from about their bound), and the bound
+  reached so far stays as a floor. `result["restarts"]` and
+  `result["restart_log"]` report them. HiGHS restarts four times on bab5
+  (20,508 → 11,243 columns); Jaddle's root reduced-cost fixing there fixed
+  up to 14% of the integers.
+- Symmetry breaking in `jm.solve` (`symmetry="auto"`: on when igraph is
+  installed, `pip install jaddle[symmetry]`). `jm.symmetry_generators`
+  finds the MIP's column symmetries over the root box as automorphisms of
+  a coloured graph with bliss (through igraph), each checked exactly;
+  `jm.orbitopes` assembles the ones that swap blocks of columns into
+  orbitopes; `jm.symmetry_rows` breaks each at the root, keeping an optimal
+  solution: packing orbitopes by `x[i, j] = 0` for `j > i` and
+  `x[i, j] <= Σ_{k<i} x[k, j−1]`, others by ordering the columns' sums.
+  The rows join the searched MIP (as coefficient tightening's do);
+  incumbents are checked against the MIP as given. `result["symmetry"]`
+  reports it. On bab5 bliss takes 0.02 s and finds 5 two-column orbitopes
+  of 440 or 446 binaries (4,412 columns, none packing): 5 rows. A 600 s
+  run found 104 strong-branching fixings (22 without), but its 20-round
+  root bound was −108,874 (−107,344 in the run without), so it ended at a
+  2.66% gap.
+- Exact strong branching with HiGHS node LPs. With
+  `node_lp_solver="highs"`, strong branching's child LPs are HiGHS's dual
+  simplex from the node's basis, each for at most twice the node LPs' mean
+  simplex iterations; a child HiGHS proves infeasible fixes its variable
+  the other way. `jm.solve`'s `branching` default is now `"auto"`:
+  reliability branching with HiGHS node LPs (strong branching in the tree
+  pauses while it has taken more than half the elapsed time), pseudocost
+  branching with Jaddle's (`node_lp_solver="jaddle"`). With HiGHS node LPs the root sweep takes
+  `4 · strong_candidates` candidates. On bab5 plain pseudocost branching
+  chose a variable with no observation in some direction 93% of the time,
+  ranking a median 17th of about 60 by exact strong branching; the old
+  root sweep (8 candidates, 50 PDHG epochs) recorded no gain for 7 of its
+  8 variables, whose exact gains were 5–20. In 600 s runs the new
+  branching found 22 fixings but solved 292 nodes instead of about 1,080,
+  and the bound still levelled off near −107,330 to −107,480, as before.
+- `jm.solve(node_lp_solver="highs")`, the default: node LPs solved exactly
+  by HiGHS's dual simplex, one node at a time, each from the basis of the
+  node before (the parent's while plunging). A node's bound is its LP
+  value, rigorous from the vertex's exact duals; its point is a vertex;
+  pseudocosts learn from every node. Dives use it too. `batch_size` is 1
+  with it, so tree cuts are available. `node_lp_solver="jaddle"` keeps Jaddle's
+  batched PDHG node LPs. On bab5 (benchmark settings, GPU) the PDHG node
+  LPs rarely converged: their bounds sat a median 239 below the exact LP
+  values at the same nodes, every child kept its parent's bound, about 470
+  nodes finished in 600 s, and the global bound never left the root's.
+  With HiGHS, about 1,080 nodes finished (0.11 s a node LP) and the bound
+  rose from −107,565 to −107,484. New results: `node_lp_solver`,
+  `node_lp_solves`, `node_simplex_iterations`, `node_lp_seconds`,
+  `node_lp_fallbacks`.
 - `jm.solve(max_tree_cuts_per_round=10)`: the most cuts a tree cut round
   (`tree_cuts`) adds, until now fixed at 10. The pool reserves room for at
   least two rounds' worth beyond the root's cuts. On a generalised
@@ -87,6 +178,66 @@
 
 ### Changed
 
+- A node whose LP point is integral but does not settle it (the point
+  fails the feasibility check, or its LP did not converge) is split on a
+  free integer instead of being closed on its LP bound. Preferred is the
+  integer in a broken row of the MIP as given with the largest
+  `|coefficient|`, else the one with the largest `|reduced cost|`. The
+  split is half a unit from the point's value, and no pseudocost is
+  learned from it. Closing it put its bound into the global bound for
+  good: in a bab5 run, a node closed at −106,162 against an incumbent of
+  −106,018 held the gap at 0.14% at least, and its other integer points
+  were never searched. Only a node with every integer fixed is still
+  closed (`"unresolved_nodes"`). New result: `"integral_splits"`.
+- With batched node LPs, `"nodes"` (and the log's node count, and
+  `max_nodes`) counts nodes finished. A node LP sent back unconverged
+  for more epochs (`batch_requeues`) used to count once per slice, so
+  with `batch_epochs=10` and `node_max_epochs=200` one node counted up
+  to 20 times. On bab5 with `batch_size=64` the log showed 115 nodes
+  with one open at depth 1: a few shallow nodes, each solved slice by
+  slice.
+- Faster root cut rounds, with the same cuts. On bab5 (20 rounds,
+  `max_cuts_per_round=500`), a profile put the rounds at about 370 s:
+  Gomory cuts 105 s, HiGHS's re-solves 89 s, `select_cuts` 75 s, the
+  separators 74 s (cover cuts 60 s), and rebuilding the searched MIP's
+  device LP every round 44 s.
+  - `select_cuts` takes a block's cosines from one Gram matrix
+    (`_gram`), computed with dense BLAS products over column chunks when
+    the cuts are dense (bab5's Gomory cuts use about half its 20,508
+    columns). Before, it ran one sparse product per chosen cut, each over
+    all of the block's nonzeros. On the 20 rounds' recorded candidates it
+    took 7.4 s instead of 40.8 s, and chose the same cuts.
+  - `cover_cuts` returns at once when the binaries are integral at the LP
+    point and fit the knapsack: no valid cover inequality can cut such a
+    point off.
+  - While HiGHS holds the rounds' LP (`simplex_cut_rounds`), each round
+    keeps its cut rows on the host only (`MIP.rows_with`) for the bound
+    and the zero-half cuts. The searched MIP and its device LP are built
+    once, when the rounds end or the first-order solver takes over.
+  - In the simplex rounds, Gomory cuts read their tableau rows from
+    HiGHS's own factors of the basis (`gomory_cuts(highs=...)`,
+    `getBasisInverseRow`) instead of a new sparse LU and dense solves.
+    The cuts match the LU's to 3e-10. On mzzv11, a round's Gomory cuts
+    took 0.9 s instead of 2.9 s once the LP held 1.8 million nonzeros,
+    and on ns1830653 about half as long.
+- With `node_lp_solver="highs"` (the default), `jm.solve` repairs a rounded
+  point that breaks rows (integers fixed, the LP in the continuous
+  variables) exactly with HiGHS's dual simplex, in the node LPs' instance,
+  within `round_repair_seconds`. It was a PDHG solve of
+  `repair_max_epochs` (20) epochs, far from converged on large LPs, after
+  which a rounding an exact LP would have repaired was marked failed for
+  good; `node_lp_solver="jaddle"` keeps it. Strong branching now starts
+  its children from the node's own basis, whatever dives and repairs left
+  in the instance.
+- `jm.solve` solves the root LP to convergence with one
+  `jaddle_linear.solve` call (within `root_max_epochs`; `None`, the
+  default: no limit) instead of `detect_infeasibility`, whose chunks of
+  doubling length with a check between them cost a feasible root about
+  2.5×: on bab5's root 0.8 s and 24 epochs against 0.3 s and 17, on
+  neos-4306827-ravan's 0.7 s and 20 against 0.3 s and 16 (compiled). The
+  infeasibility check now runs only on a root LP that stops unconverged
+  with time left, so without an epoch limit an infeasible or unbounded
+  root LP runs until `max_seconds`.
 - `jm.solve`'s HiGHS incumbent search (`highs_incumbent_seconds`) with
   `parallel_heuristics` starts as soon as the root LP is solved, beside
   the cut rounds, instead of after the root heuristics fail; while there

@@ -1,6 +1,7 @@
 """Tests for the branch-and-bound MIP solver, jaddle.jaddle_mip."""
 
 import time
+import types
 
 import highspy
 import numpy as np
@@ -32,6 +33,12 @@ PINNED = dict(
     fix_and_propagate=True,
     pump_jump_iterations=None,
     highs_incumbent_seconds=0.0,
+    # Small test models are often symmetric on purpose (faces, cliques);
+    # the symmetry tests turn it on.
+    symmetry=False,
+    # On small models a few fixings pass the restart shares, and each
+    # restart redoes the root; the restart tests turn them on.
+    restarts=0,
     rins_every=50,
     heuristic_effort=0.1,
     parallel_heuristics=False,
@@ -42,6 +49,9 @@ PINNED = dict(
 )
 
 
+# Tests of Jaddle's PDHG node LPs (batching, node precision and options,
+# bound stops) pin ``node_lp_solver="jaddle"``; the default is HiGHS's dual
+# simplex.
 def solve(model, **options):
     """``jm.solve`` with ``PINNED`` under ``options``."""
     return jm.solve(model, **{**PINNED, **options})
@@ -278,7 +288,9 @@ def test_unbounded_relaxation():
         lower_bounds=np.zeros(2),
         upper_bounds=np.full(2, np.inf),
     )
-    result = solve(jm.MIP(lp, [True, False]), max_seconds=60)
+    # The root LP runs to convergence without an epoch limit, so an
+    # unbounded one is only classified once a limit stops it unconverged.
+    result = solve(jm.MIP(lp, [True, False]), max_seconds=60, root_max_epochs=200)
     assert result["status"] == "unbounded_or_infeasible"
 
 
@@ -286,7 +298,8 @@ def test_limits_report_valid_bounds():
     mip = general_integer(n=12, m_ineq=8)
     ref = reference(mip)
     # Without root cuts: with them (simplex cut rounds) the root solves it.
-    result = solve(mip, max_nodes=5, cuts=False)
+    # Pseudocost branching: exact strong branching solves it in 5 nodes.
+    result = solve(mip, max_nodes=5, cuts=False, branching="pseudocost")
     assert result["status"] == "node_limit" and not result["converged"]
     assert result["nodes"] <= 5
     assert result["bound"] <= ref + 1e-6 * (1 + abs(ref))
@@ -826,18 +839,23 @@ def test_gomory_cuts_in_the_search():
     assert off["cuts"]["gomory"] == 0
 
 
-@pytest.mark.parametrize("simplex", [False, True])
+@pytest.mark.parametrize(
+    "simplex, age", [(False, None), (True, None), (True, 2)]
+)
 @pytest.mark.parametrize("make", [general_integer, generalised_assignment])
-def test_cut_rounds_drop_slack_cuts(make, simplex, monkeypatch):
+def test_cut_rounds_drop_slack_cuts(make, simplex, age, monkeypatch):
     """With Gomory cuts, a cut whose row is basic (slack) in a round's
     crossover basis is gone from the next round's LP; binding ones stay. In
     the simplex rounds (HiGHS's basis) a slack cut stays until it has been
-    slack for ``_SIMPLEX_CUT_AGE`` rounds in a row."""
+    slack for ``simplex_cut_age`` rounds in a row (default
+    ``_SIMPLEX_CUT_AGE``)."""
+    age_setting = {} if age is None else {"simplex_cut_age": age}
+    age = jm._SIMPLEX_CUT_AGE if age is None else age
     rounds = []  # (cuts before the round, basis) per round
     after = []  # the cut list each round's LP was built from
     real_vertex = jm._BranchAndBound.root_vertex
     real_simplex_vertex = jm._SimplexRounds.vertex
-    real_set_mip = jm._BranchAndBound.set_mip
+    real_cut_block = jm._cut_block
     real_compact = jm._BranchAndBound.compact_cuts
     compacting = []
 
@@ -853,10 +871,11 @@ def test_cut_rounds_drop_slack_cuts(make, simplex, monkeypatch):
         rounds.append((after[-1] if after else [], basis))
         return vertex, basis
 
-    def set_mip(self, mip):
+    def cut_block(cuts, *args, **kwargs):
+        # Each round builds its LP's cut block from its new cut list.
         if not compacting and len(after) < len(rounds):
-            after.append(list(getattr(self, "cut_list", [])))
-        real_set_mip(self, mip)
+            after.append(list(cuts))
+        return real_cut_block(cuts, *args, **kwargs)
 
     def compact_cuts(self, *args):
         compacting.append(True)  # the rounds are over
@@ -864,10 +883,12 @@ def test_cut_rounds_drop_slack_cuts(make, simplex, monkeypatch):
 
     monkeypatch.setattr(jm._BranchAndBound, "root_vertex", root_vertex)
     monkeypatch.setattr(jm._SimplexRounds, "vertex", simplex_vertex)
-    monkeypatch.setattr(jm._BranchAndBound, "set_mip", set_mip)
+    monkeypatch.setattr(jm, "_cut_block", cut_block)
     monkeypatch.setattr(jm._BranchAndBound, "compact_cuts", compact_cuts)
     mip = make()
-    result = solve(mip, gomory_cuts=True, max_nodes=1, simplex_cut_rounds=simplex)
+    result = solve(
+        mip, gomory_cuts=True, max_nodes=1, simplex_cut_rounds=simplex, **age_setting
+    )
     assert (result["simplex_rounds"] > 0) == simplex
     assert result["cuts"]["gomory"] > 0
     m = mip.A.shape[0]
@@ -881,7 +902,7 @@ def test_cut_rounds_drop_slack_cuts(make, simplex, monkeypatch):
             basic = basis.row_status[m + i] == highspy.HighsBasisStatus.kBasic
             slack_rounds[id(cut)] = slack_rounds.get(id(cut), 0) + 1 if basic else 0
             if simplex:
-                dropped = slack_rounds[id(cut)] >= jm._SIMPLEX_CUT_AGE
+                dropped = slack_rounds[id(cut)] >= age
             else:
                 dropped = basic
             assert (id(cut) in kept) == (not dropped)
@@ -889,7 +910,252 @@ def test_cut_rounds_drop_slack_cuts(make, simplex, monkeypatch):
     assert checked > 0
 
 
+
+def test_cap_cut_rows_drops_the_stalest_slack_cuts_first():
+    search = types.SimpleNamespace(
+        max_cut_rows=4,
+        cut_list=[
+            dict(slack_rounds=0, age=0),  # binding
+            dict(slack_rounds=3, age=0),
+            dict(slack_rounds=1, age=0),
+            dict(slack_rounds=5, age=0),
+        ],
+    )
+    cap = jm._BranchAndBound.cap_cut_rows
+    # 4 kept + 3 new, room for 5: the two slackest (5 and 3 rounds) go.
+    search.max_cut_rows = 5
+    binding = [True] * 4
+    assert cap(search, binding, ["a", "b", "c"], True, False) == ["a", "b", "c"]
+    assert binding == [True, False, True, False]
+    # Room for 4: all three slack ones go, and the new cuts fit.
+    search.max_cut_rows = 4
+    binding = [True] * 4
+    assert cap(search, binding, ["a", "b", "c"], True, False) == ["a", "b", "c"]
+    assert binding == [True, False, False, False]
+    # Only binding cuts: they stay, and the new cuts fill what is left.
+    search.cut_list = [dict(slack_rounds=0, age=0)] * 3
+    binding = [True] * 3
+    assert cap(search, binding, ["a", "b", "c"], True, False) == ["a"]
+    assert binding == [True] * 3
+    search.max_cut_rows = 2
+    assert cap(search, [True] * 3, ["a"], True, False) == []
+    # With a crossover basis (not the simplex rounds) every kept cut binds.
+    search.cut_list = [dict(age=4), dict(age=0)]
+    binding = [True, True]
+    assert cap(search, binding, ["a"], False, False) == []
+    assert binding == [True, True]
+    # First-order rounds: the idle cuts go.
+    binding = [True, True]
+    assert cap(search, binding, ["a"], False, True) == ["a"]
+    assert binding == [False, True]
+
+
+@pytest.mark.parametrize("simplex", [False, True])
+def test_max_cut_rows_caps_the_root_lp(simplex, monkeypatch):
+    sizes = []
+    real_cut_block = jm._cut_block
+
+    def cut_block(cuts, *args, **kwargs):
+        sizes.append(len(cuts))
+        return real_cut_block(cuts, *args, **kwargs)
+
+    monkeypatch.setattr(jm, "_cut_block", cut_block)
+    mip = generalised_assignment()
+    settings = dict(
+        gomory_cuts=True, max_nodes=1, simplex_cut_rounds=simplex, max_cuts_per_round=4
+    )
+    solve(mip, **settings)
+    assert max(sizes) > 6  # without the cap the pool grows past it
+    sizes.clear()
+    solve(mip, max_cut_rows=6, **settings)
+    assert sizes and max(sizes) <= 6  # every round's block and the tree's
+    assert_solved(solve(mip, max_cut_rows=6), mip, reference(mip))
+
+
+def test_gomory_candidates_limits_the_tableau_rows(monkeypatch):
+    asked = []
+    real = jm.gomory_cuts
+
+    def gomory_cuts(*args, **kwargs):
+        asked.append(kwargs["max_cuts"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(jm, "gomory_cuts", gomory_cuts)
+    mip = generalised_assignment()
+    solve(mip, gomory_cuts=True, max_nodes=1, gomory_candidates=3, max_cuts_per_round=50)
+    assert asked and set(asked) == {3}
+    asked.clear()
+    solve(mip, gomory_cuts=True, max_nodes=1, max_cuts_per_round=50)
+    assert asked and set(asked) == {100}
+
+
+@pytest.mark.parametrize(
+    "setting", ["simplex_cut_age", "max_cut_rows", "gomory_candidates"]
+)
+def test_rejects_bad_cut_pool_settings(setting):
+    with pytest.raises(ValueError, match=setting):
+        solve(knapsack(), **{setting: 0})
+    with pytest.raises(ValueError, match=setting):
+        solve(knapsack(), **{setting: 2.5})
+
 # %% Conflicts
+def cover_mip(seed, n=14, m=9):
+    """A small set cover with integer costs: its root LP leaves room below
+    the root heuristics' incumbent with nonzero reduced costs."""
+    rng = np.random.default_rng(seed)
+    A = np.zeros((m, n))
+    for i in range(m):
+        A[i, rng.choice(n, int(rng.integers(3, 6)), replace=False)] = -1.0
+    lp = jl.LP(
+        c=rng.integers(1, 30, n).astype(float),
+        A_eq=sp.csc_matrix((0, n)),
+        b_eq=np.zeros(0),
+        A_ineq=sp.csc_matrix(A),
+        b_ineq=-np.ones(m),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    return jm.MIP(lp, np.ones(n, bool))
+
+
+def _best_outside(mip, j, lo, up):
+    """The least (min-form) objective of a feasible point of ``mip`` with
+    ``x_j`` outside ``[lo, up]``; ``inf`` when there is none."""
+    best = np.inf
+    for below in (True, False):
+        lower, upper = mip.lower.copy(), mip.upper.copy()
+        if below:
+            if lo <= lower[j]:
+                continue
+            upper[j] = lo - 1.0
+        else:
+            if up >= upper[j]:
+                continue
+            lower[j] = up + 1.0
+        result = milp(
+            mip.c,
+            constraints=LinearConstraint(mip.A.toarray(), mip.row_lower, mip.row_upper),
+            integrality=mip.integrality.astype(int),
+            bounds=Bounds(lower, upper),
+        )
+        if result.success:
+            best = min(best, result.fun)
+    return best
+
+
+def _check_root_boxes(mip, records):
+    """Each recorded root box ``(lower, upper, cutoff)`` keeps every
+    feasible point better than its cutoff. Returns the bounds checked."""
+    checked = 0
+    for lower, upper, cutoff in records:
+        for j in np.flatnonzero((lower > mip.lower) | (upper < mip.upper)):
+            assert _best_outside(mip, j, lower[j], upper[j]) >= cutoff - 1e-6 * (1 + abs(cutoff))
+            checked += 1
+    return checked
+
+
+@pytest.mark.parametrize("seed", [1, 2, 7])
+def test_cutoff_probing_fixes_what_reduced_costs_miss(seed, monkeypatch):
+    records, gained = [], []
+    real = jm._BranchAndBound.cutoff_probe
+
+    def cutoff_probe(self):
+        before = (self.root_lower.copy(), self.root_upper.copy())
+        out = real(self)
+        records.append((self.root_lower.copy(), self.root_upper.copy(), self.cutoff()))
+        # Tighter than the box reduced-cost fixing left, or (False) no
+        # better solution left in it at all.
+        gained.append(
+            not out
+            or np.any(self.root_lower > before[0])
+            or np.any(self.root_upper < before[1])
+        )
+        return out
+
+    monkeypatch.setattr(jm._BranchAndBound, "cutoff_probe", cutoff_probe)
+    mip = cover_mip(seed)
+    result = solve(mip, node_lp_solver="highs", batch_size=1, cutoff_probing=50, cuts=False)
+    assert_solved(result, mip, reference(mip))
+    assert result["cutoff_probing_fixed"] > 0 and any(gained)
+    assert result["cutoff_probing_lps"] >= result["cutoff_probing_fixed"]
+    assert _check_root_boxes(mip, records) > 0
+
+
+def test_cutoff_probing_needs_highs_node_lps():
+    mip = cover_mip(1)
+    result = solve(mip, node_lp_solver="jaddle", batch_size=1, cutoff_probing=50, cuts=False)
+    assert_solved(result, mip, reference(mip))
+    assert result["cutoff_probing_lps"] == 0
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_global_redcost_row_holds_for_every_better_point(seed):
+    rng = np.random.default_rng(seed)
+    n = 8
+    r = rng.normal(size=n) * rng.integers(0, 2, n)  # some zero
+    constant, cutoff = float(rng.normal()), float(rng.uniform(0.5, 3.0))
+    pool = jm.ConflictPool(n, np.ones(n, bool))
+    pool.set_cutoff(cutoff + constant + np.minimum(r, 0).sum())  # room ``cutoff``
+    if not pool.set_global(constant, r, np.zeros(n), np.ones(n), keep=4):
+        return
+    idx, coef, offset, objective = pool.global_row
+    assert objective
+    rhs = offset + pool.cutoff_value()
+    points = ((np.arange(2**n)[:, None] >> np.arange(n)) & 1).astype(float)
+    better = points[constant + points @ r <= pool.cutoff_value()]
+    assert np.all(better[:, idx] @ coef <= rhs + 1e-9)
+
+
+def test_global_redcost_row_propagates_the_room():
+    # 3 x0 + 3 x1 + 3 x2 + x3 <= 5 over binaries (constant 0): x0 = 1 leaves
+    # room 2, so x1 = x2 = 0; x3 (|r| 1, under room / keep) is dropped.
+    pool = jm.ConflictPool(4, np.ones(4, bool))
+    pool.set_cutoff(5.0)
+    assert pool.set_global(0.0, np.array([3.0, 3.0, 3.0, 1.0]), np.zeros(4), np.ones(4), keep=4)
+    assert pool.global_row[0].tolist() == [0, 1, 2] and len(pool) == 1
+    lower, upper, infeasible = pool.propagate(np.array([1.0, 0.0, 0.0, 0.0]), np.ones(4))
+    assert not infeasible and upper[1] == 0.0 and upper[2] == 0.0 and upper[3] == 1.0
+    # The right-hand side follows the cutoff.
+    pool.set_cutoff(2.0)
+    _, _, infeasible = pool.propagate(np.array([1.0, 0.0, 0.0, 0.0]), np.ones(4))
+    assert infeasible
+    # Replaced, not added to.
+    assert pool.set_global(0.0, np.array([3.0, 0.0, 0.0, 0.0]), np.zeros(4), np.ones(4))
+    assert pool.global_row[0].tolist() == [0] and len(pool) == 1
+
+
+@pytest.mark.parametrize("make", [general_integer, generalised_assignment, knapsack])
+def test_root_redcost_propagation_keeps_the_optimum(make):
+    mip = make()
+    result = solve(mip, node_lp_solver="highs", batch_size=1, root_redcost_propagation=True)
+    assert_solved(result, mip, reference(mip))
+
+
+def test_global_redcost_fixing_holds_for_every_better_solution(monkeypatch):
+    records = []
+    real = jm._BranchAndBound.global_fix
+
+    def global_fix(self, terms):
+        real(self, terms)
+        records.append((self.root_lower.copy(), self.root_upper.copy(), self.cutoff()))
+
+    monkeypatch.setattr(jm._BranchAndBound, "global_fix", global_fix)
+    mip = general_integer()
+    result = solve(mip, node_lp_solver="highs", batch_size=1, global_redcost_fixing=True)
+    assert_solved(result, mip, reference(mip))
+    assert result["global_redcost_fixed"] > 0
+    assert _check_root_boxes(mip, records[-5:]) > 0
+
+
+@pytest.mark.parametrize(
+    "setting, value",
+    [("cutoff_probing", -1), ("cutoff_probing", 2.5), ("cutoff_probing_share", 1.5)],
+)
+def test_rejects_bad_cutoff_probing_settings(setting, value):
+    with pytest.raises(ValueError, match=setting):
+        solve(knapsack(), **{setting: value})
+
+
 def test_conflict_pool_sparsifies_and_propagates():
     n = 4
     is_int = np.ones(n, bool)
@@ -942,7 +1208,7 @@ def record_conflicts(monkeypatch):
 def test_conflicts_are_valid(make, monkeypatch):
     mip = make()
     rows = record_conflicts(monkeypatch)
-    result = solve(mip, conflicts=True)
+    result = solve(mip, node_lp_solver="jaddle", conflicts=True)
     assert_solved(result, mip, reference(mip))
     for idx, coef, rhs, cutoff, _ in rows:
         bound = None if not np.isfinite(cutoff) else cutoff
@@ -1581,7 +1847,7 @@ def test_batched_search_matches_reference(make):
     mip = make()
     # Without heuristics: with an incumbent from them, root reduced-cost
     # fixing can close the search before it branches.
-    result = solve(mip, batch_size=4, gomory_cuts=False, **no_heuristics())
+    result = solve(mip, node_lp_solver="jaddle", batch_size=4, gomory_cuts=False, **no_heuristics())
     assert_solved(result, mip, reference(mip))
     assert result["batches"] > 0
 
@@ -1590,7 +1856,7 @@ def test_batch_larger_than_the_tree():
     # Far more slots than open nodes: every batch is padded.
     mip = facility_location()
     # Without heuristics, so root reduced-cost fixing cannot end it at the root.
-    result = solve(mip, batch_size=64, gomory_cuts=False, **no_heuristics())
+    result = solve(mip, node_lp_solver="jaddle", batch_size=64, gomory_cuts=False, **no_heuristics())
     assert_solved(result, mip, reference(mip))
     assert 0 < result["batches"] <= result["nodes"]
 
@@ -1602,7 +1868,7 @@ def test_batched_search_limits_and_infeasibility():
     # incumbent could close the gap (10 nodes prove it), so a fast runner
     # reported "optimal".
     # Without root cuts, which solve this MIP at the root.
-    result = solve(mip, batch_size=4, max_nodes=3, cuts=False)
+    result = solve(mip, node_lp_solver="jaddle", batch_size=4, max_nodes=3, cuts=False)
     assert result["status"] == "node_limit" and result["nodes"] <= 3
     assert result["bound"] <= ref + 1e-6 * (1 + abs(ref))
 
@@ -1616,7 +1882,8 @@ def test_batched_search_limits_and_infeasibility():
         lower_bounds=np.zeros(n),
         upper_bounds=np.ones(n),
     )
-    assert solve(jm.MIP(lp, np.ones(n, bool)), batch_size=4)["status"] == "infeasible"
+    infeasible = jm.MIP(lp, np.ones(n, bool))
+    assert solve(infeasible, node_lp_solver="jaddle", batch_size=4)["status"] == "infeasible"
 
 
 @pytest.mark.parametrize("batch_size", [1, 8])
@@ -1839,7 +2106,7 @@ def test_repair_skipped_when_propagation_proves_the_fixed_box_infeasible(monkeyp
 def test_failed_repair_is_not_repeated(monkeypatch):
     # Every facility open, no flows: worth a repair, which (faked) fails.
     mip = facility_location()
-    search = search_for(mip, monkeypatch)
+    search = search_for(mip, monkeypatch, node_lp_solver="jaddle")
     x = np.where(mip.integrality, 1.0, 0.0)
 
     def failing_solve(lp, **kwargs):
@@ -1851,6 +2118,22 @@ def test_failed_repair_is_not_repeated(monkeypatch):
     assert not search.try_incumbent(x, "H", None)
     assert len(calls) == 1
     assert calls[0]["max_epochs"] == search.repair_max_epochs == 20
+    assert search.lp_repairs == 1 and search.lp_repairs_skipped == 1
+
+
+def test_failed_highs_repair_is_not_repeated(monkeypatch):
+    mip = facility_location()
+    search = search_for(mip, monkeypatch, node_lp_solver="highs")
+    x = np.where(mip.integrality, 1.0, 0.0)
+    calls = []
+
+    def failing_repair(lower, upper, warm):
+        calls.append(1)
+
+    monkeypatch.setattr(search, "highs_repair", failing_repair)
+    assert not search.try_incumbent(x, "H", None)
+    assert not search.try_incumbent(x, "H", None)
+    assert len(calls) == 1
     assert search.lp_repairs == 1 and search.lp_repairs_skipped == 1
 
 
@@ -1946,6 +2229,17 @@ def test_lifted_cover_cuts_are_valid(seed):
     for idx, coef, rhs in cuts:
         assert np.all(feasible[:, idx[idx < n]] @ coef[idx < n] <= rhs + 1e-9)
         assert coef @ x[idx] > rhs  # each cut cuts off the LP point
+
+
+def test_cover_cuts_skip_integral_points_only_inside_the_knapsack():
+    # 5 x0 + 5 x1 + 5 x2 + 9 x3 <= 12: (1, 1, 0, 0) fits, so nothing cuts it
+    # off; (1, 1, 1, 0) does not (it breaks the row), and the cover
+    # {0, 1, 2} still cuts it off.
+    a = np.array([5.0, 5.0, 5.0, 9.0])
+    args = (np.zeros(4), np.ones(4), np.ones(4, bool))
+    assert jm.cover_cuts(np.arange(4), a, 12.0, np.array([1.0, 1.0, 0.0, 0.0]), *args) == []
+    cuts = jm.cover_cuts(np.arange(4), a, 12.0, np.array([1.0, 1.0, 1.0, 0.0]), *args)
+    assert cuts and all(coef @ np.array([1.0, 1.0, 1.0, 0.0])[idx] > rhs for idx, coef, rhs in cuts)
 
 
 def test_lifting_beats_the_extended_cover():
@@ -2213,6 +2507,27 @@ def test_tableau_mir_cuts_are_valid(make):
         assert max_over_mip(mip, idx, coef) <= rhs + 1e-7 * (1 + abs(rhs))
 
 
+@pytest.mark.parametrize(
+    "make", [knapsack, general_integer, facility_location, generalised_assignment]
+)
+def test_gomory_cuts_from_highs_factors_match_the_lu(make):
+    # The simplex cut rounds' HiGHS instance gives the same tableau rows as
+    # a fresh sparse LU of its basis.
+    mip = make()
+    _, basis = vertex_and_basis(mip)
+    rounds = jm._SimplexRounds(mip.lp, basis)
+    assert rounds.optimal
+    x, basis = rounds.vertex()
+    args = (rounds.A, rounds.b, mip.n_eq, mip.lower, mip.upper, mip.integrality, basis, x)
+    lu = jm.gomory_cuts(*args, max_nnz=None)
+    highs = jm.gomory_cuts(*args, max_nnz=None, highs=rounds.highs)
+    assert len(highs) == len(lu) > 0
+    for (fa, ia, ca, ra), (fb, ib, cb, rb) in zip(lu, highs):
+        assert fa == fb and np.array_equal(ia, ib)
+        np.testing.assert_allclose(cb, ca, rtol=1e-9, atol=1e-9)
+        assert rb == pytest.approx(ra, rel=1e-9, abs=1e-9)
+
+
 @pytest.mark.parametrize("make", [knapsack, general_integer, generalised_assignment])
 def test_integer_aggregation_cuts_are_valid(make):
     mip = make()
@@ -2324,8 +2639,8 @@ def test_variable_bound_cmir_is_stronger():
 def test_node_bound_stop_keeps_the_optimum(make):
     mip = make()
     ref = reference(mip)
-    on = solve(mip, node_bound_stop=True)
-    off = solve(mip, node_bound_stop=False)
+    on = solve(mip, node_lp_solver="jaddle", node_bound_stop=True)
+    off = solve(mip, node_lp_solver="jaddle", node_bound_stop=False)
     assert_solved(on, mip, ref)
     assert_solved(off, mip, ref)
     assert off["bound_stops"] == 0
@@ -2334,8 +2649,8 @@ def test_node_bound_stop_keeps_the_optimum(make):
         # stop, and without zero-half cuts, which leave too small a tree for
         # it to save LP work (without any cuts the two trees differ).
         plain = dict(rins_seconds=0.0, rens_seconds=0.0, zero_half_cuts=False)
-        on = solve(mip, node_bound_stop=True, **plain)
-        off = solve(mip, node_bound_stop=False, **plain)
+        on = solve(mip, node_lp_solver="jaddle", node_bound_stop=True, **plain)
+        off = solve(mip, node_lp_solver="jaddle", node_bound_stop=False, **plain)
         assert on["bound_stops"] > 0
         assert on["lp_epochs"] < off["lp_epochs"]
 
@@ -2351,7 +2666,7 @@ def test_node_lp_tolerance_applies_to_node_solves_only(monkeypatch):
 
     monkeypatch.setattr(jm._BranchAndBound, "solve_lp", solve_lp)
     # No feasibility pump: it also solves LPs with the node budget.
-    result = solve(mip, node_lp_tolerance=3e-4, feasibility_pump=False)
+    result = solve(mip, node_lp_solver="jaddle", node_lp_tolerance=3e-4, feasibility_pump=False)
     assert_solved(result, mip, reference(mip))
     nodes = [tol for epochs, tol in calls if epochs == 200]  # node_max_epochs
     assert nodes and all(tol == 3e-4 for tol in nodes)
@@ -2534,6 +2849,52 @@ def test_select_cuts_matches_the_reference(seed):
         cuts.append(("mir", idx, coef, float(coef @ x[idx] - rng.uniform(-0.2, 0.5))))
     expected = _select_cuts_reference(cuts, x, n, max_cuts=30)
     assert [id(c) for c in jm.select_cuts(cuts, x, n, max_cuts=30)] == [id(c) for c in expected]
+
+
+@pytest.mark.parametrize("speedup", [0.0, np.inf])  # always sparse, always dense
+@pytest.mark.parametrize("seed", range(10))
+def test_select_cuts_gram_paths_match_the_reference(seed, speedup, monkeypatch):
+    monkeypatch.setattr(jm, "_GRAM_DENSE_SPEEDUP", speedup)
+    monkeypatch.setattr(jm, "_GRAM_CHUNK_ENTRIES", 1000)  # several column chunks
+    rng = np.random.default_rng(100 + seed)
+    n = int(rng.integers(20, 200))
+    x = rng.uniform(0, 1, n)
+    cuts = []
+    for _ in range(int(rng.integers(50, 400))):
+        size = int(rng.integers(1, n + 1))  # dense rows too, as Gomory cuts are
+        idx = np.sort(rng.choice(n, size, replace=False))
+        coef = rng.integers(-2, 3, size).astype(float)
+        cuts.append(("gomory", idx, coef, float(coef @ x[idx] - rng.uniform(-0.2, 0.5))))
+    expected = _select_cuts_reference(cuts, x, n, max_cuts=40)
+    got = jm.select_cuts(cuts, x, n, max_cuts=40)
+    assert [id(c) for c in got] == [id(c) for c in expected]
+
+
+def test_gram_paths_agree():
+    D = sp.random(60, 300, density=0.3, random_state=1, format="csr")
+    np.testing.assert_allclose(jm._gram(D), (D @ D.T).toarray(), rtol=1e-12, atol=1e-12)
+    dense = jm._GRAM_DENSE_SPEEDUP
+    try:
+        jm._GRAM_DENSE_SPEEDUP = np.inf
+        np.testing.assert_allclose(jm._gram(D), (D @ D.T).toarray(), rtol=1e-12, atol=1e-12)
+    finally:
+        jm._GRAM_DENSE_SPEEDUP = dense
+
+
+def test_rows_with_matches_with_rows():
+    mip, _, _ = fixed_charge()
+    rng = np.random.default_rng(0)
+    n = mip.num_variables
+    cuts = [
+        dict(idx=np.sort(rng.choice(n, 3, replace=False)), coef=rng.normal(size=3), rhs=1.0)
+        for _ in range(5)
+    ]
+    A_cuts, b_cuts = jm._cut_block(cuts, n, min_rows=16, min_nnz=64)  # padded
+    A, b = mip.rows_with(A_cuts, b_cuts)
+    full = mip.with_rows(A_cuts, b_cuts)
+    assert A.shape == full.A.shape
+    assert (A != full.A).nnz == 0
+    np.testing.assert_array_equal(b, full.b)
 
 
 def test_batched_cuts_ignore_the_precision_profile():
@@ -2842,7 +3203,7 @@ def test_rens_dives_when_its_box_is_infeasible():
 def test_dive_stops_at_its_deadline(monkeypatch):
     # Dives re-solve the LP at every step; past their deadline they stop.
     mip = general_integer()
-    search = search_for(mip, monkeypatch, **no_heuristics())
+    search = search_for(mip, monkeypatch, node_lp_solver="jaddle", **no_heuristics())
     lower, upper = mip.lower.copy(), mip.upper.copy()
     search.root_lower, search.root_upper = lower, upper
     result = search.solve_lp(search.node_lp(lower, upper), None, 2000)
@@ -2927,7 +3288,7 @@ def test_node_precision(monkeypatch, options):
     monkeypatch.setattr(jm._BranchAndBound, "solve_lp", spy_solve_lp)
     monkeypatch.setattr(jm._BranchAndBound, "detect", spy_detect)
     mip = general_integer()
-    result = solve(mip, precision="float64", node_precision="float32", **options)
+    result = solve(mip, node_lp_solver="jaddle", precision="float64", node_precision="float32", **options)
     assert_solved(result, mip, reference(mip))
     assert seen["root"] == {"float64"}
     if options.get("batch_size", 1) == 1:  # serial node LPs go through solve_lp
@@ -3215,7 +3576,10 @@ def test_root_sweep_branches_on_the_size(monkeypatch, branching):
     result = solve(mip, branching=branching, **no_heuristics())
     assert_solved(result, mip, reference(mip), rigorous=False)
     assert result["root_strong_lps"] > 0
-    assert calls and calls[0] == 0  # the cheap technology's size
+    # The cheap technology's size (0), or its peak period's count (4), which
+    # equals it at the root and has the same child bounds: a tie the root
+    # LP point's last digits break.
+    assert calls and calls[0] in (0, 4)
 
 
 def test_root_sweep_off():
@@ -3629,7 +3993,7 @@ def test_child_kernels_match_the_host(make):
 )
 def test_batched_search_with_device_children(make):
     mip = make()
-    result = solve(mip, batch_size=4, gomory_cuts=False, children_backend="jax")
+    result = solve(mip, node_lp_solver="jaddle", batch_size=4, gomory_cuts=False, children_backend="jax")
     assert_solved(result, mip, reference(mip))
     if make is general_integer:  # it always branches in batches
         assert result["batched_children"] > 0
@@ -3674,10 +4038,78 @@ def test_bulk_fix_and_propagate_with_a_box_per_start():
 def test_continuous_batching_keeps_the_optimum(make):
     # One epoch a call: almost every node LP goes back to the queue.
     mip = make()
-    result = solve(mip, batch_size=4, batch_epochs=1, gomory_cuts=False)
+    result = solve(mip, node_lp_solver="jaddle", batch_size=4, batch_epochs=1, gomory_cuts=False)
     assert_solved(result, mip, reference(mip))
     if make is general_integer:
         assert result["batch_requeues"] > 0
+
+
+def test_requeued_node_lps_are_not_counted_as_nodes(monkeypatch):
+    # Every LP slice is evaluated once; only the finished ones are nodes.
+    evaluated = []
+    real = jm._BranchAndBound.evaluate
+
+    def evaluate(self, *args, **kwargs):
+        evaluated.append(self.nodes)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(jm._BranchAndBound, "evaluate", evaluate)
+    mip = general_integer()
+    result = solve(mip, node_lp_solver="jaddle", batch_size=4, batch_epochs=1, gomory_cuts=False)
+    assert_solved(result, mip, reference(mip))
+    assert result["batch_requeues"] > 0
+    assert len(evaluated) == result["nodes"] + result["batch_requeues"]
+
+
+@pytest.mark.parametrize("node_lp_solver", ["highs", "jaddle"])
+def test_integral_node_that_fails_the_check_is_split(node_lp_solver, monkeypatch):
+    # A node whose integral LP point is turned down is split on a free
+    # integer rather than closed on its LP bound, which would leave the
+    # search "unresolved" with its bound held below the optimum.
+    rejected = []
+    real = jm._BranchAndBound.try_incumbent
+
+    def try_incumbent(self, x, source, warm):
+        if source == "T" and not rejected:
+            rejected.append(x)
+            return False
+        return real(self, x, source, warm)
+
+    monkeypatch.setattr(jm._BranchAndBound, "try_incumbent", try_incumbent)
+    mip = knapsack()
+    result = solve(mip, node_lp_solver=node_lp_solver, batch_size=1, **no_heuristics())
+    assert rejected
+    assert result["integral_splits"] >= 1
+    assert result["unresolved_nodes"] == 0
+    assert_solved(result, mip, reference(mip))
+
+
+def test_integral_split_prefers_a_variable_in_a_broken_row():
+    # x0 + x1 <= 1 broken by (1, 1, 0): x0 and x1 are in the row; x2 is not,
+    # though its reduced cost is the largest.
+    lp = jl.LP(
+        c=np.array([-1.0, -1.0, -5.0]),
+        A_eq=sp.csc_matrix((0, 3)),
+        b_eq=np.zeros(0),
+        A_ineq=sp.csc_matrix([[1.0, 2.0, 0.0]]),
+        b_ineq=np.array([1.0]),
+        lower_bounds=np.zeros(3),
+        upper_bounds=np.ones(3),
+    )
+    mip = jm.MIP(lp, np.ones(3, bool))
+    search = types.SimpleNamespace(
+        is_int=mip.integrality, original=mip, feas_tol=1e-6
+    )
+    choose = jm._BranchAndBound.integral_split_variable
+    x = np.array([1.0, 1.0, 0.0])
+    terms = (0.0, np.array([0.1, 0.1, 9.0]))
+    assert choose(search, x, np.zeros(3), np.ones(3), terms) == 1  # |a| = 2
+    # x1 fixed: x0 is the free one in the row.
+    assert choose(search, x, np.array([0.0, 1.0, 0.0]), np.ones(3), terms) == 0
+    # No broken row: the largest reduced cost.
+    assert choose(search, np.zeros(3), np.zeros(3), np.ones(3), terms) == 2
+    # Nothing free.
+    assert choose(search, x, x, x, terms) is None
 
 
 def test_batch_epochs_is_checked():
@@ -3736,7 +4168,9 @@ def test_node_lp_options_reach_node_lps_only(monkeypatch):
     detect = jm._BranchAndBound.detect
 
     def spy_solve_lp(self, lp, warm, max_epochs, **overrides):
-        seen["node"].append(dict(self.lp_kwargs, **overrides).get("iterations_per_epoch"))
+        # The first LP is the root's; the rest are nodes'.
+        side = "node" if self.nodes else "root"
+        seen[side].append(dict(self.lp_kwargs, **overrides).get("iterations_per_epoch"))
         return solve_lp(self, lp, warm, max_epochs, **overrides)
 
     def spy_detect(self, lp, result, max_epochs):
@@ -3747,7 +4181,7 @@ def test_node_lp_options_reach_node_lps_only(monkeypatch):
     monkeypatch.setattr(jm._BranchAndBound, "detect", spy_detect)
     mip = general_integer()
     result = solve(
-        mip, node_lp_options={"iterations_per_epoch": 64}, feasibility_pump=False,
+        mip, node_lp_solver="jaddle", node_lp_options={"iterations_per_epoch": 64}, feasibility_pump=False,
         gomory_cuts=False,
     )
     assert_solved(result, mip, reference(mip))
@@ -3770,6 +4204,7 @@ def test_batched_node_lps_get_node_settings(monkeypatch):
     mip = general_integer()
     result = solve(
         mip,
+        node_lp_solver="jaddle",
         batch_size=4,
         gomory_cuts=False,
         lp_tolerance=1e-6,
@@ -3787,7 +4222,10 @@ def test_node_lp_options_are_checked():
     with pytest.raises(ValueError, match="node_lp_options cannot set max_epochs"):
         solve(general_integer(), node_lp_options={"max_epochs": 5})
     with pytest.raises(ValueError, match="not_an_option"):
-        solve(general_integer(), batch_size=4, node_lp_options={"not_an_option": 1})
+        solve(
+            general_integer(), node_lp_solver="jaddle", batch_size=4,
+            node_lp_options={"not_an_option": 1},
+        )
 
 
 @NEEDS_NUMBA
@@ -3801,6 +4239,281 @@ def test_numba_jump_is_deterministic():
     ]
     np.testing.assert_array_equal(runs[0][0], runs[1][0])
     assert runs[0][1:] == runs[1][1:]
+
+
+# %% Node LPs in HiGHS (node_lp_solver)
+@pytest.mark.parametrize(
+    "make",
+    [knapsack, general_integer, facility_location, generalised_assignment,
+     lambda: fixed_charge(0)[0]],
+)
+def test_highs_node_lps_reach_the_optimum(make):
+    mip = make()
+    result = solve(mip, node_lp_solver="highs", root_strong_candidates=0)
+    assert_solved(result, mip, reference(mip))
+    assert result["node_lp_solver"] == "highs"
+    assert result["node_lp_fallbacks"] == 0
+    if result["nodes"] > 1:
+        assert result["node_lp_solves"] > 0 and result["lp_epochs"] > 0  # the root is PDHG's
+
+
+def test_highs_node_lp_is_exact_and_its_bound_rigorous(monkeypatch):
+    mip = generalised_assignment(1)
+    search = search_for(mip, monkeypatch, node_lp_solver="highs")
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    upper[:7] = 0.0  # a node's box
+    result = search.solve_highs_node(lower, upper, None)
+    assert result["converged"] and result["exact"]
+    exact = milp(  # the LP: no integers
+        mip.c,
+        constraints=LinearConstraint(mip.A.toarray(), mip.row_lower, mip.row_upper),
+        integrality=np.zeros(mip.num_variables),
+        bounds=Bounds(lower, upper),
+    )
+    x = np.asarray(result["solution"].primal)
+    assert mip.c @ x == pytest.approx(exact.fun, rel=1e-9, abs=1e-9)
+    bound, rigorous = search.bound_over(search.result_terms(result, lower, upper), lower, upper)
+    assert rigorous and bound == pytest.approx(exact.fun, rel=1e-7, abs=1e-7)
+
+
+def test_highs_node_lp_reports_an_infeasible_box(monkeypatch):
+    mip = generalised_assignment(1)
+    search = search_for(mip, monkeypatch, node_lp_solver="highs")
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    upper[:] = 0.0  # no job assigned anywhere
+    result = search.solve_highs_node(lower, upper, None)
+    assert result["infeasible"] and not result["converged"]
+
+
+def test_highs_node_lps_search_one_node_at_a_time_with_tree_cuts():
+    mip = generalised_assignment(1)
+    result = solve(
+        mip, node_lp_solver="highs", batch_size=64, tree_cuts=True, tree_cut_every=1,
+        gomory_cuts=False, root_strong_candidates=0,
+    )
+    assert_solved(result, mip, reference(mip))
+    assert result["batches"] == 0  # batch_size is 1 with HiGHS node LPs
+    assert result["tree_cuts_added"] > 0
+
+
+def test_jaddle_node_lps_still_batch():
+    mip = generalised_assignment(1)
+    result = solve(mip, node_lp_solver="jaddle", batch_size=4, root_strong_candidates=0)
+    assert_solved(result, mip, reference(mip))
+    assert result["node_lp_solves"] == 0
+    if result["nodes"] > 1:
+        assert result["batches"] > 0
+
+
+def test_auto_branching_follows_the_node_lps(monkeypatch):
+    mip = generalised_assignment(1)
+    exact = search_for(mip, monkeypatch, node_lp_solver="highs", branching="auto")
+    assert exact.branching == "reliability" and exact.strong_backend == "numpy"
+    assert exact.root_strong_candidates == 4 * exact.strong_candidates
+    jaddle_nodes = search_for(mip, monkeypatch, node_lp_solver="jaddle", branching="auto")
+    assert jaddle_nodes.branching == "pseudocost"
+    assert jaddle_nodes.root_strong_candidates == jaddle_nodes.strong_candidates
+
+
+def test_highs_strong_branching_reaches_the_optimum():
+    mip = generalised_assignment(1)
+    # Without cuts, which solve it at the root.
+    result = solve(mip, node_lp_solver="highs", branching="reliability", cuts=False)
+    assert_solved(result, mip, reference(mip))
+    assert result["nodes"] > 1
+    assert result["strong_branch_lps"] + result["root_strong_lps"] > 0
+
+
+@pytest.mark.parametrize("node_lp_solver", ["highs", "jaddle"])
+def test_rounded_point_is_repaired(monkeypatch, node_lp_solver):
+    # The optimum's openings with its flows lost: rows break, and the repair
+    # LP (openings fixed, flows free) has to find flows again.
+    mip = facility_location()
+    best = optimum(mip)
+    x = best.copy()
+    x[~mip.integrality] = 0.0
+    assert not mip.is_feasible(x)
+    search = search_for(
+        mip, monkeypatch, node_lp_solver=node_lp_solver, repair_max_epochs=2000
+    )
+    assert search.try_incumbent(x, "T", None)
+    assert search.lp_repairs == 1
+    value, point = search.incumbent
+    assert mip.is_feasible(point)
+    assert value == pytest.approx(mip.c @ best, rel=1e-6)
+    if node_lp_solver == "highs":
+        assert search.highs_node_lps().solves == 1  # exact, one HiGHS solve
+
+
+def test_highs_repair_gives_up_on_integers_no_flow_fits(monkeypatch):
+    mip = facility_location()
+    x = np.zeros(mip.num_variables)  # every facility closed
+    search = search_for(mip, monkeypatch, node_lp_solver="highs")
+    assert not search.try_incumbent(x, "T", None)
+    assert search.incumbent is None
+
+
+def test_node_lp_solver_must_be_known():
+    with pytest.raises(ValueError, match="node_lp_solver"):
+        solve(knapsack(), node_lp_solver="simplex")
+
+
+# %% Symmetry
+def identical_machines(items=7, machines=3, seed=0):
+    """Items to identical machines: ``Σ_j x[i, j] = 1`` for each item and a
+    capacity row for each machine; item ``i`` costs ``c_i`` wherever it
+    goes. Variables are item-major (``x[i, j]`` is ``i·machines + j``)."""
+    rng = np.random.default_rng(seed)
+    w = rng.integers(3, 10, items).astype(float)
+    c = np.repeat(rng.integers(1, 6, items).astype(float), machines)
+    n = items * machines
+    A_eq = sp.lil_matrix((items, n))
+    A_ineq = sp.lil_matrix((machines, n))
+    for i in range(items):
+        for j in range(machines):
+            A_eq[i, i * machines + j] = 1.0
+            A_ineq[j, i * machines + j] = w[i]
+    lp = jl.LP(
+        c=c - 3.0, A_eq=sp.csc_matrix(A_eq), b_eq=np.ones(items),
+        A_ineq=sp.csc_matrix(A_ineq), b_ineq=np.full(machines, 0.45 * w.sum()),
+        lower_bounds=np.zeros(n), upper_bounds=np.ones(n),
+    )
+    return jm.MIP(lp, np.ones(n, bool))
+
+
+def bin_packing(items=6, bins=3, seed=1):
+    """Bin packing with identical bins: ``x[i, j]`` (item-major) and a
+    used flag ``y_j`` per bin (last), ``Σ_i w_i x[i, j] <= C y_j``,
+    minimising the bins used."""
+    rng = np.random.default_rng(seed)
+    w = rng.integers(2, 7, items).astype(float)
+    n = items * bins + bins
+    A_eq = sp.lil_matrix((items, n))
+    A_ineq = sp.lil_matrix((bins, n))
+    for i in range(items):
+        for j in range(bins):
+            A_eq[i, i * bins + j] = 1.0
+            A_ineq[j, i * bins + j] = w[i]
+    for j in range(bins):
+        A_ineq[j, items * bins + j] = -10.0
+    c = np.concatenate([np.zeros(items * bins), np.ones(bins)])
+    lp = jl.LP(
+        c=c, A_eq=sp.csc_matrix(A_eq), b_eq=np.ones(items),
+        A_ineq=sp.csc_matrix(A_ineq), b_ineq=np.zeros(bins),
+        lower_bounds=np.zeros(n), upper_bounds=np.ones(n),
+    )
+    return jm.MIP(lp, np.ones(n, bool))
+
+
+@pytest.mark.parametrize("make", [identical_machines, bin_packing])
+def test_symmetry_generators_map_the_mip_to_itself(make):
+    pytest.importorskip("igraph")
+    mip = make()
+    generators = jm.symmetry_generators(mip)
+    assert generators
+    x = optimum(mip)
+    for perm in generators:
+        moved = np.empty_like(x)
+        moved[perm] = x  # column j's value goes to column perm[j]
+        assert mip.is_feasible(moved)
+        assert mip.c @ moved == pytest.approx(mip.c @ x)
+
+
+def test_orbitopes_of_identical_machines():
+    pytest.importorskip("igraph")
+    mip = identical_machines(items=7, machines=3)
+    (matrix,) = jm.orbitopes(jm.symmetry_generators(mip), mip.num_variables)
+    assert matrix.shape == (7, 3)
+    # Each row is one item's three machines.
+    assert all(len(set(row // 3)) == 1 for row in matrix)
+
+
+@pytest.mark.parametrize("make, packing", [(identical_machines, True), (bin_packing, False)])
+def test_symmetry_breaking_keeps_the_optimum(make, packing):
+    pytest.importorskip("igraph")
+    mip = make()
+    result = solve(mip, symmetry=True)
+    assert_solved(result, mip, reference(mip))
+    stats = result["symmetry"]
+    assert stats["generators"] > 0 and stats["orbitopes"]
+    if packing:
+        assert stats["fixed"] > 0  # x[i, j] = 0 for j > i
+    else:
+        assert stats["fixed"] == 0 and stats["rows"] == stats["orbitopes"][0][1] - 1
+    off = solve(mip, symmetry=False)
+    assert off["symmetry"] is None
+    assert off["objective"] == pytest.approx(result["objective"])
+
+
+def test_symmetry_must_be_known():
+    with pytest.raises(ValueError, match="symmetry"):
+        solve(knapsack(), symmetry="sometimes")
+
+
+# %% Restarts
+def force_restarts(monkeypatch, root=0.0, tree=0.0):
+    """Restart whenever one is allowed (any share fixed counts)."""
+    monkeypatch.setattr(jm, "_RESTART_ROOT_SHARE", root)
+    monkeypatch.setattr(jm, "_RESTART_TREE_SHARE", tree)
+
+
+@pytest.mark.parametrize(
+    "make", [generalised_assignment, facility_location, lambda: fixed_charge(0)[0]]
+)
+def test_restarts_keep_the_optimum(make, monkeypatch):
+    force_restarts(monkeypatch)
+    mip = make()
+    result = solve(mip, restarts=2, cuts=False)
+    assert_solved(result, mip, reference(mip))
+    assert result["restarts"] == len(result["restart_log"]) == 2
+    nodes = [entry["nodes"] for entry in result["restart_log"]]
+    assert nodes == sorted(nodes) and result["nodes"] >= nodes[-1]  # cumulative
+
+
+def test_restart_bound_is_a_floor(monkeypatch):
+    # One restart in the tree: the bound after it never falls below the
+    # bound the first round reached.
+    force_restarts(monkeypatch, root=2.0)
+    mip = generalised_assignment(1)
+    result = solve(mip, restarts=1, cuts=False, root_strong_candidates=0)
+    assert_solved(result, mip, reference(mip))
+    (entry,) = result["restart_log"]
+    assert mip.sign * (result["bound"] - entry["bound"]) >= -1e-9 * (1 + abs(entry["bound"]))
+
+
+def test_restarts_off(monkeypatch):
+    force_restarts(monkeypatch)
+    mip = generalised_assignment(1)
+    result = solve(mip, restarts=0, cuts=False)
+    assert_solved(result, mip, reference(mip))
+    assert result["restarts"] == 0 and result["restart_log"] == []
+    with pytest.raises(ValueError, match="restarts"):
+        solve(mip, restarts=-1)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"node_lp_solver": "jaddle", "batch_size": 4},
+        {"tree_cuts": True, "tree_cut_every": 1, "gomory_cuts": False},
+        {"node_lp_solver": "jaddle", "batch_size": 1, "tree_cuts": True, "gomory_cuts": False},
+    ],
+)
+def test_restarts_with_other_features(options, monkeypatch):
+    force_restarts(monkeypatch)
+    mip = generalised_assignment(1)
+    result = solve(mip, restarts=2, **options)
+    assert_solved(result, mip, reference(mip))
+    assert result["restarts"] >= 1
+
+
+def test_restarts_keep_the_symmetry_rows(monkeypatch):
+    pytest.importorskip("igraph")
+    force_restarts(monkeypatch)
+    mip = identical_machines()
+    result = solve(mip, symmetry=True, restarts=2, cuts=False)
+    assert_solved(result, mip, reference(mip))
+    assert result["restarts"] >= 1 and result["symmetry"]["fixed"] > 0
 
 
 # %% Background heuristics (parallel_heuristics)

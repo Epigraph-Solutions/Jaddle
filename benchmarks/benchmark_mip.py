@@ -93,10 +93,13 @@ print(
 # The other defaults: pseudocost branching (reliability branching spent over
 # half the run strong-branching here; the root still strong-branches its
 # highest-impact candidates once, which on buildingenergy finds the sizing
-# variable holding the root gap); the root LP and cut rounds in float64 and
-# node LPs in float32 (laptop GPUs run float64 at a small fraction of
-# float32 speed); 32 node LPs per device call (on ns1830653 that halves the
-# device time per node against 16; tree cuts are off when batching).
+# variable holding the root gap); the root LP and cut rounds in float64;
+# node LPs solved exactly by HiGHS's dual simplex, one node at a time
+# (`node_lp_solver="highs"`; on bab5 PDHG node bounds were too loose for the
+# global bound to move). With `node_lp_solver="jaddle"` node LPs run on the
+# device in float32 (laptop GPUs run float64 at a small fraction of float32
+# speed), `batch_size` at a time (on ns1830653, 32 halves the device time
+# per node against 16; tree cuts are off when batching).
 
 # %%
 result = jm.solve(
@@ -106,12 +109,16 @@ result = jm.solve(
     verbose=True,
     log_every_seconds=10,
     device=DEVICE,
+    lp_tolerance=1e-4,
+    root_crossover=False,
+    cut_rounds=50,
     batch_size=1,
-    cut_rounds=20,
-    tree_cuts=True,
+    tree_cuts=False,
     max_cuts_per_round=100,
-    max_tree_cuts_per_round=100,
-    tree_cut_rows=1000,
+    node_lp_solver="highs",
+    max_cut_rows=1500,
+    simplex_cut_age=3,
+    gomory_candidates=400,
 )
 print(f"Status: {result['status']}")
 print(f"Bound: {result['bound']:.6g}")
