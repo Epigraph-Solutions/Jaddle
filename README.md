@@ -726,7 +726,7 @@ columns are not supported.
   helped flugpl (302 → 204 nodes) but cost time elsewhere, and RINS found
   p0201's optimum at node 550 instead of 1,085 but doubled its run time
   (each Jaddle sub-search costs ~0.4s). The defaults are tuned for large
-  MIPs on a GPU (`examples/mip/miplib.py`), where both pay off; RINS runs
+  MIPs on a GPU (`benchmarks/benchmark_mip.py`), where both pay off; RINS runs
   on HiGHS, on a background thread (`parallel_heuristics`).
 - **Node crossover** (`node_crossover`, opt-in). A PDHG point lies inside
   the LP's optimal face, so it is integral far less often than the vertex a
@@ -762,7 +762,7 @@ reports `bound_rigorous=False`.
 | `reliability_threshold`, `strong_candidates`, `strong_epochs`, `strong_max_depth` | `4`, `8`, `50`, `None` | Reliability branching (`branching="reliability"`): pseudocost observations per direction before a variable stops being strong-branched, the most variables whose child LPs are solved at a node, the epochs of each child LP, and the deepest node that strong-branches (`None`: any). |
 | `strong_screen`, `strong_backend` | `32`, `"jax"` | Candidates whose children are propagated and bounded on the device before the child LPs are picked; `"jax"` runs strong branching as one device pipeline, `"numpy"` on the host. |
 | `integrality_tolerance` | `1e-5` | How close to an integer an LP value must be to count as integral. |
-| `feasibility_tolerance` | `1e-6` | Largest row violation (relative to `1 + ‖b‖∞`) and bound violation an incumbent may have. |
+| `feasibility_tolerance` | `1e-6` | Largest row violation (each row's, relative to its own `1 + \|b_i\|`) and bound violation an incumbent may have. |
 | `lp_tolerance`, `lp_options` | `1e-4`, `None` | The node LPs' relative tolerances, and any other `jl.solve` option. |
 | `node_max_epochs`, `root_max_epochs` | `200`, `None` | Epoch budgets for a node LP and the root LP. |
 | `node_lp_tolerance` | `None` | Tolerance for node LPs only (`None`: `lp_tolerance`). Experimental: looser node LPs are cheaper but give rougher branching and pseudocost data. |

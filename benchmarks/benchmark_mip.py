@@ -8,7 +8,7 @@
 # Pass the model file on the command line: any MPS file (or another format
 # HiGHS reads, such as `.lp`), e.g.
 #
-#     python examples/mip/miplib.py path/to/model.mps [--device cpu|gpu|tpu|auto]
+#     python benchmarks/benchmark_mip.py path/to/model.mps [--device cpu|gpu|tpu|auto]
 #
 # `--device` picks where Jaddle's search runs (default `cpu`; `auto` puts
 # MIPs with at most 10,000 nonzeros on the CPU and the rest on JAX's default
@@ -50,7 +50,7 @@ DEVICE = args.device
 PATH_TO_MPS = args.model
 if not os.path.exists(PATH_TO_MPS):
     PATH_TO_MPS = os.path.join(
-        os.path.dirname(__file__), "..", "..", "data", f"{PATH_TO_MPS}.mps"
+        os.path.dirname(__file__), "..", "data", f"{PATH_TO_MPS}.mps"
     )
     if not os.path.exists(PATH_TO_MPS):
         sys.exit(f"no such file: {args.model} (nor {os.path.normpath(PATH_TO_MPS)})")
@@ -100,6 +100,14 @@ print(
 # device in float32 (laptop GPUs run float64 at a small fraction of float32
 # speed), `batch_size` at a time (on ns1830653, 32 halves the device time
 # per node against 16; tree cuts are off when batching).
+#
+# Also on here, though off by default: the root cut pool's limits
+# (`max_cut_rows`, `simplex_cut_age`, `gomory_candidates`), and three uses of
+# the incumbent for the bound. `cutoff_probing` gives exact HiGHS LPs to the
+# integers that root reduced-cost fixing only just fails to fix (it needs
+# HiGHS node LPs). `root_redcost_propagation` propagates the root's
+# reduced-cost row at every node. `global_redcost_fixing` fixes the root box
+# with every LP's duals, not only the root's.
 
 # %%
 result = jm.solve(
@@ -111,17 +119,33 @@ result = jm.solve(
     device=DEVICE,
     lp_tolerance=1e-4,
     root_crossover=False,
-    cut_rounds=50,
-    batch_size=1,
+    cut_rounds=30,
+    batch_size=64,
     tree_cuts=False,
-    max_cuts_per_round=100,
-    node_lp_solver="highs",
-    max_cut_rows=1500,
-    simplex_cut_age=3,
+    cut_pool_propagation=True,
+    plunge_depth=1000,
+    plunge_child="rounding",
+    max_cuts_per_round=50,
+    max_tree_cuts_per_round=50,
+    node_lp_solver="jaddle",
+    rins_solver="highs",
+    max_cut_rows=2000,
+    tree_cut_rows=2000,
+    simplex_cut_age=10,
     gomory_candidates=400,
+    cutoff_probing=200,
+    root_redcost_propagation=True,
+    global_redcost_fixing=True,
+    implied_integer_cuts=True,
 )
 print(f"Status: {result['status']}")
 print(f"Bound: {result['bound']:.6g}")
+print(
+    f"Cutoff probing: {result['cutoff_probing_fixed']} fixed in "
+    f"{result['cutoff_probing_lps']} LPs, {result['cutoff_probing_seconds']:.1f}s; "
+    f"global reduced-cost fixing: {result['global_redcost_fixed']} bounds; "
+    f"restarts: {result['restarts']}"
+)
 if result["x"] is not None:
     print(f"Incumbent: {result['objective']:.6g} (gap {100 * result['gap']:.2f}%)")
     print(f"Feasible after postsolve: {result['postsolve_feasible']}")

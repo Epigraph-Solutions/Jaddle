@@ -13,7 +13,7 @@ import jaddle.jaddle_linear as jl
 import jaddle.jaddle_mip as jm
 from jaddle import highs_helpers as hh
 
-# solve()'s defaults are tuned for large MIPs on a GPU (examples/mip/miplib.py):
+# solve()'s defaults are tuned for large MIPs on a GPU (benchmarks/benchmark_mip.py):
 # loose LP tolerances, float32 node LPs, batched nodes and heuristics on
 # background threads, so runs depend on timing. The tests run with the
 # settings those replaced: exact, serial and repeatable, so they can check
@@ -693,6 +693,27 @@ def lp_point(mip):
         dual_gap_tolerance=1e-7,
     )
     return np.asarray(result["solution"].primal, np.float64)
+
+
+def test_row_violation_is_relative_to_each_rows_rhs():
+    # One large right-hand side must not excuse a violation of another row
+    # (map06: b up to 5.1e7 let rows with b = 0 be off by 0.3).
+    A_eq, b_eq = no_rows(2)
+    lp = jl.LP(
+        c=np.array([-1.0, 0.0]),
+        A_eq=A_eq,
+        b_eq=b_eq,
+        A_ineq=sp.csc_matrix(np.array([[1.0, 1.0], [1.0, -1.0]])),
+        b_ineq=np.array([1e7, 0.0]),
+        lower_bounds=np.zeros(2),
+        upper_bounds=np.full(2, 10.0),
+    )
+    mip = jm.MIP(lp, np.array([False, True]))
+    x = np.array([1.3, 1.0])  # x0 - x1 <= 0 violated by 0.3
+    assert mip.violation(x)["rows"] == pytest.approx(0.3)
+    assert not mip.is_feasible(x)
+    assert list(jm._violated_rows(mip, x, 1e-6)) == [1]
+    assert mip.is_feasible(np.array([1.0, 1.0]))
 
 
 def test_fix_and_propagate_finds_an_assignment():
@@ -4066,15 +4087,22 @@ def test_integral_node_that_fails_the_check_is_split(node_lp_solver, monkeypatch
     # A node whose integral LP point is turned down is split on a free
     # integer rather than closed on its LP bound, which would leave the
     # search "unresolved" with its bound held below the optimum.
-    rejected = []
-    real = jm._BranchAndBound.try_incumbent
+    # The first integral point at a node with a free integer is turned
+    # down (at a node with every integer fixed there is nothing to split).
+    rejected, box = [], {}
+    real, real_evaluate = jm._BranchAndBound.try_incumbent, jm._BranchAndBound._evaluate
+
+    def _evaluate(self, node, lower, upper, lp, result):
+        box["free"] = bool(np.any(self.is_int & (lower < upper)))
+        return real_evaluate(self, node, lower, upper, lp, result)
 
     def try_incumbent(self, x, source, warm):
-        if source == "T" and not rejected:
+        if source == "T" and not rejected and box.get("free"):
             rejected.append(x)
             return False
         return real(self, x, source, warm)
 
+    monkeypatch.setattr(jm._BranchAndBound, "_evaluate", _evaluate)
     monkeypatch.setattr(jm._BranchAndBound, "try_incumbent", try_incumbent)
     mip = knapsack()
     result = solve(mip, node_lp_solver=node_lp_solver, batch_size=1, **no_heuristics())
@@ -4110,6 +4138,329 @@ def test_integral_split_prefers_a_variable_in_a_broken_row():
     assert choose(search, np.zeros(3), np.zeros(3), np.ones(3), terms) == 2
     # Nothing free.
     assert choose(search, x, x, x, terms) is None
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [{}, {"branching": "most_fractional", "root_strong_candidates": 0}],  # ties too
+)
+@pytest.mark.parametrize("rule", ["score", "estimate", "rounding"])
+@pytest.mark.parametrize("make", [knapsack, general_integer, generalised_assignment])
+def test_plunges_and_dives_take_the_best_scored_child(make, settings, rule, monkeypatch):
+    # The plunge child (and, in a dive, the child popped next), by
+    # ``plunge_child``: "score", the higher (1 + inferences) / (1 + cost /
+    # unit), equal scores to the lower estimated bound, then to the rounding
+    # direction of the LP value; "estimate", from the second step;
+    # "rounding", the last only.
+    checked, ties = [], []
+    real_branch, real_push = jm._BranchAndBound.branch, jm._BranchAndBound.push
+    pushed = []
+
+    def push(self, node):
+        pushed.append(node)
+        return real_push(self, node)
+
+    def branch(self, node, lower, upper, x, var, bound, *args, **kwargs):
+        pushed.clear()
+        before = self.plunge_node
+        counts, sums = self.pc_count.copy(), self.pc_sum.copy()
+        out = real_branch(self, node, lower, upper, x, var, bound, *args, **kwargs)
+        kids = [n for n in pushed if n.depth == node.depth + 1]
+        if self.plunge_node is not None and self.plunge_node is not before:
+            chosen = self.plunge_node
+            kids.append(chosen)
+        elif self.diving() and len(kids) == 2:
+            chosen = kids[-1]  # depth-first: the last pushed goes next
+        else:
+            return out
+        if len(kids) != 2:
+            return out  # one child pruned or infeasible: nothing to choose
+        f = x[var] - np.floor(x[var])
+        known = counts > 0
+        unit = sums[known].sum() / counts[known].sum() if known.any() else 1.0
+        unit = unit if unit > 0 else 1.0
+
+        def estimate(child):
+            down = child.branch[1]
+            gain = 0.0
+            if np.all(counts[:, var] > 0):
+                side = 0 if down else 1
+                gain = (f if down else 1.0 - f) * sums[side, var] / counts[side, var]
+            return child.bound + gain
+
+        def score(child):
+            return (1.0 + child.inferences) / (1.0 + max(estimate(child) - bound, 0.0) / unit)
+
+        other = kids[0] if kids[1] is chosen else kids[1]
+        if rule == "score":
+            a, b = score(chosen), score(other)
+            if abs(a - b) > 1e-9 * (1.0 + abs(a) + abs(b)):
+                checked.append(a > b)
+                return out
+        ea, eb = estimate(chosen), estimate(other)
+        if rule != "rounding" and abs(ea - eb) > 1e-9 * (1.0 + abs(ea) + abs(eb)):
+            checked.append(ea < eb)
+        elif abs(f - 0.5) > 1e-6:
+            ties.append(chosen.branch[1] == (f < 0.5))
+        return out
+
+    monkeypatch.setattr(jm._BranchAndBound, "branch", branch)
+    monkeypatch.setattr(jm._BranchAndBound, "push", push)
+    mip = make()
+    result = solve(
+        mip, node_lp_solver="highs", batch_size=1, cuts=False, plunge_depth=1000,
+        plunge_child=rule, **settings,
+    )
+    assert_solved(result, mip, reference(mip))
+    assert checked or ties
+    assert all(checked) and all(ties)
+
+
+def test_plunge_child_is_checked():
+    with pytest.raises(ValueError, match="plunge_child"):
+        solve(knapsack(), plunge_child="deepest")
+
+
+def test_implicit_integers_from_highs_stay_continuous():
+    # HiGHS's presolve marks continuous columns that some optimum has
+    # integral as implicit integers. They load as continuous (a point may
+    # have them fractional; they are never branched on), marked
+    # ``MIP.implied``, and count as integral for the objective step.
+    import highspy
+
+    lp = highspy.HighsLp()
+    lp.num_col_, lp.num_row_ = 2, 1
+    lp.col_cost_ = np.array([3.0, 2.0])
+    lp.col_lower_ = np.zeros(2)
+    lp.col_upper_ = np.array([1.0, 5.0])
+    lp.row_lower_ = np.array([1.0])
+    lp.row_upper_ = np.array([np.inf])
+    lp.a_matrix_.format_ = highspy.MatrixFormat.kColwise
+    lp.a_matrix_.start_ = np.array([0, 1, 2], np.int32)
+    lp.a_matrix_.index_ = np.array([0, 0], np.int32)
+    lp.a_matrix_.value_ = np.array([1.0, 1.0])
+    lp.integrality_ = [highspy.HighsVarType.kInteger, highspy.HighsVarType.kImplicitInteger]
+    highs = highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.passModel(lp)
+    held = highs.getLp()
+    assert int(held.integrality_[1]) == int(highspy.HighsVarType.kImplicitInteger)
+    mip = jm._mip_from_highs_lp(held)
+    assert mip.integrality.tolist() == [True, False]
+    assert mip.implied.tolist() == [False, True]
+    assert jm.objective_step(mip.c, mip.integrality) is None  # a cost on a continuous
+    assert jm.objective_step(mip.c, mip.integrality | mip.implied) == 1.0
+
+
+def test_implied_mask_is_checked_and_kept_to_continuous_columns():
+    lp = jl.LP(
+        c=np.array([1.0, 1.0, 0.5]),
+        A_eq=sp.csc_matrix([[1.0, 1.0, -1.0]]),
+        b_eq=np.zeros(1),
+        A_ineq=sp.csc_matrix([[-1.0, -1.0, 0.0]]),
+        b_ineq=np.array([-1.0]),
+        lower_bounds=np.zeros(3),
+        upper_bounds=np.array([1.0, 1.0, 2.0]),
+    )
+    mip = jm.MIP(lp, np.array([True, True, False]))
+    assert not mip.implied.any()
+    with pytest.raises(ValueError, match="implied"):
+        jm.MIP(lp, np.ones(3, bool), implied=np.ones(2, bool))
+    marked = jm.MIP(lp, np.array([True, True, False]), implied=np.ones(3, bool))
+    assert marked.implied.tolist() == [False, False, True]  # continuous only
+    assert marked.with_rows(sp.csr_matrix((1, 3)), np.zeros(1)).implied.tolist() == [False, False, True]
+
+
+def _knapsack_with_an_implied_sum(seed=0, n=15):
+    """``knapsack`` plus a continuous ``y = x0 + x1 + x2`` with a cost: an
+    implied integer (integral whenever the binaries are), marked so."""
+    base = knapsack(seed=seed, n=n)
+    lp = base.lp.to_scipy()
+    A_ineq = sp.hstack([sp.csr_matrix(lp.A_ineq), sp.csr_matrix((lp.A_ineq.shape[0], 1))]).tocsc()
+    row = np.zeros(n + 1)
+    row[:3], row[n] = 1.0, -1.0
+    sense = 1.0 if base.maximise else -1.0
+    implied = np.zeros(n + 1, bool)
+    implied[n] = True
+    mip = jm.MIP(
+        jl.LP(
+            c=np.append(lp.c, 0.37 * sense),
+            A_eq=sp.csc_matrix(row[None, :]),
+            b_eq=np.zeros(1),
+            A_ineq=A_ineq,
+            b_ineq=lp.b_ineq,
+            lower_bounds=np.append(lp.lower_bounds, 0.0),
+            upper_bounds=np.append(lp.upper_bounds, 3.0),
+        ),
+        np.append(base.integrality, False),
+        base.offset,
+        base.maximise,
+        implied,
+    )
+    return mip
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_implied_integer_cuts_keep_the_optimum(on, monkeypatch):
+    mip = _knapsack_with_an_implied_sum()
+    seen = []
+    real = jm.CutSeparator.__init__
+
+    def init(self, *args, **kwargs):
+        real(self, *args, **kwargs)
+        seen.append(bool(self.is_int[-1]))
+
+    monkeypatch.setattr(jm.CutSeparator, "__init__", init)
+    result = solve(mip, node_lp_solver="highs", batch_size=1, implied_integer_cuts=on)
+    assert_solved(result, mip, reference(mip))
+    assert seen and all(flag == on for flag in seen)  # y counts as an integer for cuts
+
+
+def test_implied_columns_are_never_branched_on(monkeypatch):
+    # facility_location's flows marked implied: still continuous, so the
+    # search branches only on the openings and finds the same optimum.
+    base = facility_location()
+    implied = ~base.integrality
+    mip = jm.MIP(base.lp, base.integrality, base.offset, base.maximise, implied)
+    split = []
+    real = jm._BranchAndBound.branch
+
+    def branch(self, node, lower, upper, x, var, *args, **kwargs):
+        split.append(var)
+        return real(self, node, lower, upper, x, var, *args, **kwargs)
+
+    monkeypatch.setattr(jm._BranchAndBound, "branch", branch)
+    result = solve(mip, node_lp_solver="highs", batch_size=1, **no_heuristics())
+    assert_solved(result, mip, reference(mip))
+    assert all(base.integrality[v] for v in split)
+
+
+@pytest.mark.parametrize(
+    "make", [knapsack, general_integer, generalised_assignment, facility_location]
+)
+def test_cut_pool_propagation_keeps_valid_cuts(make, monkeypatch):
+    # Every archived cut holds at the optimum (it holds at every feasible
+    # point), the search still finds the optimum, and its propagator runs
+    # the archived cuts beside the rows.
+    seen = {}
+    real = jm._BranchAndBound.result
+
+    def result(self, status):
+        seen["archive"] = list(self.cut_archive.values())
+        seen["pooled"] = self.propagator is not self.row_propagator
+        return real(self, status)
+
+    monkeypatch.setattr(jm._BranchAndBound, "result", result)
+    mip = make()
+    out = solve(mip, node_lp_solver="highs", batch_size=1, gomory_cuts=True, cut_pool_propagation=True)
+    assert_solved(out, mip, reference(mip))
+    assert out["cut_pool_rows"] == len(seen["archive"])
+    limit = max(32, mip.num_variables // 8)
+    x, _ = reference_point(mip)
+    for idx, coef, rhs in seen["archive"]:
+        assert 0 < idx.size <= limit
+        assert coef @ x[idx] <= rhs + 1e-6 * (1 + abs(rhs))
+    if seen["archive"]:
+        assert seen["pooled"]
+
+
+def test_cut_pool_is_off_by_default():
+    mip = generalised_assignment()
+    out = solve(mip, node_lp_solver="highs", batch_size=1, gomory_cuts=True)
+    assert out["cut_pool_rows"] == 0
+
+
+def test_strong_branching_share_counts_tree_time_only():
+    # With HiGHS node LPs, strong branching pauses once it has taken more
+    # than _STRONG_SHARE of the time in the tree (after a grace period);
+    # the time before the tree (root, cut rounds) does not count.
+    now = time.time()
+    search = types.SimpleNamespace(
+        node_lp_solver="highs", branching="reliability", strong_candidates=8,
+        strong_max_depth=None, out_of_time=lambda: False,
+        tree_seconds=0.0, tree_strong_seconds=0.0,
+    )
+    node = types.SimpleNamespace(depth=3)
+    on = jm._BranchAndBound.strong_branching_on
+    share, grace = jm._STRONG_SHARE, jm._STRONG_GRACE_SECONDS
+    # Root strong branching before the tree (100 s) is not counted.
+    search.strong_branch_seconds = 100.0 + 0.2 * 10.0
+    search.tree_clock = (now - 10.0, 100.0)  # 10 s in the tree, 2 s strong
+    assert on(search, node) == (0.2 < share)
+    search.strong_branch_seconds = 100.0 + 0.5 * 10.0
+    assert not on(search, node)
+    # Within the grace period it runs whatever its share.
+    search.tree_clock = (now - 0.5 * grace, 100.0)
+    assert on(search, node)
+    # Earlier rounds (before a restart) count too.
+    search.tree_clock = (now - 10.0, 105.0)
+    search.tree_seconds, search.tree_strong_seconds = 30.0, 30.0
+    assert not on(search, node)
+
+
+def test_children_count_their_propagation_fixings(monkeypatch):
+    # max x0 + x1 + x2 with 3 x0 + 3 x1 + 3 x2 <= 4 over binaries: the LP
+    # point is 4/9 each. Up on one fixes the other two to 0 (2 inferences);
+    # down fixes nothing.
+    lp = jl.LP(
+        c=-np.ones(3),
+        A_eq=sp.csc_matrix((0, 3)),
+        b_eq=np.zeros(0),
+        A_ineq=sp.csc_matrix([[3.0, 3.0, 3.0]]),
+        b_ineq=np.array([4.0]),
+        lower_bounds=np.zeros(3),
+        upper_bounds=np.ones(3),
+    )
+    mip = jm.MIP(lp, np.ones(3, bool))
+    seen = []
+    real_branch, real_push = jm._BranchAndBound.branch, jm._BranchAndBound.push
+    pushed = []
+
+    def push(self, node):
+        pushed.append(node)
+        return real_push(self, node)
+
+    def branch(self, node, *args, **kwargs):
+        pushed.clear()
+        out = real_branch(self, node, *args, **kwargs)
+        kids = pushed + ([self.plunge_node] if self.plunge_node is not None else [])
+        seen.append({child.branch[1]: child.inferences for child in kids if child.depth == node.depth + 1})
+        return out
+
+    monkeypatch.setattr(jm._BranchAndBound, "branch", branch)
+    monkeypatch.setattr(jm._BranchAndBound, "push", push)
+    result = solve(
+        mip, node_lp_solver="highs", batch_size=1, branching="most_fractional",
+        root_strong_candidates=0, coefficient_tightening=False, probing=False,
+        **no_heuristics(),
+    )
+    assert_solved(result, mip, reference(mip))
+    first = seen[0]
+    assert first == {True: 0, False: 2}  # down: none; up: the other two
+
+
+def test_highs_node_lps_restore_a_stored_basis():
+    # A node LP starts from its parent's stored basis: set again when HiGHS
+    # holds another one, skipped when it already holds it. Same optimum.
+    mip = generalised_assignment(seed=2)
+    held = jm._HighsNodeLPs(mip)
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    root = held.solve(lower, upper)
+    assert root["converged"]
+    parent = held.held_basis()
+    j = int(np.flatnonzero(mip.integrality)[0])
+    up = upper.copy()
+    up[j] = lower[j]
+    first = held.solve(lower, up, basis=parent)  # held already: no restore
+    assert held.basis_restores == 0
+    other = lower.copy()
+    other[j] = upper[j]
+    held.solve(other, upper)  # moves HiGHS on to another node's basis
+    again = held.solve(lower, up, basis=parent)  # restored
+    assert held.basis_restores == 1
+    value = lambda result: float(mip.c @ np.asarray(result["solution"].primal))
+    assert first["converged"] and again["converged"]
+    assert value(again) == pytest.approx(value(first), rel=1e-9, abs=1e-9)
 
 
 def test_batch_epochs_is_checked():

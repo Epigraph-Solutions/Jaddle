@@ -4,6 +4,26 @@
 
 ### Added
 
+- Cut separation counts implied integers as integers
+  (`jm.solve(implied_integer_cuts=True)`, the default), as HiGHS's cuts
+  do. This covers the Gomory, cover, c-MIR, flow cover, clique (the
+  conflict graph's binaries) and zero-half cuts, at the root and in the
+  tree (`CutSeparator(integrality=...)`, `ConflictGraph(integrality=...)`).
+  - Presolve has shown that every choice of the integers has a best
+    completion with them integral. No such cut removes it, so node bounds
+    stay valid, and node points with fractional implied columns still
+    count as integral.
+  - On ns1830653 the root bound (100 rounds, no restarts) rose from 11,819
+    to 12,583 (HiGHS: 11,622), with 92 zero-half and 20 clique cuts in the
+    LP against 8 and 3.
+- Cut pool propagation in `jm.solve` (`cut_pool_propagation`, off by
+  default). Every cut the root and tree rounds select is kept (those with
+  at most `max(32, n / 8)` nonzeros, the newest 10,000), and the search's
+  bound propagation runs them beside the rows at every node, also after
+  they have left the LP. HiGHS propagates its cut pool the same way: on
+  ns1830653 it keeps 6,000 to 10,000 cuts with 100 to 170 in its LP, and
+  about 38% of its nodes are leaves. Jaddle's open nodes there grew almost
+  one for one with the nodes solved. New result: `cut_pool_rows`.
 - Three ways for `jm.solve` to raise the bound with the incumbent, all
   off by default until compared on large MIPs:
   - `cutoff_probing` (the most candidates per incumbent; with
@@ -175,6 +195,78 @@
   0.2 s; on exact LPs the clique cuts alone take the root bound from
   −115,370 to −113,411 in 56 cuts, and they add about 1,000 to it alongside
   the other families.
+
+### Fixed
+
+- `MIP.violation` and `MIP.is_feasible`, and with them every incumbent
+  check in `jm.solve`, now measure each row's violation against its own
+  `1 + |b_i|`. Before, every row's was divided by `1 + ‖b‖∞`, so one large
+  right-hand side excused large violations of every other row. On map06
+  (one right-hand side of 5.1e7) the root rounding was taken as an
+  incumbent at -402.49 against a known optimum of -289, with 7,174 rows
+  violated by up to 0.32, and the search stopped as "optimal". The jump
+  heuristic's row tolerances (`_jump_rows`) and the repair's violated rows
+  (`_violated_rows`) use the same per-row measure.
+- With HiGHS node LPs, each node's LP now starts from its parent's basis.
+  The basis is stored with the node (`_Node.basis`, for the rows it
+  belongs to) and set again when HiGHS holds another one. Before, every
+  node LP started from whatever basis the last node left behind. Within a
+  plunge that is the parent's, but after a jump to the best-bound node
+  it's an unrelated node's. On ns1830653 node LPs averaged 215 to 353
+  pivots, against about 70 for HiGHS's own search. A plunge child solved
+  just after its parent skips the reset (no refactorisation). New result:
+  `node_basis_restores`.
+- Strong branching in the tree (reliability branching with HiGHS node LPs)
+  is capped at 25% of the time spent in the tree, after a 2 s grace
+  period. It used to be capped at half of all the time since the start,
+  root included. So once the tree started it could run nonstop for as long
+  as the root had taken. On ns1830653, with a 52 s root (100 cut rounds),
+  a profile put 49 of the tree's 56 s in strong-branching child LPs: about
+  16 a node at 28 ms each, against 20 ms for the node LP itself. HiGHS
+  spends 27% of its simplex iterations on strong branching there.
+- HiGHS's implicit integers now load as continuous columns. Presolve marks
+  continuous columns that some optimal solution has integral
+  (`kImplicitInteger`). They were loaded as integers, so a node LP point
+  counted as integral only if they were integral too, and the search
+  branched on them.
+  - On ns1830653 they are 134 of the 592 columns after presolve. The model
+    has 171 continuous columns and 1,458 binaries, and presolve leaves
+    "458 binary, 134 implied int., 0 continuous".
+  - No node LP ever gave an incumbent, and they took 11 of 32 branchings
+    in a traced plunge, most at x = 0.5. HiGHS improves its incumbent there
+    mostly from integral node LPs.
+  - `MIP.implied` now marks them, carried through `with_rows`, coefficient
+    tightening, sub-searches and restarts. They count as integral only for
+    the objective step (`objective_step`): ns1830653's are all costed, and
+    its objective still has step 1, as HiGHS reports.
+- Plunges and depth-first dives now follow the LP point's rounding
+  direction. `branch` compared each child's `down` flag with `prefer_up`,
+  which put the wrong child last, so the plunge child (and, in a dive, the
+  child popped next) was the one against the LP value. On ns1830653
+  plunges went up at x = 0.08 and their bounds climbed by 500–1,000 a
+  step, from 12,598 to 31,039. In 891 nodes no plunge reached an integral
+  leaf, and the root incumbent (35,622) never improved. HiGHS improves
+  its incumbent mostly from integral node LPs at the bottom of its
+  plunges, and reaches the optimum (20,622) in 236 s.
+- The plunge child, and in a dive the child taken next, is now the one
+  with the higher `(1 + inferences) / (1 + cost / unit)`:
+  - `inferences` is the number of bounds the child's propagation tightened
+    beyond the split (now kept as `_Node.inferences`);
+  - `cost` is its estimated bound gain: its bound (from the parent's
+    duals or strong branching), plus its pseudocost gain once both
+    directions of the variable have observations;
+  - `unit` is the mean pseudocost gain observed so far.
+
+  Equal scores go to the lower estimated bound, then to the rounding
+  direction (within 1e-9, relative). `jm.solve(plunge_child=...)` picks
+  the rule: `"score"` (the default), `"estimate"` (the lower estimated
+  bound, then rounding) or `"rounding"` (the LP point's direction only).
+  It was chosen while implicit integers still loaded as integers, so it
+  has not been compared on ns1830653. A child that fixes many variables
+  reaches an integral point in fewer steps. On ns1830653, plunges that
+  kept to the cheaper child still had about 100 fractional integers at
+  depth 27. Most of its branchings are at x = 0.5, where rounding says
+  nothing.
 
 ### Changed
 
