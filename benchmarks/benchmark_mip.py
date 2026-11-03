@@ -101,16 +101,17 @@ print(
 # %%
 result = jm.solve(
     PATH_TO_MPS,
-    branching="reliability",
     presolve=True,
     max_seconds=MAX_SECONDS,
     verbose=True,
     log_every_seconds=10,
     device=DEVICE,
     batch_size=1,
+    cut_rounds=20,
     tree_cuts=True,
-    node_lp_tolerance=1e-6,
-    node_crossover=True,
+    max_cuts_per_round=100,
+    max_tree_cuts_per_round=100,
+    tree_cut_rows=1000,
 )
 print(f"Status: {result['status']}")
 print(f"Bound: {result['bound']:.6g}")
@@ -125,7 +126,6 @@ if result["x"] is not None:
 # %%
 highs = highspy.Highs()
 highs.setOptionValue("output_flag", True)
-highs.setOptionValue("solver", "pdlp")
 highs.setOptionValue("parallel", "on")
 highs.setOptionValue("threads", 12)
 highs.setOptionValue("time_limit", float(MAX_SECONDS))

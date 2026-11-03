@@ -4,6 +4,57 @@
 
 ### Added
 
+- `jm.solve(max_tree_cuts_per_round=10)`: the most cuts a tree cut round
+  (`tree_cuts`) adds, until now fixed at 10. The pool reserves room for at
+  least two rounds' worth beyond the root's cuts. On a generalised
+  assignment test model, 40 a round adds 40, 25 and 32 in its first three
+  rounds.
+- `jm.solve(tree_cut_rows=None, tree_cut_nnz=None)`: the size of the tree
+  cut pool (cuts, the root's included, and their nonzeros), until now
+  fixed at twice the root's. With only `tree_cut_rows`, the nonzeros
+  scale with it. `result["tree_cuts_dropped"]` counts violated tree cuts
+  left out for want of room, and the log's cut lines show the pool's
+  cuts and nonzeros. On a generalised assignment test model with 40 cuts
+  a round, the default pool fills and drops 156 cuts; with
+  `tree_cut_rows=1000` it drops none.
+- `jm.highs_rens`: RENS with HiGHS, with a dive when the RENS box is
+  infeasible. Degenerate root LPs have vertices that are integral on many
+  integers by accident, and fixing them all can leave no solution. When
+  HiGHS proves the box empty, the time left goes to a dive in the manner
+  of HiGHS's RENS: it fixes a tenth of the integers at a time towards the
+  LP point and re-solves the LP with HiGHS's dual simplex until half as
+  many are fixed as in the failed box, then searches that sub-MIP with the
+  unfixed integers free. A box proven empty backs the dive up to half its
+  depth and halves the target (down to 10%). `jm.solve`'s root RENS uses
+  it. On neos-4306827-ravan, 39,000 of 41,000 integers are integral at the
+  root vertex but only 331 have a nonzero reduced cost; the RENS box is
+  infeasible in 0.2 s, and Jaddle found no incumbent in 300 s. The dive
+  finds 11,557 offline (its first point after 5 s), and `jm.solve` now
+  ends the 300 s run at 11,004.5 (HiGHS: 10,320.6), with a better bound
+  (4,782 against 4,724).
+- `jm.solve` simplex cut rounds (`simplex_cut_rounds="auto"`: on with
+  Gomory cuts). The root LP stays in HiGHS through the cut rounds: the
+  first crossover's basis is kept, each round deletes the cuts slack for
+  10 rounds in a row, adds the new ones and re-solves with the dual
+  simplex from that basis. Each round gets an exact vertex, exact duals
+  and the Gomory basis without a first-order re-solve or a crossover, and
+  the stall check sees exact bounds (over 10 rounds). The root is solved
+  once more with the first-order method afterwards, warm from the exact
+  point. With clique and zero-half cuts, bab5's root bound goes from
+  −112,232 (71 s, first-order rounds) to −107,349 (171 s, 13 s of it in
+  27 re-solves) and ns1830653's from 11,962 (32 s) to 12,622 (30 s), past
+  HiGHS's root bounds of −107,454 and 11,622. `result["simplex_rounds"]`
+  counts the re-solves.
+- `jm.solve` zero-half cuts (`zero_half_cuts=True`, family `"zerohalf"`).
+  `jm.zero_half_cuts` separates {0, ½}-Chvátal–Gomory cuts: half the sum of
+  a set of rows with integer coefficients on integer variables, rounded
+  down, with each variable measured from its nearer bound. The sets come
+  from Gaussian elimination over GF(2) on the parities of the tight rows
+  (packed 64-bit words), as in HiGHS's mod-k separator with k = 2. Root and
+  tree rounds separate them from the LP's rows and the cuts in it. On
+  bab5's root, with exact LPs and 20 rounds, they take the bound with the
+  other families from −111,209 to −107,410, past HiGHS's root bound
+  (−107,454); alone they reach −111,545 in 4 s.
 - `jaddle.jaddle_stochastic`: stochastic saddle-point optimisation for
   convex problems whose objective and constraints are means over data.
   `JaddleCPStochastic` takes each term as a per-example function
@@ -36,6 +87,26 @@
 
 ### Changed
 
+- `jm.solve`'s HiGHS incumbent search (`highs_incumbent_seconds`) with
+  `parallel_heuristics` starts as soon as the root LP is solved, beside
+  the cut rounds, instead of after the root heuristics fail; while there
+  is no incumbent it runs again with twice the budget each time it finds
+  nothing (10 s, 20 s, 40 s, ...; `result["highs_incumbent_calls"]`).
+  On neos-4306827-ravan HiGHS needs 16 s for its first point, so the one
+  10 s call found nothing. When its point arrives first, the root
+  heuristics that run only without an incumbent are skipped: on
+  ns1830653 it gives 35,622 at 16.8 s, during the cut rounds.
+- Faster root cut rounds; the cuts are unchanged. bab5's cut rounds take
+  84 s instead of 141 s:
+  - batched c-MIR and flow cover searches size each call to at most
+    256 × 1,024 padded entries (`_SEPARATION_ENTRIES`), so one wide base
+    no longer pads a whole 256-row chunk. bab5 had one 5,538-term base in
+    a 256 × 16,384 call, nine times all the others' entries; c-MIR time
+    went from 42 s to 5 s.
+  - `jm.gomory_cuts` computes its tableau rows in blocks of 64 (one solve
+    with the factors and one product with Aᵀ a block, the rest
+    vectorised), from 35 s to 15 s.
+  - `jm.select_cuts` takes its cosines a block of candidates at a time.
 - `jm.solve`'s `max_cuts_per_round` default is 100 (was 10). With 10 a
   round, the strongest cover cuts took every slot on bab5 and no Gomory cut
   got in. With clique cuts, 100 takes bab5's root bound from −113,254 to

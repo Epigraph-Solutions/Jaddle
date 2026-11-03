@@ -285,7 +285,8 @@ def test_unbounded_relaxation():
 def test_limits_report_valid_bounds():
     mip = general_integer(n=12, m_ineq=8)
     ref = reference(mip)
-    result = solve(mip, max_nodes=5)
+    # Without root cuts: with them (simplex cut rounds) the root solves it.
+    result = solve(mip, max_nodes=5, cuts=False)
     assert result["status"] == "node_limit" and not result["converged"]
     assert result["nodes"] <= 5
     assert result["bound"] <= ref + 1e-6 * (1 + abs(ref))
@@ -623,11 +624,19 @@ def test_cuts_strengthen_the_root():
     ref = reference(mip)
     with_cuts = solve(mip)
     without = solve(mip, cuts=False)
-    for result in (with_cuts, without):
+    first_order = solve(mip, simplex_cut_rounds=False)
+    for result in (with_cuts, without, first_order):
         assert_solved(result, mip, ref)
-    # MIR or flow cover cuts (on these fixed-charge rows flow covers often win).
-    assert with_cuts["cuts"]["mir"] + with_cuts["cuts"]["flowcover"] > 0
-    assert without["cuts"] == {"gomory": 0, "cover": 0, "mir": 0, "flowcover": 0, "clique": 0}
+    # MIR or flow cover cuts (on these fixed-charge rows flow covers often
+    # win). At HiGHS's exact vertex (the simplex rounds) the flow cover is
+    # slack, so it leaves the LP; the first-order rounds' vertex keeps it.
+    assert first_order["cuts"]["mir"] + first_order["cuts"]["flowcover"] > 0
+    assert with_cuts["history"][0]["bound"] == pytest.approx(
+        first_order["history"][0]["bound"], rel=1e-6
+    )
+    assert without["cuts"] == {
+        "gomory": 0, "cover": 0, "mir": 0, "flowcover": 0, "clique": 0, "zerohalf": 0,
+    }
     assert without["root_bound_before_cuts"] is None
     # The cuts close part of the root gap and the tree is no larger.
     root = with_cuts["root_bound_before_cuts"]
@@ -702,6 +711,7 @@ def test_fix_and_propagate_gives_up_on_an_infeasible_box():
 def test_root_heuristics_find_incumbents(seed):
     mip = generalised_assignment(seed)
     ref = reference(mip)
+    # RENS off too: on seed 0 its box is infeasible but its dive finds a point.
     off = solve(
         mip,
         max_nodes=1,
@@ -709,6 +719,7 @@ def test_root_heuristics_find_incumbents(seed):
         fix_and_propagate=False,
         feasibility_jump=False,
         feasibility_pump=False,
+        rens_seconds=0,
     )
     assert off["x"] is None
     result = solve(mip, max_nodes=1, cuts=False)
@@ -815,20 +826,31 @@ def test_gomory_cuts_in_the_search():
     assert off["cuts"]["gomory"] == 0
 
 
+@pytest.mark.parametrize("simplex", [False, True])
 @pytest.mark.parametrize("make", [general_integer, generalised_assignment])
-def test_cut_rounds_drop_slack_cuts(make, monkeypatch):
+def test_cut_rounds_drop_slack_cuts(make, simplex, monkeypatch):
     """With Gomory cuts, a cut whose row is basic (slack) in a round's
-    crossover basis is gone from the next round's LP; binding ones stay."""
-    rounds = []  # (cuts before the round, basis) per crossover
+    crossover basis is gone from the next round's LP; binding ones stay. In
+    the simplex rounds (HiGHS's basis) a slack cut stays until it has been
+    slack for ``_SIMPLEX_CUT_AGE`` rounds in a row."""
+    rounds = []  # (cuts before the round, basis) per round
     after = []  # the cut list each round's LP was built from
     real_vertex = jm._BranchAndBound.root_vertex
+    real_simplex_vertex = jm._SimplexRounds.vertex
     real_set_mip = jm._BranchAndBound.set_mip
     real_compact = jm._BranchAndBound.compact_cuts
     compacting = []
 
     def root_vertex(self, lower, upper, solution):
         vertex, basis = real_vertex(self, lower, upper, solution)
-        rounds.append((list(self.cut_list), basis))
+        if not simplex:
+            rounds.append((list(self.cut_list), basis))
+        return vertex, basis
+
+    def simplex_vertex(self):
+        vertex, basis = real_simplex_vertex(self)
+        # Called once a round, before its cuts are chosen.
+        rounds.append((after[-1] if after else [], basis))
         return vertex, basis
 
     def set_mip(self, mip):
@@ -841,20 +863,28 @@ def test_cut_rounds_drop_slack_cuts(make, monkeypatch):
         return real_compact(self, *args)
 
     monkeypatch.setattr(jm._BranchAndBound, "root_vertex", root_vertex)
+    monkeypatch.setattr(jm._SimplexRounds, "vertex", simplex_vertex)
     monkeypatch.setattr(jm._BranchAndBound, "set_mip", set_mip)
     monkeypatch.setattr(jm._BranchAndBound, "compact_cuts", compact_cuts)
     mip = make()
-    result = solve(mip, gomory_cuts=True, max_nodes=1)
+    result = solve(mip, gomory_cuts=True, max_nodes=1, simplex_cut_rounds=simplex)
+    assert (result["simplex_rounds"] > 0) == simplex
     assert result["cuts"]["gomory"] > 0
     m = mip.A.shape[0]
     checked = 0
+    slack_rounds = {}
     for (before, basis), cuts in zip(rounds, after):
         if basis is None:
             continue
         kept = {id(cut) for cut in cuts}
         for i, cut in enumerate(before):
             basic = basis.row_status[m + i] == highspy.HighsBasisStatus.kBasic
-            assert (id(cut) in kept) == (not basic)
+            slack_rounds[id(cut)] = slack_rounds.get(id(cut), 0) + 1 if basic else 0
+            if simplex:
+                dropped = slack_rounds[id(cut)] >= jm._SIMPLEX_CUT_AGE
+            else:
+                dropped = basic
+            assert (id(cut) in kept) == (not dropped)
             checked += 1
     assert checked > 0
 
@@ -1348,14 +1378,15 @@ def test_node_crossover_in_the_search(batch_size):
 
 def test_node_crossover_every_and_failed_crossovers(monkeypatch):
     mip = general_integer()
-    sparse = solve(mip, node_crossover=True, node_crossover_every=1000)
+    # Without root cuts: with them the tree is too small to cross over in.
+    sparse = solve(mip, node_crossover=True, node_crossover_every=1000, cuts=False)
     assert_solved(sparse, mip, reference(mip))
     assert sparse["node_crossovers"] <= 1  # only the node count 0 qualifies
     # A crossover HiGHS cannot finish leaves the PDHG point in place.
     monkeypatch.setattr(
         jm.jl, "crossover", lambda lp, solution, highs_options=None: {"converged": False}
     )
-    result = solve(mip, node_crossover=True)
+    result = solve(mip, node_crossover=True, cuts=False)
     assert_solved(result, mip, reference(mip))
     assert result["node_crossovers"] > 0 and result["node_crossover_vertices"] == 0
 
@@ -1420,12 +1451,14 @@ def test_repair_gives_up_when_the_neighbourhood_is_infeasible():
 
 def test_highs_incumbent_fallback():
     mip = generalised_assignment(0)
+    # RENS off too: its dive finds a point here.
     off = dict(
         max_nodes=1,
         cuts=False,
         fix_and_propagate=False,
         feasibility_jump=False,
         feasibility_pump=False,
+        rens_seconds=0,
     )
     assert solve(mip, **off)["x"] is None  # the fallback is off by default
     result = solve(mip, highs_incumbent_seconds=10, **off)
@@ -1489,9 +1522,13 @@ def test_highs_submip_respects_the_box_and_cutoff():
 )
 def test_root_rens_with_highs_finds_the_first_incumbent(make):
     mip = make()
+    # With zero-half cuts (either kind of cut round) general_integer's root
+    # point changes and the tree finds the first incumbent, RENS still
+    # running; without them RENS's sub-MIP finds it.
     result = solve(
         mip, gomory_cuts=True, feasibility_jump=False, fix_and_propagate=False,
         feasibility_pump=False, bulk_rounding=False, round_repair=False,
+        zero_half_cuts=False, simplex_cut_rounds=False,
     )
     assert_solved(result, mip, reference(mip))
     assert result["history"][0]["source"] == "E"  # RENS
@@ -1564,7 +1601,8 @@ def test_batched_search_limits_and_infeasibility():
     # The root and one batch cut short by the limit. At 6 nodes a quick
     # incumbent could close the gap (10 nodes prove it), so a fast runner
     # reported "optimal".
-    result = solve(mip, batch_size=4, max_nodes=3)
+    # Without root cuts, which solve this MIP at the root.
+    result = solve(mip, batch_size=4, max_nodes=3, cuts=False)
     assert result["status"] == "node_limit" and result["nodes"] <= 3
     assert result["bound"] <= ref + 1e-6 * (1 + abs(ref))
 
@@ -1982,6 +2020,60 @@ def test_tree_cuts_are_added_without_recompiling(monkeypatch):
     assert traces == []  # the same shapes throughout
 
 
+@pytest.mark.parametrize("per_round", [1, 3, 40])
+def test_tree_cuts_per_round_follow_the_option(per_round, monkeypatch):
+    mip = generalised_assignment(1)
+    search = search_for(
+        mip, monkeypatch, tree_cuts=True, tree_cut_every=1, max_nodes=40,
+        gomory_cuts=False, max_tree_cuts_per_round=per_round,
+    )
+    monkeypatch.undo()
+    added = []
+    real = search.tree_cut_round
+
+    def counted(x, warm):
+        before = search.tree_cuts_added
+        out = real(x, warm)
+        added.append(search.tree_cuts_added - before)
+        return out
+
+    search.tree_cut_round = counted
+    result = search._run()
+    assert result["tree_cuts_added"] > 0
+    assert max(added) <= per_round
+    # The pool has room for two rounds beyond the root's cuts.
+    assert search.tree_rows_cap - search.tree_padding_rows >= 2 * per_round
+
+
+def test_tree_cuts_per_round_must_be_positive():
+    with pytest.raises(ValueError, match="max_tree_cuts_per_round"):
+        solve(knapsack(), tree_cuts=True, max_tree_cuts_per_round=0)
+    for name in ("tree_cut_rows", "tree_cut_nnz"):
+        with pytest.raises(ValueError, match=name):
+            solve(knapsack(), tree_cuts=True, **{name: 0})
+
+
+def test_tree_cut_pool_size_follows_the_options(monkeypatch):
+    mip = generalised_assignment(2)
+    options = dict(
+        tree_cuts=True, tree_cut_every=1, max_nodes=200, gomory_cuts=False,
+        max_tree_cuts_per_round=40,
+    )
+    small = solve(mip, **options)
+    assert small["tree_cuts_dropped"] > 0  # the default pool fills
+    search = search_for(mip, monkeypatch, tree_cut_rows=1000, **options)
+    monkeypatch.undo()
+    large = search._run()
+    assert_solved(large, mip, reference(mip))
+    assert search.tree_rows_cap - search.tree_padding_rows >= 1000
+    assert search.tree_nnz_cap >= 1000 * 16  # scaled with the rows
+    assert large["tree_cuts_dropped"] == 0
+    search = search_for(mip, monkeypatch, tree_cut_rows=1000, tree_cut_nnz=5000, **options)
+    monkeypatch.undo()
+    search._run()
+    assert search.tree_nnz_cap == 8192  # as given, to a power of two
+
+
 def test_tree_cuts_are_off_when_batched():
     result = solve(knapsack(), tree_cuts=True, batch_size=4)
     assert result["tree_cuts_added"] == 0
@@ -2238,8 +2330,10 @@ def test_node_bound_stop_keeps_the_optimum(make):
     assert_solved(off, mip, ref)
     assert off["bound_stops"] == 0
     if make is general_integer:
-        # Without sub-MIP heuristics, so the two trees differ only by the stop.
-        plain = dict(rins_seconds=0.0, rens_seconds=0.0)
+        # Without sub-MIP heuristics, so the two trees differ only by the
+        # stop, and without zero-half cuts, which leave too small a tree for
+        # it to save LP work (without any cuts the two trees differ).
+        plain = dict(rins_seconds=0.0, rens_seconds=0.0, zero_half_cuts=False)
         on = solve(mip, node_bound_stop=True, **plain)
         off = solve(mip, node_bound_stop=False, **plain)
         assert on["bound_stops"] > 0
@@ -2596,6 +2690,94 @@ def test_clique_cut_from_edge_rows_and_in_the_search():
     assert solve(mip, clique_cuts=False)["cuts"]["clique"] == 0
 
 
+def odd_cycle(k=5):
+    """max Σx with x_i + x_{i+1} <= 1 around a cycle of odd length k: the
+    LP optimum is k/2 at x = 1/2, the MIP's (k − 1)/2. Its cliques are the
+    edges, so only an odd-cycle (zero-half) cut closes the gap."""
+    A = np.zeros((k, k))
+    for i in range(k):
+        A[i, [i, (i + 1) % k]] = 1.0
+    A_eq, b_eq = no_rows(k)
+    lp = jl.LP(
+        c=-np.ones(k), A_eq=A_eq, b_eq=b_eq, A_ineq=sp.csc_matrix(A),
+        b_ineq=np.ones(k), lower_bounds=np.zeros(k), upper_bounds=np.ones(k),
+    )
+    return jm.MIP(lp, np.ones(k, bool))
+
+
+def zero_half(mip, x):
+    return jm.zero_half_cuts(
+        mip.A, mip.b, mip.n_eq, x, mip.lower, mip.upper, mip.integrality
+    )
+
+
+def test_zero_half_cut_on_an_odd_cycle():
+    mip = odd_cycle()
+    cuts = zero_half(mip, np.full(5, 0.5))
+    # Half the five edge rows: Σx <= 5/2, rounded down to 2.
+    assert len(cuts) == 1
+    family, idx, coef, rhs = cuts[0]
+    assert family == "zerohalf"
+    assert list(idx) == list(range(5)) and np.all(coef == 1.0)
+    assert rhs == pytest.approx(2.0)
+    # At an integral point nothing is violated.
+    assert zero_half(mip, np.array([1.0, 0, 1, 0, 0])) == []
+
+
+def small_general_integer(seed, n=5, m_eq=1, m_ineq=4):
+    """General integers in [0, 3] (1,024 points) with rows a random point
+    satisfies."""
+    rng = np.random.default_rng(seed)
+    x0 = rng.integers(0, 4, n).astype(float)
+    A_eq = rng.integers(-2, 3, (m_eq, n)).astype(float)
+    A_ineq = rng.integers(-3, 4, (m_ineq, n)).astype(float)
+    lp = jl.LP(
+        c=rng.standard_normal(n), A_eq=sp.csc_matrix(A_eq), b_eq=A_eq @ x0,
+        A_ineq=sp.csc_matrix(A_ineq), b_ineq=A_ineq @ x0 + rng.integers(0, 3, m_ineq),
+        lower_bounds=np.zeros(n), upper_bounds=np.full(n, 3.0),
+    )
+    return jm.MIP(lp, np.ones(n, bool))
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_zero_half_cuts_hold_at_every_feasible_point(seed):
+    rng = np.random.default_rng(seed)
+    for mip, values in ((random_binary_rows(seed), 2), (small_general_integer(seed), 4)):
+        n = mip.num_variables
+        grid = np.array(np.meshgrid(*[np.arange(values)] * n)).reshape(n, -1).T.astype(float)
+        points = np.array([x for x in grid if mip.is_feasible(x)])
+        found = 0
+        for _ in range(20):
+            x = rng.uniform(mip.lower, mip.upper)
+            for family, idx, coef, rhs in zero_half(mip, x):
+                found += 1
+                assert family == "zerohalf" and coef @ x[idx] > rhs
+                assert np.all(points[:, idx] @ coef <= rhs + 1e-9)
+        if seed == 0:
+            assert found
+
+
+@pytest.mark.parametrize("make", [general_integer, fixed_charge, generalised_assignment])
+def test_zero_half_cuts_are_valid_on_mixed_rows(make):
+    # Rows with continuous variables or fractional coefficients sit out; the
+    # cuts from the rest hold over the MIP (checked with HiGHS).
+    made = make()
+    mip = made[0] if isinstance(made, tuple) else made
+    x, _ = vertex_and_basis(mip)
+    for _, idx, coef, rhs in zero_half(mip, x):
+        assert coef @ x[idx] > rhs
+        assert max_over_mip(mip, idx, coef) <= rhs + 1e-7 * (1 + abs(rhs))
+
+
+def test_zero_half_cuts_in_the_search():
+    mip = odd_cycle(7)
+    result = solve(mip, clique_cuts=False, gomory_cuts=False)
+    assert_solved(result, mip, reference(mip))
+    assert result["cuts"]["zerohalf"] >= 1
+    assert result["root_bound_before_cuts"] == pytest.approx(-3.5, abs=1e-4)
+    assert solve(mip, zero_half_cuts=False)["cuts"]["zerohalf"] == 0
+
+
 # %% Incumbent heuristics: RENS, dives, objective-aware propagation
 def test_rens_returns_only_better_points(monkeypatch):
     mip = generalised_assignment(1)
@@ -2613,6 +2795,48 @@ def test_rens_returns_only_better_points(monkeypatch):
     if search.incumbent is not before:
         assert mip.is_feasible(search.incumbent[1])
         assert search.incumbent[0] < cutoff
+
+
+def rens_trap(n_binaries=20):
+    """A MIP whose RENS box is empty: ``y = 3w`` with ``y >= 1/2`` has the
+    LP point ``y = 1/2, w = 1/6``, but every integer point has ``y >= 3``;
+    ``n_binaries`` binaries with cost 1 are integral (zero) there. Returns
+    the MIP and its LP point."""
+    n = 2 + n_binaries
+    A_eq = sp.lil_matrix((1, n))
+    A_eq[0, 0], A_eq[0, 1] = 1.0, -3.0
+    A_ineq = sp.lil_matrix((1, n))
+    A_ineq[0, 0] = -1.0
+    c = np.ones(n)
+    c[1] = 0.0
+    lp = jl.LP(
+        c=c, A_eq=sp.csc_matrix(A_eq), b_eq=np.zeros(1),
+        A_ineq=sp.csc_matrix(A_ineq), b_ineq=np.array([-0.5]),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.concatenate([[10.0, 3.0], np.ones(n_binaries)]),
+    )
+    x = np.zeros(n)
+    x[0], x[1] = 0.5, 1.0 / 6.0
+    return jm.MIP(lp, np.ones(n, bool)), x
+
+
+def test_rens_dives_when_its_box_is_infeasible():
+    mip, x = rens_trap()
+    integral = np.abs(x - np.round(x)) <= 1e-9
+    sub_lower = np.where(integral, np.round(x), np.floor(x))
+    sub_upper = np.where(integral, np.round(x), np.ceil(x))
+    assert jm.highs_submip(mip, sub_lower, sub_upper) is None
+    propagator = jm.BoundPropagator(mip.A, mip.row_lower, mip.row_upper, mip.integrality)
+    found = jm.highs_rens(
+        mip, x, mip.lower, mip.upper, sub_lower, sub_upper, propagator, max_seconds=10
+    )
+    assert found is not None and mip.is_feasible(found)
+    assert found[0] == 3.0 and found[1] == 1.0
+    # A cutoff no point beats leaves nothing.
+    assert jm.highs_rens(
+        mip, x, mip.lower, mip.upper, sub_lower, sub_upper, propagator,
+        cutoff=2.0, max_seconds=10,
+    ) is None
 
 
 def test_dive_stops_at_its_deadline(monkeypatch):
@@ -2794,8 +3018,10 @@ def test_reliability_branching_matches_reference(make, batch_size):
 
 def test_reliability_branching_needs_fewer_nodes():
     mip = general_integer()
-    plain = solve(mip, branching="pseudocost")
-    strong = solve(mip, branching="reliability")
+    # Without zero-half cuts, which leave too small a tree to tell the two
+    # apart (23 nodes each); without them it is 14 nodes against 21.
+    plain = solve(mip, branching="pseudocost", zero_half_cuts=False)
+    strong = solve(mip, branching="reliability", zero_half_cuts=False)
     assert_solved(strong, mip, reference(mip))
     assert strong["strong_branch_nodes"] > 0
     assert strong["nodes"] < plain["nodes"]
@@ -3341,15 +3567,17 @@ def test_bulk_fix_and_propagate_returns_feasible_points(make, backend):
 def test_bulk_rounding_in_the_search():
     for seed in range(3):
         mip = generalised_assignment(seed)
+        # RENS off: on seed 0 its dive finds a point after bulk rounding fails.
         result = solve(
-            mip, max_nodes=1, cuts=False, feasibility_jump=False, feasibility_pump=False
+            mip, max_nodes=1, cuts=False, feasibility_jump=False, feasibility_pump=False,
+            rens_seconds=0,
         )
         if result["x"] is not None:
             assert mip.is_feasible(result["x"])
             assert result["history"][0]["source"] in ("P", "B")
     off = solve(
         generalised_assignment(0), max_nodes=1, cuts=False, fix_and_propagate=False,
-        feasibility_jump=False, feasibility_pump=False,
+        feasibility_jump=False, feasibility_pump=False, rens_seconds=0,
     )
     assert off["x"] is None
 
@@ -3587,6 +3815,33 @@ def test_parallel_heuristics_match_reference(make):
     assert_solved(result, mip, reference(mip))
     stats = result["parallel_heuristics"]
     assert set(stats) == {"jobs", "seconds", "improvements", "jump_slices"}
+
+
+def test_highs_incumbent_search_repeats_with_doubled_budget(monkeypatch):
+    budgets = []
+
+    def finds_nothing(mip, max_seconds=30.0, model=None, stop=None):
+        budgets.append(max_seconds)
+
+    monkeypatch.setattr(jm, "highs_incumbent", finds_nothing)
+    search = search_for(
+        general_integer(), monkeypatch, parallel_heuristics=True,
+        highs_incumbent_seconds=1.0,
+    )
+    try:
+        for _ in range(3):
+            search.queue_highs_incumbent()
+            search.queue_highs_incumbent()  # the lane is busy: no second job
+            deadline = time.time() + 10
+            while not search.workers.idle("highs") and time.time() < deadline:
+                search.collect_heuristics(schedule=False)
+        assert budgets == [1.0, 2.0, 4.0]
+        assert search.highs_incumbent_calls == 3
+        search.incumbent = (0.0, np.zeros(search.mip.num_variables))
+        search.queue_highs_incumbent()  # an incumbent: no more searches
+        assert search.workers.idle("highs") and budgets == [1.0, 2.0, 4.0]
+    finally:
+        search.workers.shutdown()
 
 
 def test_background_workers_run_jobs_in_order_and_stop():

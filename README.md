@@ -804,6 +804,8 @@ reports `bound_rigorous=False`.
 | `separation_backend` | `"jax"` | Run the c-MIR and flow cover searches batched in JAX (float64), or `"numpy"` for the per-row reference searches. |
 | `flow_covers` | `True` | Flow cover cuts from rows with continuous variables, over their variable bounds (`y <= u·z`). |
 | `clique_cuts` | `True` | Clique cuts from a conflict graph on the binaries, built once from the rows over the root box (`jm.ConflictGraph`). |
+| `zero_half_cuts` | `True` | Zero-half ({0, ½}-Chvátal–Gomory) cuts from the rows and cuts with integer coefficients, found by elimination over GF(2) (`jm.zero_half_cuts`). |
+| `simplex_cut_rounds` | `"auto"` | Run the root cut rounds in HiGHS's dual simplex, warm from the last basis, for exact bounds each round (`"auto"`: with Gomory cuts). |
 | `aggregate_integers` | `"auto"` | Aggregate rows through integer variables too, up to five rows, for MIR and cover cuts (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
 | `tree_cuts`, `tree_cut_every` | `False`, `10` | Global cover and MIR cuts added in the tree every this many nodes (branch and cut; serial search only). |
 | `conflicts`, `conflict_pool_size`, `conflict_max_nnz` | `True`, `2000`, `None` | Learn dual proofs and no-goods from closed nodes and propagate them at every node before its LP (`None`: at most `max(25, n // 10)` variables per proof). |
