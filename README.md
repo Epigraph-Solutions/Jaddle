@@ -114,7 +114,7 @@ can be combined, for example `pip install "jaddle[cuda12,examples]"`:
 | `rag_examples` | `fastembed`, `snowballstemmer`, and `examples` | The retrieval (RAG) examples |
 | `benchmarks` | `mpax` | The benchmarks |
 | `cvxpy` | `cvxpy` | [Modelling with CVXPY](#modelling-with-cvxpy) |
-| `fast` | `numba` | The incremental feasibility jump in the MIP solver, much faster than the device one for finding first incumbents |
+| `fast` | `numba` | The incremental feasibility jump in the MIP solver, much faster than the device one for finding first incumbents, and compiled bound propagation (the same bounds as the numpy version, about 7× faster a call) |
 | `test` | `pytest`, `cvxpy`, `numba` | Running the test suite |
 | `dev` | `examples`, `test`, `build`, `twine` | Development and packaging |
 
@@ -654,7 +654,10 @@ columns are not supported.
   first incumbent, then takes the best bound with plunges: after each
   best-bound node, up to `plunge_depth` steps follow its preferred child, so
   the search keeps reaching leaves and finding better incumbents while it
-  raises the bound. `"best_first"` and
+  raises the bound. A plunge stops early at a child whose bound is more
+  than `plunge_gap` (default 0.25) of the way from the best open bound to
+  the cutoff, so the better the incumbent, the more LPs go to the nodes
+  that hold the bound. `"best_first"` and
   `"depth_first"` use one rule throughout.
 - **Incumbents.** LP points whose integers are integral, and the LP point
   at every `heuristic_every`-th node, are rounded and checked against the
@@ -775,6 +778,7 @@ reports `bound_rigorous=False`.
 | `repair_max_epochs` | `20` | Epoch budget of the LP that repairs a rounded point's continuous variables (skipped for integers that already failed, or when propagation shows the fixed box infeasible). |
 | `jump_iterations` | `None` | Feasibility jump steps per start (`None`: `max(10000, 20·(n + m))`). |
 | `plunge_depth` | `8` | Steps a plunge follows a best-bound node's children (`0`: pure best-bound). |
+| `plunge_gap` | `0.25` | A plunge stops at a child whose bound is past this share of the way from the best open bound to the cutoff (`1.0`: the depth limit only; `result["plunges_stopped"]`). |
 | `device` | `"auto"` | `"auto"` runs MIPs with at most 10,000 nonzeros on the CPU (their node LPs are latency-bound on a GPU: flugpl takes 3s on the CPU, 18s on a GPU); `"cpu"`/`"gpu"`/`"tpu"` or a `jax.Device` pick one, `None` keeps JAX's default. |
 | `precision` | `"float64"` | `"float64"`, `"float32"` or `"float16"` for the whole search, node LPs included (`None` keeps the global profile). |
 | `node_precision` | `"float32"` | The node LPs' profile (serial, batched and strong branching's child LPs); the root LP, cut rounds and heuristic LPs stay at `precision`. Laptop GPUs run float64 at a small fraction of float32 speed (`None`: `precision`). |
@@ -805,6 +809,11 @@ reports `bound_rigorous=False`.
 | `flow_covers` | `True` | Flow cover cuts from rows with continuous variables, over their variable bounds (`y <= u·z`). |
 | `clique_cuts` | `True` | Clique cuts from a conflict graph on the binaries, built once from the rows over the root box (`jm.ConflictGraph`). |
 | `zero_half_cuts` | `True` | Zero-half ({0, ½}-Chvátal–Gomory) cuts from the rows and cuts with integer coefficients, found by elimination over GF(2) (`jm.zero_half_cuts`). |
+| `implied_bound_cuts` | `True` | Implied-bound cuts `x_j <= u0 + (u1 − u0)·z` (and the same for lower bounds) from what probing learnt about each binary `z` (`jm.ImpliedBounds`). |
+| `mip_start` | `None` | A starting point over the model's columns, tried before the root LP (`result["mip_start_accepted"]`). Continuous entries may be NaN: an LP with the integers fixed fills them in. With `presolve=True` it is checked against the original model and its value becomes the reduced search's cutoff; if nothing better turns up, it is returned. |
+| `branch_implied` | `False` | Let fractional implied integers (HiGHS's implicit integers, `MIP.implied`) be branched on, scored like the integers; nodes still close when the real integers are integral (`result["implied_branchings"]`). |
+| `objective_propagation` | `False` | Propagate the objective row `c·x <= cutoff` in the search (node boxes, children, strong branching's children), at the current cutoff (`jm.CutoffPropagator`); host propagation only. |
+| `one_opt` | `True` | 1-opt on every new incumbent (`jm.one_opt`): each integer moves in its improving direction as far as the rows allow (`result["one_opt_finds"]`). |
 | `simplex_cut_rounds` | `"auto"` | Run the root cut rounds in HiGHS's dual simplex, warm from the last basis, for exact bounds each round (`"auto"`: with Gomory cuts). |
 | `aggregate_integers` | `"auto"` | Aggregate rows through integer variables too, up to five rows, for MIR and cover cuts (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
 | `tree_cuts`, `tree_cut_every` | `False`, `10` | Global cover and MIR cuts added in the tree every this many nodes (branch and cut; serial search only). |

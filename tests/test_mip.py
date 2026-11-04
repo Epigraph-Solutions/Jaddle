@@ -649,6 +649,7 @@ def test_cuts_strengthen_the_root():
     )
     assert without["cuts"] == {
         "gomory": 0, "cover": 0, "mir": 0, "flowcover": 0, "clique": 0, "zerohalf": 0,
+        "impliedbound": 0,
     }
     assert without["root_bound_before_cuts"] is None
     # The cuts close part of the root gap and the tree is no larger.
@@ -1225,17 +1226,18 @@ def record_conflicts(monkeypatch):
     return rows
 
 
+@pytest.mark.parametrize("node_lp_solver", ["jaddle", "highs"])
 @pytest.mark.parametrize("make", [general_integer, generalised_assignment])
-def test_conflicts_are_valid(make, monkeypatch):
+def test_conflicts_are_valid(make, node_lp_solver, monkeypatch):
     mip = make()
     rows = record_conflicts(monkeypatch)
-    result = solve(mip, node_lp_solver="jaddle", conflicts=True)
+    result = solve(mip, node_lp_solver=node_lp_solver, conflicts=True)
     assert_solved(result, mip, reference(mip))
     for idx, coef, rhs, cutoff, _ in rows:
         bound = None if not np.isfinite(cutoff) else cutoff
         most = max_over_mip(mip, idx, coef, objective_at_most=bound)
         assert most <= rhs + 1e-6 * (1 + abs(rhs))
-    if make is general_integer:
+    if make is general_integer and node_lp_solver == "jaddle":
         assert rows and result["conflict_pruned"] > 0
 
 
@@ -1256,6 +1258,34 @@ def test_farkas_proof_excludes_an_infeasible_box(monkeypatch):
     assert len(search.conflicts) == 1
     assert search.conflicts.propagate(lower, upper)[2]
     assert not search.conflicts.propagate(mip.lower, mip.upper)[2]
+
+
+@pytest.mark.parametrize("make", [knapsack, general_integer])
+def test_highs_dual_ray_gives_a_farkas_proof(make, monkeypatch):
+    # An infeasible node LP solved by HiGHS leaves a Farkas proof from its
+    # dual ray, whatever HiGHS's sign convention.
+    mip = make()
+    search = search_for(mip, monkeypatch, conflicts=True, node_lp_solver="highs")
+    search.root_lower, search.root_upper = mip.lower.copy(), mip.upper.copy()
+    held = search.highs_node_lps()
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    if make is knapsack:  # the heaviest items at 1 until they overflow
+        w = np.asarray(mip.A.toarray()[0])
+        for j in np.argsort(-w):
+            lower[j] = 1.0
+            if w @ lower > mip.b[0]:
+                break
+    else:  # every variable at its upper bound breaks an equality row
+        lower = upper.copy()
+    result = held.solve(search.lp_lower(lower), search.lp_upper(upper))
+    assert result["infeasible"] and result["dual_ray"] is not None
+    search.learn_ray(result["dual_ray"], lower, upper)
+    assert search.conflicts.added["farkas"] == 1
+    assert search.conflicts.propagate(lower, upper)[2]
+    assert not search.conflicts.propagate(mip.lower, mip.upper)[2]
+    # A ray of the wrong length (other rows) is ignored.
+    search.learn_ray(np.ones(3), lower, upper)
+    assert search.conflicts.added["farkas"] == 1
 
 
 def test_nogood_is_minimal(monkeypatch):
@@ -4998,3 +5028,402 @@ def test_numba_jump_stops_when_asked():
         mip, np.zeros(mip.num_variables), improve=True, stop=stop
     )
     assert steps == 0
+
+
+# -- user starting solutions (mip_start) -------------------------------------
+
+
+def test_mip_start_is_the_first_incumbent():
+    mip = knapsack()
+    best = solve(mip)
+    result = solve(mip, mip_start=best["x"])
+    assert_solved(result, mip, reference(mip))
+    assert result["mip_start_accepted"] is True
+    assert result["history"][0]["source"] == "S"
+    assert solve(mip)["mip_start_accepted"] is None
+
+
+def test_infeasible_mip_start_is_ignored():
+    mip = knapsack()
+    result = solve(mip, mip_start=np.ones(mip.num_variables))  # over capacity
+    assert result["mip_start_accepted"] is False
+    assert_solved(result, mip, reference(mip))
+    assert all(entry["source"] != "S" for entry in result["history"])
+
+
+def test_mip_start_fills_in_continuous_variables():
+    mip = facility_location()
+    best = solve(mip)
+    start = np.where(mip.integrality, best["x"], np.nan)
+    result = solve(mip, mip_start=start, one_opt=False)
+    assert result["mip_start_accepted"] is True
+    assert result["history"][0]["source"] == "S"
+    assert result["history"][0]["objective"] == pytest.approx(best["objective"], rel=1e-6)
+    assert_solved(result, mip, reference(mip))
+
+
+@pytest.mark.parametrize("make", [knapsack, facility_location])
+def test_mip_start_with_presolve(make):
+    highs = reducible_highs(make())
+    original = jm.from_highs(highs)
+    ref = reference(original)
+    best = solve(reducible_highs(make()), presolve=True)
+    result = solve(reducible_highs(make()), presolve=True, mip_start=best["x"])
+    assert result["mip_start_accepted"] is True
+    assert result["postsolve_feasible"]
+    assert_solved(result, original, ref)
+    # Nothing beats an optimal start by more than the gap: it comes back.
+    np.testing.assert_allclose(result["x"], best["x"], atol=1e-6)
+    assert result["gap"] <= 1e-4 * (1 + 1e-9)
+
+
+def test_bad_mip_starts_raise():
+    mip = facility_location()
+    with pytest.raises(ValueError, match="entries"):
+        solve(mip, mip_start=np.zeros(3))
+    start = np.zeros(mip.num_variables)
+    start[0] = np.nan  # an integer
+    with pytest.raises(ValueError, match="NaN"):
+        solve(mip, mip_start=start)
+
+
+# -- implied-bound cuts --------------------------------------------------------
+
+
+def implied_bounds_of(mip):
+    probed = jm.probe(
+        mip.A, mip.row_lower, mip.row_upper, mip.integrality,
+        mip.lower.copy(), mip.upper.copy(), backend="numpy",
+    )
+    return jm.ImpliedBounds(probed.cache, probed.lower, probed.upper, mip.integrality), probed
+
+
+@pytest.mark.parametrize("seed", [None, 0, 1, 5, 7])
+def test_implied_bound_cuts_are_valid(seed):
+    mip = facility_location() if seed is None else random_binary_rows(seed)
+    implied, _ = implied_bounds_of(mip)
+    assert len(implied)
+    A = mip.A.toarray()
+    for k in range(len(implied)):
+        # The most any feasible point violates candidate k by: at most 0.
+        c = np.zeros(mip.num_variables)
+        c[implied.j[k]] -= implied.sense[k]
+        c[implied.z[k]] -= implied.coef_z[k]
+        worst = milp(
+            c,
+            constraints=LinearConstraint(A, mip.row_lower, mip.row_upper),
+            integrality=mip.integrality.astype(int),
+            bounds=Bounds(mip.lower, mip.upper),
+        )
+        assert worst.success
+        assert -worst.fun - implied.rhs[k] <= 1e-7 * (1 + abs(implied.rhs[k]))
+
+
+def test_implied_bound_cuts_link_flows_to_openings():
+    mip = facility_location()
+    implied, probed = implied_bounds_of(mip)
+    # Half-open facilities with full flows: each y_fk <= u·x_f is violated.
+    x = probed.upper.copy()
+    x[mip.integrality] = 0.5
+    x[~mip.integrality] = np.minimum(x[~mip.integrality], 3.0)
+    cuts = implied.cuts(x)
+    assert cuts
+    for family, idx, coef, rhs in cuts:
+        assert family == "impliedbound"
+        assert coef @ x[idx] > rhs
+        assert mip.integrality[idx[1]] and not mip.integrality[idx[0]]
+    result = solve(mip)
+    assert_solved(result, mip, reference(mip))
+    assert result["cuts"]["impliedbound"] > 0
+    assert solve(mip, implied_bound_cuts=False)["cuts"]["impliedbound"] == 0
+
+
+# -- 1-opt ---------------------------------------------------------------------
+
+
+def test_one_opt_improves_within_the_rows():
+    mip = knapsack()
+    x = np.zeros(mip.num_variables)
+    better = jm.one_opt(mip, x)
+    assert better is not None
+    assert mip.is_feasible(better)
+    assert mip.c @ better < mip.c @ x
+    # At its result no single variable can move further.
+    assert jm.one_opt(mip, better) is None
+
+
+def test_one_opt_leaves_equality_rows_alone():
+    # min −x0 − x1 with x0 + x1 = 1 (equality) and x2 free to improve.
+    lp = jl.LP(
+        c=np.array([-1.0, -1.0, -1.0]),
+        A_eq=sp.csc_matrix([[1.0, 1.0, 0.0]]),
+        b_eq=np.array([1.0]),
+        A_ineq=sp.csc_matrix([[0.0, 0.0, 1.0]]),
+        b_ineq=np.array([3.0]),
+        lower_bounds=np.zeros(3),
+        upper_bounds=np.full(3, 5.0),
+    )
+    mip = jm.MIP(lp, np.ones(3, bool))
+    better = jm.one_opt(mip, np.array([1.0, 0.0, 0.0]))
+    np.testing.assert_array_equal(better, [1.0, 0.0, 3.0])
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_one_opt_points_stay_feasible(seed):
+    mip = general_integer(seed)
+    found = solve(mip, one_opt=False, max_nodes=1)
+    if found["x"] is None:
+        pytest.skip("no point to start from")
+    better = jm.one_opt(mip, found["x"])
+    if better is not None:
+        assert mip.is_feasible(better)
+        assert mip.c @ better < mip.c @ found["x"]
+
+
+# -- objective propagation -------------------------------------------------------
+
+
+def test_cutoff_propagator_follows_the_cutoff():
+    # min −x0 − x1 − x2 over x in {0..5}^3 with x0 + x1 + x2 <= 10.
+    A = sp.csr_matrix([[1.0, 1.0, 1.0]])
+    c = -np.ones(3)
+    cutoff = [np.inf]
+    prop = jm.CutoffPropagator(
+        A, np.array([-np.inf]), np.array([10.0]), c, np.ones(3, bool), lambda: cutoff[0]
+    )
+    lower, upper = np.zeros(3), np.full(3, 5.0)
+    lo, up, infeasible = prop(lower, upper)
+    assert not infeasible and np.array_equal(lo, lower)
+    # Better than −13 needs Σx >= 13, over the row's 10: no room.
+    cutoff[0] = -13.0
+    assert prop(lower, upper)[2]
+    # Better than −9 (Σx >= 9) with x1, x2 <= 3 forces x0 >= 3.
+    cutoff[0] = -9.0
+    lo, up, infeasible = prop(lower, np.array([5.0, 3.0, 3.0]))
+    assert not infeasible and lo[0] == 3.0
+    # The plain rows alone do not.
+    plain = jm.BoundPropagator(A, np.array([-np.inf]), np.array([10.0]), np.ones(3, bool))
+    assert plain(lower, np.array([5.0, 3.0, 3.0]))[0][0] == 0.0
+
+
+@pytest.mark.parametrize("make", [knapsack, facility_location, general_integer])
+def test_objective_propagation_keeps_the_optimum(make):
+    mip = make()
+    result = solve(mip, objective_propagation=True)
+    assert_solved(result, mip, reference(mip))
+
+
+def test_objective_propagation_with_the_cut_pool():
+    mip = facility_location()
+    result = solve(mip, objective_propagation=True, cut_pool_propagation=True)
+    assert_solved(result, mip, reference(mip))
+
+
+# -- gap-aware plunging ------------------------------------------------------------
+
+
+def test_plunge_gap_stops_plunges_and_keeps_the_optimum():
+    mip = generalised_assignment(1)
+    ref = reference(mip)
+    # Without cuts the tree is deep enough for plunges (~100 nodes).
+    deep = dict(plunge_depth=1000, cuts=False)
+    stopped = solve(mip, plunge_gap=0.0, **deep)
+    assert_solved(stopped, mip, ref)
+    assert stopped["plunges_stopped"] > 0
+    free = solve(mip, plunge_gap=1.0, **deep)
+    assert_solved(free, mip, ref)
+    assert free["plunges_stopped"] == 0
+
+
+def test_plunge_reaches_measures_from_the_best_open_bound():
+    node = lambda bound: jm._Node(bound, 1, None, None, None)  # noqa: E731
+    # The method on a stand-in search: best open bound 0, cutoff 10.
+    search = types.SimpleNamespace(
+        plunge_gap=0.25, cutoff=lambda: 10.0, open=[((0.0,), 0, node(0.0))]
+    )
+    reaches = lambda child, bound: jm._BranchAndBound.plunge_reaches(  # noqa: E731
+        search, node(child), bound
+    )
+    assert reaches(2.4, bound=5.0)
+    assert not reaches(2.6, bound=5.0)
+    # Measured from the node being split when it is the best: −10 + 0.25·20.
+    assert reaches(-5.1, bound=-10.0) and not reaches(-4.9, bound=-10.0)
+    # No incumbent (an infinite cutoff): no limit.
+    search.cutoff = lambda: np.inf
+    assert reaches(1e9, bound=5.0)
+    search.cutoff, search.plunge_gap = (lambda: 10.0), 1.0
+    assert reaches(9.9, bound=5.0)
+
+
+def test_rejects_bad_plunge_gap():
+    with pytest.raises(ValueError, match="plunge_gap"):
+        solve(knapsack(), plunge_gap=1.5)
+
+
+@pytest.mark.parametrize(
+    "make", [generalised_assignment, facility_location, lambda: fixed_charge(0)[0]]
+)
+def test_restarts_with_objective_propagation_keep_the_optimum(make, monkeypatch):
+    # After a restart the root box holds only solutions better than the
+    # incumbent; when the objective row shows it empty, the incumbent is
+    # optimal (it was reported "infeasible").
+    force_restarts(monkeypatch)
+    mip = make()
+    result = solve(mip, restarts=2, cuts=False, objective_propagation=True)
+    assert_solved(result, mip, reference(mip))
+
+
+# -- branching on implied integers (branch_implied) ---------------------------------
+
+
+def penalty_cycle(k=7):
+    """An odd cycle of binaries y (neighbours not both 1) with a penalty
+    p_i in [0, 1] costing 1,000 when y_i is 0 (y_i + p_i >= 1), and y
+    costing 1. Every choice of y has its best p integral, so the p are
+    implied integers that carry the objective, as on ns1830653; the LP
+    puts y = p = 1/2 everywhere. The p come first, so most-fractional
+    branching takes one on the tie."""
+    n = 2 * k
+    A = np.zeros((2 * k, n))
+    for i in range(k):
+        A[i, [k + i, k + (i + 1) % k]] = 1.0  # y_i + y_{i+1} <= 1
+        A[k + i, [i, k + i]] = -1.0  # −p_i − y_i <= −1
+    lp = jl.LP(
+        c=np.concatenate([np.full(k, 1000.0), np.ones(k)]),
+        A_eq=sp.csc_matrix((0, n)), b_eq=np.zeros(0),
+        A_ineq=sp.csc_matrix(A), b_ineq=np.concatenate([np.ones(k), -np.ones(k)]),
+        lower_bounds=np.zeros(n), upper_bounds=np.ones(n),
+    )
+    ints = np.arange(n) >= k
+    return jm.MIP(lp, ints, implied=~ints)
+
+
+# A tree to branch in: no root heuristics or root sweep to close it first.
+TREE = dict(no_heuristics(), root_strong_candidates=0)
+
+
+@pytest.mark.parametrize("node_lp_solver", ["highs", "jaddle"])
+def test_branch_implied_branches_on_them_and_keeps_the_optimum(node_lp_solver, monkeypatch):
+    # Branch on an implied integer whenever one is a candidate (the LP's
+    # values tie at 1/2 up to rounding), to check the children, their LP
+    # bounds and the closing of nodes end to end.
+    real = jm._BranchAndBound.choose_variable
+
+    def choose_variable(self, x, fractional):
+        implied = fractional & self.mip.implied
+        return real(self, x, implied if implied.any() else fractional)
+
+    monkeypatch.setattr(jm._BranchAndBound, "choose_variable", choose_variable)
+    mip = penalty_cycle()
+    ref = reference(mip)
+    assert ref == pytest.approx(4 * 1000 + 3)  # (k + 1) / 2 penalties, (k − 1) / 2 ones
+    settings = dict(TREE, branching="most_fractional", node_lp_solver=node_lp_solver)
+    plain = solve(mip, **settings)
+    assert_solved(plain, mip, ref)
+    assert plain["implied_branchings"] == 0
+    implied = solve(mip, branch_implied=True, **settings)
+    assert_solved(implied, mip, ref)
+    assert implied["implied_branchings"] > 0
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {},
+        {"branching": "pseudocost"},
+        {"strong_backend": "numpy"},
+        {"node_lp_solver": "jaddle", "strong_backend": "jax", "branching": "reliability"},
+    ],
+)
+def test_branch_implied_candidates_reach_every_branching_rule(settings, monkeypatch):
+    seen = []
+    real = jm._BranchAndBound.choose_branch
+
+    def choose_branch(self, node, x, fractional, *args, **kwargs):
+        seen.append(bool((fractional & self.mip.implied).any()))
+        return real(self, node, x, fractional, *args, **kwargs)
+
+    monkeypatch.setattr(jm._BranchAndBound, "choose_branch", choose_branch)
+    mip = penalty_cycle()
+    result = solve(mip, branch_implied=True, **TREE, **settings)
+    assert_solved(result, mip, reference(mip))
+    assert any(seen)
+
+
+def test_lp_bounds_take_branched_implied_bounds_rounded_outward():
+    is_int = np.array([True, False, False])
+    search = types.SimpleNamespace(
+        is_int=is_int,
+        mip=types.SimpleNamespace(lower=np.zeros(3), upper=np.full(3, 5.0)),
+        branch_implied_cols=np.array([1]),  # column 2 is plain continuous
+    )
+    lower, upper = np.array([1.0, 2.3, 0.7]), np.array([4.0, 2.9999999, 4.2])
+    lo = jm._BranchAndBound.lp_lower(search, lower)
+    up = jm._BranchAndBound.lp_upper(search, upper)
+    np.testing.assert_array_equal(lo, [1.0, 2.0, 0.0])
+    np.testing.assert_array_equal(up, [4.0, 3.0, 5.0])
+    search.branch_implied_cols = None
+    np.testing.assert_array_equal(jm._BranchAndBound.lp_lower(search, lower), [1.0, 0.0, 0.0])
+
+
+# -- numba bound propagation ----------------------------------------------------------
+
+
+@pytest.mark.skipif(jm._numba_propagate() is None, reason="needs numba")
+@pytest.mark.parametrize(
+    "make",
+    [knapsack, general_integer, facility_location, generalised_assignment,
+     lambda: random_binary_rows(4), lambda: penalty_cycle(9)],
+)
+def test_numba_propagation_matches_numpy_bit_for_bit(make):
+    mip = make()
+    rng = np.random.default_rng(0)
+    args = (mip.A, mip.row_lower, mip.row_upper, mip.integrality)
+    fast = jm.BoundPropagator(*args, backend="numba")
+    slow = jm.BoundPropagator(*args, backend="numpy")
+    outcomes = set()
+    for trial in range(200):
+        lower, upper = mip.lower.copy(), mip.upper.copy()
+        # Fix or narrow a random share of the variables.
+        for j in np.flatnonzero(rng.random(mip.num_variables) < rng.uniform(0, 0.5)):
+            lo = lower[j] if np.isfinite(lower[j]) else -5.0
+            up = upper[j] if np.isfinite(upper[j]) else lo + 10.0
+            v = rng.uniform(lo, up)
+            if mip.integrality[j]:
+                v = np.round(v)
+            if rng.random() < 0.5:
+                lower[j] = upper[j] = v
+            elif rng.random() < 0.5:
+                lower[j] = v
+            else:
+                upper[j] = v
+        passes = int(rng.integers(1, 21))
+        a = fast(lower, upper, max_passes=passes)
+        b = slow(lower, upper, max_passes=passes)
+        assert a[2] == b[2]
+        np.testing.assert_array_equal(a[0], b[0])
+        np.testing.assert_array_equal(a[1], b[1])
+        outcomes.add(a[2])
+    assert outcomes == {True, False}  # both kinds of box were tried
+
+
+@pytest.mark.skipif(jm._numba_propagate() is None, reason="needs numba")
+def test_cutoff_propagator_uses_the_numba_kernel_with_the_cutoff():
+    mip = knapsack()
+    cutoff = [np.inf]
+    args = (mip.A, mip.row_lower, mip.row_upper, mip.c, mip.integrality, lambda: cutoff[0])
+    fast = jm.CutoffPropagator(*args, backend="numba")
+    slow = jm.CutoffPropagator(*args, backend="numpy")
+    for value in (np.inf, -60.0, -100.0, -1e9):
+        cutoff[0] = value
+        a, b = fast(mip.lower, mip.upper), slow(mip.lower, mip.upper)
+        assert a[2] == b[2]
+        np.testing.assert_array_equal(a[0], b[0])
+        np.testing.assert_array_equal(a[1], b[1])
+    assert a[2]  # no point is that good
+
+
+def test_propagation_backend_is_checked():
+    mip = knapsack()
+    with pytest.raises(ValueError, match="backend"):
+        jm.BoundPropagator(mip.A, mip.row_lower, mip.row_upper, mip.integrality, backend="gpu")

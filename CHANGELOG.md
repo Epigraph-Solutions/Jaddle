@@ -4,6 +4,73 @@
 
 ### Added
 
+- Bound propagation compiled with numba (`jaddle._propagate_numba`, with
+  the `fast` extra). `jm.BoundPropagator` (and `jm.CutoffPropagator`) uses
+  it when numba is installed (`backend="auto"`; `"numpy"` keeps the numpy
+  passes). It follows the numpy version's rules step for step and sums
+  each row in the same order, so the bounds match bit for bit. That is
+  checked on 1,200 random boxes across six test models. On ns1830653 a
+  call takes 0.11 ms against 0.82 ms. In the tree phase
+  (benchmark settings, 150 s) propagation fell from about 20 s to 4 s and
+  the node rate rose from 16.7 to 22.6 nodes/s. HiGHS's node and
+  strong-branching LPs are now about 86% of the tree's time.
+- Farkas proofs from HiGHS node LPs. With `node_lp_solver="highs"`, a
+  node LP, strong-branching child or cutoff-probing child that HiGHS
+  proves infeasible now leaves a Farkas proof from HiGHS's dual ray in the
+  conflict pool (`_BranchAndBound.learn_ray`), as PDHG's infeasible node
+  LPs already did. Before, those nodes closed and taught nothing. The
+  multipliers are clipped to valid signs and the ray's sign that excludes
+  the box is kept, so HiGHS's sign convention does not matter. On
+  ns1830653 (120 s) the pool learned 38 Farkas proofs instead of none, and
+  10 nodes closed on them before their LP. HiGHS's own search there ends
+  with about 10,000 conflicts.
+- A user starting solution for `jm.solve` (`mip_start`): one entry per
+  column of the model (NaN allowed for continuous ones, which the repair
+  LP fills in). It is tried before the root LP, so its value prunes and
+  drives reduced-cost fixing from the start; `result["mip_start_accepted"]`
+  reports whether it was feasible, and its `history` entry has source
+  `"S"`. With `presolve=True`, where HiGHS cannot map a point into the
+  reduced MIP, the start is completed in the original model, and the
+  reduced search looks only for points better by more than the gap
+  tolerances; the start comes back when none turns up.
+- Implied-bound cuts (`jm.solve(implied_bound_cuts=True)`, the default;
+  `jm.ImpliedBounds`). When probing a binary `z` shows `x_j <= u0` at
+  `z = 0` and `x_j <= u1` at `z = 1`, the cut `x_j <= u0 + (u1 − u0)·z`
+  holds for every feasible point (likewise for lower bounds). On facility
+  location they give the `y_fk <= u·x_f` links the capacity rows state
+  only in aggregate. New result key: `cuts["impliedbound"]`.
+- Branching on implied integers in `jm.solve` (`branch_implied`, off by
+  default until compared on large MIPs). Fractional implied integers join
+  the branching candidates and are scored like integers (pseudocosts,
+  strong branching, `branching_impact`). They stay out of the integrality
+  test, so a node whose real integers are integral still closes on its
+  repaired point; this keeps what loading them as continuous gained.
+  Their branched bounds go into node LPs rounded outward to whole numbers.
+  On ns1830653 the 134 implied columns cost 1,000 each. Branching on the
+  binaries alone left the bound at the root's 12,622 for 450 nodes, and
+  root strong branching's 64 child LPs gained nothing. Before they loaded
+  as continuous, plunges that branched on them raised the bound by 500 to
+  1,000 a step. New result: `implied_branchings`.
+- Gap-aware plunging in `jm.solve` (`plunge_gap=0.25`, as SCIP's
+  `maxplungequot`). A plunge stops at a child whose bound is more than
+  `plunge_gap` of the way from the best open bound to the cutoff, and the
+  next LP goes to the best open node. Until now only `plunge_depth`
+  ended a plunge, so with deep plunges (`plunge_depth=1000` in the
+  ns1830653 benchmark) most LPs went to nodes above the global bound.
+  `1.0` restores the old behaviour. New result: `plunges_stopped`.
+- Objective propagation in the search (`jm.solve(objective_propagation=True)`,
+  off by default until compared on large MIPs; `jm.CutoffPropagator`).
+  The search's bound propagation (node boxes before their LPs, children
+  after branching, strong branching's children, the root box at a
+  restart) also runs the row `c·x <= cutoff`, at the current cutoff, read
+  at every call. Until now only the heuristics propagated it. Boxes with
+  no room left below the cutoff close before their LP. Host propagation
+  only: batched device children and device strong branching skip it.
+- 1-opt on every new incumbent (`jm.solve(one_opt=True)`, the default;
+  `jm.one_opt`): each integer with a nonzero cost moves in its improving
+  direction as far as its bounds and the rows' slack allow, largest gains
+  first, with the continuous variables fixed. Points it improves have
+  source `"1"`; `result["one_opt_finds"]` counts them.
 - Cut separation counts implied integers as integers
   (`jm.solve(implied_integer_cuts=True)`, the default), as HiGHS's cuts
   do. This covers the Gomory, cover, c-MIR, flow cover, clique (the
