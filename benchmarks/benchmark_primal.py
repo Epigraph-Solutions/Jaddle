@@ -112,7 +112,6 @@ def run_instance(name, path, optimum, args):
             cuts=False,
             rens_seconds=0.0,
             rins_seconds=0.0,
-            highs_incumbent_seconds=0.0,
             precision=args.precision,
             device=None if args.device == "default" else args.device,
             verbose=args.verbose,

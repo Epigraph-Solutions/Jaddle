@@ -1,5 +1,6 @@
 """Tests for the LP solver, jaddle.jaddle_linear."""
 
+import copy
 import threading
 
 import jax
@@ -1689,3 +1690,146 @@ def test_make_solver_bound_target_off_by_default():
     )
     assert int(plain.stop_code) == int(stopping.stop_code) == 1
     assert abs(int(plain.epochs) - int(stopping.epochs)) <= 1
+
+
+# %% solve_many: a batch of LPs that differ in their bounds
+def _boxes(lp, size, seed=0):
+    """``size`` boxes inside ``lp``'s: random upper bounds cut down."""
+    rng = np.random.default_rng(seed)
+    lower = np.tile(np.asarray(lp.lower_bounds, np.float64), (size, 1))
+    upper = np.tile(np.asarray(lp.upper_bounds, np.float64), (size, 1))
+    for i in range(size):
+        cols = rng.choice(lower.shape[1], 4, replace=False)
+        upper[i, cols] = np.minimum(upper[i, cols], 0.5)
+    return lower, upper
+
+
+def test_solve_many_matches_separate_solves():
+    lp = jl.to_jaddle_sparse(random_lp(seed=3))
+    lower, upper = _boxes(lp, 5)
+    tol = dict(
+        primal_feasibility_tolerance=1e-7,
+        dual_feasibility_tolerance=1e-7,
+        dual_gap_tolerance=1e-7,
+    )
+    out = jl.solve_many(lp, lower, upper, **tol)
+    assert out["solution"].primal.shape == lower.shape
+    for i in range(lower.shape[0]):
+        member = lp.with_values(
+            lp.values()._replace(
+                lower_bounds=jnp.asarray(lower[i], lp.c.dtype),
+                upper_bounds=jnp.asarray(upper[i], lp.c.dtype),
+            )
+        )
+        alone = jl.solve(member, **tol)
+        assert bool(out["converged"][i]) == alone["converged"]
+        assert int(out["epochs"][i]) == alone["epochs"]
+        np.testing.assert_allclose(
+            np.asarray(lp.c) @ np.asarray(out["solution"].primal[i]),
+            np.asarray(lp.c) @ np.asarray(alone["solution"].primal),
+            rtol=1e-6,
+            atol=1e-8,
+        )
+
+
+def test_solve_many_warm_starts_and_epoch_budget():
+    lp = jl.to_jaddle_sparse(random_lp(seed=4))
+    lower, upper = _boxes(lp, 3, seed=1)
+    cold = jl.solve_many(lp, lower, upper, max_epochs=2)
+    assert np.all(np.asarray(cold["epochs"]) <= 2)
+    assert np.all(np.asarray(cold["stop_code"])[~np.asarray(cold["converged"])] == 0)
+    done = jl.solve_many(lp, lower, upper)
+    assert np.all(np.asarray(done["converged"]))
+    # From the converged points every member is done at once.
+    warm = jl.solve_many(lp, lower, upper, initial_solutions=done["solution"])
+    assert np.all(np.asarray(warm["converged"]))
+    assert np.all(np.asarray(warm["epochs"]) <= np.asarray(done["epochs"]))
+
+
+def test_solve_many_scales_an_lp_once(monkeypatch):
+    lp = jl.to_jaddle_sparse(random_lp(seed=6))
+    lower, upper = _boxes(lp, 3, seed=3)
+    calls = []
+    scale_problem = jl.scale_problem
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return scale_problem(*args, **kwargs)
+
+    monkeypatch.setattr(jl, "scale_problem", spy)
+    first = jl.solve_many(lp, lower, upper)
+    again = jl.solve_many(lp, lower, upper)
+    assert len(calls) == 1  # the same LP: its scaling is kept
+    np.testing.assert_array_equal(
+        np.asarray(first["solution"].primal), np.asarray(again["solution"].primal)
+    )
+    # Another LP object, or other scaling settings, is scaled anew.
+    jl.solve_many(copy.copy(lp), lower, upper)
+    assert len(calls) == 2
+    jl.solve_many(lp, lower, upper, ruiz_iterations=3)
+    assert len(calls) == 3
+
+
+def test_solve_many_starts_from_given_step_sizes():
+    lp = jl.to_jaddle_sparse(random_lp(seed=7))
+    lower, upper = _boxes(lp, 2, seed=4)
+    cold = jl.solve_many(lp, lower, upper, max_epochs=3)
+    k, eta = tuple(cold["opt_state"])[:2]
+    assert np.shape(k) == (2,) and np.shape(eta) == (2,)
+    # Each member starts from its own step sizes (one per member).
+    warm = jl.solve_many(
+        lp,
+        lower,
+        upper,
+        initial_solutions=cold["solution"],
+        initial_opt_states=(k, eta),
+        max_epochs=3,
+    )
+    assert np.all(np.isfinite(np.asarray(tuple(warm["opt_state"])[0])))
+    assert np.all(np.asarray(warm["epochs"]) <= 3)
+
+
+def test_solve_many_bound_target_stops_members():
+    lp = jl.to_jaddle_sparse(random_lp(seed=5))
+    lower, upper = _boxes(lp, 3, seed=2)
+    upper = np.minimum(upper, 10.0)  # finite boxes: finite Lagrangian bounds
+    out = jl.solve_many(lp, lower, upper, bound_target=-1e30)
+    # Any finite Lagrangian bound passes a target that low: members stop on it.
+    assert np.all(np.asarray(out["stop_code"]) == 4)
+    assert not np.any(np.asarray(out["converged"]))
+
+
+def test_solve_many_reuses_its_compile_across_sparsity_patterns(monkeypatch):
+    # Rows with other columns but the same shapes (rows, nonzeros) go in as
+    # data: no new trace, unlike make_solver, which compiles the pattern in.
+    traces = []
+    real = jl._SolvePrograms._device
+
+    def counted(self, problem):
+        traces.append(1)
+        return real(self, problem)
+
+    monkeypatch.setattr(jl._SolvePrograms, "_device", counted)
+    rng = np.random.default_rng(0)
+    n, m = 12, 6
+    lower, upper = np.zeros((2, n)), np.ones((2, n))
+    for k in range(3):
+        A = np.zeros((m, n))
+        for row in range(m):
+            A[row, rng.choice(n, 3, replace=False)] = rng.uniform(0.5, 1.5, 3)
+        lp = jl.to_jaddle_sparse(
+            jl.LP(
+                c=-np.ones(n),
+                A_eq=sp.csc_matrix((0, n)),
+                b_eq=np.zeros(0),
+                A_ineq=sp.csc_matrix(A),
+                b_ineq=np.full(m, 2.0),
+                lower_bounds=np.zeros(n),
+                upper_bounds=np.ones(n),
+            )
+        )
+        before = len(traces)
+        out = jl.solve_many(lp, lower, upper)
+        assert np.all(np.asarray(out["converged"]))
+        if k:
+            assert len(traces) == before  # compiled once, for the first

@@ -46,7 +46,7 @@ import scipy.sparse as sp
 from jaddle import highs_helpers as hh
 from jaddle import jaddle_linear as jl
 from jaddle import jaddle_optimisers as jo
-from jaddle.jaddle_basic_types import LP, JaddleLP, SaddleState, _wide
+from jaddle.jaddle_basic_types import LP, JaddleLP, _wide
 
 # Slack when rounding bounds of integer variables, so 2.9999999 becomes 3.
 _ROUND_SLACK = 1e-6
@@ -971,6 +971,18 @@ def _probe_chunk_jax(data, lower, upper, cols, split, valid, m, k):
     }
 
 
+def _same_shapes(a, b):
+    """Whether two pytrees of arrays have the same structure, shapes and
+    dtypes (so a jitted function of one takes the other without a new
+    compile)."""
+    if jax.tree.structure(a) != jax.tree.structure(b):
+        return False
+    return all(
+        np.shape(x) == np.shape(y) and jnp.result_type(x) == jnp.result_type(y)
+        for x, y in zip(jax.tree.leaves(a), jax.tree.leaves(b))
+    )
+
+
 class _ChildKernels:
     """
     The children of a whole batch of nodes on the device, for batched tree
@@ -983,15 +995,30 @@ class _ChildKernels:
     """
 
     def __init__(self, mip, propagate, reduced_cost_tolerance, size):
-        with jax.enable_x64(True):
-            self.data = _propagation_data(
-                mip.A, mip.row_lower, mip.row_upper, mip.integrality
-            )
+        self.data = self.data_for(mip)
         self.m, self.n = mip.A.shape
         self.propagate = bool(propagate)
         self.rc_tol = float(reduced_cost_tolerance)
         self.size = int(size)
         self._children = jax.jit(self._children_impl)
+
+    @staticmethod
+    def data_for(mip):
+        """The device data of ``mip``'s rows (``_propagation_data``)."""
+        with jax.enable_x64(True):
+            return _propagation_data(
+                mip.A, mip.row_lower, mip.row_upper, mip.integrality
+            )
+
+    def set_mip(self, mip):
+        """Point the kernels at ``mip``'s rows, when its data has the shapes
+        they were compiled for (a cut block of the same capacity): the
+        compiled kernels are kept. Returns whether it did."""
+        data = self.data_for(mip)
+        if mip.A.shape != (self.m, self.n) or not _same_shapes(data, self.data):
+            return False
+        self.data = data
+        return True
 
     def __call__(self, lower, upper, var, xv, r, constant):
         """Host arrays in (``size`` rows each), host arrays out: ``lower``,
@@ -1074,17 +1101,8 @@ class _StrongKernels:
         branch_implied=False,
     ):
         self.lp_dtype = lp_dtype
-        with jax.enable_x64(True):
-            self.data = _propagation_data(
-                mip.A, mip.row_lower, mip.row_upper, mip.integrality
-            )
-            self.data["c"] = jnp.asarray(mip.c, jnp.float64)
-            self.data["b"] = jnp.asarray(mip.b, jnp.float64)
-            self.data["lower"] = jnp.asarray(mip.lower, jnp.float64)
-            self.data["upper"] = jnp.asarray(mip.upper, jnp.float64)
-            # Implied integers whose box bounds go into the child LPs,
-            # rounded outward (``branch_implied``, ``_BranchAndBound.lp_lower``).
-            self.data["implied_box"] = jnp.asarray(mip.implied & bool(branch_implied))
+        self.branch_implied = bool(branch_implied)
+        self.data = self.data_for(mip)
         self.m, self.n = mip.A.shape
         self.n_eq = mip.n_eq
         self.propagate = bool(propagate)
@@ -1092,6 +1110,36 @@ class _StrongKernels:
         self.screen_size, self.k = int(screen_size), int(k)
         self._screen = jax.jit(self._screen_impl)
         self._child_bounds = jax.jit(self._child_bounds_impl)
+
+    def data_for(self, mip):
+        """The device data of ``mip``: its rows (``_propagation_data``),
+        costs, right-hand sides and bounds."""
+        with jax.enable_x64(True):
+            data = _propagation_data(
+                mip.A, mip.row_lower, mip.row_upper, mip.integrality
+            )
+            data["c"] = jnp.asarray(mip.c, jnp.float64)
+            data["b"] = jnp.asarray(mip.b, jnp.float64)
+            data["lower"] = jnp.asarray(mip.lower, jnp.float64)
+            data["upper"] = jnp.asarray(mip.upper, jnp.float64)
+            # Implied integers whose box bounds go into the child LPs,
+            # rounded outward (``branch_implied``, ``_BranchAndBound.lp_lower``).
+            data["implied_box"] = jnp.asarray(mip.implied & self.branch_implied)
+        return data
+
+    def set_mip(self, mip):
+        """Point the kernels at ``mip``, when its data has the shapes they
+        were compiled for (a cut block of the same capacity). Returns
+        whether it did."""
+        data = self.data_for(mip)
+        if (
+            mip.A.shape != (self.m, self.n)
+            or mip.n_eq != self.n_eq
+            or not _same_shapes(data, self.data)
+        ):
+            return False
+        self.data = data
+        return True
 
     def screen(self, *args):
         with jax.enable_x64(True):
@@ -2930,7 +2978,6 @@ def gomory_cuts(
     max_cuts=200,
     tableau_mir=False,
     max_nnz="auto",
-    highs=None,
 ):
     """
     Gomory mixed-integer (GMI) cuts from an optimal basis of the LP
@@ -2965,12 +3012,6 @@ def gomory_cuts(
     mapped back through their rows make GMI cuts dense, so the cap can
     reject nearly all of them (197 of 198 at the root of ns1830653). The
     root cut loop lifts it and keeps only the cuts that end up binding.
-
-    ``highs``: a ``highspy.Highs`` holding this LP, its rows in this order,
-    factored at ``basis`` (the simplex cut rounds' instance). The tableau
-    rows' basis-inverse rows then come from its factors
-    (``getBasisInverseRow``) instead of a new sparse LU and its dense
-    solves. Rows are checked as above, against ``A``.
     """
     import highspy
     from scipy.sparse.linalg import splu
@@ -3007,25 +3048,23 @@ def gomory_cuts(
 
     basic_cols = np.flatnonzero(col_basic)
     basic_rows = np.flatnonzero(row_basic)
-    inverse_rows = None if highs is None else _highs_inverse_rows(highs, n, m)
-    if inverse_rows is None:
-        B = sp.hstack(
-            [
-                A.tocsc()[:, basic_cols],
-                sp.csc_matrix(
-                    (
-                        np.ones(basic_rows.size),
-                        (basic_rows, np.arange(basic_rows.size)),
-                    ),
-                    shape=(m, basic_rows.size),
+    B = sp.hstack(
+        [
+            A.tocsc()[:, basic_cols],
+            sp.csc_matrix(
+                (
+                    np.ones(basic_rows.size),
+                    (basic_rows, np.arange(basic_rows.size)),
                 ),
-            ],
-            format="csc",
-        )
-        try:
-            lu = splu(B)
-        except RuntimeError:  # singular
-            return []
+                shape=(m, basic_rows.size),
+            ),
+        ],
+        format="csc",
+    )
+    try:
+        lu = splu(B)
+    except RuntimeError:  # singular
+        return []
 
     frac = x - np.floor(x)
     candidates = [
@@ -3065,12 +3104,9 @@ def gomory_cuts(
         q = len(block)
         P = np.array([p for _, p, _ in block])
         K = np.array([k for _, _, k in block])
-        if inverse_rows is not None:
-            U = inverse_rows(K)
-        else:
-            E = np.zeros((m, q))
-            E[P, np.arange(q)] = 1.0
-            U = lu.solve(E, trans="T").reshape(m, q)
+        E = np.zeros((m, q))
+        E[P, np.arange(q)] = 1.0
+        U = lu.solve(E, trans="T").reshape(m, q)
         ABAR = AT @ U  # tableau entries of the columns, one column a row
         expected = np.zeros((basic_cols.size, q))
         expected[P, np.arange(q)] = 1.0
@@ -3144,41 +3180,6 @@ def gomory_cuts(
             if best is not None:
                 cuts.append(best)
     return cuts
-
-
-def _highs_inverse_rows(highs, n, m):
-    """For ``gomory_cuts(highs=...)``: a function from basic columns ``K``
-    to the matrix whose column ``j`` is ``uⱼ`` with ``uⱼᵀB = e`` at
-    ``K[j]``'s basis position, read from HiGHS's factors; ``None`` when
-    HiGHS has no factored basis of this shape. The basis matrix's logical
-    columns may differ in sign from ``gomory_cuts``'s slacks, which leaves
-    the rows of structural basic columns unchanged."""
-    import highspy
-
-    if highs.getLp().num_row_ != m or highs.getLp().num_col_ != n:
-        return None
-    try:
-        status, basic = highs.getBasicVariables()
-    except Exception:  # no factored basis
-        return None
-    if status == highspy.HighsStatus.kError:
-        return None
-    position = {int(v): p for p, v in enumerate(np.asarray(basic)) if v >= 0}
-
-    def rows(K):
-        U = np.empty((m, len(K)))
-        for j, k in enumerate(K):
-            p = position.get(int(k))
-            status, row = (
-                (highspy.HighsStatus.kError, None)
-                if p is None
-                else (highs.getBasisInverseRow(p))
-            )
-            # A row HiGHS cannot give fails ``gomory_cuts``'s check.
-            U[:, j] = np.asarray(row) if status != highspy.HighsStatus.kError else 0.0
-        return U
-
-    return rows
 
 
 # Clique cuts (``ConflictGraph``): conflicts a row may add beyond the clique
@@ -3902,6 +3903,25 @@ class CutSeparator:
             if idx.size == 0:
                 break
         return path
+
+
+def violated_cuts(cuts, x, min_efficacy=1e-4):
+    """The ``cuts`` (``(family, idx, coef, rhs)``) that ``x`` violates by an
+    efficacy (distance) of at least ``min_efficacy``, in the order given:
+    ``select_cuts``'s candidates before its limit and parallelism test."""
+    if not cuts:
+        return []
+    x = np.asarray(x, np.float64)
+    lengths = np.array([cut[1].size for cut in cuts])
+    k = len(cuts)
+    rows = np.repeat(np.arange(k), lengths)
+    cols = np.concatenate([np.asarray(cut[1], np.int64) for cut in cuts])
+    vals = np.concatenate([np.asarray(cut[2], np.float64) for cut in cuts])
+    rhs = np.array([cut[3] for cut in cuts], np.float64)
+    norm = np.sqrt(np.bincount(rows, vals * vals, minlength=k))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        efficacy = (np.bincount(rows, vals * x[cols], minlength=k) - rhs) / norm
+    return [cuts[i] for i in np.flatnonzero(efficacy >= min_efficacy)]
 
 
 def select_cuts(cuts, x, n, min_efficacy=1e-4, max_cuts=100):
@@ -5092,135 +5112,10 @@ def feasibility_jump(
     return best, False, steps
 
 
-def _interrupt_on(highs, stop):
-    """Make the ``highspy.Highs`` ``highs`` stop at its next interrupt check
-    once ``stop`` (a ``threading.Event``, or ``None``) is set. The checks
-    are callbacks into Python, made about as often as HiGHS checks its time
-    limit; HiGHS stops within about a second of ``stop``."""
-    if stop is None:
-        return
-
-    def check(event):
-        if stop.is_set():
-            event.interrupt()
-
-    highs.cbSimplexInterrupt += check
-    highs.cbIpmInterrupt += check
-    highs.cbMipInterrupt += check
-
-
-def highs_incumbent(mip, max_seconds=30.0, model=None, stop=None):
-    """The best feasible point of ``mip`` that HiGHS's MIP solver finds
-    within ``max_seconds`` (or its optimum, if it gets there first). Returns
-    it in ``mip``'s variables, or ``None``. HiGHS's first solution is
-    usually a trivial one from its own feasibility jump (133808 on
-    ns1830653, against 36622 from its root sub-MIP a few seconds later), so
-    it runs for the whole budget. This hands the search to HiGHS; ``solve``
-    uses it only when asked (``highs_incumbent_seconds``). ``model`` (a
-    ``highspy.HighsLp`` of ``mip``, as ``to_highs`` or ``hh.jaddle_lp_to_highs``
-    make) saves building it, which reads ``mip``'s JAX arrays; ``stop`` (a
-    ``threading.Event``) interrupts HiGHS, which then returns its best
-    point so far."""
-    import highspy
-
-    highs = highspy.Highs()
-    highs.setOptionValue("output_flag", False)
-    highs.setOptionValue("time_limit", float(max_seconds))
-    highs.passModel(to_highs(mip) if model is None else model)
-    _interrupt_on(highs, stop)
-    highs.run()
-    if highs.getInfo().primal_solution_status != 2:  # kSolutionStatusFeasible
-        return None
-    return np.array(highs.getSolution().col_value, dtype=np.float64)
-
-
-def highs_submip(
-    mip,
-    lower,
-    upper,
-    cutoff=None,
-    max_seconds=5.0,
-    max_nodes=None,
-    start=None,
-    model=None,
-    stop=None,
-):
-    """
-    The sub-MIP of ``mip`` over the box ``[lower, upper]`` solved by HiGHS,
-    as HiGHS's own RENS and RINS do: HiGHS presolves it (fixed columns and
-    what they imply drop out, so a neighbourhood with most integers fixed
-    becomes a small MIP) and searches it for up to ``max_seconds`` and
-    ``max_nodes`` nodes. ``cutoff`` (``c·x`` of ``mip``'s minimisation, no
-    offset) is passed as HiGHS's ``objective_bound``, so only better points
-    come back; a dense cutoff row would get in presolve's way. ``start``,
-    if given (an incumbent for RINS), is offered to HiGHS as a starting
-    solution. ``model`` (``hh.jaddle_lp_to_highs`` of ``mip``, built once)
-    saves rebuilding it each call; it is not changed. ``stop`` (a
-    ``threading.Event``) interrupts HiGHS. Returns the best point found, or
-    ``None``.
-    """
-    return _highs_submip_status(
-        mip, lower, upper, cutoff, max_seconds, max_nodes, start, model, stop
-    )[0]
-
-
-def _highs_submip_status(
-    mip,
-    lower,
-    upper,
-    cutoff=None,
-    max_seconds=5.0,
-    max_nodes=None,
-    start=None,
-    model=None,
-    stop=None,
-):
-    """``highs_submip``, returning ``(point or None, infeasible)``:
-    ``infeasible`` when HiGHS proved the box holds no point (below the
-    cutoff, when there is one), rather than stopping at a limit."""
-    import highspy
-
-    lower = np.asarray(lower, np.float64)
-    upper = np.asarray(upper, np.float64)
-    if model is None:
-        model = hh.jaddle_lp_to_highs(mip.lp, mip.integrality)
-        model.col_lower_ = lower
-        model.col_upper_ = upper
-        prebuilt = False
-    else:
-        prebuilt = True
-    highs = highspy.Highs()
-    highs.setOptionValue("output_flag", False)
-    highs.setOptionValue("time_limit", float(max(max_seconds, 1e-3)))
-    if max_nodes is not None:
-        highs.setOptionValue("mip_max_nodes", int(max_nodes))
-    finite_cutoff = cutoff is not None and np.isfinite(cutoff)
-    if finite_cutoff:
-        highs.setOptionValue("objective_bound", float(cutoff))
-    highs.passModel(model)
-    if prebuilt:
-        # The shared model keeps its own bounds; this copy gets the box.
-        n = lower.size
-        highs.changeColsBounds(n, np.arange(n, dtype=np.int32), lower, upper)
-    _interrupt_on(highs, stop)
-    if start is not None:
-        solution = highspy.HighsSolution()
-        solution.col_value = list(np.asarray(start, np.float64))
-        solution.value_valid = True
-        highs.setSolution(solution)
-    highs.run()
-    if highs.getInfo().primal_solution_status != 2:  # kSolutionStatusFeasible
-        return None, highs.getModelStatus() == highspy.HighsModelStatus.kInfeasible
-    x = np.array(highs.getSolution().col_value, dtype=np.float64)
-    if finite_cutoff and mip.c @ x > cutoff + 1e-9 * (1.0 + abs(cutoff)):
-        return None, False  # e.g. the start itself, no better than the cutoff
-    return x, False
-
-
 def integer_roundings(x, integrality, lower, upper, snap=1e-6):
     """
-    Up to three roundings of ``x``'s integers, in the order ``highs_round_repair``
-    tries them: up (``ceil(x − snap)``), nearest and down
+    Up to three roundings of ``x``'s integers, in the order round and repair
+    tries them (``_BranchAndBound.round_repair``): up (``ceil(x − snap)``), nearest and down
     (``floor(x + snap)``), each within ``[lower, upper]``, duplicates
     dropped. ``snap`` puts values within it of an integer on that integer
     first, so the noise of a PDHG point does not round them away. Returns a
@@ -5239,261 +5134,6 @@ def integer_roundings(x, integrality, lower, upper, snap=1e-6):
     return out
 
 
-def highs_round_repair(
-    mip,
-    x,
-    lower,
-    upper,
-    cutoff=None,
-    max_seconds=10.0,
-    snap=1e-6,
-    roundings=None,
-    model=None,
-    stop=None,
-):
-    """
-    Round and repair: round ``x``'s integers (``integer_roundings``: up,
-    nearest, down), fix them, and let HiGHS solve the rest exactly
-    (``highs_submip`` with every integer fixed: its presolve leaves an LP over
-    the continuous variables). ``roundings`` (arrays over the integers) are
-    tried instead when given. ``cutoff`` keeps only better points; the
-    roundings share ``max_seconds``. Returns the best point, or ``None``.
-
-    Rounding up suits integers that count units which continuous variables
-    then use, as on buildingenergy (``n ≤ x ≤ 5n``, ``n ≤ N``): from the
-    root LP vertex, rounding up and repairing gives 33,325 in 0.6 s, against
-    33,747 from RENS after 190 s (optimum 33,283.85); from the up child of
-    the sizing variable, 33,285.6. Rounding to nearest there gives 33,688,
-    and down 34,210.
-    """
-    ints = mip.integrality
-    if roundings is None:
-        roundings = integer_roundings(x, ints, lower, upper, snap)
-    deadline = time.time() + max_seconds
-    best, best_value = None, cutoff
-    for k, values in enumerate(roundings):
-        left = deadline - time.time()
-        if left <= 0 or (stop is not None and stop.is_set()):
-            break
-        fixed_lower = np.asarray(mip.lower, np.float64).copy()
-        fixed_upper = np.asarray(mip.upper, np.float64).copy()
-        fixed_lower[ints] = values
-        fixed_upper[ints] = values
-        point = highs_submip(
-            mip,
-            fixed_lower,
-            fixed_upper,
-            cutoff=best_value,
-            max_seconds=left / (len(roundings) - k),
-            model=model,
-            stop=stop,
-        )
-        if point is not None:
-            best, best_value = point, float(mip.c @ point)
-    return best
-
-
-def highs_rins(mip, incumbent, x_lp, cutoff, max_seconds=5.0, min_fixed=0.3):
-    """
-    RINS (relaxation induced neighbourhood search) with HiGHS as the sub-MIP
-    solver (``highs_submip``): the integer variables on which the
-    ``incumbent`` and the LP point ``x_lp`` agree are fixed at the
-    incumbent's value, and HiGHS searches the rest for points below
-    ``cutoff`` (``c`` of ``mip``'s minimisation, no offset) for up to
-    ``max_seconds``. Skipped (``None``) when fewer than ``min_fixed`` of the
-    integers agree, since the sub-MIP would then be nearly the whole MIP.
-    Returns the best point HiGHS found, or ``None``.
-    """
-    ints = mip.integrality
-    incumbent = np.asarray(incumbent, np.float64)
-    agree = ints & (np.abs(np.asarray(x_lp, np.float64) - incumbent) <= 1e-6)
-    if ints.sum() == 0 or agree.sum() < min_fixed * ints.sum():
-        return None
-    lower = np.where(agree, incumbent, mip.lower)
-    upper = np.where(agree, incumbent, mip.upper)
-    return highs_submip(
-        mip, lower, upper, cutoff, max_seconds=max_seconds, start=incumbent
-    )
-
-
-# The RENS dive (``highs_rens``): each step fixes at most this share of the
-# integers free in the root box; the dive gives up when its target fixing
-# rate falls below the minimum (HiGHS's RENS needs 10% too) or after this
-# many failures.
-_RENS_DIVE_STEP = 0.1
-_RENS_MIN_FIXING = 0.1
-_RENS_DIVE_TRIES = 10
-
-
-def highs_rens(
-    mip,
-    x,
-    lower,
-    upper,
-    sub_lower,
-    sub_upper,
-    propagator,
-    cutoff=None,
-    max_seconds=10.0,
-    max_nodes=None,
-    model=None,
-    stop=None,
-):
-    """
-    RENS with HiGHS: the sub-MIP of ``mip`` over ``[sub_lower, sub_upper]``
-    (the integers integral at the LP point ``x`` fixed, the fractional ones
-    within their floor and ceiling; ``highs_submip``) and, if HiGHS proves
-    it infeasible, a dive that fixes fewer (``_rens_dive``) within what is
-    left of ``max_seconds``. ``lower``/``upper`` is the root box the dive
-    starts from; ``propagator`` (a ``BoundPropagator`` over ``mip``'s rows,
-    or rows valid for its integer points) checks each step. Returns the
-    best point found, or ``None``.
-
-    The dive is for degenerate root LPs, whose vertex is integral on many
-    integers by accident. On neos-4306827-ravan, 39,000 of 41,000 integers
-    are integral at the root vertex but only 331 of them have a nonzero
-    reduced cost; the RENS box is infeasible (HiGHS's presolve shows it in
-    0.2 s), and so is fixing a random half of them or only capping the
-    general integers at their ceilings. The dive finds 11,557 in 26 s, its
-    first point after 5 s.
-    """
-    deadline = time.time() + max_seconds
-    found, infeasible = _highs_submip_status(
-        mip,
-        sub_lower,
-        sub_upper,
-        cutoff,
-        max_seconds=max_seconds,
-        max_nodes=max_nodes,
-        model=model,
-        stop=stop,
-    )
-    if found is not None or not infeasible:
-        return found
-    if time.time() >= deadline or (stop is not None and stop.is_set()):
-        return None
-    return _rens_dive(
-        mip, x, lower, upper, propagator, cutoff, deadline, max_nodes, model, stop
-    )
-
-
-def _rens_dive(
-    mip,
-    x,
-    lower,
-    upper,
-    propagator,
-    cutoff,
-    deadline,
-    max_nodes,
-    model,
-    stop,
-    tol=1e-6,
-):
-    """
-    RENS by diving, as HiGHS's RENS builds its neighbourhood: from the root
-    box, fix up to ``_RENS_DIVE_STEP`` of the free integers at a time at
-    their rounding of the LP point (integral values first, then the most
-    nearly integral; values above the lower bound and larger reduced costs
-    break ties), propagate, and re-solve the LP relaxation with HiGHS's
-    dual simplex from the last basis. Once the integers fixed reach the
-    target rate (half that of the RENS box, which failed), HiGHS searches
-    the sub-MIP; unlike RENS's, it leaves the unfixed integers their whole
-    range. When propagation, the LP or the sub-MIP proves the box empty
-    (or the LP's objective reaches ``cutoff``), the dive backs up to half
-    its depth and halves the target, as HiGHS does. Returns the first point
-    a sub-MIP finds, or ``None``.
-    """
-    import highspy
-
-    ints = np.asarray(mip.integrality, bool)
-    n = ints.size
-    x = np.asarray(x, np.float64)
-    lower = np.asarray(lower, np.float64)
-    upper = np.asarray(upper, np.float64)
-    free = ints & (lower < upper)
-    n_free = int(free.sum())
-    if n_free == 0:
-        return None
-
-    def rate(lo, up):
-        return np.count_nonzero(free & (lo == up)) / n_free
-
-    def time_left():
-        if stop is not None and stop.is_set():
-            return 0.0
-        return deadline - time.time()
-
-    if model is None:
-        model = hh.jaddle_lp_to_highs(mip.lp, mip.integrality)
-    relaxation = highspy.Highs()
-    relaxation.setOptionValue("output_flag", False)
-    relaxation.passModel(model)
-    cols = np.arange(n, dtype=np.int32)
-    relaxation.changeColsIntegrality(n, cols, np.zeros(n, dtype=np.uint8))
-    _interrupt_on(relaxation, stop)
-    c = np.asarray(mip.c, np.float64)
-    finite_cutoff = cutoff is not None and np.isfinite(cutoff)
-
-    integral = free & (np.abs(x - np.round(x)) <= tol)
-    target = 0.5 * np.count_nonzero(integral) / n_free
-    step = max(1, math.ceil(_RENS_DIVE_STEP * n_free))
-    # The box, LP point and reduced costs at each depth (none at the root,
-    # whose point comes from the caller's LP).
-    stack = [(lower, upper, x, None)]
-    for _ in range(_RENS_DIVE_TRIES):
-        while True:
-            if time_left() <= 0 or target < _RENS_MIN_FIXING:
-                return None
-            lo, up, xd, reduced = stack[-1]
-            done = rate(lo, up)
-            if done >= target:
-                found, infeasible = _highs_submip_status(
-                    mip,
-                    lo,
-                    up,
-                    cutoff,
-                    max_seconds=time_left(),
-                    max_nodes=max_nodes,
-                    model=model,
-                    stop=stop,
-                )
-                if found is not None or not infeasible:
-                    return found
-                failed = done
-                break
-            cand = np.flatnonzero(ints & (lo < up))
-            values = np.clip(np.round(xd[cand]), lo[cand], up[cand])
-            distance = np.abs(xd[cand] - values)
-            raised = values > lo[cand]
-            pinned = np.zeros(cand.size) if reduced is None else np.abs(reduced[cand])
-            order = np.lexsort((-pinned, ~raised, distance))
-            k = min(cand.size, step, max(1, math.ceil((target - done) * n_free)))
-            pick = order[:k]
-            lo2, up2 = lo.copy(), up.copy()
-            lo2[cand[pick]] = up2[cand[pick]] = values[pick]
-            failed = rate(lo2, up2)
-            lo2, up2, empty = propagator(lo2, up2)
-            if empty:
-                break
-            relaxation.setOptionValue("time_limit", float(max(time_left(), 1e-3)))
-            relaxation.changeColsBounds(n, cols, lo2, up2)
-            relaxation.run()
-            status = relaxation.getModelStatus()
-            if status == highspy.HighsModelStatus.kInfeasible:
-                break
-            if status != highspy.HighsModelStatus.kOptimal:
-                return None  # out of time, or numerical trouble
-            solution = relaxation.getSolution()
-            x2 = np.array(solution.col_value, np.float64)
-            if finite_cutoff and c @ x2 >= cutoff:
-                break
-            stack.append((lo2, up2, x2, np.array(solution.col_dual, np.float64)))
-        target = 0.5 * failed
-        del stack[(len(stack) - 1) // 2 + 1 :]
-    return None
-
-
 def _relative_gap(value, bound):
     """The relative gap between an incumbent's min-form ``value`` and a
     lower ``bound`` (both with the objective's offset)."""
@@ -5503,8 +5143,9 @@ def _relative_gap(value, bound):
 def _complete_start(mip, x, tol, max_seconds):
     """The user's start ``x`` (``check_mip_start``) as a feasible point of
     ``mip``: its integers rounded and, when it is not feasible as it is and
-    ``mip`` has continuous variables, those solved for by HiGHS with the
-    integers fixed (``highs_round_repair``). ``None`` when it cannot be."""
+    ``mip`` has continuous variables, those solved for by a Jaddle LP with
+    the integers fixed (as ``_BranchAndBound.try_incumbent`` repairs a
+    rounding). ``None`` when it cannot be."""
     ints = mip.integrality
     point = _fill_start(x, mip.lower, mip.upper)
     point[ints] = np.round(point[ints])
@@ -5512,17 +5153,26 @@ def _complete_start(mip, x, tol, max_seconds):
         return point
     if ints.all():
         return None
-    repaired = highs_round_repair(
-        mip,
-        point,
-        mip.lower,
-        mip.upper,
-        max_seconds=max_seconds,
-        roundings=[point[ints]],
-    )
-    if repaired is None:
+    fixed_lower = np.where(ints, point, mip.lower)
+    fixed_upper = np.where(ints, point, mip.upper)
+    if np.any(fixed_lower > fixed_upper):
         return None
-    repaired = np.asarray(repaired, np.float64)
+    dtype = mip.lp.c.dtype
+    lp = mip.lp.with_values(
+        mip.lp.values()._replace(
+            lower_bounds=jnp.asarray(fixed_lower, dtype),
+            upper_bounds=jnp.asarray(fixed_upper, dtype),
+        )
+    )
+    result = jl.solve(
+        lp,
+        max_seconds=max_seconds,
+        primal_feasibility_tolerance=0.1 * tol,
+        termination_norm="inf",
+    )
+    repaired = np.clip(
+        np.asarray(result["solution"].primal, np.float64), fixed_lower, fixed_upper
+    )
     repaired[ints] = point[ints]
     return repaired if mip.is_feasible(repaired, tol) else None
 
@@ -5774,6 +5424,16 @@ def _cast_warm(warm, dtype):
     return jax.tree.map(cast, warm)
 
 
+def _step_sizes(opt_state):
+    """The step sizes ``(k, eta)`` of a solve's ``opt_state`` as host
+    floats (``None`` without one): what a batched node LP takes, without
+    the Halpern anchor some solves also carry."""
+    if opt_state is None:
+        return None
+    k, eta = tuple(opt_state)[:2]
+    return float(k), float(eta)
+
+
 def _raw_of(child):
     """A strong child's unrounded bound."""
     return child.bound if child.raw is None else child.raw
@@ -5809,6 +5469,49 @@ class _StrongChild(
     __slots__ = ()
 
 
+# The progress table (``verbose``), laid out as HiGHS's MIP log.
+_LOG_LEGEND = (
+    "Src: B => Bulk rounding; D => Dive; E => RENS; F => Feasibility pump;\n"
+    "     H => Rounding; J => Feasibility jump; N => RINS; P => Fix-and-propagate;\n"
+    "     R => Repair; S => User start; T => Evaluate node; U => Round and repair;\n"
+    "     1 => 1-opt"
+)
+_LOG_HEADER = (
+    "        Nodes      |    B&B Tree     |            Objective Bounds"
+    "              |  Dynamic Constraints |       Work      \n"
+    "Src  Proc. InQueue |  Leaves   Expl. | BestBound       BestSol"
+    "              Gap |   Cuts   InLp Confl. |  Epochs     Time"
+)
+# Status names for the solving report.
+_STATUS_TEXT = {
+    "optimal": "Optimal",
+    "infeasible": "Infeasible",
+    "time_limit": "Time limit reached",
+    "node_limit": "Node limit reached",
+    "interrupted": "Interrupted",
+    "unresolved": "Unresolved",
+    "unbounded_or_infeasible": "Unbounded or infeasible",
+}
+
+
+def _log_count(value):
+    """A count in at most 7 characters, as HiGHS's log (``12345k``)."""
+    value = int(value)
+    if value < 10_000_000:
+        return str(value)
+    if value < 10_000_000_000:
+        return f"{value // 1000}k"
+    return f"{value // 1_000_000}m"
+
+
+def _log_value(value):
+    """An objective value in at most 15 characters."""
+    if not np.isfinite(value):
+        return "inf" if value > 0 else "-inf"
+    text = f"{value:.10g}"
+    return text if len(text) <= 15 else f"{value:.8e}"
+
+
 class _Node:
     """An open node: its bound, depth, bound changes against the root (as
     ``(index, lower, upper)``), the parent's warm start, the branching
@@ -5822,21 +5525,35 @@ class _Node:
         "warm",
         "branch",
         "epochs",
-        "basis",
         "inferences",
+        "cut_version",
+        "cut_rounds",
+        "branch_value",
     )
 
     def __init__(
-        self, bound, depth, changes, warm, branch, epochs=0, basis=None, inferences=0
+        self,
+        bound,
+        depth,
+        changes,
+        warm,
+        branch,
+        epochs=0,
+        inferences=0,
+        cut_rounds=0,
+        branch_value=None,
     ):
         self.bound, self.depth, self.changes = bound, depth, changes
         self.warm, self.branch = warm, branch
         self.epochs = epochs
         # Bounds that propagation tightened beyond the split that made it.
         self.inferences = inferences
-        # The parent's HiGHS basis as ``(rows, basis)`` (``node_lp_solver=
-        # "highs"``): the node's LP starts from it.
-        self.basis = basis
+        # The cut block version its warm start is for (set when it is
+        # queued), the re-solves it has had for new tree cuts, and its LP's
+        # value before them (for its pseudocost).
+        self.cut_version = None
+        self.cut_rounds = cut_rounds
+        self.branch_value = branch_value
 
 
 _LP_RESERVED = (
@@ -5853,23 +5570,20 @@ _LP_RESERVED = (
 # many seconds, each from the incumbent of its time (see
 # ``_BranchAndBound.schedule_improve_jump``).
 _JUMP_SLICE_SECONDS = 5.0
-
-
 class _HeuristicWorkers:
     """Background threads for the CPU heuristics (``parallel_heuristics``),
     so they run while the main thread keeps the device busy with node LPs.
 
-    There are two lanes, each one thread running one job at a time, in the
-    order given: ``"highs"`` for HiGHS (RENS, RINS, the incumbent search;
-    HiGHS shares one task scheduler between its instances, so they run one
-    after another) and ``"jump"`` for the numba feasibility jump. A job is a
-    function of NumPy arrays and HiGHS models only, never of JAX arrays:
-    JAX's precision settings are per thread, and the search may be inside
-    ``local_settings``. Both HiGHS and numba release the GIL while they
-    work. The search collects finished jobs with ``finished`` and checks
+    Two lanes, each a thread running one job at a time in the order given:
+    ``"jump"``, the numba feasibility jump (the root's first jumps, then the
+    improving jump), and ``"round"``, fix-and-propagate roundings of the
+    root LP's, cut rounds' and node LPs' points (``parallel_rounding``). A job is a function of NumPy arrays only, never
+    of JAX arrays: JAX's precision settings are per thread, and the search
+    may be inside ``local_settings``. numba releases the GIL while it
+    works. The search collects finished jobs with ``finished`` and checks
     their points itself."""
 
-    LANES = ("highs", "jump")
+    LANES = ("jump", "round")
 
     def __init__(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -5922,363 +5636,134 @@ class _HeuristicWorkers:
             self.jobs[lane] = []
 
 
-# The simplex cut rounds (``simplex_cut_rounds``): rounds a cut stays in
-# the LP while slack (basic), as HiGHS's LP age limit, and the rounds over
-# which the bound must gain ``cut_min_progress``.
-_SIMPLEX_CUT_AGE = 10
+def _fix_and_propagate_job(x, lower, upper, integrality, propagator, stop=None):
+    """``fix_and_propagate`` as a background job (``_HeuristicWorkers``),
+    in the jump's form: ``(point, found, None)``."""
+    point = fix_and_propagate(x, lower, upper, integrality, propagator)
+    return point, point is not None, None
+
+
+def _jump_job(skip, *args, stop=None, **kwargs):
+    """``feasibility_jump`` as a background job, unless ``skip()`` holds
+    when it starts (then ``(None, False, None)``)."""
+    if skip():
+        return None, False, None
+    return feasibility_jump(*args, stop=stop, **kwargs)
+
+
+# Background jobs' kinds (``_HeuristicWorkers.submit``) and the source
+# their incumbents are marked with.
+_JOB_SOURCES = {"jump": "J", "fixprop": "P"}
+
+# Root cut rounds (``cut_age``): the rounds in a row a cut stays in the LP
+# while idle (slack, with a zero dual), as HiGHS's LP age limit.
+_CUT_AGE = 10
 # The most cuts kept for propagation (``cut_pool_propagation``).
 _CUT_POOL_MAX_ROWS = 10_000
-_SIMPLEX_STALL_ROUNDS = 10
-
-# The rows of an LP on the host only (``MIP.rows_with``) with ``A``'s
-# transpose: the cut rounds in HiGHS bound and separate from them without
-# rebuilding the device LP every round.
-_HostRows = collections.namedtuple("_HostRows", "A b A_T")
-
-
-class _SimplexRounds:
-    """
-    The root LP held in HiGHS through the cut rounds
-    (``simplex_cut_rounds``): its rows (equalities, inequalities, then the
-    cuts, as ``highs_helpers.jaddle_lp_to_highs`` orders them) and an
-    optimal basis. A round deletes the cut rows that went slack, which are
-    basic, so the basis stays valid, adds the new cuts with basic slacks,
-    which keeps it dual feasible, and re-solves with the dual simplex from
-    there. Each round then has an exact vertex and duals, and the basis the
-    Gomory cuts need, without a first-order solve or a crossover.
-
-    ``A`` and ``b`` (CSR, ``<=`` for the inequalities) are the rows as held;
-    ``optimal`` says whether the last solve proved optimality.
-    """
-
-    def __init__(self, lp, basis, seconds=None):
-        import highspy
-
-        model = hh.jaddle_lp_to_highs(lp)
-        self.n_eq = int(lp.A_eq.shape[0])
-        self.A = sp.csc_matrix(
-            (model.a_matrix_.value_, model.a_matrix_.index_, model.a_matrix_.start_),
-            shape=(model.num_row_, model.num_col_),
-        ).tocsr()
-        self.b = np.asarray(model.row_upper_, np.float64)
-        self.base_rows = model.num_row_
-        self.highs = highspy.Highs()
-        self.highs.setOptionValue("output_flag", False)
-        self.highs.setOptionValue("presolve", "off")
-        self.highs.passModel(model)
-        self.highs.setBasis(basis)
-        self.status = None
-        self.iterations = 0
-        self.seconds = 0.0
-        self.run(seconds)
-
-    @property
-    def optimal(self):
-        import highspy
-
-        return self.status == highspy.HighsModelStatus.kOptimal
-
-    @property
-    def infeasible(self):
-        import highspy
-
-        return self.status == highspy.HighsModelStatus.kInfeasible
-
-    def run(self, seconds=None):
-        started = time.time()
-        limit = np.inf if seconds is None else max(float(seconds), 0.0)
-        self.highs.setOptionValue("time_limit", limit)
-        self.highs.run()
-        self.status = self.highs.getModelStatus()
-        self.iterations += max(int(self.highs.getInfo().simplex_iteration_count), 0)
-        self.seconds += time.time() - started
-
-    def resolve(self, drop, cuts, seconds=None):
-        """Delete the cut rows numbered ``drop`` (0 = the first cut, and
-        each basic), append ``cuts`` (``(family, idx, coef, rhs)``) and
-        re-solve from the basis."""
-        if len(drop):
-            rows = self.base_rows + np.asarray(drop, np.int32)
-            self.highs.deleteRows(len(rows), rows)
-            keep = np.ones(self.A.shape[0], bool)
-            keep[rows] = False
-            self.A, self.b = self.A[keep], self.b[keep]
-        if cuts:
-            lengths = [len(idx) for _, idx, _, _ in cuts]
-            starts = np.concatenate([[0], np.cumsum(lengths)[:-1]]).astype(np.int32)
-            index = np.concatenate([np.asarray(idx, np.int32) for _, idx, _, _ in cuts])
-            value = np.concatenate(
-                [np.asarray(coef, np.float64) for _, _, coef, _ in cuts]
-            )
-            rhs = np.array([rhs for _, _, _, rhs in cuts], np.float64)
-            self.highs.addRows(
-                len(cuts),
-                np.full(len(cuts), -np.inf),
-                rhs,
-                index.size,
-                starts,
-                index,
-                value,
-            )
-            block = sp.csr_matrix(
-                (value, index, np.concatenate([starts, [index.size]])),
-                shape=(len(cuts), self.A.shape[1]),
-            )
-            self.A = sp.vstack([self.A, block], format="csr")
-            self.b = np.concatenate([self.b, rhs])
-        self.run(seconds)
-
-    def vertex(self):
-        """``(x, basis)`` at the last solve's vertex."""
-        x = np.asarray(self.highs.getSolution().col_value, np.float64)
-        return x, self.highs.getBasis()
-
-    def solution(self, like, n_ineq):
-        """The vertex and its duals as a ``SaddleState`` shaped like
-        ``like``, the inequality duals padded with zeros to ``n_ineq``."""
-        vertex = self.highs.getSolution()
-        lp = self.highs.getLp()
-        dual_eq, dual_ineq = hh.highs_duals_to_jaddle(
-            np.asarray(vertex.row_dual),
-            np.asarray(lp.row_lower_),
-            np.asarray(lp.row_upper_),
-        )
-        padded = np.zeros(n_ineq)
-        padded[: dual_ineq.size] = dual_ineq
-        # An empty equality block is one zero row in a ``SaddleState``.
-        padded_eq = np.zeros(max(np.asarray(like.dual_eq).size, dual_eq.size))
-        padded_eq[: dual_eq.size] = dual_eq
-        dtype = np.asarray(like.primal).dtype
-        return like._replace(
-            primal=jnp.asarray(np.asarray(vertex.col_value), dtype),
-            dual_eq=jnp.asarray(padded_eq, np.asarray(like.dual_eq).dtype),
-            dual_ineq=jnp.asarray(padded, np.asarray(like.dual_ineq).dtype),
-        )
-
-
-# HiGHS's "no limit" for integer options (kHighsIInf).
-_HIGHS_NO_LIMIT = 2**31 - 1
-# Exact strong branching (``node_lp_solver="highs"``): a child LP gets at
-# most this many times the node LPs' mean simplex iterations (and at least
-# _STRONG_MIN_ITERATIONS), and strong branching in the tree pauses while it
-# has taken more than _STRONG_SHARE of the time spent in the tree. (It was
-# half of all the time since the start, root included: on ns1830653 the
-# tree's first 50 s, as long as the root's cut rounds, went almost all to
-# strong branching, 16 child LPs a node at 28 ms against a node LP's 20.
-# HiGHS spends 27% of its simplex iterations there.)
-_STRONG_ITERATION_FACTOR = 2.0
-_STRONG_MIN_ITERATIONS = 100
-_STRONG_SHARE = 0.15
-# The tree's first seconds strong-branch freely (small MIPs are done by then).
-_STRONG_GRACE_SECONDS = 2.0
-# Root cutoff probing (``cutoff_probing``): the least |reduced cost|, as a
-# share of the room below the cutoff, of an integer worth an exact LP.
-_PROBE_MIN_RATIO = 0.25
+# In-out separation (``inout_separation``): once λ would pass this, the
+# cut rounds stop separating at the in-out point until the incumbent
+# changes (the point is all but the LP point by then).
+_INOUT_MAX_LAMBDA = 0.9
+# The global cut pool (``_CutPool``): the most cuts kept (newest), and the
+# least efficacy for a pooled cut to come back into the LP.
+_CUT_POOL_SIZE = 10_000
+_CUT_POOL_MIN_EFFICACY = 1e-4
+# Tree cut refreshes (``tree_cuts``): the tree's first seconds refresh
+# freely, then within ``tree_cut_share`` of its time; a slot idle for this
+# many refreshes in a row may take a new cut.
+_TREE_CUT_GRACE_SECONDS = 2.0
+_TREE_CUT_IDLE_REFRESHES = 2
+# Hybrid branching scores (``branching_scores``): the weights of the
+# conflict, cutoff and inference parts beside the bound gains (SCIP's
+# defaults, which HiGHS also uses), and the conflict scores' decay per
+# conflict (VSIDS).
+_CONFLICT_WEIGHT = 1e-2
+_CUTOFF_WEIGHT = 1e-4
+_INFERENCE_WEIGHT = 1e-4
+_CONFLICT_DECAY = 0.95
 # Restarts (``restarts``), as HiGHS restarts: the share of the integers free
 # at the last (re)start that reduced-cost fixing of the root box has fixed
 # since, at the root (after its heuristics) and in the tree.
 _RESTART_ROOT_SHARE = 0.025
 _RESTART_TREE_SHARE = 0.10
-# The root sweep's candidates with HiGHS node LPs (``root_strong_candidates=
-# "auto"``): this many times ``strong_candidates``.
-_ROOT_STRONG_FACTOR = 4
-
-
-class _HighsNodeLPs:
+class _CutPool:
     """
-    Node LPs solved exactly by HiGHS's dual simplex (``node_lp_solver="highs"``).
-    One HiGHS instance holds the LP of the search's rows (``mip``: the
-    MIP's rows and the cut pool). Each node sets its column bounds and
-    HiGHS re-solves from the basis it holds, the last node's. Changing
-    bounds keeps a basis dual feasible, so the parent's basis (while
-    plunging) or any other node's is a valid start. When the rows change
-    (a tree cut round rebuilds the pool at a fixed size), the last basis
-    carries over to the new rows.
-
-    On bab5, exact node LPs sat a median 239 (up to 982) above the
-    Lagrangian bounds of the unconverged PDHG node LPs at the same nodes;
-    every child kept its parent's bound, and the global bound stayed at the
-    root's for 600 s.
+    The global cut pool: every cut the root and tree rounds have found, the
+    newest ``size`` of them: ``coef·x[idx] <= rhs`` by key (``_cut_key``).
+    Each was separated over the root box of its time, which only shrinks,
+    so each holds at every later node, across restarts too. ``violated``
+    finds those an LP point cuts off, to go back into the LP.
     """
 
-    def __init__(self, mip, basis=None):
-        import highspy
+    def __init__(self, size):
+        self.size = int(size)
+        self.cuts = {}  # key -> (family, idx, coef, rhs), oldest first
+        self._block = None  # (keys, CSR rows, rhs) of ``cuts``
 
-        self.mip = mip
-        model = hh.jaddle_lp_to_highs(mip.lp)
-        self.n, self.m = model.num_col_, model.num_row_
-        self.cols = np.arange(self.n, dtype=np.int32)
-        self.row_lower = np.asarray(model.row_lower_, np.float64)
-        self.row_upper = np.asarray(model.row_upper_, np.float64)
-        self.highs = highspy.Highs()
-        self.highs.setOptionValue("output_flag", False)
-        self.highs.setOptionValue("presolve", "off")
-        self.highs.setOptionValue("solver", "simplex")
-        self.highs.passModel(model)
-        if (
-            basis is not None
-            and len(basis.col_status) == self.n
-            and len(basis.row_status) == self.m
-        ):
-            self.highs.setBasis(basis)
-        self.solves = 0
-        self.iterations = 0
-        self.seconds = 0.0
-        self.basis_restores = 0
-        # The basis object HiGHS holds as it is (``held_basis``), or ``None``
-        # once a solve has moved it on.
-        self.current = None
-        self.strong_solves = 0
-        self.strong_iterations = 0
-        self.strong_seconds = 0.0
-        # HiGHS's dual ray for the last LP it proved infeasible (one entry a
-        # row), or ``None``: a Farkas proof for the conflict pool.
-        self.last_ray = None
+    def __len__(self):
+        return len(self.cuts)
 
-    def _ray(self):
-        """The dual ray of the LP HiGHS just proved infeasible, or ``None``."""
-        try:
-            _, has_ray, values = self.highs.getDualRay()
-        except Exception:  # an older highspy without it
-            return None
-        values = np.asarray(values, np.float64)
-        if not has_ray or values.shape != (self.m,) or not np.all(np.isfinite(values)):
-            return None
-        return values
+    def add(self, cuts):
+        """Keep ``cuts`` (``(family, idx, coef, rhs)``); returns their keys."""
+        keys = []
+        changed = False
+        for cut in cuts:
+            key = _cut_key(cut)
+            changed |= self.cuts.pop(key, None) is None
+            self.cuts[key] = cut  # the newest now
+            keys.append(key)
+        while len(self.cuts) > self.size:
+            self.cuts.pop(next(iter(self.cuts)))
+            changed = True
+        if changed:
+            # Only a new or evicted cut stales the block (``violated``):
+            # cuts re-added (moved to the newest) keep their rows there.
+            self._block = None
+        return keys
 
-    def basis(self):
-        """The basis held, or ``None`` before a solve."""
-        basis = self.highs.getBasis()
-        return basis if basis.valid else None
-
-    def held_basis(self):
-        """``basis()``, remembered as the one HiGHS holds (so a solve that
-        asks to start from it need not set it again)."""
-        self.current = self.basis()
-        return self.current
-
-    def restore(self, basis):
-        """Hold ``basis`` again (after child LPs moved off it)."""
-        self.highs.setBasis(basis)
-        self.current = basis
-
-    def solve(self, lower, upper, seconds=None, like=None, basis=None):
-        """
-        The LP over the box ``[lower, upper]``, from ``basis`` when given
-        (a node's parent's; else whatever basis is held), as a ``solve_lp``-style
-        result: optimal (``"converged"`` and ``"exact"``, with the vertex and
-        its duals as a ``SaddleState`` shaped like ``like``), infeasible
-        (``"infeasible"``) or out of time (``stop_reason`` ``"time_limit"``).
-        ``None`` when HiGHS stops otherwise; the caller then falls back to
-        PDHG, and the next solve here starts afresh.
-        """
-        import highspy
-
-        started = time.time()
-        if basis is not None and basis is not self.current:
-            self.highs.setBasis(basis)
-            self.basis_restores += 1
-        self.current = None
-        limit = np.inf if seconds is None else max(float(seconds), 1e-3)
-        self.highs.setOptionValue("time_limit", limit)
-        self.highs.changeColsBounds(
-            self.n,
-            self.cols,
-            np.asarray(lower, np.float64),
-            np.asarray(upper, np.float64),
-        )
-        self.highs.run()
-        status = self.highs.getModelStatus()
-        self.solves += 1
-        self.iterations += max(int(self.highs.getInfo().simplex_iteration_count), 0)
-        self.seconds += time.time() - started
-        Status = highspy.HighsModelStatus
-        out = dict(solution=like, opt_state=None, converged=False, epochs=0)
-        if status == Status.kOptimal:
-            return dict(
-                out,
-                solution=self.solution(like),
-                converged=True,
-                stop_reason="optimal",
-                exact=True,
+    def violated(self, x, exclude=(), min_efficacy=_CUT_POOL_MIN_EFFICACY):
+        """The kept cuts that ``x`` violates by an efficacy of at least
+        ``min_efficacy``, other than those keyed in ``exclude``."""
+        if not self.cuts:
+            return []
+        if self._block is None:
+            keys = list(self.cuts)
+            cuts = [self.cuts[key] for key in keys]
+            lengths = [cut[1].size for cut in cuts]
+            rows = sp.csr_matrix(
+                (
+                    np.concatenate([np.asarray(cut[2], np.float64) for cut in cuts]),
+                    np.concatenate([cut[1] for cut in cuts]).astype(np.int64),
+                    np.concatenate([[0], np.cumsum(lengths)]),
+                ),
+                shape=(len(cuts), x.shape[0]),
             )
-        if status == Status.kInfeasible:
-            self.last_ray = self._ray()
-            return dict(
-                out, stop_reason="infeasible", infeasible=True, dual_ray=self.last_ray
-            )
-        if status == Status.kTimeLimit:
-            return dict(out, stop_reason="time_limit")
-        self.highs.clearSolver()
-        return None
+            norms = np.sqrt(rows.multiply(rows).sum(axis=1)).A1
+            rhs = np.array([cut[3] for cut in cuts], np.float64)
+            self._block = (keys, rows, rhs, np.maximum(norms, 1e-12))
+        keys, rows, rhs, norms = self._block
+        efficacy = (rows @ x - rhs) / norms
+        exclude = set(exclude)
+        return [
+            self.cuts[keys[i]]
+            for i in np.flatnonzero(efficacy >= min_efficacy)
+            if keys[i] not in exclude
+        ]
 
-    def child(self, lower, upper, basis, iterations, like=None):
-        """
-        A strong-branching child's LP over ``[lower, upper]``: at most
-        ``iterations`` dual simplex pivots from ``basis`` (the node's).
-        Returns ``"infeasible"`` when HiGHS proves it so, else the duals it
-        stopped with as a ``SaddleState`` (``solution``): a dual simplex
-        that stops early holds a dual feasible basis, and any duals give a
-        valid Lagrangian bound. ``None`` when HiGHS stops otherwise. The
-        caller puts the node's basis back afterwards.
-        """
-        import highspy
 
-        started = time.time()
-        if basis is not None:
-            self.highs.setBasis(basis)
-        self.current = None
-        self.highs.setOptionValue("simplex_iteration_limit", int(iterations))
-        self.highs.setOptionValue("time_limit", np.inf)
-        self.highs.changeColsBounds(
-            self.n,
-            self.cols,
-            np.asarray(lower, np.float64),
-            np.asarray(upper, np.float64),
-        )
-        self.highs.run()
-        status = self.highs.getModelStatus()
-        self.highs.setOptionValue("simplex_iteration_limit", _HIGHS_NO_LIMIT)
-        self.strong_solves += 1
-        self.strong_iterations += max(
-            int(self.highs.getInfo().simplex_iteration_count), 0
-        )
-        self.strong_seconds += time.time() - started
-        Status = highspy.HighsModelStatus
-        if status == Status.kInfeasible:
-            self.last_ray = self._ray()
-            return "infeasible"
-        if status in (Status.kOptimal, Status.kIterationLimit):
-            return self.solution(like)
-        return None
+def _as_cut(cut):
+    """A ``cut_list`` entry (a dict) as ``(family, idx, coef, rhs)``."""
+    return (cut["family"], cut["idx"], cut["coef"], cut["rhs"])
 
-    def mean_iterations(self):
-        """Simplex iterations per node solve so far (``None`` before any)."""
-        return self.iterations / self.solves if self.solves else None
 
-    def solution(self, like=None):
-        """The last vertex and its duals as a ``SaddleState`` of NumPy
-        arrays, the dual blocks padded with zeros to ``like``'s (a PDHG
-        solution of the same rows, whose empty blocks are one zero row)."""
-        point = self.highs.getSolution()
-        dual_eq, dual_ineq = hh.highs_duals_to_jaddle(
-            np.asarray(point.row_dual), self.row_lower, self.row_upper
-        )
-
-        def padded(values, template):
-            size = max(values.size, 1 if template is None else np.shape(template)[0])
-            out = np.zeros(size)
-            out[: values.size] = values
-            return out
-
-        # Host arrays: the search reads them on the host (bounds, branching),
-        # and a PDHG warm start from them copies them to the device itself.
-        # As JAX arrays they went to the GPU and back, 15 s of 154 on bab5.
-        return SaddleState(
-            primal=np.asarray(point.col_value, np.float64),
-            dual_ineq=padded(dual_ineq, None if like is None else like.dual_ineq),
-            dual_eq=padded(dual_eq, None if like is None else like.dual_eq),
-        )
+def _cut_key(cut):
+    """A cut's identity: its columns, coefficients and right-hand side."""
+    _, idx, coef, rhs = cut
+    return (
+        np.asarray(idx).tobytes(),
+        np.asarray(coef, np.float64).tobytes(),
+        float(rhs),
+    )
 
 
 class _BranchAndBound:
@@ -6318,7 +5803,6 @@ class _BranchAndBound:
         jump_iterations,
         repair,
         repair_max_epochs,
-        highs_incumbent_seconds,
         rins_seconds,
         rins_every,
         plunge_depth,
@@ -6332,7 +5816,6 @@ class _BranchAndBound:
         log_every_seconds,
         start,
         device=None,
-        rins_solver="highs",
         rins_nodes=200,
         rens_seconds=None,
         rens_nodes=500,
@@ -6345,12 +5828,16 @@ class _BranchAndBound:
         flow_covers=True,
         clique_cuts=True,
         zero_half_cuts=True,
-        simplex_cut_rounds="auto",
-        simplex_cut_age=_SIMPLEX_CUT_AGE,
+        cut_age=_CUT_AGE,
         max_cut_rows=None,
         gomory_candidates=None,
-        cutoff_probing=0,
-        cutoff_probing_share=0.1,
+        inout_separation=None,
+        tree_cut_points=4,
+        tree_cut_rounds=1,
+        tree_cut_share=0.25,
+        tree_cut_max_nnz=None,
+        cut_pool_size=_CUT_POOL_SIZE,
+        cutoff_from_start=False,
         root_redcost_propagation=False,
         global_redcost_fixing=False,
         cut_pool_propagation=False,
@@ -6396,7 +5883,6 @@ class _BranchAndBound:
         node_precision=None,
         jump_backend="auto",
         parallel_heuristics=False,
-        node_lp_solver="highs",
         symmetry="auto",
         restarts=5,
         mip_start=None,
@@ -6405,30 +5891,15 @@ class _BranchAndBound:
         objective_propagation=False,
         plunge_gap=0.25,
         branch_implied=False,
+        near_integral_tolerance=1e-2,
+        tree_pool_every=1,
+        parallel_rounding=True,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
         self.settings = {
             key: value for key, value in locals().items() if key not in ("self", "mip")
         }
-        if rins_solver not in ("auto", "jaddle", "highs"):
-            raise ValueError(
-                f"rins_solver must be 'auto', 'jaddle' or 'highs', not {rins_solver!r}"
-            )
-        if rins_solver == "auto":
-            # On large MIPs a Jaddle sub-search is slow and weak: on
-            # ns1830653 it took a third of the run and left a 71% gap,
-            # against 52% with HiGHS.
-            rins_solver = "jaddle" if mip.A.nnz <= _SMALL_MIP_NNZ else "highs"
-        self.rins_solver, self.rins_nodes = rins_solver, rins_nodes
-        if node_lp_solver not in ("highs", "jaddle"):
-            raise ValueError(
-                f"node_lp_solver must be 'highs' or 'jaddle', not {node_lp_solver!r}"
-            )
-        # Node LPs by HiGHS's dual simplex (``_HighsNodeLPs``) solve one node
-        # at a time: no batches on the device.
-        self.node_lp_solver = node_lp_solver
-        if node_lp_solver == "highs" and int(batch_size) >= 1:
-            batch_size = 1
+        self.rins_nodes = rins_nodes
         if symmetry not in ("auto", True, False):
             raise ValueError(
                 f"symmetry must be 'auto', True or False, not {symmetry!r}"
@@ -6443,12 +5914,6 @@ class _BranchAndBound:
         # and the best bound of the rounds before (a floor for the bound).
         self.restart_free = None
         self.bound_floor = -np.inf
-        self._highs_nodes = None
-        # The basis of the last node LP HiGHS solved, with the rows it is
-        # for: strong branching starts its children there, whatever dives
-        # and repairs did in the same instance since.
-        self.node_basis = None
-        self.node_lp_fallbacks = 0
         self.rins_seen = set()  # neighbourhoods searched by jaddle_rins
         # A warm start for the root LP (a sub-search's, from its parent).
         self.root_warm = None
@@ -6463,9 +5928,10 @@ class _BranchAndBound:
         if branching not in ("auto", "pseudocost", "most_fractional", "reliability"):
             raise ValueError(f"unknown branching rule {branching!r}")
         if branching == "auto":
-            # Exact strong branching makes reliability branching worth its
-            # cost; with PDHG's truncated child LPs it is not.
-            branching = "reliability" if node_lp_solver == "highs" else "pseudocost"
+            # PDHG's truncated child LPs make reliability branching's strong
+            # branching too dear in the tree; the root sweep seeds the
+            # pseudocosts instead.
+            branching = "pseudocost"
         # Reliability branching: a variable is strong-branched until each
         # direction has this many pseudocost observations.
         self.reliability_threshold = int(reliability_threshold)
@@ -6477,10 +5943,6 @@ class _BranchAndBound:
             raise ValueError(
                 f"strong_backend must be 'jax' or 'numpy', not {strong_backend!r}"
             )
-        # Tree cuts change the LP's shape, which the device kernels fix; with
-        # HiGHS node LPs, strong branching is HiGHS's too (``strong_branch``).
-        if node_lp_solver == "highs" or (tree_cuts and int(batch_size) == 1):
-            strong_backend = "numpy"
         self.strong_backend = strong_backend
         self._strong_kernels = None  # (mip, _StrongKernels)
         self.strong_branch_nodes = 0
@@ -6491,10 +5953,7 @@ class _BranchAndBound:
         # the root on the candidates with the largest ``impact``, which seeds
         # the pseudocosts. Off for most-fractional branching.
         if root_strong_candidates == "auto":
-            # Exact HiGHS children are cheap enough for a wider sweep.
-            root_strong_candidates = self.strong_candidates * (
-                _ROOT_STRONG_FACTOR if node_lp_solver == "highs" else 1
-            )
+            root_strong_candidates = self.strong_candidates
         if branching == "most_fractional":
             root_strong_candidates = 0
         self.root_strong_candidates = max(int(root_strong_candidates), 0)
@@ -6606,22 +6065,12 @@ class _BranchAndBound:
         self.use_one_opt = bool(one_opt)
         self.one_opt_finds = 0
         self._original_csc = None  # the MIP as given, in CSC form, for 1-opt
-        # Cut rounds in HiGHS's dual simplex from the last basis
-        # (``simplex_cut_rounds``; ``"auto"``: with Gomory cuts, whose
-        # rounds cross over to a basis with HiGHS anyway).
-        if simplex_cut_rounds not in ("auto", True, False):
-            raise ValueError(
-                f"simplex_cut_rounds must be 'auto', True or False, not {simplex_cut_rounds!r}"
-            )
-        self.use_simplex_rounds = (
-            self.gomory if simplex_cut_rounds == "auto" else bool(simplex_cut_rounds)
-        )
         # The root cut pool's growth: rounds a slack cut stays in the
         # simplex rounds, the most cut rows in the root LP (``None``: no
         # limit) and the tableau rows tried per round (``None``: twice
         # ``max_cuts_per_round``).
         for name, value in (
-            ("simplex_cut_age", simplex_cut_age),
+            ("cut_age", cut_age),
             ("max_cut_rows", max_cut_rows),
             ("gomory_candidates", gomory_candidates),
         ):
@@ -6629,34 +6078,97 @@ class _BranchAndBound:
                 raise ValueError(
                     f"{name} must be a positive integer or None, not {value!r}"
                 )
-        if simplex_cut_age is None:
-            raise ValueError("simplex_cut_age must be a positive integer, not None")
-        self.simplex_cut_age = int(simplex_cut_age)
+        if cut_age is None:
+            raise ValueError("cut_age must be a positive integer, not None")
+        self.cut_age = int(cut_age)
         self.max_cut_rows = None if max_cut_rows is None else int(max_cut_rows)
         self.gomory_candidates = (
             None if gomory_candidates is None else int(gomory_candidates)
         )
-        # The incumbent's use for the bound: root cutoff probing (the most
-        # candidates per incumbent, within ``cutoff_probing_share`` of the
-        # elapsed time), the root's reduced-cost row in the conflict pool, and
-        # root reduced-cost fixing from every LP's duals.
-        if int(cutoff_probing) != cutoff_probing or cutoff_probing < 0:
-            raise ValueError(
-                f"cutoff_probing must be a non-negative integer, not {cutoff_probing!r}"
-            )
-        if not 0.0 <= cutoff_probing_share <= 1.0:
-            raise ValueError(
-                f"cutoff_probing_share must be in [0, 1], not {cutoff_probing_share!r}"
-            )
-        self.cutoff_probing = int(cutoff_probing)
-        self.cutoff_probing_share = float(cutoff_probing_share)
+        # The incumbent's use for the bound: the root's reduced-cost row in
+        # the conflict pool, and root reduced-cost fixing from every LP's
+        # duals.
         self.root_redcost_propagation = bool(root_redcost_propagation)
         self.global_redcost_fixing = bool(global_redcost_fixing)
-        self.root_basis = None  # (rows, HiGHS basis) of the root box's LP
-        self.cutoff_probing_lps = 0
-        self.cutoff_probing_fixed = 0
-        self.cutoff_probing_seconds = 0.0
         self.global_redcost_fixed = 0
+        # In-out separation (``inout_separation``): the cut rounds also
+        # separate at ``λ·x + (1 − λ)·incumbent``, λ starting here.
+        if inout_separation is not None and not 0.0 < inout_separation < 1.0:
+            raise ValueError(
+                f"inout_separation must be in (0, 1) or None, not {inout_separation!r}"
+            )
+        self.inout_separation = (
+            None if inout_separation is None else float(inout_separation)
+        )
+        self.inout_lambda = self.inout_separation
+        self.inout_at = None  # the incumbent value λ was last reset for
+        self.inout_cuts = 0
+        self.inout_rounds = 0
+        # Tree cuts (``tree_cuts``): refreshes of the LP's cut block between
+        # node solves (``refresh_cuts``), separating at up to
+        # ``tree_cut_points`` points, re-solving members their new cuts cut
+        # off up to ``tree_cut_rounds`` times, within ``tree_cut_share`` of
+        # the tree's time; cuts denser than ``tree_cut_max_nnz`` are left out.
+        for name, value, least in (
+            ("tree_cut_points", tree_cut_points, 1),
+            ("tree_cut_rounds", tree_cut_rounds, 0),
+            ("cut_pool_size", cut_pool_size, 0),
+        ):
+            if int(value) != value or value < least:
+                raise ValueError(
+                    f"{name} must be an integer of at least {least}, not {value!r}"
+                )
+        self.tree_cut_points = int(tree_cut_points)
+        self.tree_cut_rounds = int(tree_cut_rounds)
+        if not 0.0 <= tree_cut_share <= 1.0:
+            raise ValueError(
+                f"tree_cut_share must be in [0, 1], not {tree_cut_share!r}"
+            )
+        self.tree_cut_share = float(tree_cut_share)
+        # The densest cut kept for the tree (``None``: ``max(64, n / 8)``):
+        # dense rows make every iteration of the node LPs dearer.
+        if tree_cut_max_nnz is not None and (
+            int(tree_cut_max_nnz) != tree_cut_max_nnz or tree_cut_max_nnz < 1
+        ):
+            raise ValueError(
+                f"tree_cut_max_nnz must be a positive integer or None, "
+                f"not {tree_cut_max_nnz!r}"
+            )
+        self.tree_cut_max_nnz = (
+            max(64, mip.num_variables // 8)
+            if tree_cut_max_nnz is None
+            else int(tree_cut_max_nnz)
+        )
+        # The root's separators over the root box, for the tree's refreshes
+        # (``node_separators``), and a lock, since a separation keeps state.
+        self._node_separators = None  # (key, [CutSeparator, ...])
+        self._separator_lock = threading.Lock()
+        # The cut block's version (``refresh_cuts``): it goes up whenever a
+        # refresh changes the block, and each slot keeps the version its
+        # cut came in at, so a warm start from an older block has the duals
+        # of replaced slots zeroed (``fit_warm``).
+        self.cut_version = 0
+        self.slot_version = []
+        self.tree_cut_refreshes = 0
+        self.tree_cut_requeued = 0
+        self.tree_cut_seconds = 0.0
+        self.tree_cut_pool_hits = 0
+        self.tree_cut_skipped = 0
+        self.tree_cut_families = collections.Counter()
+        self.last_refresh_nodes = 0
+        self.last_pool_nodes = 0  # the last pool refresh (``tree_pool_every``)
+        self.tree_pool_refreshes = 0
+        # The heuristic clock (``heuristic_due``): the multiple of each
+        # schedule's period it last ran at.
+        self.heuristic_fired = {}
+        # A lock for what background work shares with the search (the cut
+        # pool, the archive, the counters).
+        self._shared_lock = threading.Lock()
+        self.cut_pool = _CutPool(int(cut_pool_size))
+        # A solution is known before the search (``mip_start`` with
+        # presolve: its value is ``initial_cutoff``, but the point is not in
+        # this MIP's columns), so hybrid node selection need not dive.
+        self.cutoff_from_start = bool(cutoff_from_start)
         self.tree_clock = None  # (start, strong seconds then) while in the tree
         self.tree_seconds = 0.0
         self.tree_strong_seconds = 0.0
@@ -6674,7 +6186,6 @@ class _BranchAndBound:
             )
         self.plunge_child = plunge_child
         self.cut_archive = {}
-        self.simplex_rounds = 0
         self.conflict_graph = None
         if separation_backend not in ("jax", "numpy"):
             raise ValueError(
@@ -6684,10 +6195,13 @@ class _BranchAndBound:
         # Node LPs stop once their Lagrangian bound passes the cutoff.
         self.node_bound_stop = bool(node_bound_stop)
         self.bound_stops = 0
-        self.use_tree_cuts = bool(tree_cuts) and int(batch_size) == 1
-        if tree_cuts and not self.use_tree_cuts and verbose:
-            print("Tree cuts are off with batch_size > 1")
+        self.use_tree_cuts = bool(tree_cuts)
         self.tree_cut_every = tree_cut_every
+        if int(tree_pool_every) < 0:
+            raise ValueError(
+                f"tree_pool_every must be at least 0, not {tree_pool_every!r}"
+            )
+        self.tree_pool_every = int(tree_pool_every)
         if int(max_tree_cuts_per_round) < 1:
             raise ValueError(
                 f"max_tree_cuts_per_round must be at least 1, not {max_tree_cuts_per_round!r}"
@@ -6718,7 +6232,6 @@ class _BranchAndBound:
         self.worker_jobs = 0
         self.worker_seconds = 0.0
         self.worker_finds = 0
-        self.host_highs_model = None  # built on first use, by highs_model()
         self.jump_slices = 0
         # The incumbent value the last improving-jump slice started from, and
         # the slices' box and warm start (the root's, once it has one).
@@ -6733,22 +6246,10 @@ class _BranchAndBound:
             raise ValueError(f"repair_share must be in [0, 1], not {repair_share!r}")
         self.repair_share = float(repair_share)
         self.repair_max_epochs = repair_max_epochs
-        self.highs_seconds = highs_incumbent_seconds
-        # The background incumbent search's next budget (it doubles after
-        # each search that finds nothing) and its calls so far.
-        self.highs_next_seconds = highs_incumbent_seconds
-        self.highs_incumbent_calls = 0
-        # RENS at the root (``None``: auto): with HiGHS solving the sub-MIP,
-        # 10% of the time limit up to 30 s (10 s without one), as HiGHS's own
-        # root RENS is the heuristic that finds its early incumbents; the
-        # slower Jaddle sub-search keeps to small MIPs (5 s).
+        # RENS at the root (``None``: auto): a Jaddle sub-search, on small
+        # MIPs only (5 s).
         if rens_seconds is None:
-            if rins_solver == "jaddle":
-                rens_seconds = 5.0 if small else 0.0
-            elif deadline is None:
-                rens_seconds = 10.0
-            else:
-                rens_seconds = min(30.0, 0.1 * max(deadline - start, 0.0))
+            rens_seconds = 5.0 if small else 0.0
         if rins_seconds is None:
             rins_seconds = 5.0  # RINS on, 5 s a call (``None``: auto)
         # The share of the elapsed time RINS in the tree may take (the root
@@ -6835,7 +6336,8 @@ class _BranchAndBound:
         self.deferred_roundings = []
         self.batched_children = 0
         self.batched_roundings = 0
-        self._vmapped = {}  # max_epochs -> (mip, jitted vmapped node solver)
+        # The batched node LPs' options (``node_batch``), built on first use.
+        self._node_batch_settings = None
         self.pump_last = None
         self.use_pump = feasibility_pump
         self.pump_iterations, self.pump_tolerance = pump_iterations, pump_tolerance
@@ -6869,10 +6371,26 @@ class _BranchAndBound:
         self.probing_stats = {"probed": 0, "fixed": 0, "tightened": 0, "seconds": 0.0}
         self.heuristic_budget = heuristic_seconds
         self.heuristic_seconds = 0.0
+        self.root_heuristic_used = 0.0  # by ``root_heuristics``' calls
         self.rel_gap, self.abs_gap = mip_rel_gap, mip_abs_gap
         self.max_nodes, self.deadline = max_nodes, deadline
         self.branching, self.node_selection = branching, node_selection
         self.int_tol = integrality_tolerance
+        # Node LP points this close to integral are rounded and tried
+        # (``near_integral_tolerance``), each rounding once.
+        if not near_integral_tolerance >= 0:
+            raise ValueError(
+                "near_integral_tolerance must be at least 0, not "
+                f"{near_integral_tolerance!r}"
+            )
+        self.near_integral_tol = float(near_integral_tolerance)
+        # Background fix-and-propagate of root, cut round and node points
+        # (``parallel_rounding``, with ``parallel_heuristics``).
+        self.use_parallel_rounding = bool(parallel_rounding)
+        self.background_roundings = 0
+        self.near_integral_seen = set()
+        self.near_integral_tries = 0
+        self.near_integral_finds = 0
         self.feas_tol = feasibility_tolerance
         self.node_max_epochs, self.root_max_epochs = node_max_epochs, root_max_epochs
         self.cut_round_epochs = cut_round_epochs
@@ -6949,7 +6467,22 @@ class _BranchAndBound:
         self.counter = itertools.count()
         self.pc_sum = np.zeros((2, mip.num_variables))  # [down, up]
         self.pc_count = np.zeros((2, mip.num_variables))
+        # Branching history beside the pseudocosts (``branching_scores``):
+        # per variable and direction [down, up], the children made and those
+        # that closed at once (``branch_cutoffs``), and the bounds their
+        # propagation fixed beyond the split (``inference_sum``); per
+        # variable, a decaying count of the closed boxes it was tightened
+        # in (``conflict_score``, bumped by ``conflict_bump``).
+        self.branch_children = np.zeros((2, mip.num_variables))
+        self.branch_cutoffs = np.zeros((2, mip.num_variables))
+        self.inference_sum = np.zeros((2, mip.num_variables))
+        self.inference_count = np.zeros((2, mip.num_variables))
+        self.conflict_score = np.zeros(mip.num_variables)
+        self.conflict_bump = 1.0
         self.last_log = -np.inf
+        self.log_header_printed = False
+        self.tree_started = False  # for ``explored``
+        self.branched_nodes = 0  # nodes split (the rest of ``nodes`` are leaves)
         # The bound of the node being evaluated (it is in no list meanwhile).
         self.active_bound = np.inf
         # A batch's members still to be evaluated (also in no list meanwhile).
@@ -6985,8 +6518,11 @@ class _BranchAndBound:
         self.conflict_pruned = 0
         self.conflict_tightenings = 0
 
-    def set_mip(self, mip):
-        """Search ``mip`` (the MIP as given, or it with cuts)."""
+    def set_mip(self, mip, rows_only=False):
+        """Search ``mip`` (the MIP as given, or it with cuts). ``rows_only``
+        (a tree cut refresh, ``refresh_cuts``): only the LP and its rows
+        change; the propagators keep the cut rows they were built with,
+        which hold everywhere, so they stay valid."""
         self.mip = mip
         self.A_T = mip.A.T.tocsr()
         self.m_ineq = mip.A.shape[0] - mip.n_eq
@@ -7000,6 +6536,8 @@ class _BranchAndBound:
                 self.node_dtype = _wide(jo.jaddle_dtype())
                 self.node_mip_lp = jl._cast_lp(mip.lp, self.node_dtype)
         self.node_values = self.node_mip_lp.values()
+        if rows_only:
+            return
         # The heuristics propagate even when the search does not.
         self.row_propagator = BoundPropagator(
             mip.A, mip.row_lower, mip.row_upper, self.is_int
@@ -7020,6 +6558,18 @@ class _BranchAndBound:
             np.append(mip.row_upper, np.inf),
             self.is_int,
         )
+
+
+    def pool_cuts(self, cuts):
+        """Put root, tree and node cuts (``(family, idx, coef, rhs)``) into
+        the global cut pool (``cut_pool``), so the tree can take them
+        back once violated. Each was separated over the root box, which only
+        shrinks, so it holds at every node. A cut that leaves the LP for
+        being idle stays here."""
+        cuts = [cut for cut in cuts if 0 < cut[1].size <= self.tree_cut_max_nnz]
+        if cuts:
+            with self._shared_lock:
+                self.cut_pool.add(cuts)
 
     def archive_cuts(self, cuts):
         """Keep ``cuts`` (``(family, idx, coef, rhs)``) for propagation
@@ -7203,7 +6753,9 @@ class _BranchAndBound:
     # -- node keys -----------------------------------------------------------
     def diving(self):
         return self.node_selection == "depth_first" or (
-            self.node_selection == "hybrid" and self.incumbent is None
+            self.node_selection == "hybrid"
+            and self.incumbent is None
+            and not self.cutoff_from_start
         )
 
     def key(self, node, order):
@@ -7212,6 +6764,8 @@ class _BranchAndBound:
         return (node.bound, -node.depth, order)
 
     def push(self, node):
+        if node.cut_version is None:
+            node.cut_version = self.cut_version
         order = next(self.counter)
         heapq.heappush(self.open, (self.key(node, order), order, node))
 
@@ -7231,7 +6785,7 @@ class _BranchAndBound:
         keeps reaching leaves (and incumbents) while it raises the bound."""
         return (
             self.node_selection == "hybrid"
-            and self.incumbent is not None
+            and (self.incumbent is not None or self.cutoff_from_start)
             and self.plunge_depth > 0
         )
 
@@ -7298,60 +6852,14 @@ class _BranchAndBound:
         self.lp_epochs += result["epochs"]
         return result
 
-    def highs_node_lps(self):
-        """The HiGHS node LPs (``_HighsNodeLPs``) for the current rows,
-        rebuilt with the last basis when the rows change."""
-        held = self._highs_nodes
-        if held is None or held.mip is not self.mip:
-            basis = None if held is None else held.basis()
-            held = self._highs_nodes = _HighsNodeLPs(self.mip, basis)
-        return held
-
-    def solve_highs_node(self, lower, upper, warm, basis=None):
-        """A box's LP solved exactly by HiGHS (``node_lp_solver="highs"``),
-        or ``None`` when HiGHS fails (counted in ``node_lp_fallbacks``).
-        As in ``_box_lp``, only the integers' bounds come from the box. It
-        starts from ``basis`` (the parent's ``(rows, basis)``) when that is
-        for the rows held, else from the basis HiGHS holds: the last
-        node's, which is the parent's only while plunging. (Starting there
-        after a jump to the best-bound node cost 215 to 353 pivots a node LP
-        on ns1830653, against about 70 for HiGHS's own search.)"""
-        held = self.highs_node_lps()
-        start = None
-        if basis is not None and basis[0] is held.mip and basis[1] is not None:
-            start = basis[1]
-        result = held.solve(
-            self.lp_lower(lower),
-            self.lp_upper(upper),
-            self.seconds_left(),
-            None if warm is None else warm[0],
-            basis=start,
-        )
-        if result is None:
-            self.node_lp_fallbacks += 1
-        return result
-
     def result_terms(self, result, lower, upper):
-        """The Lagrangian terms of a node LP's result: an exact vertex's
-        (``vertex_terms``) for HiGHS's, else its duals' (``dual_terms``)."""
-        if result.get("exact"):
-            return self.vertex_terms(result["solution"], lower, upper)
+        """The Lagrangian terms of a node LP's result (``dual_terms``)."""
         return self.dual_terms(result["solution"])
 
-    def solve_node_lp(self, lower, upper, warm, max_epochs, basis=None):
-        """A node's LP over its box: by HiGHS's dual simplex with
-        ``node_lp_solver="highs"`` (exactly, whatever ``max_epochs``, from
-        ``basis``, the parent's ``(rows, basis)``, when it is for these rows), or
-        else (or if HiGHS fails) by PDHG at ``node_precision`` with the node
-        options (``node_lp_tolerance``, ``node_lp_options``) and, with
+    def solve_node_lp(self, lower, upper, warm, max_epochs):
+        """A node's LP over its box by PDHG at ``node_precision``, with the
+        node options (``node_lp_tolerance``, ``node_lp_options``) and, with
         ``node_bound_stop``, the bound target."""
-        if self.node_lp_solver == "highs":
-            result = self.solve_highs_node(lower, upper, warm, basis)
-            if result is not None:
-                if result.get("converged"):
-                    held = self._highs_nodes
-                    self.node_basis = (held.mip, held.held_basis())
-                return result
         target = self.node_bound_target()
         return self.solve_lp(
             self.tree_lp(lower, upper),
@@ -7389,26 +6897,24 @@ class _BranchAndBound:
             ]
         )
 
-    def dual_terms(self, solution, rows=None):
-        """``lagrangian_terms`` of a node's duals, for the searched rows or
-        ``rows`` (``_HostRows``: the same columns, other cut rows)."""
-        if rows is None:
-            rows = _HostRows(self.mip.A, self.mip.b, self.A_T)
+    def dual_terms(self, solution):
+        """``lagrangian_terms`` of a node's duals over the searched rows."""
         return lagrangian_terms(
             self.mip.c,
-            rows.A,
-            rows.b,
+            self.mip.A,
+            self.mip.b,
             self.mip.n_eq,
-            self.duals(solution, rows.A.shape[0] - self.mip.n_eq),
-            A_T=rows.A_T,
+            self.duals(solution, self.m_ineq),
+            A_T=self.A_T,
         )
 
     def vertex_terms(self, vertex, lower, upper):
         """``dual_terms`` of an exact vertex (a crossover HiGHS proved
-        optimal). Its reduced costs that point at an infinite bound of the
-        box are round-off in ``c + Aᵀy`` (on buildingenergy 14,432 of them,
-        at most 1.8e-11), which would make the bound drop them and lose its
-        rigour: they are zeroed, as a simplex solver does."""
+        optimal). Its
+        reduced costs that point at an infinite bound of the box are
+        round-off in ``c + Aᵀy`` (on buildingenergy 14,432 of them, at most
+        1.8e-11), which would make the bound drop them and lose its rigour:
+        they are zeroed, as a simplex solver does."""
         constant, r = self.dual_terms(vertex)
         roundoff = (
             ((r > 0) & ~np.isfinite(lower)) | ((r < 0) & ~np.isfinite(upper))
@@ -7428,10 +6934,9 @@ class _BranchAndBound:
             *terms, lower, upper, reduced_cost_tolerance=self.reduced_cost_tol
         )
 
-    def lp_bound(self, solution, lower, upper, rows=None):
-        """The Lagrangian bound of a node's duals over its propagated box
-        (for ``rows``, as ``dual_terms``)."""
-        return self.bound_over(self.dual_terms(solution, rows), lower, upper)
+    def lp_bound(self, solution, lower, upper):
+        """The Lagrangian bound of a node's duals over its propagated box."""
+        return self.bound_over(self.dual_terms(solution), lower, upper)
 
     def reduced_cost_fix(self, terms, lower, upper):
         """``reduced_cost_tightening`` of a box against the cutoff, then
@@ -7472,149 +6977,13 @@ class _BranchAndBound:
         )
         if infeasible:
             return False
-        if self.verbose and lower is not self.root_lower:
-            changed = (lower != self.root_lower) | (upper != self.root_upper)
-            fixed = changed & (lower == upper) & self.is_int
-            print(
-                f"Root reduced-cost fixing: {int(np.count_nonzero(changed))} bounds "
-                f"tightened ({int(np.count_nonzero(fixed))} integers fixed)"
-            )
         self.root_lower, self.root_upper = lower, upper
-        if self.cutoff_probing and not self.cutoff_probe():
-            return False
         if self.root_redcost_propagation and self.conflicts is not None:
             # The root's reduced-cost row, at this cutoff, for every node.
             self.conflicts.set_cutoff(self.proof_cutoff())
             self.conflicts.set_global(
                 *self.root_terms, self.root_lower, self.root_upper
             )
-        return True
-
-    def cutoff_probe(self):
-        """
-        Root cutoff probing (``cutoff_probing``): exact LPs for the integers
-        reduced-cost fixing only just fails to fix. A free integer at the
-        bound its root reduced cost ``r_j`` favours, with ``|r_j|`` at least
-        ``_PROBE_MIN_RATIO`` of the room (cutoff less the root bound) and
-        below it, is moved one unit off that bound; HiGHS's dual simplex
-        solves that child from the root box's basis for at most the strong
-        branching pivots. When the child is infeasible, or its Lagrangian
-        bound reaches the cutoff (any duals of a stopped dual simplex give
-        one), the integer stays at its bound in the root box: no solution
-        better than the incumbent moves it. Candidates go closest to the
-        room first, at most ``cutoff_probing`` of them, while probing has
-        taken at most ``cutoff_probing_share`` of the elapsed time. The
-        children's duals also prove their boxes closed for the conflict
-        pool, and with ``global_redcost_fixing`` fix the root box as well.
-        Returns False when the root box holds no solution below the cutoff.
-        """
-        if (
-            self.node_lp_solver != "highs"
-            or self.root_terms is None
-            or not self.root_terms_rigorous
-            or self.out_of_time()
-            or self.cutoff_probing_seconds
-            > self.cutoff_probing_share * (time.time() - self.start)
-        ):
-            return True
-        started = time.time()
-        constant, r = self.root_terms
-        lower, upper = self.root_lower.copy(), self.root_upper.copy()
-        bound, rigorous = self.bound_over(self.root_terms, lower, upper)
-        room = self.cutoff() - bound
-        if not (rigorous and np.isfinite(room) and room > 0):
-            return True
-        free = self.is_int & (lower < upper)
-        at_bound = ((r > 0) & np.isfinite(lower)) | ((r < 0) & np.isfinite(upper))
-        ratio = np.abs(r) / room
-        candidates = np.flatnonzero(
-            free & at_bound & (ratio >= _PROBE_MIN_RATIO) & (ratio < 1.0)
-        )
-        if candidates.size == 0:
-            return True
-        candidates = candidates[np.argsort(-ratio[candidates], kind="stable")]
-        candidates = candidates[: self.cutoff_probing]
-
-        held = self.highs_node_lps()
-        before = held.basis()  # the last node's: put back afterwards
-        if self.root_basis is None or self.root_basis[0] is not held.mip:
-            solved = held.solve(
-                self.lp_lower(lower),
-                self.lp_upper(upper),
-                self.seconds_left(),
-            )
-            if solved is None or not solved.get("converged"):
-                if before is not None:
-                    held.highs.setBasis(before)
-                self.cutoff_probing_seconds += time.time() - started
-                return True
-            self.root_basis = (held.mip, held.basis())
-        basis = self.root_basis[1]
-        mean = held.mean_iterations()
-        limit = (
-            _HIGHS_NO_LIMIT
-            if mean is None
-            else max(_STRONG_MIN_ITERATIONS, int(_STRONG_ITERATION_FACTOR * mean))
-        )
-        budget = self.cutoff_probing_share * (time.time() - self.start)
-        fixed = 0
-        for j in candidates:
-            if self.out_of_time() or self.cutoff_probing_seconds + (
-                time.time() - started
-            ) > max(budget, 1.0):
-                break
-            lo, up = lower.copy(), upper.copy()
-            if r[j] > 0:
-                lo[j] = lower[j] + 1.0
-            else:
-                up[j] = upper[j] - 1.0
-            if lo[j] > up[j]:
-                continue
-            child = held.child(
-                self.lp_lower(lo),
-                self.lp_upper(up),
-                basis,
-                limit,
-            )
-            self.cutoff_probing_lps += 1
-            if child is None:
-                continue
-            if isinstance(child, str):  # HiGHS proved the child infeasible
-                closed, terms = True, None
-                self.learn_ray(held.last_ray, lo, up)
-            else:
-                terms = self.dual_terms(child)
-                raw, child_rigorous = self.bound_over(terms, lo, up)
-                closed = child_rigorous and self.round_bound(raw) >= self.cutoff()
-                if self.global_redcost_fixing:
-                    self.global_fix(terms)
-                    lower = np.maximum(lower, self.root_lower)
-                    upper = np.minimum(upper, self.root_upper)
-            if not closed:
-                continue
-            if r[j] > 0:
-                upper[j] = lower[j]
-            else:
-                lower[j] = upper[j]
-            fixed += 1
-            if terms is not None:
-                self.learn(terms, lo, up)
-        if basis is not None:
-            held.highs.setBasis(before if before is not None else basis)
-        infeasible = bool(np.any(lower > upper))
-        if fixed and not infeasible and self.propagator is not None:
-            lower, upper, infeasible = self.propagator(lower, upper)
-        self.cutoff_probing_fixed += fixed
-        self.cutoff_probing_seconds += time.time() - started
-        if self.verbose:
-            print(
-                f"Root cutoff probing: {fixed} of {len(candidates)} candidates fixed, "
-                f"{time.time() - started:.1f}s"
-            )
-        if infeasible:
-            return False
-        self.root_lower = np.maximum(self.root_lower, lower)
-        self.root_upper = np.minimum(self.root_upper, upper)
         return True
 
     def global_fix(self, terms):
@@ -7719,8 +7088,6 @@ class _BranchAndBound:
         self.root_terms = None
         self.root_terms_rigorous = False
         self.root_fixed_at = None
-        self.node_basis = None
-        self.root_basis = None
         return self.root_lower.copy(), self.root_upper.copy()
 
     def close_all(self):
@@ -7778,42 +7145,6 @@ class _BranchAndBound:
         self.conflicts.set_cutoff(self.proof_cutoff())
         self.conflicts.add(*terms, lower, upper, self.root_lower, self.root_upper, kind)
 
-    def learn_farkas(self, detection, lower, upper):
-        """A Farkas proof from ``detect``'s dual ray for an infeasible box.
-        The proof holds for either sign of the ray; the one that excludes
-        the box is kept."""
-        if self.conflicts is None or detection.get("dual_ray_ineq") is None:
-            return
-        y = np.concatenate(
-            [
-                np.asarray(detection["dual_ray_eq"], np.float64)[: self.mip.n_eq],
-                np.asarray(detection["dual_ray_ineq"], np.float64)[: self.m_ineq],
-            ]
-        )
-        zero = np.zeros(self.mip.num_variables)
-        for sign in (1.0, -1.0):
-            terms = lagrangian_terms(
-                zero, self.mip.A, self.mip.b, self.mip.n_eq, sign * y, A_T=self.A_T
-            )
-            if self.conflicts.add(
-                *terms, lower, upper, self.root_lower, self.root_upper, "farkas"
-            ):
-                return
-
-    def learn_ray(self, ray, lower, upper):
-        """A Farkas proof from HiGHS's dual ray for an LP it proved
-        infeasible over a box no wider than ``[lower, upper]`` (its rows the
-        searched ones, in their order). Any multipliers aggregate the rows
-        into a valid row (``lagrangian_terms`` clips the inequality ones to
-        their sign), and ``learn_farkas`` keeps the sign of the ray that
-        excludes the box, so HiGHS's sign convention does not matter."""
-        if ray is None or ray.shape != (self.mip.A.shape[0],):
-            return
-        n_eq = self.mip.n_eq
-        self.learn_farkas(
-            {"dual_ray_eq": ray[:n_eq], "dual_ray_ineq": ray[n_eq:]}, lower, upper
-        )
-
     def learn_nogood(self, lower, upper, max_size=64):
         """A no-good from a child box that propagation found infeasible: its
         binary fixings (against the root box), cut down by a deletion filter
@@ -7840,6 +7171,7 @@ class _BranchAndBound:
             if trial and infeasible(np.array(trial)):
                 kept = trial
         kept = np.array(kept)
+        self.bump_conflict(lower, upper, cols=kept)
         self.conflicts.add_nogood(kept[lower[kept] == 1.0], kept[lower[kept] == 0.0])
 
     def conflict_propagate(self, lower, upper):
@@ -7892,25 +7224,6 @@ class _BranchAndBound:
             self.failed_roundings.add(key)
         return worth
 
-    def highs_repair(self, fixed_lower, fixed_upper, warm):
-        """The repair LP of ``try_incumbent`` (the integers fixed, the
-        continuous variables free in their bounds) solved exactly by HiGHS's
-        dual simplex in the node LPs' instance (``_HighsNodeLPs``), within
-        ``round_repair_seconds`` and the time left. Returns its vertex, or
-        ``None`` when HiGHS proves it infeasible or does not finish. With
-        ``node_lp_solver="jaddle"`` the repair is PDHG's, for
-        ``repair_max_epochs``: 20 epochs by default, far from converged on
-        large LPs, after which a rounding that a solved LP would have
-        repaired was marked failed for good."""
-        seconds = self.round_repair_limit
-        if self.deadline is not None:
-            seconds = min(seconds, self.seconds_left())
-        result = self.highs_node_lps().solve(
-            fixed_lower, fixed_upper, seconds, None if warm is None else warm[0]
-        )
-        if result is None or not result.get("converged"):
-            return None
-        return np.asarray(result["solution"].primal, np.float64)
 
     def try_incumbent(self, x, source, warm):
         """Round ``x``'s integers and make it the incumbent if it is feasible
@@ -7931,27 +7244,21 @@ class _BranchAndBound:
                 self.lp_repairs_skipped += 1
                 return False
             self.lp_repairs += 1
-            if self.node_lp_solver == "highs":
-                repaired = self.highs_repair(fixed_lower, fixed_upper, warm)
-                if repaired is None:  # no continuous point fits these integers
-                    self.failed_roundings.add(candidate[self.is_int].tobytes())
-                    return False
-            else:
-                lp = self.mip.lp.with_values(
-                    self.values._replace(
-                        lower_bounds=jnp.asarray(fixed_lower, self.dtype),
-                        upper_bounds=jnp.asarray(fixed_upper, self.dtype),
-                    )
+            lp = self.mip.lp.with_values(
+                self.values._replace(
+                    lower_bounds=jnp.asarray(fixed_lower, self.dtype),
+                    upper_bounds=jnp.asarray(fixed_upper, self.dtype),
                 )
-                tight = 0.1 * self.feas_tol
-                result = self.solve_lp(
-                    lp,
-                    warm,
-                    self.repair_max_epochs,
-                    primal_feasibility_tolerance=tight,
-                    termination_norm="inf",
-                )
-                repaired = np.asarray(result["solution"].primal, np.float64)
+            )
+            tight = 0.1 * self.feas_tol
+            result = self.solve_lp(
+                lp,
+                warm,
+                self.repair_max_epochs,
+                primal_feasibility_tolerance=tight,
+                termination_norm="inf",
+            )
+            repaired = np.asarray(result["solution"].primal, np.float64)
             candidate = np.clip(repaired, fixed_lower, fixed_upper)
             candidate[self.is_int] = fixed_lower[self.is_int]
             if not self.original.is_feasible(candidate, self.feas_tol):
@@ -7978,7 +7285,7 @@ class _BranchAndBound:
                 source=source,
             )
         )
-        self.log(source, bound, depth=None, force=True)
+        self.log(source, bound, force=True)
         if switch and self.node_selection == "hybrid":
             self.rekey()
         if self.use_one_opt and source != "1":
@@ -8029,7 +7336,80 @@ class _BranchAndBound:
         if self.branching == "most_fractional" or not self.pc_count.any():
             f = x[candidates] - np.floor(x[candidates])
             return candidates[np.argmax(np.minimum(f, 1.0 - f))]
-        return candidates[np.argmax(self.pseudocost_scores(x, candidates))]
+        scores = self.branching_scores(
+            candidates, self.pseudocost_scores(x, candidates)
+        )
+        return candidates[np.argmax(scores)]
+
+    def branching_scores(self, candidates, gains):
+        """
+        The hybrid branching score of each candidate, as SCIP's and HiGHS's:
+        its bound-gain product (``gains``: pseudocost estimates, or strong
+        branching's child gains) first, then its conflict, cutoff and
+        inference history. Each part ``v`` is mapped to ``1 − 1/(1 + v/v̄)``
+        against its mean ``v̄`` over the candidates, and they are weighed
+        1, ``_CONFLICT_WEIGHT``, ``_CUTOFF_WEIGHT`` and
+        ``_INFERENCE_WEIGHT``. The gains decide; the history settles near
+        ties (on ns1830653 most branchings are at x = 0.5).
+
+        * conflict: ``conflict_score``, how often (decaying) the variable
+          was tightened in a box that closed;
+        * cutoff: the share of its children, either way, that closed at
+          once (infeasible after propagation, past the cutoff, or by their
+          LP), summed over the two directions;
+        * inference: the product over the directions of the mean bounds
+          propagation fixed in its children beyond the split.
+
+        ``-inf`` gains (fixed candidates) stay ``-inf``.
+        """
+        gains = np.asarray(gains, np.float64)
+
+        def mapped(values):
+            finite = values[np.isfinite(values) & (values > 0)]
+            mean = finite.mean() if finite.size else 0.0
+            if mean <= 0.0:
+                return np.zeros_like(values)
+            return 1.0 - 1.0 / (1.0 + np.maximum(values, 0.0) / mean)
+
+        made = self.branch_children[:, candidates]
+        cutoff = (self.branch_cutoffs[:, candidates] / np.maximum(made, 1.0)).sum(
+            axis=0
+        )
+        count = self.inference_count[:, candidates]
+        mean_inferences = self.inference_sum[:, candidates] / np.maximum(count, 1.0)
+        inference = np.prod(
+            np.where(count > 0, np.maximum(mean_inferences, 1e-6), 1e-6), axis=0
+        )
+        score = (
+            mapped(np.where(np.isfinite(gains), gains, 0.0))
+            + _CONFLICT_WEIGHT * mapped(self.conflict_score[candidates])
+            + _CUTOFF_WEIGHT * mapped(cutoff)
+            + _INFERENCE_WEIGHT * mapped(inference)
+        )
+        return np.where(np.isfinite(gains), score, -np.inf)
+
+    def record_cutoff(self, branch):
+        """A child of the branching ``branch`` (``_Node.branch``: var,
+        down, ...) closed at once."""
+        if branch is None:
+            return
+        self.branch_cutoffs[0 if branch[1] else 1, branch[0]] += 1
+
+    def bump_conflict(self, lower, upper, cols=None):
+        """The variables tightened (against the root box) in a box that just
+        closed, or ``cols``, gain ``conflict_bump``, which then grows by
+        ``1/_CONFLICT_DECAY``: newer conflicts weigh more (VSIDS)."""
+        if cols is None:
+            cols = np.flatnonzero(
+                (lower > self.root_lower) | (upper < self.root_upper)
+            )
+        if np.size(cols) == 0:
+            return
+        self.conflict_score[cols] += self.conflict_bump
+        self.conflict_bump /= _CONFLICT_DECAY
+        if self.conflict_bump > 1e100:  # rescale before overflow
+            self.conflict_score /= self.conflict_bump
+            self.conflict_bump = 1.0
 
     def integral_split_variable(self, x, lower, upper, terms):
         """The integer to split at a node whose LP point is integral but
@@ -8064,20 +7444,46 @@ class _BranchAndBound:
             return
         self.record_gain(var, down, max(value - parent_value, 0.0) / distance)
 
+    def tree_elapsed(self):
+        """Seconds spent in the tree so far, over every round between
+        restarts (0 outside it)."""
+        if self.tree_clock is None:
+            return self.tree_seconds
+        return self.tree_seconds + time.time() - self.tree_clock[0]
+
+    def heuristic_clock(self):
+        """The node count the tree heuristics are scheduled by: the nodes
+        finished, plus the time tree cut refreshes (``tree_cuts``) took
+        counted as the nodes it would have been without them (at the tree's
+        mean time a node without them). Cut rounds slow the nodes, and the
+        heuristics run every so many nodes: on ns1830653 three rounds a node
+        took the search from 1,173 nodes in 81 s to 165 in 140 s, and the
+        incumbent RINS had found at node 1,638 was late."""
+        if not self.use_tree_cuts or self.tree_cut_seconds <= 0.0 or self.nodes <= 0:
+            return float(self.nodes)
+        plain = self.tree_elapsed() - self.tree_cut_seconds
+        if plain <= 0.0:
+            return float(self.nodes)
+        return self.nodes + self.tree_cut_seconds * self.nodes / plain
+
+    def heuristic_due(self, name, every):
+        """Whether the heuristic ``name``, run every ``every`` nodes, is due:
+        ``nodes % every == 0`` without tree cuts; with them, once
+        ``heuristic_clock`` passes the next multiple of ``every`` (at the
+        first node that asks after it)."""
+        if not every:
+            return False
+        if not self.use_tree_cuts:
+            return self.nodes % every == 0
+        period = int(self.heuristic_clock() // every)
+        if period <= self.heuristic_fired.get(name, 0):
+            return False
+        self.heuristic_fired[name] = period
+        return True
+
     def strong_branching_on(self, node):
         """Whether reliability branching strong-branches at ``node``: within
-        ``strong_max_depth`` and, with HiGHS node LPs, while strong
-        branching in the tree has taken at most ``_STRONG_SHARE`` of the time
-        spent in the tree (pseudocosts decide meanwhile; the root's node is
-        not held to it)."""
-        if self.node_lp_solver == "highs" and self.tree_clock is not None:
-            started, strong_before = self.tree_clock
-            tree = self.tree_seconds + time.time() - started
-            strong = (
-                self.tree_strong_seconds + self.strong_branch_seconds - strong_before
-            )
-            if tree > _STRONG_GRACE_SECONDS and strong > _STRONG_SHARE * tree:
-                return False
+        ``strong_max_depth``."""
         return (
             self.branching == "reliability"
             and self.strong_candidates > 0
@@ -8126,7 +7532,8 @@ class _BranchAndBound:
         started = time.time()
         if self.strong_backend == "jax":
             if pending is None:  # every candidate was reliable
-                return candidates[np.argmax(score)], None, lower, upper, bound
+                best = np.argmax(self.branching_scores(candidates, score))
+                return candidates[best], None, lower, upper, bound
             self.strong_branch_nodes += 1
             try:
                 children, solved = self.finish_strong(pending, x, terms, bound, raw)
@@ -8137,7 +7544,8 @@ class _BranchAndBound:
                 self.pc_count[:, candidates].min(axis=0) < self.reliability_threshold
             )
             if unreliable.size == 0:
-                return candidates[np.argmax(score)], None, lower, upper, bound
+                best = np.argmax(self.branching_scores(candidates, score))
+                return candidates[best], None, lower, upper, bound
             # High-impact variables first (``branching_impact``).
             priority = score[unreliable] * self.impact[candidates[unreliable]]
             chosen = unreliable[np.argsort(-priority, kind="stable")]
@@ -8167,6 +7575,7 @@ class _BranchAndBound:
         if applied is None:
             return None
         lower, upper, strong_bound, results = applied
+        score = self.branching_scores(candidates, score)
         best = int(np.argmax(score))
         if not np.isfinite(score[best]):
             # Every candidate was fixed: solve the node again in its box.
@@ -8177,7 +7586,6 @@ class _BranchAndBound:
                     self.compress(lower, upper),
                     warm,
                     None,
-                    basis=self.node_basis,
                 )
             )
             return None
@@ -8218,6 +7626,9 @@ class _BranchAndBound:
             k = position.get(var)
             if k is None:  # screened, but reduced-cost fixing took it out
                 continue
+            self.branch_children[:, var] += 1
+            self.branch_cutoffs[0, var] += down.closed
+            self.branch_cutoffs[1, var] += up.closed
             if down.closed and up.closed:
                 self.close(max(min(down.bound, up.bound), bound))
                 return None
@@ -8297,7 +7708,6 @@ class _BranchAndBound:
             self.strong_branch_lps = lps
         est_down, est_up = self.pseudocost_estimates(x, cand)
         score = np.maximum(est_down, 1e-6) * np.maximum(est_up, 1e-6)
-        fixings = self.strong_fixings
         applied = self.apply_strong(
             children,
             set(chosen.tolist()),
@@ -8311,18 +7721,13 @@ class _BranchAndBound:
             bound,
             raw,
         )
-        if self.verbose:
-            line = (
-                f"Root strong branching: {chosen.size} candidates, "
-                f"{self.root_strong_lps} LPs, {self.strong_fixings - fixings} fixed"
-            )
-            if applied is not None:
-                line += f", bound {self.model_value(applied[2]):.6e}"
-            print(line + f", {self.root_strong_seconds:.1f}s")
         return applied
 
     def strong_kernels(self):
         """The device kernels for the current LP, built once per shape."""
+        held = self._strong_kernels
+        if held is not None and held[0] is not self.mip and held[1].set_mip(self.mip):
+            self._strong_kernels = (self.mip, held[1])  # same shapes: kept
         if self._strong_kernels is None or self._strong_kernels[0] is not self.mip:
             screen = self.strong_screen
             # Screened boxes are (screen, 2, n) float64 arrays: keep them small.
@@ -8390,17 +7795,23 @@ class _BranchAndBound:
             np.float64(raw if np.isfinite(raw) else -1e300),
             np.float64(self.cutoff()),
         )
-        values = self.node_values._replace(
-            lower_bounds=screened["lp_lower"], upper_bounds=screened["lp_upper"]
-        )
         width = 2 * kernels.k
         with self.node_settings():
             warm_starts = jax.tree.map(
                 lambda leaf: jnp.broadcast_to(leaf, (width,) + jnp.shape(leaf)),
                 _cast_warm(warm[0], self.node_dtype),
             )
-        out = self.batched_solver(self.strong_epochs)(
-            values, warm_starts, *self.bound_target_arg()
+        steps = _step_sizes(warm[1])
+        if steps is not None:
+            # The parent's step sizes, for every child.
+            dtype = _wide(self.node_dtype)
+            steps = tuple(jnp.full(width, value, dtype) for value in steps)
+        out, _ = self.node_batch(
+            screened["lp_lower"],
+            screened["lp_upper"],
+            warm_starts,
+            self.strong_epochs,
+            steps,
         )
         bounds = kernels.child_bounds(
             out.solution, screened["sel_lower"], screened["sel_upper"]
@@ -8555,25 +7966,11 @@ class _BranchAndBound:
                         pending.append((var, down, lo, up, pre, pre_raw))
                 children.setdefault(var, {})[down] = child
 
-        if self.node_lp_solver == "highs":
-            results = self.highs_strong_children(pending, lower, upper, warm)
-        else:
-            results = self.solve_children([box[2:4] for box in pending], warm)
+        results = self.solve_children([box[2:4] for box in pending], warm)
         self.strong_branch_lps += len(pending)
         for (var, down, lo, up, pre, pre_raw), result in zip(pending, results):
-            if result is None:  # HiGHS failed: the parent's bound only
-                children[var][down] = _StrongChild(pre, False, None, pre_raw)
-                continue
-            if result.get("infeasible"):
-                self.learn_ray(result.get("dual_ray"), lo, up)
-                children[var][down] = _StrongChild(np.inf, True, None)
-                continue
             solution = result["solution"]
-            child_terms = (
-                self.vertex_terms(solution, lo, up)
-                if result.get("exact")
-                else self.dual_terms(solution)
-            )
+            child_terms = self.result_terms(result, lo, up)
             child_raw, rigorous = self.bound_over(child_terms, lo, up)
             child_raw = max(child_raw, pre_raw)
             score_raw = child_raw  # for the score and pseudocost either way
@@ -8595,65 +7992,12 @@ class _BranchAndBound:
             )
         return {var: (sides[True], sides[False]) for var, sides in children.items()}
 
-    def highs_strong_children(self, pending, lower, upper, warm):
-        """Strong branching's child LPs (``pending``: ``strong_branch``'s
-        boxes) by HiGHS's dual simplex from the node's basis (``node_basis``),
-        each for at most ``_STRONG_ITERATION_FACTOR`` times the node LPs'
-        mean iterations. At the root, whose LP PDHG solved, the node LP
-        (``[lower, upper]``) is solved exactly first for that basis. Returns
-        ``solve_lp``-style results (``"infeasible"`` for a child HiGHS
-        proves empty), ``None`` where HiGHS failed."""
-        held = self.highs_node_lps()
-        like = None if warm is None else warm[0]
-        if self.node_basis is None or self.node_basis[0] is not held.mip:
-            # No HiGHS basis for this node (the root's LP is PDHG's): solve
-            # its LP for one.
-            held.solve(
-                self.lp_lower(lower),
-                self.lp_upper(upper),
-                self.seconds_left(),
-                like,
-            )
-            self.node_basis = (held.mip, held.held_basis())
-        basis = self.node_basis[1]
-        mean = held.mean_iterations()
-        limit = (
-            _HIGHS_NO_LIMIT
-            if mean is None
-            else max(_STRONG_MIN_ITERATIONS, int(_STRONG_ITERATION_FACTOR * mean))
-        )
-        out = []
-        for _, _, lo, up, _, _ in pending:
-            if self.out_of_time():
-                out.append(None)
-                continue
-            child = held.child(
-                self.lp_lower(lo),
-                self.lp_upper(up),
-                basis,
-                limit,
-                like,
-            )
-            if isinstance(child, str):
-                out.append({"infeasible": True, "dual_ray": held.last_ray})
-            elif child is None:
-                out.append(None)
-            else:
-                out.append({"solution": child, "converged": False})
-        if basis is not None:
-            held.restore(basis)  # the node's, for the next node
-        return out
 
     def solve_children(self, boxes, warm):
         """The LPs of ``boxes`` for ``strong_epochs``, warm-started from
-        ``warm``: in one vmapped call (padded to a power of two), or one by
-        one while tree cuts change the LP's shape."""
+        ``warm``, in one batched call (padded to a power of two)."""
         if not boxes:
             return []
-        if self.use_tree_cuts:
-            return [
-                self.solve_node_lp(lo, up, warm, self.strong_epochs) for lo, up in boxes
-            ]
         # One batch shape for the whole search, so one compile.
         size = _next_power_of_two(max(2 * self.strong_candidates, len(boxes)))
         results = self.solve_batch(
@@ -8729,6 +8073,7 @@ class _BranchAndBound:
         strong branching) gives the children a bound and a warm start of
         their own. ``precomputed`` is this node's row of ``_ChildKernels``
         (the children already propagated and bounded on the device)."""
+        self.branched_nodes += 1
         xv = x[var]
         if not self.is_int[var]:
             self.implied_branchings += 1  # an implied integer (``branch_implied``)
@@ -8742,6 +8087,8 @@ class _BranchAndBound:
                     continue
                 if precomputed["empty"][side]:
                     self.infeasible_nodes += 1
+                    self.branch_children[side, var] += 1
+                    self.branch_cutoffs[side, var] += 1
                     self.learn_nogood(*_child_box((lower, upper), var, xv, down))
                     continue
                 lo = np.array(precomputed["lower"][side], np.float64)
@@ -8754,19 +8101,27 @@ class _BranchAndBound:
                     lo[var] = max(lo[var], math.ceil(xv))
                 if lo[var] > up[var]:
                     continue
+                self.branch_children[side, var] += 1
                 if self.propagator is not None:
                     branched = (lo, up)
                     lo, up, infeasible = self.propagator(lo, up)
                     if infeasible:
                         self.infeasible_nodes += 1
+                        self.branch_cutoffs[side, var] += 1
                         self.learn_nogood(*branched)
                         continue
+            if precomputed is not None:
+                self.branch_children[side, var] += 1
             lo, up, infeasible = self.conflict_propagate(lo, up)
             if infeasible:
                 self.conflict_pruned += 1
+                self.branch_cutoffs[side, var] += 1
+                self.bump_conflict(lo, up)
                 self.close(max(bound, self.cutoff_bound()))
                 continue
             inferences = int(np.count_nonzero((lo != split_lo) | (up != split_up)))
+            self.inference_sum[side, var] += inferences
+            self.inference_count[side, var] += 1
             if precomputed is not None:
                 # Over the box before the conflict pool, which holds it.
                 child_bound = float(precomputed["bound"][side])
@@ -8786,6 +8141,7 @@ class _BranchAndBound:
                     )
             if child_bound >= self.cutoff():
                 self.children_pruned += 1
+                self.branch_cutoffs[side, var] += 1
                 self.close(child_bound, rigorous)
                 if rigorous:
                     self.learn(terms, lo, up)
@@ -8798,7 +8154,6 @@ class _BranchAndBound:
                     self.compress(lo, up),
                     child_warm,
                     (var, down, distance, value),
-                    basis=self.node_basis,  # this node's: the child starts there
                     inferences=inferences,
                 )
             )
@@ -8842,6 +8197,7 @@ class _BranchAndBound:
             if self.plunge_reaches(children[-1], bound):
                 # Plunge: the next step continues into the preferred child.
                 self.plunge_node = children.pop()
+                self.plunge_node.cut_version = self.cut_version
                 self.plunge_left -= 1
             else:
                 self.plunges_stopped += 1
@@ -8872,12 +8228,6 @@ class _BranchAndBound:
             self.active_bound = np.inf
 
     def _evaluate(self, node, lower, upper, lp, result):
-        if result.get("infeasible"):
-            # HiGHS proved the node's LP infeasible: its dual ray is a
-            # Farkas proof for the conflict pool.
-            self.infeasible_nodes += 1
-            self.learn_ray(result.get("dual_ray"), lower, upper)
-            return
         terms = self.result_terms(result, lower, upper)
         raw, rigorous = self.bound_over(terms, lower, upper)
         bound = max(self.round_bound(raw), node.bound)
@@ -8906,25 +8256,15 @@ class _BranchAndBound:
                     (result["solution"], result["opt_state"]),
                     node.branch,
                     spent,
+                    cut_rounds=node.cut_rounds,
+                    branch_value=node.branch_value,
                 )
             )
             return
-        if not result["converged"] and bound < self.cutoff() and not self.out_of_time():
-            # An LP that will not converge is often infeasible.
-            if lp is None:  # built only when needed
-                lp = self.node_lp(lower, upper)
-            detection = self.detect(lp, result, self.node_max_epochs)
-            if detection["status"] == "primal_infeasible":
-                self.infeasible_nodes += 1
-                self.learn_farkas(detection, lower, upper)
-                return
-            result = detection["result"]
-            new_terms = self.dual_terms(result["solution"])
-            new_raw, new_rigorous = self.bound_over(new_terms, lower, upper)
-            if new_raw > raw:
-                terms, raw, rigorous = new_terms, new_raw, new_rigorous
-                bound = max(self.round_bound(raw), bound)
-                self.active_bound = bound
+        # An LP that did not converge keeps its Lagrangian bound (valid at
+        # any duals) and branches on its point. An infeasible one has duals
+        # that diverge along a Farkas ray, so its bound passes the cutoff and
+        # closes it (``node_bound_stop``) without infeasibility detection.
         root = node.depth == 0 and node.branch is None
         if root and self.root_terms is not None and self.root_terms_rigorous:
             # Exact duals from a root crossover (``root_exact_terms``): a
@@ -8943,8 +8283,15 @@ class _BranchAndBound:
         x = np.asarray(result["solution"].primal, np.float64)
         value = float(self.mip.c @ x) if converged else None
         if node.branch is not None and converged:
-            self.update_pseudocost(node, value)
+            # The gain of the branching alone: the LP before this node's
+            # re-solve with new tree cuts (``refresh_cuts``), whose gain is
+            # the cuts', not the branched variable's.
+            self.update_pseudocost(
+                node, value if node.branch_value is None else node.branch_value
+            )
         if bound >= self.cutoff():
+            self.record_cutoff(node.branch)
+            self.bump_conflict(lower, upper)
             self.close(bound, rigorous)
             if rigorous:
                 self.learn(terms, lower, upper)
@@ -9003,6 +8350,10 @@ class _BranchAndBound:
             self.branch(node, lower, upper, split, var, bound, None, warm, terms)
             return
         self.bound_rigorous &= rigorous
+        self.try_near_integral(x, xi, warm)
+        # Every node's LP point is rounded in the background, beside the
+        # node LPs (``parallel_rounding``).
+        rounding_queued = self.background_rounding(x, lower, upper, warm)
         if self.branch_implied_cols is not None:
             # Fractional implied integers join the candidates (not the
             # integrality test): on ns1830653 they carry the objective.
@@ -9024,8 +8375,12 @@ class _BranchAndBound:
                 raw,
             )
         if self.heuristic_every and (self.nodes - 1) % self.heuristic_every == 0:
-            if self.try_incumbent(x, "H", warm) or not self.use_fix_and_propagate:
-                pass
+            if (
+                self.try_incumbent(x, "H", warm)
+                or not self.use_fix_and_propagate
+                or rounding_queued
+            ):
+                pass  # (the background lane rounds this point)
             elif self.deferring and self.batch_roundings:
                 # Batched on the device: rounded with the batch's others.
                 self.deferred_roundings.append((x, lower.copy(), upper.copy(), warm))
@@ -9041,16 +8396,14 @@ class _BranchAndBound:
                 self.close(bound, rigorous)
                 return
         if not root and self.round_repair_due():
-            self.round_repair(
-                x, lower, upper, warm, background=self.workers is not None
-            )
+            self.round_repair(x, lower, upper, warm)
             if bound >= self.cutoff():
                 self.close(bound, rigorous)
                 return
         if (
             self.rins_seconds
             and self.incumbent is not None
-            and (self.nodes % self.rins_every == 0 or self.rins_pending)
+            and (self.rins_pending or self.heuristic_due("rins", self.rins_every))
             and not self.out_of_time()
             and self.submip_budget_left()
         ):
@@ -9066,8 +8419,8 @@ class _BranchAndBound:
                 return
         if (
             self.dive_every
-            and self.nodes % self.dive_every == 0
             and not self.out_of_time()
+            and self.heuristic_due("dive", self.dive_every)
         ):
             self.dive(x, lower, upper, warm)
             if bound >= self.cutoff():
@@ -9093,7 +8446,6 @@ class _BranchAndBound:
                     self.compress(lower, upper),
                     warm,
                     None,
-                    basis=self.node_basis,
                 )
             )
             return
@@ -9118,7 +8470,6 @@ class _BranchAndBound:
                         self.compress(lower, upper),
                         warm,
                         None,
-                        basis=self.node_basis,
                     )
                 )
                 return
@@ -9149,17 +8500,6 @@ class _BranchAndBound:
                 self.close(bound, rigorous)
                 return
         self.active_bound = bound
-        if (
-            self.use_tree_cuts
-            and self.tree_cut_every
-            and self.nodes % self.tree_cut_every == 0
-        ):
-            warm = self.tree_cut_round(x, warm)
-            # The strong children's duals miss the new cut rows.
-            if strong is not None:
-                strong = {
-                    d: child._replace(solution=None) for d, child in strong.items()
-                }
         if self.deferring:
             # Batched on the device: split with the batch's other members.
             self.deferred_branches.append(
@@ -9179,28 +8519,160 @@ class _BranchAndBound:
             return
         self.branch(node, lower, upper, x, var, bound, value, warm, terms, strong)
 
-    def log(self, source, bound, depth, force=False):
-        """A progress line (``bound=None``: the global bound)."""
+    def try_near_integral(self, x, xi, warm):
+        """A node LP point whose integers ``xi`` are all within
+        ``near_integral_tolerance`` of integers, though not within
+        ``integrality_tolerance``, is rounded and tried (``"T"``). A loose
+        PDHG point (float32 nodes at 1e-4, no node crossover) rarely passes
+        the integrality test even at an integral optimum (a binary at
+        0.9997). The node branches as usual; each rounding is tried once."""
+        tol = self.near_integral_tol
+        if not tol or not xi.size:
+            return
+        rounded = np.round(xi)
+        if np.abs(xi - rounded).max() > tol:
+            return
+        key = rounded.tobytes()
+        if key in self.near_integral_seen:
+            return
+        if len(self.near_integral_seen) >= 100_000:
+            self.near_integral_seen.clear()
+        self.near_integral_seen.add(key)
+        before = None if self.incumbent is None else self.incumbent[0]
+        self.near_integral_tries += 1
+        self.try_incumbent(x, "T", warm)
+        self.near_integral_finds += self.incumbent is not None and (
+            before is None or self.incumbent[0] < before
+        )
+
+    def explored(self):
+        """The share of the tree closed, as HiGHS's ``Expl.``: one less the
+        weight (``2^-depth``) of the nodes still open, waiting in a batch or
+        evaluated but not yet split. 0 before the tree starts."""
+        if not self.tree_started:
+            return 0.0
+        nodes = list(self.open_nodes()) + list(self.batch_waiting)
+        nodes += [entry["node"] for entry in self.deferred_branches]
+        weight = math.fsum(0.5 ** node.depth for node in nodes)
+        return min(1.0, max(0.0, 1.0 - weight))
+
+    def log(self, source, bound, force=False):
+        """A progress line, as HiGHS's (``bound=None``: the global bound).
+        The first one prints the source legend and the header."""
         if not self.verbose:
             return
         now = time.time()
         if not force and now - self.last_log < self.log_every:
             return
         self.last_log = now
+        if not self.log_header_printed:
+            self.log_header_printed = True
+            print(_LOG_LEGEND)
+            print()
+            print(_LOG_HEADER)
+            print()
         if bound is None:
             bound = self.global_bound()
-        incumbent = (
-            f"{self.model_value(self.incumbent[0]):13.6e}"
-            if self.incumbent is not None
-            else f"{'-':>13}"
-        )
+        best = np.inf if self.incumbent is None else self.incumbent[0]
         gap = self.gap(bound)
-        gap_text = f"{100 * gap:8.2f}%" if np.isfinite(gap) else f"{'-':>9}"
+        if not np.isfinite(gap):
+            gap_text = "inf"
+        elif 100 * gap >= 9999:
+            gap_text = "Large"
+        else:
+            gap_text = f"{100 * gap:.2f}%"
+        leaves = max(0, self.nodes - self.branched_nodes)
+        conflicts = 0 if self.conflicts is None else len(self.conflicts)
         print(
-            f"{source:>1} {self.nodes:8d} {len(self.open):8d} "
-            f"{'' if depth is None else depth:>6} {self.model_value(bound):13.6e} "
-            f"{incumbent} {gap_text} {now - self.start:8.1f}s"
+            f" {source:1.1} {_log_count(self.nodes):>7} {_log_count(len(self.open)):>7}"
+            f"   {_log_count(leaves):>7} {100 * self.explored():6.2f}%"
+            f"   {_log_value(self.model_value(bound)):<15}"
+            f" {_log_value(self.model_value(best)):<15} {gap_text:>8}"
+            f"   {len(self.cut_pool):6d} {len(self.cut_list):6d} {conflicts:6d}"
+            f"   {_log_count(self.lp_epochs):>7} {now - self.start:7.1f}s"
         )
+
+    def report(self, status, bound, objective):
+        """The end of the log, as HiGHS's solving report: the last table
+        line, then the status, bounds, gap, time and counts."""
+        if self.log_header_printed:
+            self.log(" ", bound, force=True)
+        print()
+        print("Solving report")
+        rows = [("Status", _STATUS_TEXT.get(status, status))]
+        rows.append(
+            ("Primal bound", "inf" if objective is None else f"{objective:.10g}")
+        )
+        rows.append(("Dual bound", f"{self.model_value(bound):.10g}"))
+        gap = self.gap(bound)
+        gap_text = f"{100 * gap:.4g}%" if np.isfinite(gap) else "inf"
+        rows.append(("Gap", f"{gap_text} (tolerance: {100 * self.rel_gap:.4g}%)"))
+        elapsed = time.time() - self.start
+        rows.append(("Timing", f"{elapsed:.2f} (total)"))
+        rows.append(("", f"{self.heuristic_seconds:.2f} (heuristics)"))
+        if self.strong_branch_seconds:
+            rows.append(("", f"{self.strong_branch_seconds:.2f} (strong branching)"))
+        rows.append(("Nodes", str(self.nodes)))
+        rows.append(("LP epochs", f"{self.lp_epochs} (total)"))
+        if self.cut_list or self.root_bound_before_cuts is not None:
+            families = [cut["family"] for cut in self.cut_list]
+            names = (
+                ("gomory", "Gomory"),
+                ("cover", "cover"),
+                ("mir", "MIR"),
+                ("flowcover", "flow cover"),
+                ("clique", "clique"),
+                ("zerohalf", "zero-half"),
+                ("impliedbound", "implied bound"),
+            )
+            counts = ", ".join(
+                f"{families.count(key)} {name}"
+                for key, name in names
+                if families.count(key)
+            )
+            rows.append(
+                ("Cuts", f"{len(families)} in the LP" + (f" ({counts})" if counts else ""))
+            )
+            if self.use_tree_cuts:
+                rows.append(("", f"{self.tree_cuts_added} added in the tree"))
+            rows.append(("", f"{len(self.cut_pool)} in the pool"))
+        if self.conflicts is not None and any(self.conflicts.added.values()):
+            added = self.conflicts.added
+            rows.append(
+                (
+                    "Conflicts",
+                    f"{added['objective']} objective, {added['nogood']} no-goods",
+                )
+            )
+            rows.append(
+                (
+                    "",
+                    f"{self.conflict_pruned} nodes pruned, "
+                    f"{self.conflict_tightenings} bounds tightened",
+                )
+            )
+        if self.strong_branch_nodes:
+            rows.append(
+                (
+                    "Strong branching",
+                    f"{self.strong_branch_nodes} nodes, {self.strong_branch_lps} LPs, "
+                    f"{self.strong_fixings} fixings",
+                )
+            )
+        if self.background_roundings:
+            rows.append(
+                ("Roundings", f"{self.background_roundings} in the background")
+            )
+        if self.near_integral_tries:
+            rows.append(
+                (
+                    "Near-integral",
+                    f"{self.near_integral_tries} tried, "
+                    f"{self.near_integral_finds} improved",
+                )
+            )
+        for label, value in rows:
+            print(f"  {label:<18}{value}")
 
     def result(self, status):
         # Background points that are in already (the rest are dropped).
@@ -9219,57 +8691,7 @@ class _BranchAndBound:
         x = None if self.incumbent is None else self.incumbent[1]
         objective = None if x is None else self.model_value(self.incumbent[0])
         if self.verbose:
-            print("----------------------------------------------")
-            print(f"Status: {status}")
-            print(f"Nodes: {self.nodes}, LP epochs: {self.lp_epochs}")
-            if self._highs_nodes is not None or self.node_lp_fallbacks:
-                held = self._highs_nodes
-                solves, iterations, seconds = (
-                    (0, 0, 0.0)
-                    if held is None
-                    else (held.solves, held.iterations, held.seconds)
-                )
-                print(
-                    f"Node LPs in HiGHS: {solves} solves, {iterations} simplex iterations, "
-                    f"{seconds:.1f}s"
-                    + (
-                        f", {self.node_lp_fallbacks} handed to PDHG"
-                        if self.node_lp_fallbacks
-                        else ""
-                    )
-                )
-            if self.cut_list or self.root_bound_before_cuts is not None:
-                families = [cut["family"] for cut in self.cut_list]
-                line = (
-                    f"Cuts: {len(families)} in the LP ({families.count('cover')} "
-                    f"cover, {families.count('mir')} MIR, "
-                    f"{families.count('flowcover')} flow cover, "
-                    f"{families.count('clique')} clique, "
-                    f"{families.count('zerohalf')} zero-half, "
-                    f"{families.count('impliedbound')} implied bound, "
-                    f"{families.count('gomory')} Gomory)"
-                )
-                if self.use_tree_cuts:
-                    line += f", {self.tree_cuts_added} added in the tree"
-                print(line)
-            if self.conflicts is not None and any(self.conflicts.added.values()):
-                added = self.conflicts.added
-                print(
-                    f"Conflicts: {added['objective']} objective + "
-                    f"{added['farkas']} Farkas proofs, {added['nogood']} no-goods; "
-                    f"{self.conflict_pruned} nodes pruned before their LP, "
-                    f"{self.conflict_tightenings} bounds tightened"
-                )
-            if self.strong_branch_nodes:
-                print(
-                    f"Strong branching: {self.strong_branch_nodes} nodes, "
-                    f"{self.strong_branch_lps} LPs, {self.strong_fixings} fixings, "
-                    f"{self.strong_branch_seconds:.2f} seconds"
-                )
-            if objective is not None:
-                print(f"Objective: {objective:.10g}")
-            print(f"Bound: {self.model_value(bound):.10g}")
-            print(f"Time: {time.time() - self.start:.2f} seconds")
+            self.report(status, bound, objective)
         return {
             "x": x,
             "objective": objective,
@@ -9282,9 +8704,21 @@ class _BranchAndBound:
             "infeasible_nodes": self.infeasible_nodes,
             "unresolved_nodes": self.unresolved_nodes,
             "integral_splits": self.integral_splits,
-            "cutoff_probing_lps": self.cutoff_probing_lps,
-            "cutoff_probing_fixed": self.cutoff_probing_fixed,
-            "cutoff_probing_seconds": self.cutoff_probing_seconds,
+            "near_integral": {
+                "tries": self.near_integral_tries,
+                "finds": self.near_integral_finds,
+            },
+            "background_roundings": self.background_roundings,
+            "inout_cuts": self.inout_cuts,
+            "inout_rounds": self.inout_rounds,
+            "tree_cut_refreshes": self.tree_cut_refreshes,
+            "tree_pool_refreshes": self.tree_pool_refreshes,
+            "tree_cut_requeued": self.tree_cut_requeued,
+            "tree_cut_seconds": self.tree_cut_seconds,
+            "tree_cut_pool_hits": self.tree_cut_pool_hits,
+            "tree_cut_skipped": self.tree_cut_skipped,
+            "tree_cut_families": dict(self.tree_cut_families),
+            "cut_pool": len(self.cut_pool),
             "global_redcost_fixed": self.global_redcost_fixed,
             "cut_pool_rows": len(self.cut_archive),
             "lp_epochs": self.lp_epochs,
@@ -9307,7 +8741,6 @@ class _BranchAndBound:
                 if self.root_bound_before_cuts is None
                 else self.model_value(self.root_bound_before_cuts)
             ),
-            "simplex_rounds": self.simplex_rounds,
             "heuristic_seconds": self.heuristic_seconds,
             "batches": self.batches,
             "objective_step": self.objective_step,
@@ -9321,20 +8754,6 @@ class _BranchAndBound:
             "symmetry": self.symmetry_stats,
             "restarts": len(self.restart_log),
             "restart_log": list(self.restart_log),
-            "node_lp_solver": self.node_lp_solver,
-            "node_lp_solves": (
-                0 if self._highs_nodes is None else self._highs_nodes.solves
-            ),
-            "node_simplex_iterations": (
-                0 if self._highs_nodes is None else self._highs_nodes.iterations
-            ),
-            "node_lp_seconds": (
-                0.0 if self._highs_nodes is None else self._highs_nodes.seconds
-            ),
-            "node_lp_fallbacks": self.node_lp_fallbacks,
-            "node_basis_restores": (
-                0 if self._highs_nodes is None else self._highs_nodes.basis_restores
-            ),
             "rins_calls": self.rins_calls,
             "conflicts": (
                 dict(self.conflicts.added)
@@ -9346,7 +8765,6 @@ class _BranchAndBound:
             "bound_stops": self.bound_stops,
             "submip_calls": self.submip_calls,
             "submip_seconds": self.submip_seconds,
-            "highs_incumbent_calls": self.highs_incumbent_calls,
             "parallel_heuristics": {
                 "jobs": self.worker_jobs,
                 "seconds": self.worker_seconds,
@@ -9485,16 +8903,29 @@ class _BranchAndBound:
 
     def cut_loop(self, lower, upper, result):
         """Rounds of root cuts: separate at the LP point, append the cuts,
-        re-solve warm. With Gomory cuts, each round's crossover basis says
-        which cuts are binding, and the slack ones (basic rows) are dropped
-        before the new cuts go in. Dense GMI cuts are needed for a round or
-        two, so this keeps the LP near its own size: on ns1830653 the cut
-        rows held about 170 nonzeros after eight rounds instead of 220,000,
-        for the same bound. Without a basis, a cut is dropped once it has
-        been slack with a zero dual for two rounds.
-        Stops when a round finds no cut or the bound gains less than
-        ``cut_min_progress`` (relative). Returns the last root LP result, or
-        a status string when a re-solve settles the search."""
+        re-solve warm by PDHG. With Gomory cuts, each round crosses over to
+        a vertex, whose basis gives them (and from which the other families
+        separate too).
+
+        A cut stays in the LP until it has been idle (slack, with a zero
+        dual, at the round's re-solve) for ``cut_age`` rounds in a row,
+        then it leaves the LP for the global cut pool (``pool_cuts``). On
+        degenerate LPs a cut slack at one optimum is often binding again at
+        the next, and dropped at once the rounds cycle between them
+        (ns1830653 sat at 11,622 for good, as HiGHS's simplex rounds did
+        before they kept slack cuts 10 rounds; bab5's root went from
+        −107,807 to −107,379 with them kept). ``max_cut_rows`` caps the
+        rows (``cap_cut_rows``).
+
+        From the second round on, each round's point is rounded
+        (``round_heuristics``), and the background improving jump is queued
+        again from each new incumbent.
+
+        Stops when a round finds no cut, or, once three rounds have run, the
+        bound gains less than ``cut_min_progress`` over the last three:
+        relative to the gap to the incumbent when there is one, else to the
+        bound. Also stops when a re-solve's bound reaches the cutoff
+        (``root_resolve``). Returns the last root LP result."""
         base = self.base
         n = base.num_variables
         base_m = base.A.shape[0] - base.n_eq
@@ -9508,59 +8939,28 @@ class _BranchAndBound:
         self.root_bound_before_cuts = bound
         history = [bound]  # the best bound after each round
         capacity = None
-        simplex = None  # the rounds' HiGHS LP (``simplex_cut_rounds``)
-        # While HiGHS holds the rounds' LP, the cut block goes to the host
-        # rows only (``host``), and the searched MIP, whose device LP takes
-        # 1–2 s to build on bab5, is rebuilt once (``install``) when the rounds
-        # end or the first-order solver takes over. ``pending``: the block
-        # and the exact vertex state for its rows.
-        host = pending = None
-
-        def install():
-            nonlocal host, pending
-            if pending is None:
-                return
-            A_rows, b_rows, state = pending
-            self.set_mip(base.with_rows(A_rows, b_rows))
-            if state is not None:
-                self.root_vertex_state = (self.mip, state)
-            host = pending = None
-
         for round_number in range(1, self.cut_rounds + 1):
             if self.out_of_time():
                 break
-            # The background incumbent search runs beside the rounds; one
-            # that found nothing goes again, for twice as long.
-            self.collect_heuristics(schedule=False)
-            self.queue_highs_incumbent()
+            # Pick up background jump points and queue the next slice from
+            # the incumbent, so the improving jump runs beside the rounds.
+            self.collect_heuristics()
+            round_started = time.time()
             solution = result["solution"]
             x = np.asarray(solution.primal, np.float64)
             candidates = []
-            basis = vertex = None
-            if simplex is not None:
-                vertex, basis = simplex.vertex()
-            elif self.gomory or (self.use_simplex_rounds and round_number == 1):
+            if self.gomory:
                 # Cross over to a vertex: its basis gives the Gomory cuts, and
                 # the other families separate better from a vertex too.
                 vertex, basis = self.root_vertex(lower, upper, solution)
-                if vertex is not None and self.use_simplex_rounds and round_number == 1:
-                    simplex = _SimplexRounds(
-                        self.node_lp(lower, upper), basis, self.seconds_left()
-                    )
-                    if simplex.optimal:
-                        vertex, basis = simplex.vertex()
-                    else:
-                        simplex = None
-            if vertex is not None:
-                x = vertex
-                self.root_vertex_x = vertex
-                if self.gomory:
-                    # The rows the basis is for: the HiGHS LP's, or the
-                    # crossover's (``self.mip``, padding rows included).
-                    rows = simplex if simplex is not None else self.mip
+                if vertex is not None:
+                    x = vertex
+                    self.root_vertex_x = vertex
+                    # The rows the basis is for: the crossover's
+                    # (``self.mip``, padding rows included).
                     candidates += gomory_cuts(
-                        rows.A,
-                        rows.b,
+                        self.mip.A,
+                        self.mip.b,
                         self.mip.n_eq,
                         np.where(self.cut_int, lower, base.lower),
                         np.where(self.cut_int, upper, base.upper),
@@ -9568,55 +8968,43 @@ class _BranchAndBound:
                         basis,
                         x,
                         max_cuts=self.gomory_candidates or 2 * self.max_cuts_per_round,
-                        # Dense cuts are fine here: the ones left slack
-                        # are dropped next round (see ``binding``).
+                        # Dense cuts are fine here: the ones left idle leave
+                        # the LP after ``cut_age`` rounds.
                         max_nnz=None,
-                        # HiGHS's factors of this basis, when it holds it.
-                        highs=None if simplex is None else simplex.highs,
                     )
+            if round_number > 1:
+                # Round the round's point (with ``parallel_heuristics`` on a
+                # background thread, beside this round's separation and
+                # re-solve). The first round's point is the root LP's, which
+                # the root heuristics have just rounded.
+                self.round_heuristics(
+                    x,
+                    lower,
+                    upper,
+                    (solution, result["opt_state"]),
+                    0.1 * (time.time() - round_started),
+                )
             for separator in separators:
                 candidates += separator(x)
-            candidates += self.zero_half(
-                x, lower, upper, 2 * self.max_cuts_per_round, host
+            candidates += self.zero_half(x, lower, upper, 2 * self.max_cuts_per_round)
+            inout = self.inout_candidates(
+                separators, x, lower, upper, 2 * self.max_cuts_per_round
             )
+            candidates += inout or []
             found = select_cuts(candidates, x, n, max_cuts=self.max_cuts_per_round)
+            self.inout_result(found, inout)
             self.archive_cuts(found)
+            # Every violated candidate goes into the pool, as HiGHS's, for
+            # the tree to take back when a node point violates it; the ones
+            # in the LP go in last (the newest, so the last to be evicted).
+            self.pool_cuts(violated_cuts(candidates, x))
+            self.pool_cuts(found)
             if not found:
                 break
-            if simplex is not None:
-                solution = simplex.solution(
-                    solution, np.asarray(solution.dual_ineq).size
-                )
             dual_ineq = np.asarray(solution.dual_ineq)
-            if basis is not None:
-                import highspy
-
-                # Basic rows are slack at the optimal vertex: dropping them
-                # keeps it optimal.
-                first = self.mip.n_eq + base_m
-                status = basis.row_status
-                binding = [
-                    status[first + i] != highspy.HighsBasisStatus.kBasic
-                    for i in range(len(self.cut_list))
-                ]
-                if simplex is not None:
-                    # Exact vertices: a cut slack at one is often binding
-                    # again at the next optimal vertex of a degenerate LP,
-                    # and dropped at once the rounds cycle between them
-                    # (ns1830653 sat at 11,622 for good). Keep it until it
-                    # has been slack for ``simplex_cut_age`` rounds: bab5's
-                    # root goes from −107,807 to −107,379.
-                    for i, cut in enumerate(self.cut_list):
-                        cut["slack_rounds"] = (
-                            0 if binding[i] else cut.get("slack_rounds", 0) + 1
-                        )
-                        binding[i] = cut["slack_rounds"] < self.simplex_cut_age
-            else:
-                binding = [cut["age"] < 2 for cut in self.cut_list]
+            binding = [cut["age"] < self.cut_age for cut in self.cut_list]
             if self.max_cut_rows is not None:
-                found = self.cap_cut_rows(
-                    binding, found, simplex is not None, basis is None
-                )
+                found = self.cap_cut_rows(binding, found)
                 if not found:
                     break  # the binding cuts fill the room
             kept = [
@@ -9641,136 +9029,210 @@ class _BranchAndBound:
                     2 * max(need_nnz, capacity[1]),
                 )
             A_cuts, b_cuts = _cut_block(self.cut_list, n, *capacity)
-            if simplex is not None:
-                A_host, b_host = base.rows_with(A_cuts, b_cuts)
-                host = _HostRows(A_host, b_host, A_host.T.tocsr())
-                pending = [A_cuts, b_cuts, None]
-                # The last crossover's vertex is not for these rows.
-                self.root_vertex_state = None
-            else:
-                self.set_mip(base.with_rows(A_cuts, b_cuts))
-
-            if simplex is not None:
-                # Re-solve in HiGHS from the basis: the slack cuts out, the
-                # new ones in.
-                simplex.resolve(
-                    [i for i, keep in enumerate(binding) if not keep],
-                    found,
-                    self.seconds_left(),
-                )
-                self.simplex_rounds += 1
-                if simplex.infeasible:
-                    return "infeasible"
-                if simplex.optimal:
-                    state = simplex.solution(solution, base_m + A_cuts.shape[0])
-                    pending[2] = state  # ``root_vertex_state`` once installed
-                    # Not converged as far as the first-order solver is
-                    # concerned: the tree's root is solved once more, warm
-                    # from this exact point, when the rounds end.
-                    result = dict(
-                        result, solution=state, converged=False, stop_reason="simplex"
-                    )
-                else:
-                    # Out of time or numerical trouble: the first-order
-                    # rounds take over from here (and stop at the time limit).
-                    simplex = None
-                    install()
-            if simplex is None:
-                # Warm start: the old duals, zero for the new rows and padding.
-                duals = np.zeros(base_m + A_cuts.shape[0], dtype=dual_ineq.dtype)
-                duals[:base_m] = dual_ineq[:base_m]
-                duals[base_m : base_m + len(kept)] = [dual for _, dual in kept]
-                warm = solution._replace(dual_ineq=jnp.asarray(duals))
-                lp = self.node_lp(lower, upper)
-                detection = self.detect(
-                    lp,
-                    {"solution": warm, "opt_state": result["opt_state"]},
-                    self.round_epochs(),
-                )
-                if detection["status"] == "primal_infeasible":
-                    return "infeasible"
-                result = detection["result"]
-                if result["stop_reason"] in ("interrupted", "time_limit"):
-                    return result
-
-            # Age the cuts: slack, with a zero dual.
-            y = np.asarray(result["solution"].dual_ineq, np.float64)[base_m:]
-            x = np.asarray(result["solution"].primal, np.float64)
-            y_scale = 1e-9 * (1.0 + np.abs(y).max(initial=0.0))
-            for i, cut in enumerate(self.cut_list):
-                slack = cut["rhs"] - cut["coef"] @ x[cut["idx"]]
-                idle = slack > 1e-6 * (1.0 + abs(cut["rhs"])) and y[i] <= y_scale
-                cut["age"] = cut["age"] + 1 if idle else 0
-
-            new_bound, _ = self.lp_bound(result["solution"], lower, upper, host)
-            if self.verbose:
-                families = [cut["family"] for cut in self.cut_list]
-                print(
-                    f"Cut round {round_number}: {len(found)} new, "
-                    f"{families.count('gomory')} Gomory + "
-                    f"{families.count('cover')} cover + {families.count('mir')} "
-                    f"MIR + {families.count('flowcover')} flow cover + "
-                    f"{families.count('clique')} clique + "
-                    f"{families.count('zerohalf')} zero-half + "
-                    f"{families.count('impliedbound')} implied bound in the LP, bound {self.model_value(new_bound):.6e}, "
-                    f"{time.time() - self.start:.1f}s"
-                )
+            self.set_mip(base.with_rows(A_cuts, b_cuts))
+            # Warm start: the old duals, zero for the new rows and padding.
+            duals = np.zeros(base_m + A_cuts.shape[0], dtype=dual_ineq.dtype)
+            duals[:base_m] = dual_ineq[:base_m]
+            duals[base_m : base_m + len(kept)] = [dual for _, dual in kept]
+            warm = solution._replace(dual_ineq=jnp.asarray(duals))
+            result = self.root_resolve(
+                lower, upper, (warm, result["opt_state"]), self.round_epochs()
+            )
+            if result["stop_reason"] in ("interrupted", "time_limit", "bound_target"):
+                return result
+            self.age_cuts(result["solution"])
+            new_bound, _ = self.lp_bound(result["solution"], lower, upper)
             bound = max(bound, new_bound)
             history.append(bound)
-            # Progress comes in bursts, so judge it over the last three
-            # rounds rather than the last one; over _SIMPLEX_STALL_ROUNDS
-            # with the simplex rounds, whose bounds are exact and whose
-            # re-solves cost a fraction of a second: ns1830653's bound sits
-            # at 11,622 for eight rounds, then climbs to 12,622.
-            window = _SIMPLEX_STALL_ROUNDS if simplex is not None else 3
-            gain = history[-1] - history[max(0, len(history) - 1 - window)]
+            # Progress comes in bursts (and a short re-solve's bound can dip),
+            # so judge it over three rounds, once three have run. With an
+            # incumbent it is judged against the gap left: on rmine13 the
+            # root's gap to the best known value is 0.27% of the objective,
+            # so a test against the objective stopped after one round.
+            if len(history) < 4:
+                continue
+            gain = history[-1] - history[-4]
             scale = max(1.0, abs(bound + self.mip.offset))
+            if self.incumbent is not None:
+                scale = min(scale, max(1e-9 * scale, self.incumbent[0] - bound))
             if not np.isfinite(gain) or gain <= self.cut_min_progress * scale:
                 break
-        install()
-        if self.verbose and simplex is not None and self.simplex_rounds:
-            print(
-                f"Cut rounds in HiGHS's simplex: {self.simplex_rounds} re-solves, "
-                f"{simplex.iterations} pivots, {simplex.seconds:.1f}s"
-            )
         result = self.compact_cuts(lower, upper, result)
         if (
-            isinstance(result, dict)
-            and not result["converged"]
+            not result["converged"]
+            and result["stop_reason"] != "bound_target"
             and not self.out_of_time()
         ):
             # The rounds stopped early; the tree starts from a converged root.
-            detection = self.detect(
-                self.node_lp(lower, upper), result, self.root_max_epochs
+            result = self.root_resolve(
+                lower,
+                upper,
+                (result["solution"], result["opt_state"]),
+                self.root_max_epochs,
             )
-            if detection["status"] == "primal_infeasible":
-                return "infeasible"
-            result = detection["result"]
         return result
 
-    def cap_cut_rows(self, binding, found, simplex, pdhg):
+    def round_heuristics(self, x, lower, upper, warm, seconds):
+        """Cheap roundings of a cut round's point ``x`` (its crossover
+        vertex when there is one): fix-and-propagate and, while there is no
+        incumbent, bulk rounding for up to ``seconds``. HiGHS rounds its LP
+        point during root separation too. (1-opt runs on each incumbent in
+        ``try_incumbent``.)
+
+        With ``parallel_heuristics``, fix-and-propagate goes to the
+        background ``"round"`` lane instead (``background_rounding``,
+        with ``parallel_rounding``; skipped while the lane is still busy
+        with an earlier point), and bulk rounding, a device
+        call, is left to ``root_heuristics`` after the rounds: the rounds do
+        not wait for either."""
+        if self.workers is not None:
+            self.background_rounding(x, lower, upper, warm)
+            return
+        started = time.time()
+        if self.use_fix_and_propagate:
+            candidate = fix_and_propagate(
+                x, lower, upper, self.is_int, self.heuristic_propagator()
+            )
+            if candidate is not None:
+                self.try_incumbent(candidate, "P", warm)
+        if self.use_bulk_rounding and self.incumbent is None:
+            deadline = time.time() + max(seconds, 1.0)
+            for point in self.bulk_round([x] * self.bulk_starts, lower, upper, deadline):
+                if point is not None:
+                    self.try_incumbent(point, "B", warm)
+        self.heuristic_seconds += time.time() - started
+
+    def background_rounding(self, x, lower, upper, warm):
+        """With ``parallel_heuristics`` and ``parallel_rounding``: queue
+        fix-and-propagate of ``x`` over ``lower``/``upper`` (with the
+        objective row at the cutoff, ``heuristic_propagator``) on the
+        background ``"round"`` lane, unless it is still busy with an
+        earlier point. Its point comes back through ``collect_heuristics``
+        (``"P"``). Returns whether it was queued."""
+        if (
+            self.workers is None
+            or not self.use_parallel_rounding
+            or not self.workers.idle("round")
+            or self.out_of_time()
+        ):
+            return False
+        self.workers.submit(
+            "round",
+            "fixprop",
+            _fix_and_propagate_job,
+            np.array(x, np.float64),
+            np.array(lower, np.float64),
+            np.array(upper, np.float64),
+            self.is_int,
+            self.heuristic_propagator(),
+            info=warm,
+        )
+        self.background_roundings += 1
+        return True
+
+    def background_root_heuristics(self, lower, upper, result):
+        """With ``parallel_heuristics``: the root heuristics on the first
+        root LP, before the cut rounds, as background jobs, so the rounds
+        start at once. Fix-and-propagate from the LP point goes to the
+        ``"round"`` lane (``background_rounding``) and, with the numba jump and no incumbent, the
+        jumps from the LP point and from the bounds nearest zero to the
+        ``"jump"`` lane (each skipped if an incumbent has come by the time
+        it starts; together within the heuristic budget). Bulk rounding and
+        the pump run on the device, so they wait for ``root_heuristics``
+        after the rounds, if there is still no incumbent then. Their points
+        are checked as the rounds collect them (``collect_heuristics``); the
+        first incumbent starts the background improving jump. Returns False
+        (nothing queued) without background workers."""
+        if self.workers is None:
+            return False
+        x = np.asarray(result["solution"].primal, np.float64)
+        lower = np.array(lower, np.float64)
+        upper = np.array(upper, np.float64)
+        warm = (result["solution"], result["opt_state"])
+        # The box and warm start of the background improving jump.
+        self.jump_box = (lower.copy(), upper.copy(), warm)
+        self.background_rounding(x, lower, upper, warm)
+        if (
+            self.use_jump
+            and self.jump_backend == "numba"
+            and self.incumbent is None
+            and self.workers.idle("jump")
+        ):
+            if self.heuristic_budget is not None:
+                budget = float(self.heuristic_budget)
+            elif self.deadline is not None:
+                budget = 0.2 * (self.deadline - self.start)
+            else:
+                budget = 60.0
+            now = time.time()
+            starts = ((x, 0), (np.clip(np.zeros_like(x), lower, upper), 1))
+            for i, (start, seed) in enumerate(starts):
+                deadline = now + budget * (i + 1) / len(starts)
+                if self.deadline is not None:
+                    deadline = min(deadline, self.deadline)
+                self.workers.submit(
+                    "jump",
+                    "jump",
+                    _jump_job,
+                    lambda: self.incumbent is not None,
+                    self.base,
+                    start.copy(),
+                    lower,
+                    upper,
+                    tol=self.feas_tol,
+                    max_iterations=self.jump_iterations,
+                    deadline=deadline,
+                    seed=seed,
+                    backend="numba",
+                    info=warm,
+                )
+        return True
+
+    def root_resolve(self, lower, upper, warm, max_epochs):
+        """The root LP over ``lower``/``upper`` re-solved warm (a cut round,
+        or after one), at the search's precision. It stops once its
+        Lagrangian bound reaches the cutoff (``node_bound_target``): an LP
+        made infeasible by valid cuts, whose MIP is then infeasible, has
+        duals that diverge along a Farkas ray, so its bound passes the
+        cutoff (``box_cutoff`` before an incumbent) and the root closes on
+        it. No infeasibility detection: its chunked host checks cost more
+        than the re-solve on large LPs."""
+        target = self.node_bound_target()
+        return self.solve_lp(
+            self.node_lp(lower, upper),
+            warm,
+            max_epochs,
+            **({} if target is None else {"bound_target": target}),
+        )
+
+    def age_cuts(self, solution):
+        """Count, for each cut in the LP (``cut_list``), the re-solves in a
+        row it has been idle at: slack by more than ``1e-6·(1 + |rhs|)``
+        with a dual of at most ``1e-9`` of the largest. Any other re-solve
+        resets it to 0."""
+        base_m = self.base.A.shape[0] - self.base.n_eq
+        y = np.asarray(solution.dual_ineq, np.float64)[base_m:]
+        x = np.asarray(solution.primal, np.float64)
+        y_scale = 1e-9 * (1.0 + np.abs(y).max(initial=0.0))
+        for i, cut in enumerate(self.cut_list):
+            slack = cut["rhs"] - cut["coef"] @ x[cut["idx"]]
+            idle = slack > 1e-6 * (1.0 + abs(cut["rhs"])) and y[i] <= y_scale
+            cut["age"] = cut["age"] + 1 if idle else 0
+
+    def cap_cut_rows(self, binding, found):
         """Keep a round within ``max_cut_rows``: clear ``binding`` (in place)
-        for the kept cuts slack longest, then take fewer of the new cuts
-        ``found`` (most efficacious first). Only cuts slack at the round's
-        point go: in the simplex rounds (``simplex``) the basic ones, which
-        keeps the basis optimal, and in first-order rounds (``pdhg``) the
-        idle ones; with a crossover basis every kept cut is binding.
+        for the kept cuts idle longest (``age_cuts``), then take fewer of
+        the new cuts ``found`` (most efficacious first). Only idle cuts go.
         Returns the new cuts that fit."""
-
-        def staleness(cut):
-            if simplex:
-                return cut.get("slack_rounds", 0)
-            return cut["age"] if pdhg else 0
-
         kept = [i for i, keep in enumerate(binding) if keep]
         excess = len(kept) + len(found) - self.max_cut_rows
         if excess <= 0:
             return found
-        slack = [i for i in kept if staleness(self.cut_list[i]) > 0]
-        slack.sort(key=lambda i: -staleness(self.cut_list[i]))  # stable: oldest first
-        for i in slack[:excess]:
+        idle = [i for i in kept if self.cut_list[i]["age"] > 0]
+        idle.sort(key=lambda i: -self.cut_list[i]["age"])  # stable: oldest first
+        for i in idle[:excess]:
             binding[i] = False
-        excess -= min(excess, len(slack))
+        excess -= min(excess, len(idle))
         return found[: max(0, len(found) - excess)]
 
     def round_epochs(self):
@@ -9803,27 +9265,94 @@ class _BranchAndBound:
         self.cut_list = [cut for _, cut in kept]
         self.set_mip(base.with_rows(A_cuts, b_cuts))
         warm = solution._replace(dual_ineq=jnp.asarray(duals))
-        detection = self.detect(
-            self.node_lp(lower, upper),
-            {"solution": warm, "opt_state": result["opt_state"]},
-            self.root_max_epochs,
+        return self.root_resolve(
+            lower, upper, (warm, result["opt_state"]), self.root_max_epochs
         )
-        if detection["status"] == "primal_infeasible":
-            return "infeasible"
-        return detection["result"]
 
-    def zero_half(self, x, lower, upper, max_cuts, rows=None):
+    def node_separators(self):
+        """The root's separators (``separator``) over the root box, for node
+        cut rounds: for the searched rows and, when coefficient tightening
+        changed them, the rows as given, as in ``cut_loop``. Rebuilt when
+        the rows or the root box change (a restart, reduced-cost fixing);
+        the box only shrinks, so their cuts hold at every node. Call under
+        ``_separator_lock``."""
+        key = (self.base, self.original, self.root_lower, self.root_upper)
+        held = self._node_separators
+        if held is None or any(a is not b for a, b in zip(held[0], key)):
+            separators = [self.separator(self.base, self.root_lower, self.root_upper)]
+            if self.original is not self.base:
+                separators.append(
+                    self.separator(self.original, self.root_lower, self.root_upper)
+                )
+            held = self._node_separators = (key, separators)
+        return held[1]
+
+    def node_separated(self, x):
+        """Cuts at a node's LP point ``x`` from the root's separators
+        over the root box, valid at every node."""
+        with self._separator_lock:
+            return [cut for separator in self.node_separators() for cut in separator(x)]
+
+    def zero_half(self, x, lower, upper, max_cuts):
         """Zero-half cuts at ``x`` (``zero_half_cuts``) from the LP's rows as
-        searched (or ``rows``, a ``_HostRows``), the cuts in it included,
+        searched, the cuts in it included,
         over the box ``lower``/``upper`` (the root's, so the cuts hold
         everywhere). The cut rows count too: on bab5, combining them takes
         the root bound (exact LPs, 20 rounds) from −108,341 to −107,410."""
         if not self.use_zero_half:
             return []
-        A, b = (self.mip.A, self.mip.b) if rows is None else (rows.A, rows.b)
         return zero_half_cuts(
-            A, b, self.mip.n_eq, x, lower, upper, self.cut_int, max_cuts=max_cuts
+            self.mip.A, self.mip.b, self.mip.n_eq, x, lower, upper, self.cut_int, max_cuts=max_cuts
         )
+
+    def inout_candidates(self, separators, x, lower, upper, max_cuts):
+        """
+        In-out separation (``inout_separation``): the cuts ``separators``
+        and ``zero_half`` find at ``x̃ = λ·x + (1 − λ)·x̄`` for the incumbent
+        ``x̄`` (clipped to the box), or ``None`` when it does not run (off,
+        no incumbent, or given up on for this one).
+
+        A valid cut ``a·x <= b`` that ``x̃`` violates is violated at ``x`` by
+        more when ``x̄`` satisfies it: ``a·x̃ = λ·a·x + (1 − λ)·a·x̄``. The
+        separators pick rows, divisors and covers from the point they are
+        given, and from a point nearer the feasible region they find deeper
+        cuts (Ben-Ameur and Neto 2007; Fischetti and Salvagnin 2010). The
+        cuts still go through ``select_cuts`` at ``x``, so soundness never
+        rests on ``x̄`` (it may lie outside a root box reduced-cost fixing
+        has shrunk). λ starts at ``inout_separation`` for each incumbent;
+        ``inout_result`` moves it towards ``x``.
+        """
+        if self.inout_separation is None or self.incumbent is None:
+            return None
+        value, incumbent = self.incumbent
+        x = np.asarray(x, np.float64)
+        if incumbent.shape != x.shape:
+            return None
+        if self.inout_at != value:
+            self.inout_at = value
+            self.inout_lambda = self.inout_separation
+        if self.inout_lambda is None:  # given up on for this incumbent
+            return None
+        lam = self.inout_lambda
+        point = np.clip(lam * x + (1.0 - lam) * incumbent, lower, upper)
+        self.inout_rounds += 1
+        candidates = [cut for separator in separators for cut in separator(point)]
+        candidates += self.zero_half(point, lower, upper, max_cuts)
+        return candidates
+
+    def inout_result(self, found, inout):
+        """Count the cuts ``select_cuts`` kept (``found``) from the in-out
+        point's candidates (``inout``). When it kept none, λ moves halfway to
+        1 (towards the LP point); past ``_INOUT_MAX_LAMBDA`` the incumbent
+        is not used again until it changes."""
+        if inout is None:
+            return
+        ids = {id(cut) for cut in inout}
+        kept = sum(id(cut) in ids for cut in found)
+        self.inout_cuts += kept
+        if kept == 0 and self.inout_lambda is not None:
+            lam = 0.5 * (1.0 + self.inout_lambda)
+            self.inout_lambda = None if lam > _INOUT_MAX_LAMBDA else lam
 
     def separator(self, mip, lower, upper):
         """A ``CutSeparator`` with this search's aggregation settings. The
@@ -9834,19 +9363,12 @@ class _BranchAndBound:
         graph = None
         if self.use_clique_cuts and mip is self.base:
             if self.conflict_graph is None:
-                started = time.time()
                 mips = [self.base] + (
                     [self.original] if self.original is not self.base else []
                 )
                 self.conflict_graph = ConflictGraph(
                     mips, lower, upper, integrality=self.cut_int
                 )
-                if self.verbose and len(self.conflict_graph):
-                    print(
-                        f"Conflict graph: {len(self.conflict_graph)} cliques, "
-                        f"{self.conflict_graph.num_edges} conflicts, "
-                        f"{time.time() - started:.1f}s"
-                    )
             graph = self.conflict_graph if len(self.conflict_graph) else None
         implied = None
         if (
@@ -9861,8 +9383,6 @@ class _BranchAndBound:
             ):
                 built = ImpliedBounds(self.probe_cache, lower, upper, self.cut_int)
                 self._implied_bounds = (self.probe_cache, built)
-                if self.verbose and len(built):
-                    print(f"Implied bounds: {len(built)} candidate cuts from probing")
             implied = self._implied_bounds[1] if len(self._implied_bounds[1]) else None
         return CutSeparator(
             mip,
@@ -9910,12 +9430,7 @@ class _BranchAndBound:
         self.tree_rows_cap = _next_power_of_two(rows + self.tree_padding_rows)
         dual_ineq = np.asarray(result["solution"].dual_ineq)
         self.set_mip(base.with_rows(*self.tree_block()))
-        if self.verbose:
-            print(
-                f"Tree cuts: room for {self.tree_rows_cap - self.tree_padding_rows} "
-                f"cuts ({self.tree_nnz_cap} nonzeros), {root_rows} from the root, "
-                f"a round every {self.tree_cut_every} nodes"
-            )
+        self.slot_version = [self.cut_version] * self.tree_rows_cap
         duals = np.zeros(base_m + self.tree_rows_cap, dtype=dual_ineq.dtype)
         keep = base_m + root_rows
         duals[:keep] = dual_ineq[:keep]
@@ -9932,117 +9447,307 @@ class _BranchAndBound:
         assert A_cuts.nnz == self.tree_nnz_cap
         return A_cuts, b_cuts
 
-    def tree_cut_round(self, x, warm):
-        """Separate globally valid cuts at a node's LP point ``x`` (over the
-        root box) and put the violated ones into the pool: in free capacity,
-        or in place of cuts that have been slack with a zero dual for two
-        rounds. The current node is not re-solved; its children solve
-        against the new cuts. Returns ``warm`` with the duals of replaced
-        rows zeroed."""
+    def fit_warm(self, node):
+        """``node``'s warm start for the current cut block: the duals of
+        the slots a tree cut refresh has given another cut since the warm
+        start was made (``cut_version``) are zeroed. Kept cuts keep theirs."""
+        warm = node.warm
+        if (
+            warm is None
+            or warm[0] is None
+            or node.cut_version is None
+            or node.cut_version >= self.cut_version
+        ):
+            return warm
+        stale = [i for i, v in enumerate(self.slot_version) if v > node.cut_version]
+        if not stale:
+            return warm
+        solution = warm[0]
+        base_m = self.base.A.shape[0] - self.base.n_eq
+        duals = np.array(solution.dual_ineq)
+        if duals.shape[0] < base_m + len(self.slot_version):
+            return warm
+        duals[[base_m + i for i in stale]] = 0.0
+        return (solution._replace(dual_ineq=jnp.asarray(duals)), warm[1])
+
+    def tree_cuts_due(self):
+        """The tree cut refresh due now: ``"full"`` (separation too) every
+        ``tree_cut_every`` nodes, else ``"pool"`` (the cut pool only) every
+        ``tree_pool_every``, else ``None``. Neither while refreshes have
+        taken more than ``tree_cut_share`` of the tree's time (after its
+        first seconds)."""
+        if not (self.use_tree_cuts and self.slot_version):
+            return None
+        full = (
+            self.tree_cut_every
+            and self.nodes - self.last_refresh_nodes >= self.tree_cut_every
+        )
+        pool = (
+            not full
+            and self.tree_pool_every
+            and len(self.cut_pool)
+            and self.nodes - self.last_pool_nodes >= self.tree_pool_every
+        )
+        if not (full or pool):
+            return None
+        tree = self.tree_elapsed()
+        if (
+            tree > _TREE_CUT_GRACE_SECONDS
+            and self.tree_cut_seconds > self.tree_cut_share * tree
+        ):
+            if full:
+                self.tree_cut_skipped += 1
+                self.last_refresh_nodes = self.nodes
+            self.last_pool_nodes = self.nodes
+            return None
+        if self.out_of_time():
+            return None
+        return "full" if full else "pool"
+
+    def after_node_solves(self, members, boxes, results):
+        """
+        Between solving node LPs (a batch, or one node) and evaluating them:
+        a tree cut refresh when due (``refresh_cuts``; ``tree_cuts_due``: a
+        full one, or one from the cut pool alone), from all of their
+        points. The results then have the duals of replaced slots zeroed (a
+        zero multiplier is a valid one, so their bounds hold for the new
+        rows). Members whose own point a new cut cuts off, with re-solves
+        left (``tree_cut_rounds``), go back in the queue to be solved again
+        against the new cuts before they branch; their pseudocosts keep the
+        LP value before the cuts. Returns the results and the set of
+        re-queued positions.
+        """
+        requeued = set()
+        kind = self.tree_cuts_due()
+        if kind is None:
+            return results, requeued
+        started = time.time()
+        self.last_pool_nodes = self.nodes
+        if kind == "full":
+            self.last_refresh_nodes = self.nodes
+        solved = [
+            i
+            for i, result in enumerate(results)
+            if result.get("solution") is not None
+            and np.asarray(result["solution"].dual_ineq).shape[0] == self.m_ineq
+        ]
+        if not solved:
+            return results, requeued
+        order = sorted(solved, key=lambda i: members[i].bound)
+        replaced, added = self.refresh_cuts(
+            [results[i]["solution"] for i in solved],
+            [results[i]["solution"] for i in order],
+            separate=kind == "full",
+        )
+        if replaced:
+            base_m = self.base.A.shape[0] - self.base.n_eq
+            rows = [base_m + i for i in replaced]
+            fixed = []
+            for result in results:
+                solution = result.get("solution")
+                if solution is not None:
+                    duals = np.array(solution.dual_ineq)
+                    if duals.shape[0] == self.m_ineq:
+                        duals[rows] = 0.0
+                        result = dict(
+                            result,
+                            solution=solution._replace(dual_ineq=jnp.asarray(duals)),
+                        )
+                fixed.append(result)
+            results = fixed
+        if added and self.tree_cut_rounds:
+            for i in solved:
+                node, result = members[i], results[i]
+                if node.cut_rounds >= self.tree_cut_rounds or self.out_of_time():
+                    continue
+                x = np.asarray(result["solution"].primal, np.float64)
+                if not any(
+                    coef @ x[idx] - rhs > 1e-6 * (1.0 + abs(rhs))
+                    for idx, coef, rhs in added
+                ):
+                    continue
+                value = node.branch_value
+                if value is None and result.get("converged"):
+                    value = float(self.mip.c @ x)
+                lower, upper = boxes[i]
+                requeue = _Node(
+                    node.bound,
+                    node.depth,
+                    self.compress(lower, upper),
+                    (result["solution"], result.get("opt_state")),
+                    node.branch,
+                    node.epochs,
+                    node.inferences,
+                    cut_rounds=node.cut_rounds + 1,
+                    branch_value=value,
+                )
+                self.push(requeue)
+                requeued.add(i)
+            self.tree_cut_requeued += len(requeued)
+        self.tree_cut_seconds += time.time() - started
+        return results, requeued
+
+    def refresh_cuts(self, solutions, best_first, separate=True):
+        """
+        A tree cut refresh of the LP's cut block (``tree_cuts``) from the
+        node LP solutions just solved (``solutions``; ``best_first``: them
+        by node bound, lowest first):
+
+        1. Each slot's cut ages by one if it is idle (slack, with a zero
+           dual) at every one of them, else back to 0.
+        2. Candidates: the pooled cuts (``cut_pool``) any of the points
+           violates, not in the block, and cuts separated at the points of
+           the ``tree_cut_points`` lowest-bound nodes (the root's separators
+           over the root box, ``node_separated``, and zero-half), each cut
+           holding at every node. Cuts denser than ``tree_cut_max_nnz`` are
+           left out.
+        3. The most efficacious (at their best point) go in, at most
+           ``max_tree_cuts_per_round``, none a near-duplicate of a cut in
+           the block or of another new one.
+        4. Each takes a free slot, else the slot idle longest (at least
+           ``_TREE_CUT_IDLE_REFRESHES`` refreshes); with no slot it is
+           dropped (``tree_cuts_dropped``).
+        5. The block is rebuilt at its fixed capacity and the LP's rows
+           swapped (``set_mip(rows_only=True)``): the batched node solver
+           takes the rows as data, so nothing recompiles.
+
+        Without ``separate`` (a pool refresh, every ``tree_pool_every``
+        nodes), only pooled cuts are candidates and no cut ages: as HiGHS
+        checks its cut pool at every node, between its rarer separations.
+
+        Returns the slots given new cuts that held others before, and the
+        cuts added (as ``(idx, coef, rhs)``).
+        """
+        if separate:
+            self.tree_cut_refreshes += 1
+        else:
+            self.tree_pool_refreshes += 1
         base = self.base
         n = base.num_variables
         base_m = base.A.shape[0] - base.n_eq
-        solution = warm[0]
-        y = np.asarray(solution.dual_ineq, np.float64)[base_m:]
-        y_scale = 1e-9 * (1.0 + np.abs(y).max(initial=0.0))
-        for i, cut in enumerate(self.cut_list):
-            slack = cut["rhs"] - cut["coef"] @ x[cut["idx"]]
-            idle = slack > 1e-6 * (1.0 + abs(cut["rhs"])) and y[i] <= y_scale
-            cut["age"] = cut["age"] + 1 if idle else 0
-
-        separators = [self.separator(base, self.root_lower, self.root_upper)]
-        if self.original is not base:
-            separators.append(
-                self.separator(self.original, self.root_lower, self.root_upper)
-            )
-        candidates = [cut for separator in separators for cut in separator(x)]
-        candidates += self.zero_half(
-            x, self.root_lower, self.root_upper, 2 * self.max_tree_cuts_per_round
-        )
-        # Not near-duplicates of the pool's cuts.
-        if self.cut_list and candidates:
-            pool = sp.csr_matrix(
+        points = [np.asarray(sol.primal, np.float64) for sol in solutions]
+        k = len(self.cut_list)
+        if k:
+            idle_all = np.ones(k, bool)
+            rhs = np.array([cut["rhs"] for cut in self.cut_list])
+            R = sp.csr_matrix(
                 (
+                    np.concatenate([cut["coef"] for cut in self.cut_list]),
+                    np.concatenate([cut["idx"] for cut in self.cut_list]),
                     np.concatenate(
-                        [c["coef"] / np.linalg.norm(c["coef"]) for c in self.cut_list]
-                    ),
-                    np.concatenate([c["idx"] for c in self.cut_list]),
-                    np.concatenate(
-                        [[0], np.cumsum([c["idx"].size for c in self.cut_list])]
+                        [[0], np.cumsum([cut["idx"].size for cut in self.cut_list])]
                     ),
                 ),
-                shape=(len(self.cut_list), n),
+                shape=(k, n),
             )
-            fresh = []
-            for cut in candidates:
-                _, idx, coef, _ = cut
-                direction = np.zeros(n)
-                direction[idx] = coef / np.linalg.norm(coef)
-                if np.abs(pool @ direction).max() <= _CUT_MAX_PARALLELISM:
-                    fresh.append(cut)
-            candidates = fresh
-        found = select_cuts(candidates, x, n, max_cuts=self.max_tree_cuts_per_round)
-        self.archive_cuts(found)
+            for sol, x in zip(solutions, points if separate else ()):
+                y = np.asarray(sol.dual_ineq, np.float64)[base_m : base_m + k]
+                y_scale = 1e-9 * (1.0 + np.abs(y).max(initial=0.0))
+                slack = rhs - R @ x
+                idle_all &= (slack > 1e-6 * (1.0 + np.abs(rhs))) & (y <= y_scale)
+            if separate:
+                for i, cut in enumerate(self.cut_list):
+                    cut["age"] = cut["age"] + 1 if idle_all[i] else 0
+
+        held = {cut.get("key") or _cut_key(_as_cut(cut)) for cut in self.cut_list}
+        best = {}  # key -> (efficacy, cut)
+
+        def consider(cut, x):
+            _, idx, coef, rhs = cut
+            if idx.size == 0 or idx.size > self.tree_cut_max_nnz:
+                return
+            efficacy = (coef @ x[idx] - rhs) / max(np.linalg.norm(coef), 1e-12)
+            if efficacy < _CUT_POOL_MIN_EFFICACY:
+                return
+            key = _cut_key(cut)
+            if key in held:
+                return
+            if key not in best or efficacy > best[key][0]:
+                best[key] = (efficacy, cut)
+
+        pooled = set()
+        with self._shared_lock:
+            for x in points:
+                for cut in self.cut_pool.violated(x, held):
+                    consider(cut, x)
+                    pooled.add(_cut_key(cut))
+        per_point = self.max_tree_cuts_per_round
+        separated = []  # every violated candidate, for the pool
+        for sol in best_first[: self.tree_cut_points if separate else 0]:
+            if self.out_of_time():
+                break
+            x = np.asarray(sol.primal, np.float64)
+            candidates = self.node_separated(x)
+            candidates += self.zero_half(x, self.root_lower, self.root_upper, 2 * per_point)
+            candidates = [c for c in candidates if c[1].size <= self.tree_cut_max_nnz]
+            separated += violated_cuts(candidates, x)
+            for cut in select_cuts(candidates, x, n, max_cuts=per_point):
+                consider(cut, x)
+        # Into the pool, as at the root: a later node may violate them.
+        self.pool_cuts(separated)
+        ranked = sorted(best.items(), key=lambda item: -item[1][0])
+        found, directions = [], []
+        if self.cut_list:
+            directions.append(
+                sp.csr_matrix(R.multiply(1.0 / np.maximum(
+                    np.sqrt(np.asarray(R.multiply(R).sum(axis=1)).ravel()), 1e-12
+                )[:, None]))
+            )
+        for key, (_, cut) in ranked:
+            if len(found) >= self.max_tree_cuts_per_round:
+                break
+            _, idx, coef, _ = cut
+            direction = np.zeros(n)
+            direction[idx] = coef / max(np.linalg.norm(coef), 1e-12)
+            if any(
+                block.shape[0] and np.abs(block @ direction).max() > _CUT_MAX_PARALLELISM
+                for block in directions
+            ):
+                continue
+            directions.append(sp.csr_matrix(direction[None, :]))
+            found.append((key, cut))
         if not found:
-            return warm
+            return [], []
+        self.pool_cuts([cut for _, cut in found])
+        self.archive_cuts([cut for _, cut in found])
+        self.tree_cut_pool_hits += sum(key in pooled for key, _ in found)
 
         max_rows = self.tree_rows_cap - self.tree_padding_rows
         nnz = sum(cut["idx"].size for cut in self.cut_list)
-        replaced, placed, families, dropped = [], 0, [], 0
-        for family, idx, coef, rhs in found:
-            new = dict(family=family, idx=idx, coef=coef, rhs=rhs, age=0)
+        replaced, added, families, dropped = [], [], [], 0
+        version = self.cut_version + 1
+        for key, (family, idx, coef, rhs) in found:
+            new = dict(family=family, idx=idx, coef=coef, rhs=rhs, age=0, key=key)
             if len(self.cut_list) < max_rows and nnz + idx.size <= self.tree_nnz_cap:
+                self.slot_version[len(self.cut_list)] = version
                 self.cut_list.append(new)
                 nnz += idx.size
-                placed += 1
-                families.append(family)
-                continue
-            slots = [
-                i
-                for i, cut in enumerate(self.cut_list)
-                if cut["age"] >= 2
-                and nnz - cut["idx"].size + idx.size <= self.tree_nnz_cap
-            ]
-            if not slots:
-                dropped += 1  # no room (``tree_cut_rows``, ``tree_cut_nnz``)
-                continue
-            slot = max(slots, key=lambda i: self.cut_list[i]["age"])
-            nnz += idx.size - self.cut_list[slot]["idx"].size
-            self.cut_list[slot] = new
-            replaced.append(slot)
-            placed += 1
+            else:
+                slots = [
+                    i
+                    for i, cut in enumerate(self.cut_list)
+                    if cut["age"] >= _TREE_CUT_IDLE_REFRESHES
+                    and i not in replaced
+                    and nnz - cut["idx"].size + idx.size <= self.tree_nnz_cap
+                ]
+                if not slots:
+                    dropped += 1  # no room (``tree_cut_rows``, ``tree_cut_nnz``)
+                    continue
+                slot = max(slots, key=lambda i: self.cut_list[i]["age"])
+                nnz += idx.size - self.cut_list[slot]["idx"].size
+                self.cut_list[slot] = new
+                self.slot_version[slot] = version
+                replaced.append(slot)
+            added.append((idx, coef, rhs))
             families.append(family)
         self.tree_cuts_dropped += dropped
-        if self.verbose and dropped:
-            pool = (
-                f"pool {len(self.cut_list)}/{max_rows} cuts, "
-                f"{nnz}/{self.tree_nnz_cap} nonzeros"
-            )
-        if not placed:
-            if self.verbose and dropped:
-                print(
-                    f"C {self.nodes:8d} {len(self.open):8d}   cuts +0, {dropped} dropped ({pool})"
-                )
-            return warm
-        self.tree_cuts_added += placed
-        self.set_mip(base.with_rows(*self.tree_block()))
-        if self.verbose:
-            print(
-                f"C {self.nodes:8d} {len(self.open):8d}   cuts +{placed} "
-                f"({families.count('cover')} cover, {families.count('mir')} MIR, "
-                f"{families.count('flowcover')} flow cover, "
-                f"{families.count('clique')} clique, "
-                f"{families.count('zerohalf')} zero-half)"
-                + (f", {len(replaced)} replacing idle cuts" if replaced else "")
-                + (f", {dropped} dropped" if dropped else "")
-                + f", pool {len(self.cut_list)}/{max_rows} cuts, "
-                f"{nnz}/{self.tree_nnz_cap} nonzeros"
-            )
-        if replaced:
-            duals = np.asarray(solution.dual_ineq).copy()
-            duals[[base_m + i for i in replaced]] = 0.0
-            warm = (solution._replace(dual_ineq=jnp.asarray(duals)), warm[1])
-        return warm
+        if not added:
+            return [], []
+        self.cut_version = version
+        self.tree_cuts_added += len(added)
+        self.tree_cut_families.update(families)
+        self.set_mip(base.with_rows(*self.tree_block()), rows_only=True)
+        return replaced, added
 
     def feasibility_pump(self, lower, upper, result, deadline):
         """
@@ -10199,24 +9904,17 @@ class _BranchAndBound:
         return False
 
     def rins(self, x, warm):
-        """RINS around the incumbent and the node LP point ``x``, with the
-        sub-MIP solved by HiGHS (``highs_submip``, the default) or Jaddle
-        (``jaddle_rins``), per ``rins_solver``. The node limit
-        (``rins_nodes``) doubles after a call that improves the incumbent
-        and halves after one that does not, within [50, 2000], as HiGHS
-        adapts its own sub-MIP effort."""
-        if self.parallel_highs():
-            self.queue_rins(x, warm)
-            return
+        """RINS around the incumbent and the node LP point ``x``, the
+        sub-MIP solved by a Jaddle sub-search (``jaddle_rins``). The node
+        limit (``rins_nodes``) doubles after a call that improves the
+        incumbent and halves after one that does not, within [50, 2000], as
+        HiGHS adapts its own sub-MIP effort."""
         started = time.time()
         seconds = self.rins_seconds
         if self.deadline is not None:
             seconds = min(seconds, self.deadline - started)
         before = self.incumbent[0]
-        if self.rins_solver == "highs":
-            found = self.highs_rins_search(x, seconds)
-        else:
-            found = self.jaddle_rins(x, seconds, warm)
+        found = self.jaddle_rins(x, seconds, warm)
         self.rins_calls += 1
         if found is not None:
             self.try_incumbent(found, "N", warm)
@@ -10231,11 +9929,7 @@ class _BranchAndBound:
 
     def submip_budget_left(self):
         """Whether RINS is within ``heuristic_effort`` of the elapsed time
-        (never with ``heuristic_effort=0``). In the background
-        (``parallel_heuristics``) it takes no time from the tree, so only
-        ``heuristic_effort=0`` stops it."""
-        if self.parallel_highs():
-            return self.heuristic_effort > 0
+        (never with ``heuristic_effort=0``)."""
         return self.submip_seconds < self.heuristic_effort * (time.time() - self.start)
 
     def rins_box(self, x, seconds, min_fixed=0.3):
@@ -10257,33 +9951,17 @@ class _BranchAndBound:
         upper = np.where(agree, incumbent, self.base.upper)
         return lower, upper
 
-    def highs_rins_search(self, x, seconds, min_fixed=0.3):
-        """RINS with HiGHS (``highs_submip``) in ``rins_box``'s
-        neighbourhood: the incumbent is HiGHS's start and this search's
-        cutoff its objective bound. ``None`` when ``rins_box`` skips it."""
-        box = self.rins_box(x, seconds, min_fixed)
-        if box is None:
-            return None
-        return highs_submip(
-            self.base,
-            *box,
-            cutoff=self.cutoff(),
-            max_seconds=seconds,
-            max_nodes=self.rins_nodes,
-            start=self.incumbent[1],
-        )
 
-    def round_repair(self, x, lower, upper, warm, snap=None, background=False):
+    def round_repair(self, x, lower, upper, warm, snap=None):
         """
-        Round and repair from the LP point ``x`` (``highs_round_repair``):
-        its roundings up, to nearest and down within ``[lower, upper]``, less
-        those already tried and those whose fixed box propagation shows
-        infeasible, each repaired exactly by HiGHS within
-        ``round_repair_seconds`` in all. ``snap`` (``None``: the PDHG
-        snapping, ``round_snap``) for exact vertices is ``int_tol``. With
-        ``background`` (and ``parallel_heuristics``) it runs on the HiGHS
-        lane when that is idle (skipped otherwise), and ``collect_heuristics``
-        checks its point; else here. Points are marked ``"U"``.
+        Round and repair from the LP point ``x``: its roundings up, to
+        nearest and down within ``[lower, upper]`` (``integer_roundings``),
+        less those already tried and those whose fixed box propagation shows
+        infeasible, each tried as an incumbent (marked ``"U"``):
+        ``try_incumbent`` solves for the continuous variables with a Jaddle
+        LP when the rounding alone is not feasible. ``snap`` (``None``: the
+        PDHG snapping, ``round_snap``) for exact vertices is ``int_tol``.
+        Stops after ``round_repair_seconds``.
         """
         if not self.use_round_repair or self.out_of_time():
             return
@@ -10291,10 +9969,12 @@ class _BranchAndBound:
             snap = self.round_snap
         lower = np.asarray(lower, np.float64)
         upper = np.asarray(upper, np.float64)
-        if background and not (self.workers is not None and self.workers.idle("highs")):
-            return
-        roundings = []
+        started = time.time()
+        before = None if self.incumbent is None else self.incumbent[0]
+        tried = False
         for values in integer_roundings(x, self.is_int, lower, upper, snap):
+            if self.out_of_time() or time.time() - started > self.round_repair_limit:
+                break
             key = values.tobytes()
             if key in self.round_repair_seen:
                 continue
@@ -10307,45 +9987,13 @@ class _BranchAndBound:
             fixed_upper[self.is_int] = values
             if self.row_propagator(fixed_lower, fixed_upper)[2]:
                 continue
-            roundings.append(values)
-        if not roundings:
+            point = np.clip(np.asarray(x, np.float64), lower, upper)
+            point[self.is_int] = values
+            tried = True
+            self.try_incumbent(point, "U", warm)
+        if not tried:
             return
-        seconds = self.round_repair_limit
-        if self.deadline is not None:
-            seconds = min(seconds, self.seconds_left())
-        cutoff = self.cutoff()
-        cutoff = cutoff if np.isfinite(cutoff) else None
         self.round_repair_calls += 1
-        if background and self.workers is not None:
-            self.workers.submit(
-                "highs",
-                "round",
-                highs_round_repair,
-                self.base,
-                x,
-                lower,
-                upper,
-                cutoff=cutoff,
-                max_seconds=seconds,
-                roundings=roundings,
-                model=self.highs_model(),
-                info=warm,
-            )
-            return
-        started = time.time()
-        before = None if self.incumbent is None else self.incumbent[0]
-        found = highs_round_repair(
-            self.base,
-            x,
-            lower,
-            upper,
-            cutoff=cutoff,
-            max_seconds=seconds,
-            roundings=roundings,
-            model=self.highs_model(),
-        )
-        if found is not None:
-            self.try_incumbent(found, "U", warm)
         self.round_repair_finds += self.incumbent is not None and (
             before is None or self.incumbent[0] < before
         )
@@ -10356,56 +10004,13 @@ class _BranchAndBound:
     def round_repair_due(self):
         """Whether a tree node gets round and repair: every
         ``round_repair_every`` nodes, while it has taken at most
-        ``heuristic_effort`` of the elapsed time (on the background lane it
-        takes none from the tree)."""
+        ``heuristic_effort`` of the elapsed time."""
         if not (self.use_round_repair and self.round_repair_every):
             return False
-        if self.nodes % self.round_repair_every != 0:
+        if not self.heuristic_due("round_repair", self.round_repair_every):
             return False
-        if self.workers is not None:
-            return True
         elapsed = time.time() - self.start
         return self.round_repair_seconds <= self.heuristic_effort * elapsed
-
-    def highs_model(self):
-        """``self.base`` as a ``highspy.HighsLp`` (``hh.jaddle_lp_to_highs``),
-        built once, here on the main thread (it reads JAX arrays), for the
-        background HiGHS jobs."""
-        cached = self.host_highs_model
-        if cached is None or cached[0] is not self.base:
-            model = hh.jaddle_lp_to_highs(self.base.lp, self.base.integrality)
-            cached = self.host_highs_model = (self.base, model)
-        return cached[1]
-
-    def parallel_highs(self):
-        """Whether RINS and RENS run on the background HiGHS lane."""
-        return self.workers is not None and self.rins_solver == "highs"
-
-    def queue_rins(self, x, warm):
-        """RINS around the incumbent and ``x`` on the background HiGHS lane.
-        With the lane busy it waits (``rins_pending``) for the next node."""
-        if not self.workers.idle("highs"):
-            self.rins_pending = True
-            return
-        seconds = self.rins_seconds
-        if self.deadline is not None:
-            seconds = min(seconds, self.deadline - time.time())
-        box = self.rins_box(x, seconds)
-        if box is None:
-            return
-        self.workers.submit(
-            "highs",
-            "rins",
-            highs_submip,
-            self.base,
-            *box,
-            cutoff=self.cutoff(),
-            max_seconds=seconds,
-            max_nodes=self.rins_nodes,
-            start=self.incumbent[1].copy(),
-            model=self.highs_model(),
-            info=warm,
-        )
 
     def schedule_improve_jump(self):
         """With ``parallel_heuristics`` and the numba jump: an improving
@@ -10457,76 +10062,23 @@ class _BranchAndBound:
 
     def collect_heuristics(self, schedule=True):
         """Check the points of finished background jobs
-        (``parallel_heuristics``) with ``try_incumbent``, marked as their
-        serial versions are, then queue the next improving-jump slice
-        (unless ``schedule`` is false)."""
+        (``parallel_heuristics``) with ``try_incumbent`` (jumps marked
+        ``J``, fix-and-propagate ``P``), then queue the next improving-jump
+        slice (unless ``schedule`` is false)."""
         if self.workers is None:
             return
         for kind, found, seconds, warm in self.workers.finished():
             before = None if self.incumbent is None else self.incumbent[0]
             self.worker_jobs += 1
             self.worker_seconds += seconds
-            if kind == "jump":
-                x, feasible, _ = found
-                if feasible:
-                    self.try_incumbent(x, "J", warm)
-            elif found is not None:
-                source = {"rins": "N", "rens": "E", "highs": "X", "round": "U"}[kind]
-                self.try_incumbent(found, source, warm)
-            improved = self.incumbent is not None and (
+            x, feasible, _ = found
+            if feasible:
+                self.try_incumbent(x, _JOB_SOURCES[kind], warm)
+            self.worker_finds += self.incumbent is not None and (
                 before is None or self.incumbent[0] < before
             )
-            self.worker_finds += improved
-            if kind == "round":
-                self.round_repair_finds += improved
-                self.round_repair_seconds += seconds
-            if kind in ("rins", "rens"):
-                self.submip_calls += 1
-                self.submip_seconds += seconds
-            if kind == "rins":
-                self.rins_calls += 1
-                self.rins_nodes = int(
-                    min(2000, max(50, self.rins_nodes * (2 if improved else 0.5)))
-                )
         if schedule:
             self.schedule_improve_jump()
-            self.queue_highs_incumbent()
-
-    def queue_highs_incumbent(self):
-        """With ``parallel_heuristics``, while there is no incumbent: HiGHS's
-        incumbent search (``highs_incumbent``) on the background HiGHS lane
-        when it is idle, for ``highs_incumbent_seconds`` the first time and
-        twice as long each time after one that finds nothing. The first goes
-        in as soon as the root LP is solved, so it runs beside the cut
-        rounds; on neos-4306827-ravan HiGHS needs 16 s for its first point,
-        and the root heuristics, RENS's first box and the tree found none in
-        300 s."""
-        if (
-            self.workers is None
-            or not self.highs_seconds
-            or self.incumbent is not None
-            or not self.workers.idle("highs")
-            or self.out_of_time()
-        ):
-            return
-        seconds = self.highs_next_seconds
-        if self.deadline is not None:
-            seconds = min(seconds, self.deadline - time.time())
-        if seconds <= 0:
-            return
-        self.highs_next_seconds *= 2
-        self.highs_incumbent_calls += 1
-        # No warm start: by the time the point comes back the LP may have
-        # cut rows, which the root's duals do not cover.
-        self.workers.submit(
-            "highs",
-            "highs",
-            highs_incumbent,
-            self.base,
-            max_seconds=seconds,
-            model=self.highs_model(),
-            info=None,
-        )
 
     def sub_search(self, lower, upper, seconds, nodes, warm=None):
         """
@@ -10561,7 +10113,6 @@ class _BranchAndBound:
             coefficient_tightening=False,
             feasibility_pump=False,
             feasibility_jump=False,
-            highs_incumbent_seconds=0.0,
             rins_seconds=0.0,
             rens_seconds=0.0,
             dive_every=0,
@@ -10583,6 +10134,9 @@ class _BranchAndBound:
         settings["root_crossover"] = False
         settings["round_repair"] = False
         settings["mip_start"] = None
+        # A sub-MIP's cutoff is its parent's, not a solution of its own:
+        # it dives for one (and needs no node cuts in its short budget).
+        settings["cutoff_from_start"] = False
         search = _BranchAndBound(sub_mip, **settings)
         if warm is not None:
             m_ineq = base.A.shape[0] - base.n_eq
@@ -10595,12 +10149,8 @@ class _BranchAndBound:
         RENS (relaxation enforced neighbourhood search) from the root LP
         point ``x``: the integers integral at ``x`` are fixed there, the
         fractional ones restricted to ``[floor, ceil]``, and that sub-MIP
-        searched for ``rens_seconds`` and ``rens_nodes`` nodes, by HiGHS
-        (``highs_rens``, which presolves it: the HiGHS run of the same
-        neighbourhood is what finds HiGHS's early incumbents; when HiGHS
-        proves it infeasible, a dive fixes fewer integers in the time left)
-        or, with ``rins_solver="jaddle"``, by ``sub_search``. Needs no incumbent; a
-        cutoff, when there is one, keeps only better points. Skipped when
+        searched for ``rens_seconds`` and ``rens_nodes`` nodes by a Jaddle
+        sub-search (``sub_search``). Needs no incumbent; a cutoff, when there is one, keeps only better points. Skipped when
         fewer than ``min_fixed`` of the integers are integral. A point found
         is marked ``"E"``.
         """
@@ -10625,42 +10175,7 @@ class _BranchAndBound:
             seconds = min(seconds, self.deadline - started)
         if seconds <= 0:
             return
-        if self.rins_solver == "highs":
-            # Integers keep the root box in the dive; continuous variables
-            # their bounds as given, as in the RENS box.
-            cutoff = self.cutoff()
-            args = (
-                self.base,
-                x,
-                np.where(ints, lower, self.base.lower),
-                np.where(ints, upper, self.base.upper),
-                sub_lower,
-                sub_upper,
-                self.row_propagator,
-            )
-            options = dict(
-                cutoff=cutoff if np.isfinite(cutoff) else None,
-                max_seconds=seconds,
-                max_nodes=self.rens_nodes,
-            )
-        if self.parallel_highs():
-            self.workers.submit(
-                "highs",
-                "rens",
-                highs_rens,
-                *args,
-                **options,
-                model=self.highs_model(),
-                info=warm,
-            )
-            self.heuristic_seconds += time.time() - started
-            return
-        if self.rins_solver == "highs":
-            found = highs_rens(*args, **options)
-        else:
-            found = self.sub_search(
-                sub_lower, sub_upper, seconds, self.rens_nodes, warm
-            )
+        found = self.sub_search(sub_lower, sub_upper, seconds, self.rens_nodes, warm)
         self.submip_calls += 1
         if found is not None:
             self.try_incumbent(found, "E", warm)
@@ -10768,13 +10283,7 @@ class _BranchAndBound:
                 lower, upper = lo, hi
                 if time.time() >= deadline:
                     return
-                result = None
-                if self.node_lp_solver == "highs":
-                    result = self.solve_highs_node(lower, upper, warm)
-                    if result is not None and result.get("infeasible"):
-                        return
-                if result is None:
-                    result = self.solve_lp(self.node_lp(lower, upper), warm, epochs)
+                result = self.solve_lp(self.node_lp(lower, upper), warm, epochs)
                 if result["stop_reason"] in ("interrupted", "time_limit"):
                     return
                 bound, _ = self.bound_over(
@@ -10826,10 +10335,10 @@ class _BranchAndBound:
         return (
             self.use_tree_heuristics
             and self.incumbent is not None
-            and self.nodes % self.tree_heuristic_every == 0
             and self.tree_heuristic_seconds
             < self.tree_heuristic_share * (time.time() - self.start)
             and not self.out_of_time()
+            and self.heuristic_due("tree", self.tree_heuristic_every)
         )
 
     def tree_heuristics(self, x, lower, upper, warm):
@@ -10959,16 +10468,23 @@ class _BranchAndBound:
             if repaired is not None:
                 self.try_incumbent(repaired, "R", warm)
 
-    def root_heuristics(self, lower, upper, result):
+    def root_heuristics(self, lower, upper, result, improve=True):
         """Fix-and-propagate from the root LP point, then the feasibility
-        pump while there is no incumbent, within the heuristic budget."""
+        pump while there is no incumbent, within the heuristic budget. It
+        runs on the first root LP, so the cut rounds have an incumbent (and
+        the background improving jump runs beside them), and again after
+        them; the two calls share one budget. Without background workers,
+        the improving jump from the incumbent runs only when ``improve``
+        (after the cut rounds: before them it would take the whole
+        budget)."""
         started = time.time()
         if self.heuristic_budget is not None:
-            deadline = started + self.heuristic_budget
+            budget = self.heuristic_budget
         elif self.deadline is not None:
-            deadline = started + 0.2 * (self.deadline - self.start)
+            budget = 0.2 * (self.deadline - self.start)
         else:
-            deadline = np.inf
+            budget = np.inf
+        deadline = started + max(0.0, budget - self.root_heuristic_used)
         warm = (result["solution"], result["opt_state"])
         x = np.asarray(result["solution"].primal, np.float64)
         if self.use_fix_and_propagate:
@@ -11023,7 +10539,8 @@ class _BranchAndBound:
         if self.workers is not None:
             self.schedule_improve_jump()
         elif (
-            self.use_jump
+            improve
+            and self.use_jump
             and self.jump_backend == "numba"
             and self.incumbent is not None
             and time.time() < deadline
@@ -11033,26 +10550,9 @@ class _BranchAndBound:
             # academictimetablesmall it takes a first point of about 5,600
             # down to the hundreds within seconds.
             self.improve_jump(self.incumbent[1], lower, upper, warm, deadline, seed=3)
-        if self.workers is not None:
-            self.collect_heuristics(schedule=False)
-            self.queue_highs_incumbent()
-        elif self.incumbent is None and self.highs_seconds and not self.out_of_time():
-            seconds = self.highs_seconds
-            if self.deadline is not None:
-                seconds = min(seconds, self.deadline - time.time())
-            found = highs_incumbent(self.base, max_seconds=seconds)
-            if found is not None:
-                self.try_incumbent(found, "X", warm)
+        self.collect_heuristics(schedule=False)
         self.heuristic_seconds += time.time() - started
-        if self.verbose:
-            print(
-                f"Root heuristics: {self.heuristic_seconds:.1f}s, "
-                + (
-                    f"incumbent {self.model_value(self.incumbent[0]):.6e}"
-                    if self.incumbent is not None
-                    else "no incumbent"
-                )
-            )
+        self.root_heuristic_used += time.time() - started
 
     def next_node(self):
         """The next node to solve: the pending plunge child, or else the top
@@ -11064,91 +10564,105 @@ class _BranchAndBound:
         self.plunge_left = self.plunge_depth
         return node
 
-    def batched_solver(self, max_epochs=None):
-        """``jax.vmap`` of ``jaddle_linear.make_solver`` over node bounds and
-        warm starts, jitted once for the current LP (the shape is final once
-        the root cuts are in) and each epoch limit (``None``:
-        ``node_max_epochs``). With ``node_bound_stop`` it takes a third
-        argument, the bound target (one for the whole batch): a member stops
-        once its Lagrangian bound reaches it, as serial node LPs do."""
+    def node_batch(
+        self, lp_lower, lp_upper, warm_starts, max_epochs=None, steps=None
+    ):
+        """The node LPs over the boxes ``lp_lower``/``lp_upper`` (``(batch,
+        n)``), each warm-started from its row of ``warm_starts`` and of
+        ``steps`` (the step sizes ``(k, eta)``, each ``(batch,)``; ``None``:
+        ``solve``'s defaults), in one device call
+        (``jaddle_linear.solve_many``) at ``node_precision`` with the node
+        options, for ``max_epochs`` (``None``: ``node_max_epochs``). With
+        ``node_bound_stop`` a member also stops once its Lagrangian bound
+        passes ``node_bound_target()``. The LP's rows go in as data, so a new
+        cut block of the same capacity reuses the compiled solver. Returns a
+        ``jaddle_linear.SolveCoreResult`` and the members' final step sizes
+        ``(k, eta)``; their arrays stay on the device."""
         if max_epochs is None:
             max_epochs = self.node_max_epochs
-        cached = self._vmapped.get(max_epochs)
-        if cached is None or cached[0] is not self.mip:
+        if self._node_batch_settings is None:
             import inspect
 
-            accepted = set(inspect.signature(jl.make_solver).parameters) - {"build_lp"}
+            accepted = set(inspect.signature(jl.solve_many).parameters) - {
+                "lp",
+                "lower_bounds",
+                "upper_bounds",
+                "initial_solutions",
+                "initial_opt_states",
+                "max_epochs",
+                "bound_target",
+                "device",
+                "precision",
+            }
             unknown = sorted(set(self.node_lp_options) - accepted)
             if unknown:
                 raise ValueError(
                     f"node_lp_options {', '.join(unknown)} cannot be used by batched "
-                    "node LPs (jaddle_linear.make_solver)"
+                    "node LPs (jaddle_linear.solve_many)"
                 )
-            # Node LPs: ``lp_options`` (what make_solver takes), then the
+            # Node LPs: ``lp_options`` (what solve_many takes), then the
             # node layer (``node_lp_tolerance``, ``node_lp_options``).
-            settings = {
+            self._node_batch_settings = {
                 key: value
                 for key, value in {**self.lp_kwargs, **self.node_lp_kwargs}.items()
                 if key in accepted
             }
-            # make_solver reads the precision profile when built and when
-            # traced, so both happen at ``node_precision``.
-            with self.node_settings():
-                solve_fn = jl.make_solver(
-                    self.node_mip_lp.with_values,
-                    max_epochs=max_epochs,
-                    bound_stop=self.node_bound_stop,
-                    **settings,
-                )
-            axes = jl.LPValues(*([None] * len(jl.LPValues._fields)))._replace(
-                lower_bounds=0, upper_bounds=0
+        target = None
+        if self.node_bound_stop:
+            target = self.node_bound_target()
+            target = np.inf if target is None else float(target)
+        with self.node_settings():
+            out = jl.solve_many(
+                self.node_mip_lp,
+                lp_lower,
+                lp_upper,
+                initial_solutions=warm_starts,
+                initial_opt_states=steps,
+                max_epochs=max_epochs,
+                bound_target=target,
+                **self._node_batch_settings,
             )
-            in_axes = (axes, 0, None) if self.node_bound_stop else (axes, 0)
-            jitted = jax.jit(jax.vmap(solve_fn, in_axes=in_axes))
-
-            def run(*args):
-                with self.node_settings():
-                    return jitted(*args)
-
-            cached = (self.mip, run)
-            self._vmapped[max_epochs] = cached
-        return cached[1]
-
-    def bound_target_arg(self):
-        """The batched solver's bound-target argument: ``()`` without
-        ``node_bound_stop``, else the node target (``inf`` before there is
-        a cutoff, so nothing stops)."""
-        if not self.node_bound_stop:
-            return ()
-        target = self.node_bound_target()
-        return (np.inf if target is None else float(target),)
+        core = jl.SolveCoreResult(
+            out["solution"], out["converged"], out["stop_code"], out["epochs"]
+        )
+        return core, tuple(out["opt_state"])[:2]
 
     def solve_batch(self, boxes, solutions, opt_states, max_epochs, size):
         """The node LPs of ``boxes`` in one vmapped call, each warm-started
         from its solution, padded to ``size`` members with copies of the
         last. With ``node_bound_stop``, a member also stops once its
         Lagrangian bound passes ``node_bound_target()`` (``stop_reason``
-        ``"bound_target"``). Returns a ``solve_lp``-style result per box
-        (its ``opt_state`` is the one passed in: the batched solver keeps
-        none)."""
+        ``"bound_target"``). Each member also starts from the step sizes
+        ``(k, eta)`` of its ``opt_states`` entry (a member without one takes
+        another's: they share the LP), so a child does not re-learn its
+        parent's. Returns a ``solve_lp``-style result per box, whose
+        ``opt_state`` is the member's final ``(k, eta)``."""
         pad = size - len(boxes)
         boxes = list(boxes) + [boxes[-1]] * pad
         solutions = list(solutions) + [solutions[-1]] * pad
+        steps = [_step_sizes(state) for state in opt_states]
+        known = [step for step in steps if step is not None]
+        if known:
+            steps = [known[0] if step is None else step for step in steps]
+            steps += [steps[-1]] * pad
         lp_lower = np.stack([self.lp_lower(lo) for lo, _ in boxes])
         lp_upper = np.stack([self.lp_upper(up) for _, up in boxes])
         with self.node_settings():
-            values = self.node_values._replace(
-                lower_bounds=jnp.asarray(lp_lower, self.node_dtype),
-                upper_bounds=jnp.asarray(lp_upper, self.node_dtype),
-            )
             # Root and node points may differ in precision (``node_precision``).
             solutions = [_cast_warm(s, self.node_dtype) for s in solutions]
             warm_starts = jax.tree.map(lambda *leaves: jnp.stack(leaves), *solutions)
-        # One transfer for the whole batch, then slices on the host.
-        out = jax.device_get(
-            self.batched_solver(max_epochs)(
-                values, warm_starts, *self.bound_target_arg()
+            dtype = _wide(self.node_dtype)
+            steps = (
+                tuple(
+                    jnp.asarray(np.array([step[j] for step in steps]), dtype)
+                    for j in (0, 1)
+                )
+                if known
+                else None
             )
+        # One transfer for the whole batch, then slices on the host.
+        out, steps = jax.device_get(
+            self.node_batch(lp_lower, lp_upper, warm_starts, max_epochs, steps)
         )
         converged = np.asarray(out.converged)
         stop_code = np.asarray(out.stop_code)
@@ -11163,7 +10677,7 @@ class _BranchAndBound:
                     4: "bound_target",
                 }.get(int(stop_code[i]), "max_epochs"),
                 "epochs": int(epochs[i]),
-                "opt_state": opt_states[i],
+                "opt_state": (steps[0][i], steps[1][i]),
             }
             for i in range(len(opt_states))
         ]
@@ -11199,20 +10713,25 @@ class _BranchAndBound:
         if not members:
             return
         self.batch_waiting = members
+        warms = [self.fit_warm(node) for node in members]
         results = self.solve_batch(
             boxes,
-            [node.warm[0] for node in members],
-            [node.warm[1] for node in members],
+            [warm[0] for warm in warms],
+            [warm[1] for warm in warms],
             min(self.batch_epochs, self.node_max_epochs),
             self.batch_size,
         )
         self.batches += 1
+        results, requeued = self.after_node_solves(members, boxes, results)
         self.deferring = self.batch_on_device()
         try:
             for i, (node, result) in enumerate(zip(members, results)):
                 self.batch_waiting = members[i + 1 :]
-                self.nodes += 1
                 self.lp_epochs += result["epochs"]
+                if i in requeued:
+                    # Back in the queue for new tree cuts: not a node yet.
+                    continue
+                self.nodes += 1
                 self.bound_stops += result["stop_reason"] == "bound_target"
                 # An incumbent found by an earlier member may prune this one.
                 if node.bound >= self.cutoff():
@@ -11226,7 +10745,7 @@ class _BranchAndBound:
                     # node. It counts when it finishes.
                     self.nodes -= 1
                     continue
-                self.log(" ", None, node.depth)
+                self.log(" ", None)
         finally:
             self.deferring = False
             self.batch_waiting = []
@@ -11244,6 +10763,9 @@ class _BranchAndBound:
         return self.mip.A.nnz > _SMALL_MIP_NNZ and 2 * self.batch_size * width <= 2**25
 
     def child_kernels(self):
+        held = self._child_kernels
+        if held is not None and held[0] is not self.mip and held[1].set_mip(self.mip):
+            self._child_kernels = (self.mip, held[1])  # same shapes: kept
         if self._child_kernels is None or self._child_kernels[0] is not self.mip:
             kernels = _ChildKernels(
                 self.mip,
@@ -11543,17 +11065,33 @@ class _BranchAndBound:
             )
         if result["stop_reason"] == "interrupted":
             return self.result("interrupted")
-        self.queue_highs_incumbent()
-        if (
+        self.root_heuristic_used = 0.0
+        use_root_heuristics = (
+            self.use_fix_and_propagate
+            or self.use_bulk_rounding
+            or self.use_jump
+            or self.use_pump
+        )
+        cut_loop_due = (
             self.cuts
             and self.cut_rounds
             and result["stop_reason"] != "time_limit"
             and not self.out_of_time()
-        ):
+        )
+        if cut_loop_due and use_root_heuristics:
+            # Heuristics on the first root LP, before the cut rounds: the
+            # rounds then judge their progress against the gap, and the
+            # background improving jump works beside them. Without this,
+            # rmine13's first incumbent came only after its cut loop.
+            self.active_bound = self.round_bound(
+                self.lp_bound(result["solution"], lower, upper)[0]
+            )
+            # With ``parallel_heuristics`` they run beside the rounds.
+            if not self.background_root_heuristics(lower, upper, result):
+                self.root_heuristics(lower, upper, result, improve=False)
+        if cut_loop_due and not self.out_of_time():
             result = self.cut_loop(lower, upper, result)
-            if result == "infeasible":
-                return self.empty_root()
-            lp = self.node_lp(lower, upper)
+            lp =self.node_lp(lower, upper)
             if self.cut_list and self.propagator is not None:
                 lower, upper, infeasible = self.propagator(lower, upper, max_passes=20)
                 if infeasible:
@@ -11598,33 +11136,19 @@ class _BranchAndBound:
                 upper,
                 (result["solution"], result["opt_state"]),
             )
-            if self.verbose:
-                print(
-                    f"Round and repair: {time.time() - started:.1f}s, "
-                    + (
-                        f"incumbent {self.model_value(self.incumbent[0]):.6e}"
-                        if self.incumbent is not None
-                        else "no incumbent"
-                    )
-                )
-        if (
-            self.use_fix_and_propagate
-            or self.use_bulk_rounding
-            or self.use_jump
-            or self.use_pump
-            or self.highs_seconds
-        ):
+        if use_root_heuristics:
             self.root_heuristics(lower, upper, result)
         root_x = np.asarray(result["solution"].primal, np.float64)
         root_warm = (result["solution"], result["opt_state"])
         if self.rens_seconds and not self.out_of_time():
             # From an exact vertex, as HiGHS's RENS works from its simplex
             # root: far more of it is integral than of a PDHG point. The cut
-            # loop keeps its last one; otherwise cross over now (HiGHS).
+            # loop keeps its last one; otherwise cross over now
+            # (``root_crossover``).
             vertex = self.root_vertex_x
             if vertex is None:
                 vertex = self.current_root_vertex()  # round and repair's
-            if vertex is None and self.rins_solver == "highs":
+            if vertex is None and self.root_crossover is not False:
                 vertex, _ = self.root_vertex(lower, upper, result["solution"])
             if vertex is not None:
                 self.rens(vertex, lower, upper, root_warm, min_fixed=0.3)
@@ -11640,15 +11164,6 @@ class _BranchAndBound:
             if self.incumbent is not None and time.time() < deadline:
                 self.dive(
                     root_x, lower, upper, root_warm, rule="guided", deadline=deadline
-                )
-            if self.verbose:
-                print(
-                    f"Root dives: {time.time() - started:.1f}s, "
-                    + (
-                        f"incumbent {self.model_value(self.incumbent[0]):.6e}"
-                        if self.incumbent is not None
-                        else "no incumbent"
-                    )
                 )
         if (
             self.rins_seconds
@@ -11668,14 +11183,9 @@ class _BranchAndBound:
         if self.root_lower is not lower:
             lower, upper = self.root_lower, self.root_upper
             lp = None  # rebuilt over the fixed box if ``evaluate`` needs it
-        if self.verbose:
-            if self.node_lp_solver == "highs":
-                print("Node LPs: HiGHS's dual simplex, one node at a time")
-            print(
-                f"  {'Nodes':>8} {'Open':>8} {'Depth':>6} {'Bound':>13} "
-                f"{'Incumbent':>13} {'Gap':>9} {'Time':>9}"
-            )
         self.evaluate(root, lower, upper, lp, result)
+        self.tree_started = True
+        self.log(" ", None, force=True)  # the root's line
         return None
 
     def _tree(self):
@@ -11719,10 +11229,8 @@ class _BranchAndBound:
                     continue
                 lower, upper = box
                 result = self.solve_node_lp(
-                    lower, upper, node.warm, self.node_max_epochs, node.basis
+                    lower, upper, self.fit_warm(node), self.node_max_epochs
                 )
-                self.bound_stops += result["stop_reason"] == "bound_target"
-                self.nodes += 1
                 if result["stop_reason"] == "interrupted":
                     self.push(node)
                     status = "interrupted"
@@ -11731,9 +11239,16 @@ class _BranchAndBound:
                     self.push(node)
                     status = "time_limit"
                     break
+                (result,), requeued = self.after_node_solves(
+                    [node], [(lower, upper)], [result]
+                )
+                if requeued:
+                    continue  # back in the queue for new tree cuts
+                self.bound_stops += result["stop_reason"] == "bound_target"
+                self.nodes += 1
                 # ``evaluate`` builds the LP at the search's precision if needed.
                 self.evaluate(node, lower, upper, None, result)
-                self.log(" ", None, node.depth)
+                self.log(" ", None)
         except KeyboardInterrupt:
             status = "interrupted"
         finally:
@@ -11771,12 +11286,10 @@ def solve(
     flow_covers=True,
     clique_cuts=True,
     zero_half_cuts=True,
-    simplex_cut_rounds="auto",
-    simplex_cut_age=10,
+    cut_age=10,
     max_cut_rows=None,
     gomory_candidates=None,
-    cutoff_probing=0,
-    cutoff_probing_share=0.1,
+    inout_separation=None,
     root_redcost_propagation=False,
     global_redcost_fixing=False,
     cut_pool_propagation=False,
@@ -11798,20 +11311,22 @@ def solve(
     round_repair=True,
     round_repair_every=None,
     round_repair_seconds=10.0,
-    tree_cuts=False,
+    tree_cuts=True,
     tree_cut_every=10,
     max_tree_cuts_per_round=10,
     tree_cut_rows=None,
     tree_cut_nnz=None,
+    tree_cut_points=4,
+    tree_cut_rounds=1,
+    tree_cut_share=0.25,
+    tree_cut_max_nnz=None,
     fix_and_propagate=False,
     feasibility_jump=True,
     jump_iterations=None,
     repair=True,
     repair_max_epochs=20,
-    highs_incumbent_seconds=10.0,
     rins_seconds=None,
     rins_every=5,
-    rins_solver="highs",
     rins_nodes=200,
     rens_seconds=None,
     rens_nodes=500,
@@ -11857,7 +11372,6 @@ def solve(
     node_precision="float32",
     jump_backend="auto",
     parallel_heuristics=True,
-    node_lp_solver="highs",
     symmetry="auto",
     restarts=5,
     mip_start=None,
@@ -11866,6 +11380,9 @@ def solve(
     objective_propagation=False,
     plunge_gap=0.25,
     branch_implied=False,
+    near_integral_tolerance=1e-2,
+    tree_pool_every=1,
+    parallel_rounding=True,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -11924,28 +11441,28 @@ def solve(
       and incumbent.
     * **More from the incumbent** (all off by default). Each holds for
       every solution better than the cutoff, which is all the search needs.
-      ``cutoff_probing`` (the most candidates per incumbent; needs
-      ``node_lp_solver="highs"``) gives exact LPs to the integers that root
-      reduced-cost fixing only just fails to fix: those at the bound their
-      root reduced cost ``r_j`` favours, with ``|r_j|`` from a quarter of
-      the room (cutoff less the root bound) up to all of it, closest
-      first. Each is moved one unit off its bound, and HiGHS's dual simplex
-      solves that child from the root box's basis, for at most strong
-      branching's pivots. When the child is infeasible or its bound reaches
-      the cutoff, the integer stays at its bound in the root box (so the
-      fixings count towards restarts), and the child's dual proof joins
-      the conflict pool. Probing takes at most ``cutoff_probing_share``
-      (default 0.1) of the elapsed time. ``root_redcost_propagation`` puts
-      the root's reduced-cost row (``constant + r·x <= cutoff`` over the
-      root box) in the conflict pool (``ConflictPool.set_global``), redone
-      with each incumbent. At a node whose bounds have moved variables off
-      their favoured bounds, it uses up that part of the room and can fix
-      others before the node's LP. ``global_redcost_fixing`` runs
-      reduced-cost fixing of the root box with every node LP's and probing
-      child's duals, not only the root's: ``c·x >= constant + r·x`` holds
-      for every feasible ``x`` whatever the duals. The result reports
-      ``cutoff_probing_lps``, ``cutoff_probing_fixed``,
-      ``cutoff_probing_seconds`` and ``global_redcost_fixed``.
+      ``root_redcost_propagation`` puts the root's reduced-cost row
+      (``constant + r·x <= cutoff`` over the root box) in the conflict pool
+      (``ConflictPool.set_global``), redone with each incumbent. At a node
+      whose bounds have moved variables off their favoured bounds, it uses
+      up that part of the room and can fix others before the node's LP.
+      ``global_redcost_fixing`` runs reduced-cost fixing of the root box
+      with every node LP's duals, not only the root's: ``c·x >= constant +
+      r·x`` holds for every feasible ``x`` whatever the duals. The result
+      reports ``global_redcost_fixed``.
+    * **In-out separation** (``inout_separation``, off by default; a
+      value in (0, 1)). With an incumbent ``x̄``, the root's cut rounds and
+      the tree's (``tree_cuts``) also separate at ``λ·x + (1 − λ)·x̄``.
+      A valid cut violated there is violated at the LP point ``x`` by
+      more, since ``x̄`` satisfies it. From a point nearer the feasible
+      region the separators pick other rows, divisors and covers, and
+      find deeper cuts. All candidates are still chosen at ``x``
+      (``select_cuts``). λ starts at ``inout_separation`` for each
+      incumbent. A round that keeps none of the in-out cuts moves it
+      halfway to 1, and past 0.9 the incumbent is not used again until it
+      changes. At the root an incumbent exists during the rounds after a
+      ``mip_start`` and after a restart. Results: ``inout_cuts`` (in-out cuts kept) and
+      ``inout_rounds``.
     * **Branching on implied integers** (``branch_implied``, off by
       default). Fractional implied integers (``MIP.implied``: continuous
       columns HiGHS's presolve showed some optimum has integral) join the
@@ -12044,22 +11561,29 @@ def solve(
       slack, and re-solves the LP warm. With 10 a round, the strongest
       covers took every slot on bab5 and no Gomory cut got in: 100 takes
       its root bound (with clique cuts) from −113,254 to −111,358, and
-      ns1830653's from 10,621 to 11,622, HiGHS's root bound. With Gomory cuts on, a cut is slack when its
-      row is basic in the round's crossover basis, and it goes at once:
-      GMI cuts are dense (hundreds of nonzeros on ns1830653), so they are
-      allowed at the root (``gomory_cuts(max_nnz=None)``) but leave as soon
-      as they stop binding. Without them, a cut goes after two rounds slack
-      with a zero dual. The rounds
-      stop when the bound gains less than ``cut_min_progress`` (relative)
-      over the last three rounds (default 1e-3 with the 40-round setting,
-      else 1e-4). Each round's re-solve stops after ``cut_round_epochs``
+      ns1830653's from 10,621 to 11,622, HiGHS's root bound. A cut leaves
+      the LP once it has been idle (slack, with a zero dual, at the
+      round's re-solve) for ``cut_age`` rounds in a row (default 10), and
+      stays in the global cut pool (below). On degenerate LPs a cut slack
+      at one optimum is often binding again at the next, and dropped at
+      once the rounds cycle between them (ns1830653 sat at 11,622). GMI
+      cuts are dense (hundreds of nonzeros on ns1830653), so they are
+      allowed at the root (``gomory_cuts(max_nnz=None)``) but leave once
+      idle. Once three rounds have run, the rounds
+      stop when the bound gains less than ``cut_min_progress`` over the
+      last three (default 1e-3 with the 40-round setting, else 1e-4),
+      relative to the gap to the incumbent when there is one, else to the
+      bound (rmine13's root is 0.27% of its objective from the best known
+      value, so the objective-relative test alone stopped after one
+      round). Each round's re-solve stops after ``cut_round_epochs``
       (default 10): separation needs only a reasonable point and the
       Lagrangian bound holds at any duals; the root is solved to convergence
       once the rounds end. On lseu that cuts the root from 17s to 7s (bound
       1,091 → 1,095).
       Cover and MIR cuts follow from a row and the bounds alone, so they
       are valid whatever the LP point's accuracy; Gomory cuts rest on the
-      basis, which HiGHS proves optimal, and skip tableau rows that do not
+      crossover's basis, which HiGHS proves optimal, and skip tableau rows
+      that do not
       reproduce the basis to 1e-7. The cut block is padded to
       power-of-two sizes, so rounds rarely recompile the LP solver.
       Separation is batched (``separation_backend="jax"``, the default):
@@ -12095,78 +11619,68 @@ def solve(
       bab5, with exact LPs and 20 rounds, they take the root bound with
       the other families from −111,209 to −107,410, past HiGHS's root
       bound (−107,454); their separation takes about 4 s of it.
-      With ``simplex_cut_rounds`` (``"auto"``, the default: with Gomory
-      cuts, which cross over with HiGHS each round anyway) the rounds run
-      in HiGHS (``_SimplexRounds``): the first crossover's basis is kept,
-      and each round deletes the cut rows slack for 10 rounds in a row,
-      adds the new cuts and re-solves with the dual simplex from there.
-      Each round then has an exact vertex, exact duals and the Gomory
-      cuts' basis without a first-order solve or a crossover, and the
-      rounds stop once 10 of them together gain less than
-      ``cut_min_progress``. When they end, the root is solved once more
-      with the first-order method, warm from the exact point; a round
-      HiGHS does not finish hands over to the first-order rounds. On bab5
-      the 27 re-solves take 13 s and the root bound reaches −107,349 in
-      171 s (−112,232 in 71 s with first-order rounds, which stopped on a
-      noisy bound); on ns1830653 it reaches 12,622 in 30 s (HiGHS's root
-      bound: 11,622). Cuts kept while slack matter there: dropped at
-      once, the rounds cycle between optimal vertices and the bound stays
-      at 11,622.
-      The root cut pool's growth: ``simplex_cut_age`` (default 10) is the
-      number of rounds in a row a cut may stay slack in the simplex rounds.
       ``max_cut_rows`` (default ``None``: no limit) caps the cut rows in
-      the root LP. A round that would pass it drops the kept cuts that
-      have been slack longest (never a binding one, so HiGHS's basis stays
-      optimal), then takes fewer new cuts, and the rounds stop once the
-      binding cuts fill it. ``gomory_candidates`` (default ``None``: twice
-      ``max_cuts_per_round``) is the number of tableau rows a round tries
-      for Gomory cuts, nearest ½ first. On bab5 (20 rounds,
-      ``max_cuts_per_round=500``) slack cuts kept for 10 rounds grew the
-      LP to about 3,300 cut rows, 2,400 of them zero-half cuts, and each
-      round's Gomory cuts, cut selection and re-solve slowed with it, from
-      about 5 s a round to 35 s. In the simplex rounds the tableau rows
-      come from HiGHS's own factors of the basis
-      (``gomory_cuts(highs=...)``), with the same cuts as a fresh sparse
-      LU: on mzzv11, 0.9 s a round instead of 2.9 s once the LP holds 1.8
-      million nonzeros.
-    * **Tree cuts** (``tree_cuts``, off by default). Every
-      ``tree_cut_every`` nodes, cover and MIR cuts are separated at the
-      node's LP point over the root box (so they are valid everywhere),
-      and up to ``max_tree_cuts_per_round`` (default 10) violated ones join
-      the cut pool, in free room or in place of cuts slack with a zero
-      dual for two rounds; ones that find no room are dropped
-      (``result["tree_cuts_dropped"]``). The pool holds ``tree_cut_rows``
-      cuts, the root's included, with ``tree_cut_nnz`` nonzeros between
-      them (both rounded up to powers of two). ``None`` (the default):
-      twice the root's cuts and nonzeros, and room for at least two
-      rounds; with only ``tree_cut_rows`` given, its nonzeros are that many
-      cuts of the root cuts' mean size (at least 16 each). Every node LP
-      carries the whole pool, empty room included, so a larger pool makes
-      each node LP slower. The node is not
-      re-solved; its children solve against the new cuts. The pool has a
-      fixed capacity, reserved after the root cuts, so its rows and
-      nonzeros keep one shape and the LP solver is not recompiled (the
-      compiled solver takes the sparsity pattern as data). Serial search
-      only: the batched solver captures the pattern, so ``batch_size > 1``
-      (the default) turns tree cuts off; pass ``batch_size=1`` with them.
-    * **Node LPs** (``node_lp_solver``). ``"highs"`` (default): each node's
-      LP is solved exactly by HiGHS's dual simplex (``_HighsNodeLPs``), one
-      node at a time, from the basis of the node before (the parent's while
-      plunging); the root LP and cut rounds are as below. The node's bound
-      is its LP value (the Lagrangian bound of the vertex's exact duals,
-      rigorous), its point a vertex, and pseudocosts learn from every node.
-      ``batch_size`` is then 1, so tree cuts are available. Dives solve
-      their LPs the same way. If HiGHS fails on a node, PDHG solves it
-      (``result["node_lp_fallbacks"]``). ``"jaddle"``: node LPs by Jaddle's PDHG as
-      described below, batched on the device with ``batch_size > 1``. On
-      bab5 (benchmark settings, GPU) PDHG node LPs rarely converged: their
-      bounds sat a median 239 (up to 982) below the exact LP values at the
-      same nodes, every child kept its parent's bound, about 470 nodes
-      finished in 600 s, and the global bound stayed at the root's
-      throughout. With HiGHS, about 1,080 nodes finished in the same time
-      (0.11 s a node LP) and the bound rose from −107,565 to −107,484.
-      ``result["node_lp_solves"]``, ``"node_simplex_iterations"`` and
-      ``"node_lp_seconds"`` count HiGHS's node solves.
+      the root LP. A round that would pass it drops the kept cuts idle
+      longest (never an active one), then takes fewer new cuts, and the
+      rounds stop once the active cuts fill it. ``gomory_candidates``
+      (default ``None``: twice ``max_cuts_per_round``) is the number of
+      tableau rows a round tries for Gomory cuts, nearest ½ first. Every
+      candidate a root or tree round separates that its point violates,
+      not only those chosen for the LP, joins the global cut pool
+      (``_CutPool``, the newest ``cut_pool_size``, default 10,000), as
+      HiGHS's does; the tree's refreshes take cuts back from it.
+    * **Tree cuts** (``tree_cuts``, on by default). After the root cuts,
+      the LP's cut block gets a fixed capacity: ``tree_cut_rows`` cuts with
+      ``tree_cut_nnz`` nonzeros between them (both rounded up to powers of
+      two; ``None``, the default: twice the root's cuts and nonzeros, and
+      room for at least two rounds). Every ``tree_cut_every`` nodes (default
+      10), between solving node LPs (a batch, or one node) and evaluating
+      them, the block is refreshed (``refresh_cuts``) from all of their
+      points. In between, every ``tree_pool_every`` nodes (default 1,
+      ``0``: off), a pool refresh takes back the pooled cuts the points
+      violate, without separating or ageing (steps 2-5 with the pool as
+      the only candidates), as HiGHS checks its cut pool at every node.
+      A full refresh:
+
+      1. each slot's cut ages by one if it is idle (slack, with a zero
+         dual) at every point, else back to 0;
+      2. candidates are the pooled cuts any point violates, not in the
+         block, and the cuts the root's separators (c-MIR, covers, flow
+         covers, cliques, implied bounds) and zero-half separation find at
+         the points of the ``tree_cut_points`` (default 4) lowest-bound
+         nodes, all over the root box, so they hold at every node; cuts
+         with more than ``tree_cut_max_nnz`` nonzeros (default
+         ``max(64, n / 8)``) are left out;
+      3. at most ``max_tree_cuts_per_round`` (default 10) of the most
+         efficacious go in, none a near-duplicate of another, each in a
+         free slot or in place of the cut idle longest (at least two
+         refreshes); ones that find no room are dropped
+         (``result["tree_cuts_dropped"]``);
+      4. members whose own point a new cut cuts off go back in the queue to
+         be solved again against it before they branch, up to
+         ``tree_cut_rounds`` times each (default 1); their pseudocosts use
+         the LP value before the new cuts.
+
+      The block keeps its shape, and the batched node solver
+      (``jaddle_linear.solve_many``) and the device kernels take the rows
+      as data, so a refresh recompiles nothing, batched or serial. The
+      results just solved have the duals of replaced slots zeroed, so their
+      bounds hold for the new rows, and an open node's warm start has them
+      zeroed when it is solved (``fit_warm``, by the block version it was
+      made under). Refreshes take at most ``tree_cut_share`` (default 0.25)
+      of the tree's time after its first seconds, and the tree heuristics
+      then run by a clock that counts their time as nodes
+      (``heuristic_clock``). Results: ``tree_cut_refreshes``,
+      ``tree_cuts_added``, ``tree_cut_pool_hits``, ``tree_cut_requeued``,
+      ``tree_cut_families``, ``tree_cut_seconds``, ``tree_cut_skipped`` and
+      ``cut_pool``.
+    * **Node LPs.** Every LP of the search is Jaddle's PDHG: the root and
+      its cut rounds at ``precision``, node LPs at ``node_precision``,
+      batched on the device with ``batch_size > 1``. Crossover
+      (``jaddle_linear.crossover``, HiGHS from the PDHG point) gives exact
+      vertices where asked: each Gomory cut round, ``root_crossover`` and
+      ``node_crossover``. A node's bound is the Lagrangian bound of its
+      duals, rigorous whatever their accuracy.
     * **Nodes.** Each child is warm-started from its parent's primal-dual
       point and step-size state; with the compiled solver cached, a small
       node takes milliseconds. A node is pruned when its Lagrangian bound
@@ -12195,15 +11709,16 @@ def solve(
       closes the node (``node_bound_stop``, on by default:
       ``jl.solve(bound_target=...)`` checks it every epoch). An infeasible
       node's duals diverge along a Farkas ray and pass the cutoff within a
-      few epochs, instead of running ``node_max_epochs`` and
-      ``detect_infeasibility``. On ns1830653 (3 minutes) that took the
-      search from 140 nodes to 385 (21.9 to 10.2 epochs a node) and the
-      bound from 11,678 to 11,976 (``bound_stops`` in the result).
+      few epochs, instead of running ``node_max_epochs``. On ns1830653 (3
+      minutes) that took the search from 140 nodes to 385 (21.9 to 10.2
+      epochs a node) and the bound from 11,678 to 11,976 (``bound_stops``
+      in the result). No node LP or root cut round runs infeasibility
+      detection: a node LP that stops unconverged keeps its bound and
+      branches on its point.
     * **Conflicts** (``conflicts``, on by default; ``ConflictPool``). Each
       node or child closed by its Lagrangian bound leaves a dual proof,
       ``constant + r·x <= cutoff``, which every better solution satisfies
-      whatever the accuracy of the duals; an LP that ``detect`` proves
-      infeasible leaves one from its dual ray, and a child that propagation
+      whatever the accuracy of the duals, and a child that propagation
       proves infeasible leaves a no-good over its binary fixings (cut down
       by a deletion filter). Proofs are reduced to the variables whose node
       bounds differ from the root's (the others go to the right-hand side),
@@ -12219,9 +11734,11 @@ def solve(
       ``incumbent − g/2``.
     * **Batched nodes** (``batch_size``). With ``batch_size > 1`` the tree
       takes up to that many open nodes at a time (the plunge child first,
-      then the heap's top) and solves their LPs in one device call:
-      ``jax.vmap`` of ``jaddle_linear.make_solver`` over the nodes' bounds
-      and warm starts, jitted once. The nodes are then evaluated in order on
+      then the heap's top) and solves their LPs in one device call
+      (``jaddle_linear.solve_many``: ``solve()``'s compiled programs vmapped
+      over the nodes' bounds and warm starts, with the LP's rows as data,
+      so it compiles once per shape and tree cut refreshes reuse it). The
+      nodes are then evaluated in order on
       the host exactly as in the serial search. Members run in lockstep, so
       a node that will not converge holds its batch to ``node_max_epochs``.
       Worth it on a GPU; on a CPU the members run one after another. The
@@ -12247,25 +11764,21 @@ def solve(
       root and cheap nodes; ``node_precision=None`` keeps the node LPs at
       ``precision``.
     * **Branching** (``branching``): ``"auto"`` (default) is
-      ``"reliability"`` with HiGHS node LPs (``node_lp_solver="highs"``)
-      and ``"pseudocost"`` with Jaddle's (``"jaddle"``). With HiGHS node LPs, strong
-      branching's child LPs are HiGHS's dual simplex from the node's basis,
-      each for at most twice the node LPs' mean simplex iterations (a dual
-      simplex stopped early still gives a valid Lagrangian bound), a child
-      HiGHS proves infeasible fixes its variable the other way, the root
-      sweep takes ``4 · strong_candidates`` candidates (``"auto"``), and
-      strong branching in the tree pauses while it has taken more than half
-      the elapsed time. On bab5 plain pseudocost branching chose a variable
-      with no observation in some direction 93% of the time; at sampled
-      nodes the chosen variable ranked a median 17th of about 60 by exact
-      strong branching, and in 7 of 16 one of its children gained nothing
-      where the best candidate's weaker child gained 15–40. The PDHG root
-      sweep (8 candidates, 50 epochs) recorded no gain for 7 of its 8
-      variables, whose exact gains were 5–20. ``"pseudocost"`` scores each
+      ``"pseudocost"``: PDHG's truncated child LPs make strong branching in
+      the tree dear for what it learns. On bab5 plain pseudocost branching
+      chose a variable with no observation in some direction 93% of the
+      time; at sampled nodes the chosen variable ranked a median 17th of
+      about 60 by exact strong branching. The PDHG root sweep (8
+      candidates, 50 epochs) recorded no gain for 7 of its 8 variables,
+      whose exact gains were 5–20. ``"pseudocost"`` scores each
       fractional variable by the product of its estimated down and up bound
       gains, learnt from the nodes solved so far (most fractional until
       there are any); ``"most_fractional"`` picks the variable nearest
-      ½. With either pseudocost rule, the root first strong-branches its
+      ½. Both pseudocost rules settle near ties by each variable's
+      conflict, cutoff and inference history (``branching_scores``, as
+      SCIP and HiGHS do), and pseudocosts measure a child's LP before its
+      re-solve with new tree cuts. With either pseudocost rule, the root
+      first strong-branches its
       ``root_strong_candidates`` (``"auto"``: ``strong_candidates``; ``0``
       turns it off) fractional integers with the largest
       ``branching_impact · f(1 − f)`` (column length times relative cost) for
@@ -12292,8 +11805,8 @@ def solve(
       Lagrangian bounds (valid however far the LPs got) are computed on
       the device. All shapes are fixed for the search, so it compiles once.
       ``"numpy"`` does the same on the host for the ``strong_candidates``
-      best by pseudocost score, with the conflict pool too; tree cuts
-      change the LP's shape and use it. The children's bounds feed the
+      best by pseudocost score, with the conflict pool too. The children's
+      bounds feed the
       pseudocosts (gains between unrounded bounds), fix a candidate with a
       closed child to its other side, raise the node's bound, and become
       the children's bounds and warm starts. ``strong_max_depth`` (``None``:
@@ -12314,14 +11827,18 @@ def solve(
       ``"best_first"`` and ``"depth_first"`` do one throughout.
     * **Incumbents.** A node LP point with integral integers (within
       ``integrality_tolerance``), and the LP point rounded at every
-      ``heuristic_every``-th node, are rounded and checked. A point is
+      ``heuristic_every``-th node, are rounded and checked. So is a node
+      LP point whose integers are all within ``near_integral_tolerance``
+      (default 1e-2; ``0``: off) of integers, once per rounding, marked
+      ``"T"``; the node still branches. A loose PDHG point (float32 nodes
+      at 1e-4 without node crossover) rarely passes the integrality test
+      even at an integral optimum (a binary at 0.9997)
+      (``result["near_integral"]``: its tries and finds). A point is
       feasible when each row's violation relative to ``1 + |b_i|`` and its bound
       violation are at most ``feasibility_tolerance``. With continuous
       variables, a rounded point that is not is repaired by fixing the
-      integers and solving the LP in the rest: exactly by HiGHS's dual
-      simplex with ``node_lp_solver="highs"`` (within
-      ``round_repair_seconds``), by PDHG for up to ``repair_max_epochs``
-      epochs with ``"jaddle"``. The repair is skipped when the same
+      integers and solving the LP in the rest by PDHG, for up to
+      ``repair_max_epochs`` epochs. The repair is skipped when the same
       integers already failed, when no violated row has a continuous
       variable, or when bound propagation shows the fixed box infeasible.
     * **Probing** (``probing``, on by default). Before the root LP, every
@@ -12336,7 +11853,15 @@ def solve(
       than 10,000 nonzeros probe chunks of variables at once in one vmapped
       JAX call (``probing_backend``). What each side implies is kept as a
       ``ProbingCache`` for bulk rounding.
-    * **Primal heuristics.** After the root cuts, ``fix_and_propagate``
+    * **Primal heuristics.** On the first root LP, before the cut rounds
+      (which then judge progress against the gap, with the background
+      improving jump running beside them), and again after them, sharing
+      one budget; each round from the second also rounds its point
+      (fix-and-propagate, and bulk rounding while there is no incumbent).
+      With ``parallel_heuristics`` the ones before and during the rounds
+      run in the background instead (below), and bulk rounding and the
+      pump wait for the call after the rounds.
+      ``fix_and_propagate``
       (off by default; the function of that name) rounds the root LP point in chunks with
       bound propagation after each; if that fails (or is off),
       ``bulk_fix_and_propagate`` (``bulk_rounding``, independent of
@@ -12375,27 +11900,14 @@ def solve(
       history. A jump that ends near-feasible is handed to ``repair`` (a
       backtracking search with propagation over the variables around its
       violated rows), marked ``"R"``, for at most ``repair_share`` of the
-      heuristic time left. ``highs_incumbent_seconds > 0`` asks
-      HiGHS (``highs_incumbent``) for its best incumbent within that many
-      seconds when all of these fail, marked ``"X"`` (default 10;
-      ``0`` keeps the search Jaddle's own). With ``parallel_heuristics``
-      it runs on the background HiGHS lane from the moment the root LP is
-      solved, beside the cut rounds, and again with twice the budget each
-      time it finds nothing while there is no incumbent (10 s, 20 s,
-      40 s, ...; ``result["highs_incumbent_calls"]`` counts them). On
-      neos-4306827-ravan HiGHS needs 16 s for a first point, and Jaddle had
-      none after 300 s with a single 10 s call. RINS (``rins_seconds``; ``None``, the default, gives
+      heuristic time left. RINS (``rins_seconds``; ``None``, the default, gives
       5s a call) runs once at the root and every ``rins_every`` nodes once
       there is an incumbent, and after each new incumbent from another
       source: the integers on which the incumbent and the node's LP point
       agree are fixed, and the rest is searched for a better solution,
-      marked ``"N"``. With ``rins_solver="highs"`` (default) HiGHS searches
-      it (``highs_submip``: it presolves the neighbourhood, takes the
-      incumbent as its start and the cutoff as its objective bound, up to
-      ``rins_nodes`` nodes); with ``"jaddle"``, this branch and bound
-      (``_BranchAndBound.jaddle_rins``, reusing the compiled LP solver);
-      ``"auto"`` picks Jaddle for MIPs with at most 10,000 nonzeros.
-      ``rins_nodes`` doubles after a call that improves the incumbent and
+      marked ``"N"``. This branch and bound searches it
+      (``_BranchAndBound.jaddle_rins``, reusing the compiled LP solver, up
+      to ``rins_nodes`` nodes). ``rins_nodes`` doubles after a call that improves the incumbent and
       halves after one that does not (within 50–2000), and RINS calls stop
       while they have taken more than ``heuristic_effort`` (0.3) of the
       elapsed time (``heuristic_effort=0``: no RINS).
@@ -12406,56 +11918,38 @@ def solve(
       ``round_repair_every`` (``None``: ``heuristic_every``) node's LP
       point have their integers rounded up, to nearest and down
       (``integer_roundings``; near-integral PDHG values are snapped first,
-      by ``100 · lp_tolerance``). Each rounding is fixed, and HiGHS solves
-      the rest exactly (``highs_round_repair``), for up to
-      ``round_repair_seconds`` (10) a call, marked ``"U"``. In the tree it
-      runs on the background HiGHS lane with ``parallel_heuristics`` (when
-      idle), else within ``heuristic_effort``. Rounding up suits integers
-      that count units for continuous variables: on buildingenergy it
-      gives 33,325 from the root vertex in 0.6 s and 33,285.6 from the
-      sizing variable's up child, against 33,747 from RENS after 190 s
-      (optimum 33,283.85). The PDHG repair of ``try_incumbent``
-      (``repair_max_epochs``, with ``node_lp_solver="jaddle"``) is far from
-      converged on such large LPs.
-    * **RENS** (``rens_seconds``; ``None``, the default, gives 10% of
-      ``max_seconds`` up to 30s, or 10s without a time limit; with
-      ``rins_solver="jaddle"``, 5s for MIPs with at most 10,000 nonzeros,
-      else off). After the root heuristics, the integers that are integral
-      at an exact root vertex (the cut loop's last crossover, else one
-      crossed over for RENS) are fixed and the fractional ones restricted to
-      their floor and ceiling, and that sub-MIP is searched as RINS's is (up
-      to ``rens_nodes`` nodes), marked ``"E"``. It needs no incumbent.
-      When HiGHS proves that box infeasible, as on degenerate root LPs
-      whose vertex is integral on many integers by accident, the time left
-      goes to a dive in the manner of HiGHS's RENS (``highs_rens``): it
-      fixes a tenth of the integers at a time towards the LP point,
-      re-solving the LP with HiGHS's dual simplex, until half as many are
-      fixed as in the failed box, then searches that sub-MIP with the
-      unfixed integers free; a box proven empty backs the dive up to half
-      its depth and halves the target. On neos-4306827-ravan the RENS box
-      is infeasible in 0.2 s and the dive finds 11,557 (first point after
-      5 s). This
-      is HiGHS's most useful heuristic: switching HiGHS's RENS off slows
-      misc07 from 20s to 45s and leaves ns1830653 at 30,808 instead of
-      25,808 after 60s. With HiGHS solving it, Jaddle reaches vpm2's
-      optimum in 12s (never within 60s before) and pp08a's within 1% in
-      4.6s (30s before).
+      by ``100 · lp_tolerance``). Each rounding that propagation does not
+      rule out is tried as an incumbent, marked ``"U"``: ``try_incumbent``
+      solves for the continuous variables with a PDHG LP (as above), within
+      ``round_repair_seconds`` (10) a call and, in the tree,
+      ``heuristic_effort``. Rounding up suits integers that count units
+      for continuous variables (on buildingenergy the sizing variable's up
+      child is where the good points are).
+    * **RENS** (``rens_seconds``; ``None``, the default, gives 5s for MIPs
+      with at most 10,000 nonzeros, else off). After the root heuristics,
+      the integers that are integral at an exact root vertex (the cut
+      loop's last crossover, else one crossed over for RENS when
+      ``root_crossover`` allows) are fixed and the fractional ones
+      restricted to their floor and ceiling, and that sub-MIP is searched
+      by a Jaddle sub-search (``sub_search``, up to ``rens_nodes`` nodes),
+      marked ``"E"``. It needs no incumbent.
     * **Background heuristics** (``parallel_heuristics``, on by default).
-      The heuristics that run on the CPU run on background threads, beside
-      the node LPs, instead of between them: HiGHS's RENS and RINS (with
-      ``rins_solver="highs"``) and its incumbent search
-      (``highs_incumbent_seconds``) on one thread, one job at a time, and
-      the numba improving jump on another. The search hands a job over
-      when it is due and its thread is free (a RINS call that finds the
-      thread busy waits for the next node) and checks the points of
-      finished jobs between nodes, marked as above. The improving jump runs
-      in slices of 5 s, each from the incumbent of its time; a slice that
-      finds nothing better is not repeated until the incumbent changes.
-      RINS then takes no time from the tree, so ``heuristic_effort`` no
-      longer limits it (``0`` still turns it off). The device heuristics
-      (bulk rounding, the pump, the tree heuristics) stay on the main
-      thread, as they would share the device with the node LPs anyway. The
-      jobs use HiGHS and NumPy only, never JAX, and stop within about a
+      The numba improving jump runs on a background thread, beside the
+      node LPs, instead of between them. The search hands a slice over when
+      the thread is free and checks the points of finished slices between
+      nodes (marked ``"J"``). The root cut rounds do not wait for
+      heuristics either: the first root LP's fix-and-propagate and its two
+      jumps (LP point, bounds nearest zero), and each later round's
+      fix-and-propagate, run on background threads beside the rounds
+      (``"P"``, ``"J"``), and the rounds collect their points. With
+      ``parallel_rounding`` (on by default, whatever ``fix_and_propagate``
+      says) every node's LP point is rounded the same way beside the node
+      LPs (``"P"``; a point is skipped while the thread is still busy with
+      an earlier one; ``result["background_roundings"]``). Each slice runs 5 s from the incumbent of its
+      time; a slice that finds nothing better is not repeated until the
+      incumbent changes. The device heuristics (bulk rounding, the pump,
+      the tree heuristics) and RINS (a Jaddle sub-search) stay on the main
+      thread. The jobs use NumPy only, never JAX, and stop within about a
       second when the search ends. A run then depends on timing, so it is
       no longer repeatable; turn it off for that.
     * **Dives** (``dive_every``; default 50, ``0``: off). LP-based dives
@@ -12543,8 +12037,7 @@ def solve(
     * ``"history"``: one dict per new incumbent (``seconds``, ``nodes``,
       ``objective``, ``bound``, ``source``: ``"H"`` rounding, ``"P"``
       fix-and-propagate, ``"J"`` feasibility jump, ``"R"`` repair, ``"F"``
-      feasibility pump, ``"U"`` round and repair, ``"X"`` HiGHS
-      (``highs_incumbent_seconds``), ``"N"``
+      feasibility pump, ``"U"`` round and repair, ``"N"``
       RINS (``rins_seconds``), ``"T"`` tree, ``"S"`` the user's start
       (``mip_start``) or ``"1"`` 1-opt (``one_opt``));
       ``"heuristic_seconds"``: time spent in the two heuristics.
@@ -12625,15 +12118,17 @@ def solve(
         max_tree_cuts_per_round=max_tree_cuts_per_round,
         tree_cut_rows=tree_cut_rows,
         tree_cut_nnz=tree_cut_nnz,
+        tree_cut_points=tree_cut_points,
+        tree_cut_rounds=tree_cut_rounds,
+        tree_cut_share=tree_cut_share,
+        tree_cut_max_nnz=tree_cut_max_nnz,
         fix_and_propagate=fix_and_propagate,
         feasibility_jump=feasibility_jump,
         jump_iterations=jump_iterations,
         repair=repair,
         repair_max_epochs=repair_max_epochs,
-        highs_incumbent_seconds=highs_incumbent_seconds,
         rins_seconds=rins_seconds,
         rins_every=rins_every,
-        rins_solver=rins_solver,
         rins_nodes=rins_nodes,
         rens_seconds=rens_seconds,
         rens_nodes=rens_nodes,
@@ -12667,7 +12162,6 @@ def solve(
         node_precision=node_precision,
         jump_backend=jump_backend,
         parallel_heuristics=parallel_heuristics,
-        node_lp_solver=node_lp_solver,
         symmetry=symmetry,
         restarts=restarts,
         heuristic_seconds=heuristic_seconds,
@@ -12683,12 +12177,10 @@ def solve(
         flow_covers=flow_covers,
         clique_cuts=clique_cuts,
         zero_half_cuts=zero_half_cuts,
-        simplex_cut_rounds=simplex_cut_rounds,
-        simplex_cut_age=simplex_cut_age,
+        cut_age=cut_age,
         max_cut_rows=max_cut_rows,
         gomory_candidates=gomory_candidates,
-        cutoff_probing=cutoff_probing,
-        cutoff_probing_share=cutoff_probing_share,
+        inout_separation=inout_separation,
         root_redcost_propagation=root_redcost_propagation,
         global_redcost_fixing=global_redcost_fixing,
         cut_pool_propagation=cut_pool_propagation,
@@ -12716,7 +12208,17 @@ def solve(
         objective_propagation=objective_propagation,
         plunge_gap=plunge_gap,
         branch_implied=branch_implied,
+        near_integral_tolerance=near_integral_tolerance,
+        tree_pool_every=tree_pool_every,
+        parallel_rounding=parallel_rounding,
     )
+    return _solve_model(
+        model, presolve, precision, highs_options, feasibility_tolerance, settings
+    )
+
+
+def _solve_model(model, presolve, precision, highs_options, feasibility_tolerance, settings):
+    """The search of ``solve``, with or without HiGHS's presolve."""
     with jo.local_settings(precision=precision):
         if presolve:
             return _solve_with_presolve(
@@ -12778,9 +12280,18 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "infeasible_nodes": 0,
             "unresolved_nodes": 0,
             "integral_splits": 0,
-            "cutoff_probing_lps": 0,
-            "cutoff_probing_fixed": 0,
-            "cutoff_probing_seconds": 0.0,
+            "near_integral": {"tries": 0, "finds": 0},
+            "background_roundings": 0,
+            "inout_cuts": 0,
+            "inout_rounds": 0,
+            "tree_cut_refreshes": 0,
+            "tree_pool_refreshes": 0,
+            "tree_cut_requeued": 0,
+            "tree_cut_seconds": 0.0,
+            "tree_cut_pool_hits": 0,
+            "tree_cut_skipped": 0,
+            "tree_cut_families": {},
+            "cut_pool": 0,
             "global_redcost_fixed": 0,
             "cut_pool_rows": 0,
             "lp_epochs": 0,
@@ -12796,7 +12307,6 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
                 "impliedbound": 0,
             },
             "root_bound_before_cuts": None,
-            "simplex_rounds": 0,
             "heuristic_seconds": 0.0,
             "batches": 0,
             "objective_step": None,
@@ -12810,12 +12320,6 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "symmetry": None,
             "restarts": 0,
             "restart_log": [],
-            "node_lp_solver": settings["node_lp_solver"],
-            "node_lp_solves": 0,
-            "node_simplex_iterations": 0,
-            "node_lp_seconds": 0.0,
-            "node_lp_fallbacks": 0,
-            "node_basis_restores": 0,
             "rins_calls": 0,
             "mip_start_accepted": None if mip_start is None else start_x is not None,
             "one_opt_finds": 0,
@@ -12854,6 +12358,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
                 settings["mip_abs_gap"], settings["mip_rel_gap"] * abs(start_value)
             )
             settings["initial_cutoff"] = start_value - allowance - reduced.offset
+            settings["cutoff_from_start"] = True
         result = _BranchAndBound(reduced, **settings).run()
         result["presolve"] = status.name
         result["mip_start_accepted"] = (

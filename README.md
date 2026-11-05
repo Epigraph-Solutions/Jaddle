@@ -533,8 +533,11 @@ columns are not supported.
   dropped without an LP solve. Proving infeasibility is slow for a
   first-order method, so this matters more here than in a simplex-based
   code.
-- **Root.** The root LP is solved by `jl.detect_infeasibility`, which
-  certifies optimality, infeasibility or an unbounded relaxation.
+- **Root.** The root LP is solved by `jl.solve`; only a root LP that stops
+  unconverged goes on to `jl.detect_infeasibility`, which certifies
+  infeasibility or an unbounded relaxation. Cut rounds and node LPs run no
+  infeasibility detection: an infeasible LP's Lagrangian bound passes the
+  cutoff and closes it.
 - **Coefficient tightening.** Ruiz and Pock–Chambolle scaling rescale whole
   rows and columns, so they cannot flatten a big-M row such as
   `y − M z ≤ 0`, where one coefficient dwarfs its rowmates. Over the
@@ -558,21 +561,24 @@ columns are not supported.
   cuts come from every aggregate. Both families are derived from a row and the
   bounds alone, so they are valid however inaccurate the LP point is; the
   point only picks which cuts to keep. A round keeps the most efficacious
-  cuts that are not near-parallel, retires cuts that sat slack with a zero
-  dual for two rounds, and re-solves the LP warm. During the rounds the cut
+  cuts that are not near-parallel, retires cuts that have been idle (slack,
+  with a zero dual) for `cut_age` rounds in a row (default 10), and
+  re-solves the LP warm. Every violated candidate, not only the cuts chosen for the LP, joins a global cut pool (as HiGHS's), for the tree to take back. During the rounds the cut
   block is padded to power-of-two sizes with room to grow, so the rounds
   share one compiled shape; afterwards idle cuts are dropped and the block
   is rebuilt at a tight size, so the node LPs pay only for the cuts in use.
-- **Tree cuts (opt-in).** `tree_cuts=True` turns the search into branch and
-  cut. The compiled LP solver takes the sparsity pattern as data, so only
-  the shapes must stay fixed: after the root cuts the block is rebuilt at a
-  fixed capacity, and every `tree_cut_every` nodes up to 10 cover and MIR
-  cuts violated at the node's LP point (separated over the root box, so
-  valid everywhere) fill free rows or replace idle cuts. The node is not
-  re-solved; its children solve against the new cuts. On lseu, 400 nodes
-  end with a bound of 1,080 instead of 1,064 (optimum 1,120), with no
-  recompiles, for about 40% more time per node. Serial search only: the
-  batched solver captures the pattern, so `batch_size > 1` turns them off.
+- **Tree cuts** (`tree_cuts`, on by default). After the root cuts the cut
+  block gets a fixed capacity, and every `tree_cut_every` nodes, between
+  solving a batch of node LPs and evaluating it, the block is refreshed
+  from all of the batch's points: slots idle at every point age, pooled
+  cuts any point violates come back, and new cuts are separated (c-MIR,
+  covers, flow covers, cliques, implied bounds, zero-half; over the root
+  box, so valid everywhere) at the `tree_cut_points` lowest-bound points.
+  Up to `max_tree_cuts_per_round` go into free or idle slots, and members a
+  new cut cuts off are solved again against it before they branch
+  (`tree_cut_rounds`). The batched node solver (`jl.solve_many`) takes the
+  LP's rows as data, so the refreshed block never recompiles it, serial or
+  batched; warm starts have the duals of replaced slots zeroed.
 - **Gomory cuts.** Gomory mixed-integer cuts need a basis: each round
   crosses the root point over to an optimal vertex with `jl.crossover`,
   reads tableau rows from a sparse LU of its basis, and separates all three
@@ -709,8 +715,8 @@ columns are not supported.
   one or the other finds an incumbent at the root in well under a second.
   *RENS* (`rens_seconds`) then fixes the integers that are integral at an
   exact root vertex, restricts the fractional ones to their floor and
-  ceiling, and has HiGHS search that sub-MIP (it presolves it to a small
-  model), as HiGHS's own RENS does. Once there is an incumbent, the
+  ceiling, and searches that sub-MIP with this branch and bound. Once
+  there is an incumbent, the
   propagation inside fix-and-propagate (and dives) carries the row
   `c·x ≤ cutoff`, so it rejects roundings that cannot improve.
   *RINS* (`rins_seconds`) runs at the root, every `rins_every` nodes and
@@ -729,8 +735,7 @@ columns are not supported.
   helped flugpl (302 → 204 nodes) but cost time elsewhere, and RINS found
   p0201's optimum at node 550 instead of 1,085 but doubled its run time
   (each Jaddle sub-search costs ~0.4s). The defaults are tuned for large
-  MIPs on a GPU (`benchmarks/benchmark_mip.py`), where both pay off; RINS runs
-  on HiGHS, on a background thread (`parallel_heuristics`).
+  MIPs on a GPU (`benchmarks/benchmark_mip.py`), where both pay off.
 - **Node crossover** (`node_crossover`, opt-in). A PDHG point lies inside
   the LP's optimal face, so it is integral far less often than the vertex a
   simplex solver would return: on `max Σx, Σx ≤ 1` over binaries PDHG gives
@@ -765,12 +770,13 @@ reports `bound_rigorous=False`.
 | `reliability_threshold`, `strong_candidates`, `strong_epochs`, `strong_max_depth` | `4`, `8`, `50`, `None` | Reliability branching (`branching="reliability"`): pseudocost observations per direction before a variable stops being strong-branched, the most variables whose child LPs are solved at a node, the epochs of each child LP, and the deepest node that strong-branches (`None`: any). |
 | `strong_screen`, `strong_backend` | `32`, `"jax"` | Candidates whose children are propagated and bounded on the device before the child LPs are picked; `"jax"` runs strong branching as one device pipeline, `"numpy"` on the host. |
 | `integrality_tolerance` | `1e-5` | How close to an integer an LP value must be to count as integral. |
+| `near_integral_tolerance` | `1e-2` | A node LP point whose integers are all this close to integers (though not within `integrality_tolerance`) is rounded and tried as an incumbent (`T`), once per rounding; the node still branches (`0`: off). Loose float32 PDHG points rarely pass the integrality test. |
 | `feasibility_tolerance` | `1e-6` | Largest row violation (each row's, relative to its own `1 + \|b_i\|`) and bound violation an incumbent may have. |
 | `lp_tolerance`, `lp_options` | `1e-4`, `None` | The node LPs' relative tolerances, and any other `jl.solve` option. |
 | `node_max_epochs`, `root_max_epochs` | `200`, `None` | Epoch budgets for a node LP and the root LP. |
 | `node_lp_tolerance` | `None` | Tolerance for node LPs only (`None`: `lp_tolerance`). Experimental: looser node LPs are cheaper but give rougher branching and pseudocost data. |
-| `node_lp_options` | `None` | Any other `jl.solve` option for node LPs only (`None`: `{"iterations_per_epoch": 64}`, unless `lp_options` sets it; `{}`: `jl.solve`'s 256), over `lp_options` and `node_lp_tolerance`: serial and batched node LPs and strong branching's child LPs (batched ones take `jl.make_solver` options only; others raise). `lp_options` applies to every LP. |
-| `node_bound_stop` | `True` | Stop a node LP as soon as the Lagrangian bound of its duals closes the node against the cutoff (`jl.solve(bound_target=...)`, and `jl.make_solver(bound_stop=True)` for each member of a batch); infeasible nodes stop within a few epochs. |
+| `node_lp_options` | `None` | Any other `jl.solve` option for node LPs only (`None`: `{"iterations_per_epoch": 64}`, unless `lp_options` sets it; `{}`: `jl.solve`'s 256), over `lp_options` and `node_lp_tolerance`: serial and batched node LPs and strong branching's child LPs (batched ones take `jl.solve_many` options only; others raise). `lp_options` applies to every LP. |
+| `node_bound_stop` | `True` | Stop a node LP as soon as the Lagrangian bound of its duals closes the node against the cutoff (`jl.solve(bound_target=...)`, and `jl.solve_many(bound_target=...)` for each member of a batch); infeasible nodes stop within a few epochs. |
 | `batch_epochs` | `10` | Batched search: the most epochs a node LP runs in one batch call; an unfinished node goes back to the queue, warm-started, until `node_max_epochs` in all, so one slow member cannot hold its batch (`None`: `node_max_epochs`). |
 | `children_backend`, `batch_roundings` | `"auto"`, `False` | Batched search: split all members at once on the device (`"auto"`: above 10,000 nonzeros; `"jax"`, `"numpy"`), and round the batch's tree heuristics as one bulk rounding (opt-in: slower than the classic one per node on ns1830653). |
 | `heuristic_every` | `5` | Run rounding (then fix-and-propagate if it fails) every this many nodes (`0` = only on integral LP points). |
@@ -782,14 +788,12 @@ reports `bound_rigorous=False`.
 | `device` | `"auto"` | `"auto"` runs MIPs with at most 10,000 nonzeros on the CPU (their node LPs are latency-bound on a GPU: flugpl takes 3s on the CPU, 18s on a GPU); `"cpu"`/`"gpu"`/`"tpu"` or a `jax.Device` pick one, `None` keeps JAX's default. |
 | `precision` | `"float64"` | `"float64"`, `"float32"` or `"float16"` for the whole search, node LPs included (`None` keeps the global profile). |
 | `node_precision` | `"float32"` | The node LPs' profile (serial, batched and strong branching's child LPs); the root LP, cut rounds and heuristic LPs stay at `precision`. Laptop GPUs run float64 at a small fraction of float32 speed (`None`: `precision`). |
-| `batch_size` | `32` | Open nodes solved together in one `vmap`-ed device call (`1`: the serial search, needed for tree cuts). |
-| `highs_incumbent_seconds` | `10` | HiGHS supplies its best incumbent within this many seconds when Jaddle's heuristics find none (`0`: off). |
+| `batch_size` | `32` | Open nodes solved together in one `vmap`-ed device call (`jl.solve_many`; `1`: the serial search). |
 | `rins_seconds`, `rins_every` | `None`, `5` | RINS at the root, every `rins_every` nodes and after each new incumbent (`None`: 5s a call; `0`: off). |
 | `heuristic_effort` | `0.3` | The share of the elapsed time RINS may take; calls stop while they have used more (`0`: no RINS). |
-| `parallel_heuristics` | `True` | Run the CPU heuristics (HiGHS's RENS, RINS and incumbent search, round and repair in the tree, the numba improving jump) on background threads beside the node LPs. Runs then depend on timing; `False` makes them repeatable. |
-| `rens_seconds`, `rens_nodes` | `None`, `500` | RENS at the root (`None`: 10% of `max_seconds` up to 30s, 10s without a limit; with `rins_solver="jaddle"`, 5s for small MIPs, else off). |
+| `parallel_heuristics` | `True` | Run the numba improving jump on a background thread beside the node LPs. Runs then depend on timing; `False` makes them repeatable. |
+| `rens_seconds`, `rens_nodes` | `None`, `500` | RENS at the root, a Jaddle sub-search (`None`: 5s for MIPs with at most 10,000 nonzeros, else off). |
 | `dive_every`, `dive_depth` | `50`, `20` | LP-based dives every this many nodes and at the root (`0`: off), and their depth. |
-| `rins_solver`, `rins_nodes` | `"highs"`, `200` | Who searches the RENS and RINS sub-MIPs: `"highs"` (presolved by HiGHS, up to `rins_nodes` nodes, which adapts to success), `"jaddle"`, this branch and bound (reusing the compiled LP solver), or `"auto"` (Jaddle for MIPs with at most 10,000 nonzeros, HiGHS above). On lseu the Jaddle sub-searches take ~0.4s each against HiGHS's ~0.01s. |
 | `pump_iterations`, `pump_tolerance` | `30`, `1e-4` | The pump's LP solves and their tolerance. |
 | `pump_jump_iterations`, `pump_jump_share` | `3000`, `0.2` | Feasibility jump steps from each rounding the pump rejects (`0`: none), and the most of the pump's time the jumps may take. |
 | `probing`, `probing_seconds`, `probing_max_variables`, `probing_backend`, `probing_max_useless` | `True`, `None`, `None`, `"auto"`, `1000` | Root probing; its budget (`None`: 5% of `max_seconds` up to 30 s, 10 s without one); the most variables probed; `"numpy"`, `"jax"` or `"auto"` (JAX above 10,000 nonzeros); stop after this many variables in a row change nothing (`None`: never). |
@@ -797,11 +801,11 @@ reports `bound_rigorous=False`.
 | `bulk_rounding`, `bulk_starts` | `True`, `4` | Bulk fix-and-propagate at the root and in the pump, and how many starts run side by side. |
 | `node_crossover`, `node_crossover_every`, `node_crossover_seconds` | `False`, `1`, `2.0` | Cross node LP points over to exact vertices with HiGHS (opt-in), every this many nodes, with this time limit per call; the vertex is used for the integrality test, branching and heuristics, and its duals for the bound. |
 | `tree_heuristics`, `tree_heuristic_every`, `tree_heuristic_share`, `tree_jump_iterations` | `True`, `10`, `0.05`, `3000` | GPU heuristics from node LP points once there is an incumbent: bulk rounding, then a feasibility jump with the objective cutoff row, every this many nodes, while they have taken at most this share of the elapsed time, with this many jump steps per call. |
-| `heuristic_seconds` | `10` | Time for the root heuristics (`None`: 20% of `max_seconds`, or no time limit without one). |
+| `heuristic_seconds` | `10` | Time for the root heuristics, shared by their runs before and after the cut rounds (`None`: 20% of `max_seconds`, or no time limit without one). |
 | `propagate` | `True` | Bound propagation at the root and at each child. |
 | `coefficient_tightening` | `True` | Shrink binaries' big-M coefficients at the root (see above). |
 | `cuts`, `cut_rounds` | `True`, `None` | Root cuts, and the most rounds of them (`None`: 40 with Gomory cuts on, else 5). |
-| `max_cuts_per_round`, `cut_min_progress` | `100`, `None` | Cuts added per round, and the relative bound gain below which the rounds stop. |
+| `max_cuts_per_round`, `cut_min_progress` | `100`, `None` | Cuts added per round, and the bound gain over three rounds below which the rounds stop (judged once three have run; relative to the gap to the incumbent when there is one, else to the bound). |
 | `cut_round_epochs` | `10` | Epoch budget of each cut round's root re-solve (`None`: to convergence); the root is converged once the rounds end. |
 | `gomory_cuts` | `True` | Gomory mixed-integer cuts from a crossover basis at each root round (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
 | `root_crossover` | `False` | Cross the root LP over to an exact vertex for rigorous reduced-cost tightening duals (`"auto"`: only when that tightening runs; `True`: always). |
@@ -813,13 +817,18 @@ reports `bound_rigorous=False`.
 | `mip_start` | `None` | A starting point over the model's columns, tried before the root LP (`result["mip_start_accepted"]`). Continuous entries may be NaN: an LP with the integers fixed fills them in. With `presolve=True` it is checked against the original model and its value becomes the reduced search's cutoff; if nothing better turns up, it is returned. |
 | `branch_implied` | `False` | Let fractional implied integers (HiGHS's implicit integers, `MIP.implied`) be branched on, scored like the integers; nodes still close when the real integers are integral (`result["implied_branchings"]`). |
 | `objective_propagation` | `False` | Propagate the objective row `c·x <= cutoff` in the search (node boxes, children, strong branching's children), at the current cutoff (`jm.CutoffPropagator`); host propagation only. |
+| `inout_separation` | `None` | In-out separation: with an incumbent `x̄`, the cut rounds also separate at `λ·x + (1 − λ)·x̄`, λ starting at this value (in (0, 1)). A cut violated there is violated at the LP point `x` too. A round that keeps none of those cuts moves λ halfway to 1, and past 0.9 it stops until the incumbent changes (`result["inout_cuts"]`, `["inout_rounds"]`). |
 | `one_opt` | `True` | 1-opt on every new incumbent (`jm.one_opt`): each integer moves in its improving direction as far as the rows allow (`result["one_opt_finds"]`). |
-| `simplex_cut_rounds` | `"auto"` | Run the root cut rounds in HiGHS's dual simplex, warm from the last basis, for exact bounds each round (`"auto"`: with Gomory cuts). |
 | `aggregate_integers` | `"auto"` | Aggregate rows through integer variables too, up to five rows, for MIR and cover cuts (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
-| `tree_cuts`, `tree_cut_every` | `False`, `10` | Global cover and MIR cuts added in the tree every this many nodes (branch and cut; serial search only). |
+| `tree_cuts`, `tree_cut_every`, `max_tree_cuts_per_round` | `True`, `10`, `10` | Refresh the LP's cut block between node solves every this many nodes, adding at most this many cuts a refresh (branch and cut, serial or batched). |
+| `parallel_rounding` | `True` | With `parallel_heuristics`: fix-and-propagate of the root LP point, each cut round's point and every node's LP point on a background thread (`P`), skipped while it is busy; independent of `fix_and_propagate` (`result["background_roundings"]`). |
+| `tree_pool_every` | `1` | Between full refreshes, take back the cut pool's violated cuts every this many nodes, without separating (as HiGHS checks its pool at every node; `0`: off; `result["tree_pool_refreshes"]`). |
+| `tree_cut_points`, `tree_cut_rounds`, `tree_cut_share`, `tree_cut_max_nnz` | `4`, `1`, `0.25`, `None` | Points a refresh separates new cuts at (the lowest-bound nodes'), re-solves a node gets for new cuts that cut it off, the most of the tree's time refreshes take, and the densest cut kept (`None`: `max(64, n / 8)`). |
+| `tree_cut_rows`, `tree_cut_nnz` | `None`, `None` | The cut block's capacity in the tree: cuts and their nonzeros (`None`: twice the root's, with room for two refreshes). |
+| `cut_age` | `10` | Root cut rounds: the rounds in a row a cut stays in the LP while idle (slack, with a zero dual). |
 | `conflicts`, `conflict_pool_size`, `conflict_max_nnz` | `True`, `2000`, `None` | Learn dual proofs and no-goods from closed nodes and propagate them at every node before its LP (`None`: at most `max(25, n // 10)` variables per proof). |
 | `presolve`, `highs_options` | `False`, `None` | HiGHS presolve and postsolve, and options for the HiGHS instance. |
-| `verbose`, `log_every_seconds` | `False`, `1.0` | Progress table. |
+| `verbose`, `log_every_seconds` | `False`, `1.0` | Progress table and solving report, laid out as HiGHS's MIP log (source, nodes, queue, leaves, explored share, bounds, gap, cuts in the pool and the LP, conflicts, PDHG epochs, time). |
 
 Use the `float64` profile for the default tolerances.
 
@@ -832,7 +841,7 @@ maximisation), `gap`, `status` (`"optimal"`, `"infeasible"`,
 or `"interrupted"`), `converged`, `bound_rigorous`, the counts `nodes`,
 `infeasible_nodes`, `unresolved_nodes` and `lp_epochs`, `seconds`, and
 `history`, one entry per new incumbent, `cuts` (the cuts in the final LP by
-family: `gomory`, `cover`, `mir`), `root_bound_before_cuts`, `tree_cuts_added`, `rins_calls`, `heuristic_seconds`,
+family: `gomory`, `cover`, `mir`), `root_bound_before_cuts`, `tree_cuts_added`, `tree_cut_refreshes`, `tree_cut_pool_hits`, `tree_cut_requeued`, `rins_calls`, `heuristic_seconds`,
 `objective_step` (or `None`), `reduced_cost_tightenings`, `children_pruned`
 (children closed on their parent's duals), and `lp_repairs` / `lp_repairs_skipped`
 (repair LPs solved, and rounded points rejected without one), and

@@ -65,49 +65,46 @@ print(
 
 # %% [markdown]
 # ## Branch and bound
-# `jm.solve`'s defaults are tuned for this kind of run: large MIPs on a GPU.
-# `presolve=True` works on HiGHS's reduced MIP and postsolves the incumbent.
-# Every primal heuristic is on by default, Jaddle's and HiGHS's:
+# Every LP of the search is Jaddle's (PDHG): the root and its cut rounds in
+# float64, node LPs `batch_size` at a time on the device (laptop GPUs run
+# float64 at a small fraction of float32 speed). HiGHS only reads the model,
+# presolves it (`presolve=True` works on HiGHS's reduced MIP and postsolves
+# the incumbent) and crosses PDHG points over to vertices (Gomory cut
+# rounds, `root_crossover`, `node_crossover`).
+#
+# Every primal heuristic is on by default:
 # - root probing;
-# - round and repair: LP points rounded up, to nearest and down, with
-#   HiGHS solving the continuous rest exactly (at the root, the root's
-#   strong children and every few nodes);
+# - round and repair: LP points rounded up, to nearest and down, the
+#   continuous rest solved by a PDHG LP (at the root, the root's strong
+#   children and every few nodes);
 # - bulk fix-and-propagate (several starts at once; the classic one is off);
 # - the feasibility jump, then an improving jump from each incumbent;
 # - the feasibility pump, with a short jump from each rounding it rejects;
-# - HiGHS: RENS at the root, RINS in the tree (every 5 nodes, up to 30% of
-#   the run), and its own MIP search for an incumbent if all of the above
-#   fail;
+# - RENS at the root (small MIPs) and RINS in the tree, as Jaddle
+#   sub-searches;
 # - in the tree: LP dives every 50 nodes, and GPU bulk rounding and jumps
 #   from node points every 10.
 #
 # The log marks their incumbents `U` (round and repair), `P`
 # (fix-and-propagate), `B` (bulk), `J` (jump), `F` (pump), `R` (repair), `E`
-# (RENS), `N` (RINS), `X` (HiGHS) and `D` (dive). The CPU ones (HiGHS, round
-# and repair in the tree, and the numba improving jump) run on background
-# threads beside the node LPs (`parallel_heuristics`), so runs are not
-# repeatable. With HiGHS searching the RINS sub-MIPs, ns1830653 went from
-# 131,808 to 36,808 within 10 s of the first point in a 5-minute test (best
-# known: 20,622).
+# (RENS), `N` (RINS) and `D` (dive). The numba improving jump runs on a
+# background thread beside the node LPs (`parallel_heuristics`), so runs are
+# not repeatable.
 #
-# The other defaults: pseudocost branching (reliability branching spent over
-# half the run strong-branching here; the root still strong-branches its
-# highest-impact candidates once, which on buildingenergy finds the sizing
-# variable holding the root gap); the root LP and cut rounds in float64;
-# node LPs solved exactly by HiGHS's dual simplex, one node at a time
-# (`node_lp_solver="highs"`; on bab5 PDHG node bounds were too loose for the
-# global bound to move). With `node_lp_solver="jaddle"` node LPs run on the
-# device in float32 (laptop GPUs run float64 at a small fraction of float32
-# speed), `batch_size` at a time (on ns1830653, 32 halves the device time
-# per node against 16; tree cuts are off when batching).
+# Cuts: the root cut rounds keep a cut until it has been idle for
+# `cut_age` rounds, and every cut joins a global pool. Tree cuts
+# (`tree_cuts`) refresh the LP's cut block between node solves: pooled cuts
+# the batch's points violate come back, new ones are separated at the
+# lowest-bound points, and members a new cut cuts off are solved again
+# before they branch. The block keeps its shape, so the batched node solver
+# never recompiles.
 #
 # Also on here, though off by default: the root cut pool's limits
-# (`max_cut_rows`, `simplex_cut_age`, `gomory_candidates`), and three uses of
-# the incumbent for the bound. `cutoff_probing` gives exact HiGHS LPs to the
-# integers that root reduced-cost fixing only just fails to fix (it needs
-# HiGHS node LPs). `root_redcost_propagation` propagates the root's
-# reduced-cost row at every node. `global_redcost_fixing` fixes the root box
-# with every LP's duals, not only the root's.
+# (`max_cut_rows`, `gomory_candidates`) and three uses of the incumbent for
+# the bound. `root_redcost_propagation` propagates the root's reduced-cost
+# row at every node. `global_redcost_fixing` fixes the root box with every
+# LP's duals, not only the root's. `inout_separation` also separates cuts at
+# a point between the LP point and the incumbent.
 
 # %%
 result = jm.solve(
@@ -117,39 +114,54 @@ result = jm.solve(
     verbose=True,
     log_every_seconds=10,
     device=DEVICE,
-    lp_tolerance=1e-4,
+    lp_tolerance=1e-6,
     root_crossover=False,
     cut_rounds=30,
-    batch_size=1,
-    cuts=True,
-    tree_cuts=False,
+    batch_size=8,
+    node_lp_tolerance=1e-6,
+    node_crossover=True,
+    node_precision="float64",
+    cuts=False,
+    tree_cuts=True,
     cut_pool_propagation=True,
     plunge_depth=8,
     plunge_child="rounding",
     max_cuts_per_round=50,
-    max_tree_cuts_per_round=50,
-    node_lp_solver="highs",
-    rins_solver="highs",
+    max_tree_cuts_per_round=1e3,
     max_cut_rows=2000,
     tree_cut_rows=2000,
-    simplex_cut_age=10,
+    tree_cut_every=1,
+    cut_age=100,
     gomory_candidates=400,
-    cutoff_probing=200,
+    inout_separation=0.5,
     root_redcost_propagation=True,
     global_redcost_fixing=True,
     implied_integer_cuts=True,
     one_opt=True,
     objective_propagation=True,
     branch_implied=True,
-    parallel_heuristics=False,
+    parallel_heuristics=True,
+    # Off for now: the heuristics that solve PDHG LPs or sub-searches on the
+    # whole model (slow per node on large MIPs).
+    round_repair=True,
+    rins_seconds=30,
+    rens_seconds=30,
+    dive_every=10,
 )
 print(f"Status: {result['status']}")
 print(f"Bound: {result['bound']:.6g}")
 print(
-    f"Cutoff probing: {result['cutoff_probing_fixed']} fixed in "
-    f"{result['cutoff_probing_lps']} LPs, {result['cutoff_probing_seconds']:.1f}s; "
-    f"global reduced-cost fixing: {result['global_redcost_fixed']} bounds; "
-    f"restarts: {result['restarts']}"
+    f"Global reduced-cost fixing: {result['global_redcost_fixed']} bounds; "
+    f"restarts: {result['restarts']}; in-out separation: "
+    f"{result['inout_cuts']} cuts kept in {result['inout_rounds']} rounds"
+)
+print(
+    f"Tree cuts: {result['tree_cuts_added']} added in "
+    f"{result['tree_cut_refreshes']} refreshes ({result['tree_cut_pool_hits']} "
+    f"from the pool, {result['tree_cuts_dropped']} dropped for room), "
+    f"{result['tree_cut_requeued']} nodes re-solved for them, "
+    f"{result['tree_cut_seconds']:.1f}s; families {result['tree_cut_families']}; "
+    f"pool {result['cut_pool']}"
 )
 if result["x"] is not None:
     print(f"Incumbent: {result['objective']:.6g} (gap {100 * result['gap']:.2f}%)")

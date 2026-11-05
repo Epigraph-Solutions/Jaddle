@@ -1959,14 +1959,19 @@ class _SolvePrograms:
         _, carry, _, _, _, norms = self._device(problem)
         return carry, norms
 
+    def _chunk_fn(self, ipe):
+        """The chunk of ``ipe`` iterations an epoch, not jitted (``chunk``
+        jits it; ``solve_many`` vmaps it first)."""
+
+        def run(problem, carry, n_epochs):
+            build_chunk = self._device(problem)[0]
+            return build_chunk(ipe)(carry, n_epochs)
+
+        return run
+
     def chunk(self, ipe):
         if ipe not in self._chunks:
-
-            def run(problem, carry, n_epochs):
-                build_chunk = self._device(problem)[0]
-                return build_chunk(ipe)(carry, n_epochs)
-
-            self._chunks[ipe] = jax.jit(run)
+            self._chunks[ipe] = jax.jit(self._chunk_fn(ipe))
         return self._chunks[ipe]
 
 
@@ -2851,6 +2856,363 @@ def solve(
             if bound_target is not None
             else {}
         ),
+    }
+
+
+# ``_SolvePrograms`` jitted and vmapped over a batch (``solve_many``), per
+# program; the shapes of the data key jit's own cache.
+_BATCHED_PROGRAMS = {}
+
+
+def _merge_member(shared, member):
+    """``solve()``'s problem dict from the batch's shared part and one
+    member's (its bounds, warm start and step-size state)."""
+    lp = dict(
+        shared["lp"],
+        lower_bounds=member["lower_bounds"],
+        upper_bounds=member["upper_bounds"],
+    )
+    return dict(
+        shared,
+        lp=lp,
+        initial_solution=member["initial_solution"],
+        initial_opt_state=member["initial_opt_state"],
+    )
+
+
+def _batched_program(programs, ipe=None):
+    """``jax.jit(jax.vmap(...))`` of ``programs``' ``init`` (``ipe=None``)
+    or its chunk of ``ipe`` iterations an epoch, over the members of a
+    batch with the shared problem broadcast. Cached, so batches of the same
+    shapes compile once whatever the LP's numbers or sparsity pattern."""
+    key = (id(programs), ipe)
+    cached = _BATCHED_PROGRAMS.get(key)
+    if cached is None or cached[0] is not programs:
+        if ipe is None:
+
+            def fn(shared, member):
+                return programs._init(_merge_member(shared, member))
+
+            jitted = jax.jit(jax.vmap(fn, in_axes=(None, 0)))
+        else:
+            run = programs._chunk_fn(ipe)
+
+            def fn(shared, member, carry, n_epochs):
+                return run(_merge_member(shared, member), carry, n_epochs)
+
+            jitted = jax.jit(jax.vmap(fn, in_axes=(None, 0, 0, None)))
+        if len(_BATCHED_PROGRAMS) > 64:
+            _BATCHED_PROGRAMS.clear()
+        cached = (programs, jitted)
+        _BATCHED_PROGRAMS[key] = cached
+    return cached[1]
+
+
+# ``solve_many``'s last prepared LP: ``(lp, key, prepared)``. A branch and
+# bound calls it with one LP for batch after batch; scaling that LP (Ruiz
+# passes over the whole matrix) and placing its scales on the device are
+# done once, until the LP or the settings change.
+_MANY_PREPARED = None
+
+
+@jo._with_local_settings
+def solve_many(
+    lp: JaddleLP,
+    lower_bounds,
+    upper_bounds,
+    initial_solutions=None,
+    initial_opt_states=None,
+    max_epochs=None,
+    iterations_per_epoch=256,
+    dual_damping_ineq=0.0,
+    dual_damping_eq=0.0,
+    primal_damping=0.0,
+    primal_feasibility_tolerance=1e-3,
+    dual_feasibility_tolerance=1e-3,
+    dual_gap_tolerance=1e-3,
+    gap_test="pdlp",
+    dual_residual="pdlp",
+    termination_norm="l2",
+    restart_norm="l2",
+    average=True,
+    report_best=True,
+    update_mode="alternating",
+    k_scale=1e8,
+    k_theta=0.5,
+    k_init=None,
+    k_update_per_epoch=False,
+    adaptive_eta=True,
+    step_size=1.0,
+    scale=True,
+    scaled_objective=True,
+    scaled_rhs=True,
+    scaled_augmented=True,
+    augmented_weight=1.0,
+    ruiz_iterations=10,
+    pc_iterations=1,
+    cost_col_floor=0,
+    restarts=True,
+    epochs_per_restart=None,
+    restart_multiplier=1.0,
+    artificial_restart_fraction=0.36,
+    restart_decay=0.2,
+    necessary_decay=0.8,
+    primal_stop=False,
+    primal_stop_window=5,
+    primal_stop_obj_tol=1e-4,
+    halpern_reanchor_per_epoch=False,
+    iterations_per_epoch_min=100,
+    restart_check_every="auto",
+    diag_adapt=True,
+    diag_theta=0.5,
+    diag_clamp=10.0,
+    bound_target=None,
+    device=None,
+    precision=None,
+):
+    """
+    Solve a batch of LPs that share ``lp``'s rows, costs and right-hand
+    sides and differ in their variable bounds: member ``i`` has
+    ``lower_bounds[i] <= x <= upper_bounds[i]`` (arrays of shape
+    ``(batch, n)``). ``initial_solutions`` (a ``SaddleState`` whose arrays
+    have a leading batch axis, in true units) warm-starts each member, and
+    ``initial_opt_states`` (likewise batched, or ``None``) their step sizes.
+
+    It runs ``solve()``'s own compiled device programs (``_SolvePrograms``)
+    under ``jax.vmap``: the LP, its sparsity pattern included, goes in as
+    data, so a batch of LPs with other rows but the same shapes (nonzeros,
+    rows, columns) reuses the compiled programs. That is what lets a branch
+    and bound swap the cuts in a fixed-capacity block without recompiling,
+    where ``make_solver`` reads the pattern on the host and compiles it in.
+    The LP is scaled once for the batch (scaling never reads the bounds,
+    which are then divided by the column scales per member), and the
+    scaled LP is kept for the next call with the same ``lp`` object and
+    settings: a branch and bound pays for the scaling once per LP, not
+    once per batch. Members run in
+    lockstep until the last one stops; a finished member is frozen.
+    The epoch length never changes (no ``iterations_per_epoch_decay``), and
+    there is no ``verbose``, ``max_seconds``, ``vertex_bias`` or ``cancel``.
+    The whole batch is one device call, and nothing is read back: the
+    results stay on the device until the caller reads them.
+
+    ``bound_target`` (a float) stops a member once the Lagrangian bound of
+    its reported point reaches it, as ``solve(bound_target=...)``.
+
+    Returns a dict of arrays with a leading batch axis: ``"solution"``
+    (``SaddleState``, true units), ``"opt_state"``, ``"converged"``,
+    ``"stop_code"`` (1 certificate, 2 ``primal_stop``, 4 bound target, 0 the
+    epoch budget) and ``"epochs"``.
+    """
+    given = lp  # the cache's key: before the cast and padding below
+    if precision is not None:
+        _, compute_dtype = __profile_dtypes()
+        lp = _cast_lp(lp, compute_dtype)
+        initial_solutions = _cast_state(initial_solutions, compute_dtype)
+    lp = __pad_empty_blocks(lp)
+    k_lo, k_hi, adaptive_step, step_size, halpern = _check_settings(
+        dual_residual,
+        termination_norm,
+        restart_norm,
+        update_mode,
+        k_scale,
+        adaptive_eta,
+        step_size,
+        gap_test,
+    )
+    global _MANY_PREPARED
+    key = (
+        scale,
+        scaled_objective,
+        scaled_rhs,
+        scaled_augmented,
+        augmented_weight,
+        ruiz_iterations,
+        pc_iterations,
+        cost_col_floor,
+        step_size,
+        str(lp.c.dtype),
+        str(jax.config.jax_default_device),
+    )
+    held = _MANY_PREPARED
+    if held is not None and held[0] is given and held[1] == key:
+        lp, row_scale_ineq, row_scale_eq, col_scale, c_max, step_size = held[2]
+    else:
+        if scale:
+            lp, row_scale, col_scale, c_max = scale_problem(
+                lp,
+                scaled_objective=scaled_objective,
+                scaled_rhs=scaled_rhs,
+                augmented=scaled_augmented,
+                augmented_weight=augmented_weight,
+                ruiz_iter=ruiz_iterations,
+                pc_iter=pc_iterations,
+                cost_col_floor=cost_col_floor,
+            )
+        else:
+            row_scale = np.ones(lp.A_eq.shape[0] + lp.A_ineq.shape[0])
+            col_scale = np.ones(lp.c.shape[0])
+            c_max = 1.0
+            lp = copy.copy(lp)
+        if step_size == "auto":
+            step_size = 0.99 / float(estimate_augmented_spectral_norm(lp))
+        _np_dtype = jnp.dtype(_wide(lp.c.dtype))
+        _row_scale_host = np.asarray(row_scale)
+        row_scale_ineq = jax.device_put(
+            _row_scale_host[len(lp.b_eq) :].astype(_np_dtype)
+        )
+        row_scale_eq = jax.device_put(
+            _row_scale_host[: len(lp.b_eq)].astype(_np_dtype)
+        )
+        col_scale = jax.device_put(np.asarray(col_scale).astype(_np_dtype))
+        _MANY_PREPARED = (
+            given,
+            key,
+            (lp, row_scale_ineq, row_scale_eq, col_scale, c_max, step_size),
+        )
+    _state_dtype = _wide(lp.c.dtype)
+
+    lower = jnp.asarray(lower_bounds, lp.lower_bounds.dtype)
+    upper = jnp.asarray(upper_bounds, lp.upper_bounds.dtype)
+    if lower.ndim != 2 or lower.shape != upper.shape:
+        raise ValueError("lower_bounds and upper_bounds must be (batch, n) arrays")
+    size = lower.shape[0]
+    scaled_lower = lower / col_scale.astype(lower.dtype)
+    scaled_upper = upper / col_scale.astype(upper.dtype)
+    m_ineq, m_eq = lp.A_ineq.shape[0], lp.A_eq.shape[0]
+    if initial_solutions is None:
+        primal = jnp.clip(jnp.zeros_like(scaled_lower), scaled_lower, scaled_upper)
+        initial = SaddleState(
+            primal=primal.astype(_state_dtype),
+            dual_ineq=jnp.zeros((size, m_ineq), _state_dtype),
+            dual_eq=jnp.zeros((size, m_eq), _state_dtype),
+        )
+    else:
+
+        def fit(dual, rows):
+            dual = jnp.asarray(dual, _state_dtype)
+            if dual.shape[1] == rows:
+                return dual
+            if dual.shape[1] == 0 and rows == 1:
+                return jnp.zeros((dual.shape[0], 1), _state_dtype)
+            raise ValueError(
+                f"initial_solutions have {dual.shape[1]} duals for {rows} rows"
+            )
+
+        initial = SaddleState(
+            primal=jnp.asarray(initial_solutions.primal, _state_dtype) / col_scale,
+            dual_ineq=fit(initial_solutions.dual_ineq, m_ineq)
+            / (row_scale_ineq * c_max),
+            dual_eq=fit(initial_solutions.dual_eq, m_eq) / (row_scale_eq * c_max),
+        )
+
+    settings = dict(
+        k_lo=k_lo,
+        k_hi=k_hi,
+        halpern=halpern,
+        vertex_bias=0.0,
+        primal_damping=primal_damping,
+        dual_damping_ineq=dual_damping_ineq,
+        dual_damping_eq=dual_damping_eq,
+        primal_feasibility_tolerance=primal_feasibility_tolerance,
+        dual_feasibility_tolerance=dual_feasibility_tolerance,
+        dual_gap_tolerance=dual_gap_tolerance,
+        gap_test=gap_test,
+        dual_residual=dual_residual,
+        termination_norm=termination_norm,
+        restart_norm=restart_norm,
+        verbose=False,
+        log_every=1,
+        average=average,
+        report_best=report_best,
+        update_mode=update_mode,
+        k_theta=k_theta,
+        k_update_per_epoch=k_update_per_epoch,
+        iterations_per_epoch=iterations_per_epoch,
+        restarts=restarts,
+        epochs_per_restart=epochs_per_restart,
+        restart_multiplier=restart_multiplier,
+        artificial_restart_fraction=artificial_restart_fraction,
+        restart_decay=restart_decay,
+        necessary_decay=necessary_decay,
+        primal_stop=primal_stop,
+        primal_stop_window=primal_stop_window,
+        primal_stop_obj_tol=primal_stop_obj_tol,
+        halpern_reanchor_per_epoch=halpern_reanchor_per_epoch,
+        iterations_per_epoch_decay=1.0,
+        iterations_per_epoch_min=iterations_per_epoch_min,
+        restart_check_every=restart_check_every,
+        reference_objective=None,
+        diag_adapt=diag_adapt,
+        diag_theta=diag_theta,
+        diag_clamp=diag_clamp,
+        adaptive_step=adaptive_step,
+        bound_stop=bound_target is not None,
+        polish_trigger=None,
+    )
+    programs = _solve_programs(lp.n_eq, lp.cones, tuple(settings.items()))
+    shared = dict(
+        lp=_lp_arrays(lp),
+        c_true=lp.c,
+        c_max=jnp.asarray(c_max, _state_dtype),
+        col_scale=col_scale,
+        jnp_row_scale_ineq=row_scale_ineq,
+        jnp_row_scale_eq=row_scale_eq,
+        k_init=None if k_init is None else jnp.asarray(k_init, _state_dtype),
+        eta_init=jnp.asarray(step_size, _state_dtype),
+    )
+    # The bounds, warm starts and step sizes are each member's; the LP's
+    # arrays and scales are the batch's.
+    member = dict(
+        lower_bounds=scaled_lower,
+        upper_bounds=scaled_upper,
+        initial_solution=initial,
+        initial_opt_state=initial_opt_states,
+    )
+    carry, _ = _batched_program(programs)(shared, member)
+    if bound_target is not None:
+        carry = {
+            **carry,
+            "bound_target": jnp.full_like(carry["bound_target"], float(bound_target)),
+        }
+    # One call: the epoch length never changes here, so the device loop only
+    # returns once every member has stopped or ``max_epochs`` have run. No
+    # host synchronisation: the results stay on the device until read.
+    n_epochs = int(max_epochs) if max_epochs else _UNBOUNDED_EPOCHS
+    carry = _batched_program(programs, int(iterations_per_epoch))(
+        shared, member, carry, n_epochs
+    )
+
+    state, average_state = carry["state"], carry["avg"]
+    if report_best and average:
+        used = carry["used_avg"]
+        output = jax.tree.map(
+            lambda a, s: jnp.where(
+                used.reshape((-1,) + (1,) * (a.ndim - 1)), a, s
+            ),
+            average_state,
+            state,
+        )
+    elif average:
+        output = average_state
+    else:
+        output = state
+    output = _unscale_output(
+        output,
+        col_scale,
+        row_scale_ineq,
+        row_scale_eq,
+        c_max,
+        scale=bool(scale),
+        scaled_objective=bool(scaled_objective),
+    )
+    stop_code = carry["stop_code"]
+    done = carry["done"]
+    return {
+        "solution": output,
+        "opt_state": carry["opt"],
+        "converged": done & (stop_code != 4),
+        "stop_code": jnp.where(done, stop_code, 0),
+        "epochs": carry["count"],
     }
 
 
