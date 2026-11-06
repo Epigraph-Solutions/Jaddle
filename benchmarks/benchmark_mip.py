@@ -117,20 +117,27 @@ result = jm.solve(
     lp_tolerance=1e-6,
     root_crossover=False,
     cut_rounds=30,
-    batch_size=8,
-    node_lp_tolerance=1e-6,
-    node_crossover=True,
-    node_precision="float64",
-    cuts=False,
+    # 128 nodes a batch on a GPU, 32 on a CPU (ns1830653, GPU: 147 nodes a
+    # second with 8, 394 with 128).
+    batch_size=32,
+    # Truncated node LPs (the defaults, spelt out): each node LP runs at most
+    # 2 epochs and then branches on its point, with no requeue. On
+    # ns1830653 this took the tree from 16 to 147 nodes a second.
+    batch_epochs=2,
+    node_max_epochs=None,
+    node_lp_tolerance=1e-3,
+    node_crossover=False,
+    node_precision="float32",
+    cuts=True,
     tree_cuts=True,
     cut_pool_propagation=True,
-    plunge_depth=8,
+    plunge_depth=1000,
     plunge_child="rounding",
     max_cuts_per_round=50,
     max_tree_cuts_per_round=1e3,
     max_cut_rows=2000,
     tree_cut_rows=2000,
-    tree_cut_every=1,
+    tree_cut_every=10,
     cut_age=100,
     gomory_candidates=400,
     inout_separation=0.5,
@@ -141,12 +148,13 @@ result = jm.solve(
     objective_propagation=True,
     branch_implied=True,
     parallel_heuristics=True,
-    # Off for now: the heuristics that solve PDHG LPs or sub-searches on the
-    # whole model (slow per node on large MIPs).
+    # Off for throughput: the sub-search and dive heuristics run on the main
+    # thread and stall the node loop (RINS, RENS and dives took over half
+    # the tree's time on ns1830653).
     round_repair=True,
-    rins_seconds=30,
-    rens_seconds=30,
-    dive_every=10,
+    rins_seconds=0,
+    rens_seconds=0,
+    dive_every=0,
 )
 print(f"Status: {result['status']}")
 print(f"Bound: {result['bound']:.6g}")

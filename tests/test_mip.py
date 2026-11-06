@@ -2111,14 +2111,14 @@ def test_logged_bound_never_falls(monkeypatch, make, batch_size):
     logged = {}
     real = jm._BranchAndBound.log
 
-    def recorded(self, source, bound, depth, force=False):
+    def recorded(self, source, bound, force=False):
         # The search's own log: RENS and RINS run sub-searches (with a node
         # limit), which log nothing.
         if self.max_nodes is None:
             logged.setdefault(id(self), []).append(
                 self.global_bound() if bound is None else bound
             )
-        return real(self, source, bound, depth, force)
+        return real(self, source, bound, force)
 
     monkeypatch.setattr(jm._BranchAndBound, "log", recorded)
     mip = make()
@@ -2333,11 +2333,40 @@ def test_node_points_are_rounded_in_the_background(monkeypatch):
     assert result["status"] in ("optimal", "node_limit")
     assert result["background_roundings"] == len(in_tree) > 0
     assert any(in_tree)  # at nodes below the root
+    # Node jobs carry a jump for when their rounding fails.
+    assert result["background_jumps"] > 0
     if result["status"] == "optimal":
         assert_solved(result, mip, ref, rigorous=False)
     in_tree.clear()
     off = solve(mip, parallel_rounding=False, **options)
     assert off["background_roundings"] == 0 and not in_tree
+
+
+def test_node_heuristic_job_jumps_when_rounding_fails():
+    """The background node job: fix-and-propagate, and when that fails, an
+    improving jump from the point for the given seconds (marked ``"J"``)."""
+    pytest.importorskip("numba")
+    mip = knapsack()
+    x = np.full(mip.num_variables, 0.5)
+    rows = jm.BoundPropagator(mip.A, mip.row_lower, mip.row_upper, mip.integrality)
+    point, found, source = jm._node_heuristic_job(
+        x, mip.lower, mip.upper, mip.integrality, rows
+    )
+    assert source == "P" and (found == (point is not None))
+
+    def rejects(lower, upper, max_passes=5):  # every rounding fails
+        return lower, upper, True
+
+    point, found, source = jm._node_heuristic_job(
+        x, mip.lower, mip.upper, mip.integrality, rejects
+    )
+    assert (point, found, source) == (None, False, "P")  # no jump asked for
+    jump = dict(mip=mip, seconds=1.0, tol=1e-6, seed=0, cutoff=None)
+    point, found, source = jm._node_heuristic_job(
+        x, mip.lower, mip.upper, mip.integrality, rejects, jump=jump
+    )
+    assert source == "J" and found
+    assert mip.is_feasible(point, 1e-6)
 
 
 def test_near_integral_points_are_tried_once(monkeypatch):
@@ -4315,13 +4344,40 @@ def test_bulk_rounding_in_the_search():
 
 
 # %% Batched children and roundings on the device
+def test_tree_cut_refreshes_keep_the_child_kernels(monkeypatch):
+    """The device child kernels are padded to the tree cut block's
+    capacity, so refreshes that change the block's nonzeros reuse them
+    (each new ``_ChildKernels`` is a compile; ns1830653 built 14 a
+    minute)."""
+    built = []
+    real = jm._ChildKernels.__init__
+
+    def init(self, *args, **kwargs):
+        built.append(kwargs.get("nnz_capacity"))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(jm._ChildKernels, "__init__", init)
+    mip = generalised_assignment(2)
+    result = solve(
+        mip, batch_size=4, children_backend="jax", tree_cuts=True,
+        tree_cut_every=1, max_nodes=60, gomory_cuts=False,
+    )
+    assert result["tree_cuts_added"] > 0 and result["tree_cut_refreshes"] > 1
+    assert len(built) == 1 and built[0] is not None
+
+
+
+@pytest.mark.parametrize("capacity", [None, 4096])
 @pytest.mark.parametrize("make", [general_integer, facility_location, generalised_assignment])
-def test_child_kernels_match_the_host(make):
+def test_child_kernels_match_the_host(make, capacity):
+    # ``capacity``: the entries padded (a free row of ones) to that many.
     mip = make()
     rng = np.random.default_rng(5)
     propagator = jm.BoundPropagator(mip.A, mip.row_lower, mip.row_upper, mip.integrality)
     size, n = 4, mip.num_variables
-    kernels = jm._ChildKernels(mip, True, 1e-9, size)
+    kernels = jm._ChildKernels(mip, True, 1e-9, size, nnz_capacity=capacity)
+    if capacity:
+        assert kernels.data["vals"].shape == (capacity,)
     ints = np.flatnonzero(mip.integrality)
     lower = np.tile(mip.lower, (size, 1))
     upper = np.tile(mip.upper, (size, 1))
@@ -4404,9 +4460,12 @@ def test_bulk_fix_and_propagate_with_a_box_per_start():
 # %% Continuous batching and the root-box cutoff
 @pytest.mark.parametrize("make", [general_integer, facility_location, generalised_assignment])
 def test_continuous_batching_keeps_the_optimum(make):
-    # One epoch a call: almost every node LP goes back to the queue.
+    # One epoch a call, 200 in all: almost every node LP goes back to the
+    # queue.
     mip = make()
-    result = solve(mip, batch_size=4, batch_epochs=1, gomory_cuts=False)
+    result = solve(
+        mip, batch_size=4, batch_epochs=1, node_max_epochs=200, gomory_cuts=False
+    )
     assert_solved(result, mip, reference(mip))
     if make is general_integer:
         assert result["batch_requeues"] > 0
@@ -4431,10 +4490,106 @@ def test_requeued_node_lps_are_not_counted_as_nodes(monkeypatch):
     monkeypatch.setattr(jm._BranchAndBound, "__init__", init)
     monkeypatch.setattr(jm._BranchAndBound, "evaluate", evaluate)
     mip = general_integer()
-    result = solve(mip, batch_size=4, batch_epochs=1, gomory_cuts=False)
+    result = solve(
+        mip, batch_size=4, batch_epochs=1, node_max_epochs=200, gomory_cuts=False
+    )
     assert_solved(result, mip, reference(mip))
     assert result["batch_requeues"] > 0
-    assert len(evaluated) == result["nodes"] + result["batch_requeues"]
+    # Each evaluation that was not a requeue is a node; a node can also be
+    # closed without one (an earlier member's incumbent prunes it).
+    assert len(evaluated) - result["batch_requeues"] <= result["nodes"]
+    assert result["nodes"] < len(evaluated)  # the requeued slices are not
+
+
+@pytest.mark.parametrize("make", [general_integer, facility_location, generalised_assignment])
+def test_truncated_node_lps_branch_after_one_call(make, monkeypatch):
+    """By default (``node_max_epochs=None``) a batched node LP gets one call
+    of ``batch_epochs`` and branches on its point: no requeue, except for a
+    node with every integer fixed, whose LP gets the full budget so it can
+    close proven. Pseudocosts learn from the truncated LPs' bounds."""
+    gains = []
+    real = jm._BranchAndBound.record_gain
+
+    def record_gain(self, var, down, gain):
+        gains.append(gain)
+        return real(self, var, down, gain)
+
+    monkeypatch.setattr(jm._BranchAndBound, "record_gain", record_gain)
+    mip = make()
+    result = solve(mip, batch_size=4, batch_epochs=1, gomory_cuts=False)
+    assert_solved(result, mip, reference(mip))
+    if result["nodes"] > 3:
+        assert gains  # the pseudocosts learnt, though few LPs converged
+
+
+@pytest.mark.parametrize("pipeline", [True, False])
+@pytest.mark.parametrize("make", [general_integer, facility_location, generalised_assignment])
+def test_pipelined_batches_keep_the_optimum(make, pipeline, monkeypatch):
+    """The pipelined batch loop (``pipeline_batches``: one batch evaluated
+    on the host while the next is on the device, children two batches
+    later) and the plain one reach the optimum with valid bounds, tree cut
+    refreshes between dispatch and evaluation included, and leave nothing
+    in flight."""
+    searches = []
+    real_init = jm._BranchAndBound.__init__
+
+    def init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        searches.append(self)
+
+    monkeypatch.setattr(jm._BranchAndBound, "__init__", init)
+    mip = make()
+    result = solve(
+        mip, batch_size=4, pipeline_batches=pipeline, tree_cuts=True,
+        tree_cut_every=1, gomory_cuts=False,
+    )
+    assert_solved(result, mip, reference(mip))
+    search = searches[0]
+    assert search.pipeline_batches == pipeline
+    assert search.in_flight is None and search.pending_children is None
+    assert search._device_thread is None  # shut down with the search
+
+
+def test_stale_cut_duals_are_zeroed_for_a_batch_solved_before_a_refresh(monkeypatch):
+    """A batch dispatched before a tree cut refresh is evaluated with the
+    duals of the slots that refresh replaced zeroed (``stale_free``)."""
+    zeroed = []
+    real = jm._BranchAndBound.stale_free
+
+    def stale_free(self, solution, version):
+        out = real(self, solution, version)
+        if version < self.cut_version:
+            base_m = self.base.A.shape[0] - self.base.n_eq
+            stale = [i for i, v in enumerate(self.slot_version) if v > version]
+            duals = np.asarray(out.dual_ineq)
+            zeroed.append(all(duals[base_m + i] == 0.0 for i in stale))
+        return out
+
+    monkeypatch.setattr(jm._BranchAndBound, "stale_free", stale_free)
+    mip = generalised_assignment(2)
+    result = solve(
+        mip, batch_size=4, tree_cuts=True, tree_cut_every=1, max_nodes=80,
+        gomory_cuts=False,
+    )
+    assert result["tree_cut_refreshes"] > 0
+    assert zeroed and all(zeroed)
+
+
+def test_auto_batch_size_follows_the_device(monkeypatch):
+    # The tests run on the CPU: 32 a batch; a GPU or TPU would take 128.
+    search = search_for(general_integer(), monkeypatch, batch_size="auto")
+    assert search.batch_size == jm._AUTO_BATCH_CPU == 32
+    assert jm._AUTO_BATCH_ACCELERATOR == 128
+    with pytest.raises(ValueError, match="batch_size"):
+        solve(general_integer(), batch_size="big")
+
+
+def test_truncated_defaults_do_not_requeue(monkeypatch):
+    search = search_for(general_integer(), monkeypatch, batch_size=4)
+    assert search.batch_epochs == 2 and search.batch_node_epochs == 2
+    assert search.node_max_epochs == 200  # the serial search, dives, the pump
+    given = search_for(general_integer(), monkeypatch, batch_size=4, node_max_epochs=50)
+    assert given.batch_node_epochs == 50
 
 
 def test_integral_node_that_fails_the_check_is_split(monkeypatch):

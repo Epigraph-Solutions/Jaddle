@@ -235,6 +235,13 @@
 
 ### Fixed
 
+- Batched search's device kernels (`_ChildKernels`, and strong
+  branching's `_StrongKernels`) recompiled at every tree cut refresh: their
+  row data had the cut block's exact nonzeros, which a refresh changes.
+  The data is now padded to the block's capacity (a free row of ones,
+  `_propagation_data(nnz_capacity=...)`), so a refresh reuses the compile.
+  On ns1830653 the child kernels were rebuilt 14 times a minute (about 16 s
+  of compiling in a 3-minute run); now once (811 → 889 nodes in a minute).
 - A `mip_start` with `presolve=True` no longer leaves hybrid node
   selection diving for the whole search. The start sets the reduced
   search's cutoff, but its point is not in the reduced MIP's columns, so
@@ -298,6 +305,43 @@
 
 ### Changed
 
+- Batched node LPs are truncated by default: `batch_epochs` 10 → 2, and
+  `node_max_epochs` `200` → `None`, under which a node gets its one batch
+  call and branches on its point instead of going back to the queue (its
+  Lagrangian bound holds at any duals). Pseudocost gains use that bound
+  when the LP did not converge. A node with every integer fixed still gets
+  up to 200 epochs, so it closes proven. `node_max_epochs` given keeps the
+  old continuous batching; serial node LPs, dives and the pump keep 200.
+  On ns1830653 (GPU, batches of 8, 60 s): 16 → 147 nodes a second, bound
+  13,555 → 15,239. The solving report's `Nodes` row gives the tree's node
+  rate, and the result `"tree_seconds"`.
+- Batched search is pipelined (`pipeline_batches`, default `True`): the
+  host evaluates one batch (bounds, tree cuts, heuristics, branching)
+  while the device solves the next, and the batch's children are built on
+  the device after it, reaching a batch two steps later. The LP and child
+  calls go through a device thread: XLA drives their data-dependent loops
+  from the host on a GPU, so a call returns only when its work is done,
+  and dispatched from the search's own thread it overlapped nothing. In
+  flight nodes count in the global bound; a batch solved before a tree cut
+  refresh has the replaced slots' duals zeroed (`stale_free`, shared with
+  `fit_warm`). On ns1830653 (GPU, 128 a batch, repeatable runs): 440 →
+  523 nodes a second; with the background heuristics on, about 630-660.
+  Tree cut separation on a background thread was tried and dropped: the
+  separators are Python-heavy, and contending for the GIL halved the rate.
+- `batch_size` defaults to `"auto"`: 128 on a GPU or TPU, 32 on a CPU. A
+  batch's warm starts are stacked and cast on the host and sent once per
+  array (member by member, they took half of `solve_batch` at 128), and
+  bulk rounding's row data is padded like the child kernels' (a tree cut
+  refresh recompiled it). On ns1830653 (GPU, 60 s): 8 a batch 147 nodes a
+  second, 32 298, 128 394, bound 14,560 (HiGHS: 14,543 after 180 s).
+
+- A node's background rounding that fails is followed, in the same job,
+  by an improving feasibility jump from the node point in its box, below
+  the cutoff, for `node_jump_seconds` (default 1; `"J"`;
+  `result["background_jumps"]`). On ns1830653 a node point has about 200
+  of its 458 integers at 0.5: every rounding failed (67 of 67, with or
+  without the cutoff row), while a 1 s jump beat the incumbent from 2 of
+  30 node points.
 - Every node's LP point is rounded by fix-and-propagate on the background
   `"round"` thread (`parallel_rounding`, on by default, with
   `parallel_heuristics`; `result["background_roundings"]`), beside the

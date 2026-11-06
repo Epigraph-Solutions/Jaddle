@@ -609,8 +609,10 @@ columns are not supported.
   solved in one device call: `jax.vmap` of `jl.make_solver` over the
   nodes' bounds and warm starts, compiled once, since the node LPs differ
   only in their bounds. The nodes are then evaluated in order on the host
-  as in the serial search. Members run in lockstep, so one slow node holds
-  its batch to `node_max_epochs`. The default is 32 nodes a call.
+  as in the serial search. Members run in lockstep for at most
+  `batch_epochs` (2) epochs a call, after which a node branches on its
+  point (truncated node LPs). The default is 128 nodes a call on a GPU,
+  32 on a CPU.
 - **Warm-started nodes.** Each child starts from its parent's primal–dual
   point and step-size state. The node LPs share their shapes and solver
   settings, so the compiled solver is reused and a small node takes a few
@@ -773,11 +775,11 @@ reports `bound_rigorous=False`.
 | `near_integral_tolerance` | `1e-2` | A node LP point whose integers are all this close to integers (though not within `integrality_tolerance`) is rounded and tried as an incumbent (`T`), once per rounding; the node still branches (`0`: off). Loose float32 PDHG points rarely pass the integrality test. |
 | `feasibility_tolerance` | `1e-6` | Largest row violation (each row's, relative to its own `1 + \|b_i\|`) and bound violation an incumbent may have. |
 | `lp_tolerance`, `lp_options` | `1e-4`, `None` | The node LPs' relative tolerances, and any other `jl.solve` option. |
-| `node_max_epochs`, `root_max_epochs` | `200`, `None` | Epoch budgets for a node LP and the root LP. |
+| `node_max_epochs`, `root_max_epochs` | `None`, `None` | Epoch budgets for a node LP and the root LP. `node_max_epochs=None`: 200 for serial node LPs, dives and the pump; batched node LPs get one `batch_epochs` call (truncated), except nodes with every integer fixed. |
 | `node_lp_tolerance` | `None` | Tolerance for node LPs only (`None`: `lp_tolerance`). Experimental: looser node LPs are cheaper but give rougher branching and pseudocost data. |
 | `node_lp_options` | `None` | Any other `jl.solve` option for node LPs only (`None`: `{"iterations_per_epoch": 64}`, unless `lp_options` sets it; `{}`: `jl.solve`'s 256), over `lp_options` and `node_lp_tolerance`: serial and batched node LPs and strong branching's child LPs (batched ones take `jl.solve_many` options only; others raise). `lp_options` applies to every LP. |
 | `node_bound_stop` | `True` | Stop a node LP as soon as the Lagrangian bound of its duals closes the node against the cutoff (`jl.solve(bound_target=...)`, and `jl.solve_many(bound_target=...)` for each member of a batch); infeasible nodes stop within a few epochs. |
-| `batch_epochs` | `10` | Batched search: the most epochs a node LP runs in one batch call; an unfinished node goes back to the queue, warm-started, until `node_max_epochs` in all, so one slow member cannot hold its batch (`None`: `node_max_epochs`). |
+| `batch_epochs` | `2` | Batched search: the most epochs a node LP runs in one batch call. By default the node then branches on its point (its Lagrangian bound holds at any duals); with `node_max_epochs` given, an unfinished node goes back to the queue, warm-started, until that many in all (`None`: `node_max_epochs`). |
 | `children_backend`, `batch_roundings` | `"auto"`, `False` | Batched search: split all members at once on the device (`"auto"`: above 10,000 nonzeros; `"jax"`, `"numpy"`), and round the batch's tree heuristics as one bulk rounding (opt-in: slower than the classic one per node on ns1830653). |
 | `heuristic_every` | `5` | Run rounding (then fix-and-propagate if it fails) every this many nodes (`0` = only on integral LP points). |
 | `fix_and_propagate`, `feasibility_jump`, `feasibility_pump` | `False`, `True`, `True` | The primal heuristics (classic fix-and-propagate is off; bulk rounding runs instead). |
@@ -788,7 +790,7 @@ reports `bound_rigorous=False`.
 | `device` | `"auto"` | `"auto"` runs MIPs with at most 10,000 nonzeros on the CPU (their node LPs are latency-bound on a GPU: flugpl takes 3s on the CPU, 18s on a GPU); `"cpu"`/`"gpu"`/`"tpu"` or a `jax.Device` pick one, `None` keeps JAX's default. |
 | `precision` | `"float64"` | `"float64"`, `"float32"` or `"float16"` for the whole search, node LPs included (`None` keeps the global profile). |
 | `node_precision` | `"float32"` | The node LPs' profile (serial, batched and strong branching's child LPs); the root LP, cut rounds and heuristic LPs stay at `precision`. Laptop GPUs run float64 at a small fraction of float32 speed (`None`: `precision`). |
-| `batch_size` | `32` | Open nodes solved together in one `vmap`-ed device call (`jl.solve_many`; `1`: the serial search). |
+| `batch_size` | `"auto"` | Open nodes solved together in one `vmap`-ed device call (`jl.solve_many`; `1`: the serial search). `"auto"`: 128 on a GPU or TPU, 32 on a CPU. |
 | `rins_seconds`, `rins_every` | `None`, `5` | RINS at the root, every `rins_every` nodes and after each new incumbent (`None`: 5s a call; `0`: off). |
 | `heuristic_effort` | `0.3` | The share of the elapsed time RINS may take; calls stop while they have used more (`0`: no RINS). |
 | `parallel_heuristics` | `True` | Run the numba improving jump on a background thread beside the node LPs. Runs then depend on timing; `False` makes them repeatable. |
@@ -822,6 +824,8 @@ reports `bound_rigorous=False`.
 | `aggregate_integers` | `"auto"` | Aggregate rows through integer variables too, up to five rows, for MIR and cover cuts (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
 | `tree_cuts`, `tree_cut_every`, `max_tree_cuts_per_round` | `True`, `10`, `10` | Refresh the LP's cut block between node solves every this many nodes, adding at most this many cuts a refresh (branch and cut, serial or batched). |
 | `parallel_rounding` | `True` | With `parallel_heuristics`: fix-and-propagate of the root LP point, each cut round's point and every node's LP point on a background thread (`P`), skipped while it is busy; independent of `fix_and_propagate` (`result["background_roundings"]`). |
+| `node_jump_seconds` | `1.0` | When a node's background rounding fails, the same job runs an improving feasibility jump from the node point in its box for this long (`J`; `0`: off; `result["background_jumps"]`). |
+| `pipeline_batches` | `True` | Batched search: overlap the host's evaluation of one batch with the device's LPs for the next (a device thread dispatches the LPs and child kernels; children reach a batch two steps later). |
 | `tree_pool_every` | `1` | Between full refreshes, take back the cut pool's violated cuts every this many nodes, without separating (as HiGHS checks its pool at every node; `0`: off; `result["tree_pool_refreshes"]`). |
 | `tree_cut_points`, `tree_cut_rounds`, `tree_cut_share`, `tree_cut_max_nnz` | `4`, `1`, `0.25`, `None` | Points a refresh separates new cuts at (the lowest-bound nodes'), re-solves a node gets for new cuts that cut it off, the most of the tree's time refreshes take, and the densest cut kept (`None`: `max(64, n / 8)`). |
 | `tree_cut_rows`, `tree_cut_nnz` | `None`, `None` | The cut block's capacity in the tree: cuts and their nonzeros (`None`: twice the root's, with room for two refreshes). |

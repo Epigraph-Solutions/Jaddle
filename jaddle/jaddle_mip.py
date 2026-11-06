@@ -511,18 +511,38 @@ class CutoffPropagator(BoundPropagator):
         return super().__call__(lower, upper, max_passes)
 
 
-def _propagation_data(A, row_lower, row_upper, integrality):
+def _propagation_data(A, row_lower, row_upper, integrality, nnz_capacity=None):
     """The rows of ``BoundPropagator`` as float64 device arrays, for
-    ``_propagate_jax`` and ``_lagrangian_terms_jax``. Call under x64."""
+    ``_propagate_jax`` and ``_lagrangian_terms_jax``. Call under x64.
+
+    With ``nnz_capacity``, the entries are padded to at least that many,
+    so rows with a few more or fewer nonzeros (a refreshed tree cut block)
+    give arrays of the same shapes and a jitted kernel of them does not
+    recompile. The padding is one extra row, free (``-inf`` to ``inf``),
+    whose entries are 1 on column 0: it tightens no bound and is never
+    violated, and a dual of 0 for it (``_StrongKernels``) adds nothing to
+    a reduced cost. The arrays' row count, ``row_lower.shape[0]``, is then
+    one more than ``A``'s."""
     A = sp.csc_matrix(A)
     A.eliminate_zeros()
     A.sort_indices()
     m, n = A.shape
-    cols = np.repeat(np.arange(n), np.diff(A.indptr))
+    rows = A.indices.astype(np.int32)
+    cols = np.repeat(np.arange(n), np.diff(A.indptr)).astype(np.int32)
+    vals = A.data.astype(np.float64)
+    row_lower = np.asarray(row_lower, np.float64)
+    row_upper = np.asarray(row_upper, np.float64)
+    if nnz_capacity is not None:
+        pad = max(int(nnz_capacity), vals.size) - vals.size
+        rows = np.concatenate([rows, np.full(pad, m, np.int32)])
+        cols = np.concatenate([cols, np.zeros(pad, np.int32)])
+        vals = np.concatenate([vals, np.ones(pad)])
+        row_lower = np.append(row_lower, -np.inf)
+        row_upper = np.append(row_upper, np.inf)
     return {
-        "rows": jnp.asarray(A.indices, jnp.int32),
+        "rows": jnp.asarray(rows, jnp.int32),
         "cols": jnp.asarray(cols, jnp.int32),
-        "vals": jnp.asarray(A.data, jnp.float64),
+        "vals": jnp.asarray(vals, jnp.float64),
         "row_lower": jnp.asarray(row_lower, jnp.float64),
         "row_upper": jnp.asarray(row_upper, jnp.float64),
         "is_int": jnp.asarray(integrality, bool),
@@ -994,7 +1014,10 @@ class _ChildKernels:
     children each), so it compiles once per MIP.
     """
 
-    def __init__(self, mip, propagate, reduced_cost_tolerance, size):
+    def __init__(self, mip, propagate, reduced_cost_tolerance, size, nnz_capacity=None):
+        # Entries padded to ``nnz_capacity`` (``_propagation_data``): a
+        # refreshed cut block of the same capacity keeps the compile.
+        self.nnz_capacity = nnz_capacity
         self.data = self.data_for(mip)
         self.m, self.n = mip.A.shape
         self.propagate = bool(propagate)
@@ -1002,12 +1025,16 @@ class _ChildKernels:
         self.size = int(size)
         self._children = jax.jit(self._children_impl)
 
-    @staticmethod
-    def data_for(mip):
-        """The device data of ``mip``'s rows (``_propagation_data``)."""
+    def data_for(self, mip):
+        """The device data of ``mip``'s rows (``_propagation_data``),
+        padded to ``nnz_capacity``."""
         with jax.enable_x64(True):
             return _propagation_data(
-                mip.A, mip.row_lower, mip.row_upper, mip.integrality
+                mip.A,
+                mip.row_lower,
+                mip.row_upper,
+                mip.integrality,
+                nnz_capacity=self.nnz_capacity,
             )
 
     def set_mip(self, mip):
@@ -1026,9 +1053,13 @@ class _ChildKernels:
         box before propagation), ``empty``, ``bound``, ``rigorous``
         (``size, 2``); side 0 is the down child."""
         with jax.enable_x64(True):
-            return jax.device_get(
-                self._children(self.data, lower, upper, var, xv, r, constant)
-            )
+            return jax.device_get(self.launch(lower, upper, var, xv, r, constant))
+
+    def launch(self, lower, upper, var, xv, r, constant):
+        """``__call__`` without waiting: the outputs stay on the device
+        (read them with ``jax.device_get`` under x64)."""
+        with jax.enable_x64(True):
+            return self._children(self.data, lower, upper, var, xv, r, constant)
 
     def _children_impl(self, data, lower, upper, var, xv, r, constant):
         f64 = jnp.float64
@@ -1048,7 +1079,8 @@ class _ChildKernels:
         )[..., 0]
         lo, up = lo.reshape(-1, n), up.reshape(-1, n)
         if self.propagate:
-            lo, up, empty = jax.vmap(lambda a, b: _propagate_jax(data, a, b, self.m))(
+            rows = data["row_lower"].shape[0]  # the padding row too
+            lo, up, empty = jax.vmap(lambda a, b: _propagate_jax(data, a, b, rows))(
                 lo, up
             )
         else:
@@ -1099,9 +1131,12 @@ class _StrongKernels:
         k,
         lp_dtype,
         branch_implied=False,
+        nnz_capacity=None,
     ):
         self.lp_dtype = lp_dtype
         self.branch_implied = bool(branch_implied)
+        # Entries padded as ``_ChildKernels``' (``_propagation_data``).
+        self.nnz_capacity = nnz_capacity
         self.data = self.data_for(mip)
         self.m, self.n = mip.A.shape
         self.n_eq = mip.n_eq
@@ -1116,7 +1151,11 @@ class _StrongKernels:
         costs, right-hand sides and bounds."""
         with jax.enable_x64(True):
             data = _propagation_data(
-                mip.A, mip.row_lower, mip.row_upper, mip.integrality
+                mip.A,
+                mip.row_lower,
+                mip.row_upper,
+                mip.integrality,
+                nnz_capacity=self.nnz_capacity,
             )
             data["c"] = jnp.asarray(mip.c, jnp.float64)
             data["b"] = jnp.asarray(mip.b, jnp.float64)
@@ -1182,7 +1221,7 @@ class _StrongKernels:
         empty = jnp.any(lo > up, axis=1)
         if self.propagate:
             lo, up, infeasible = jax.vmap(
-                lambda a, b: _propagate_jax(data, a, b, self.m)
+                lambda a, b: _propagate_jax(data, a, b, data["row_lower"].shape[0])
             )(lo, up)
             infeasible = infeasible | empty
         else:
@@ -1248,11 +1287,15 @@ class _StrongKernels:
             ],
             axis=1,
         )
+        constant = -(y @ data["b"])
+        # A dual of 0 for the padding row (``nnz_capacity``), if any.
+        extra = data["row_lower"].shape[0] - self.m
+        if extra:
+            y = jnp.pad(y, ((0, 0), (0, extra)))
         rows, cols, vals = data["rows"], data["cols"], data["vals"]
         r = data["c"] + jax.vmap(
             lambda yy: jax.ops.segment_sum(vals * yy[rows], cols, num_segments=self.n)
         )(y)
-        constant = -(y @ data["b"])
         wlo, wup = jax.vmap(_widen_continuous, in_axes=(0, 0, None))(
             lower.astype(f64), upper.astype(f64), data["is_int"]
         )
@@ -4502,7 +4545,9 @@ def bulk_fix_and_propagate(
                     data,
                     jnp.asarray(np.stack([b[0] for b in padded])),
                     jnp.asarray(np.stack([b[1] for b in padded])),
-                    A.shape[0],
+                    # The data's rows: ``A``'s, plus a padding row when
+                    # padded (``_propagation_data(nnz_capacity=...)``).
+                    int(data["row_lower"].shape[0]),
                 )
             )
         return [
@@ -5636,11 +5681,28 @@ class _HeuristicWorkers:
             self.jobs[lane] = []
 
 
-def _fix_and_propagate_job(x, lower, upper, integrality, propagator, stop=None):
-    """``fix_and_propagate`` as a background job (``_HeuristicWorkers``),
-    in the jump's form: ``(point, found, None)``."""
+def _node_heuristic_job(
+    x, lower, upper, integrality, propagator, jump=None, stop=None
+):
+    """A node LP point's background heuristics (``_HeuristicWorkers``):
+    fix-and-propagate, and if that fails and ``jump`` is given (keyword
+    arguments for ``feasibility_jump``: the MIP, ``seconds``, ...), an
+    improving feasibility jump from the point for ``jump["seconds"]``.
+    Returns ``(point, found, source)``, ``source`` the log's mark (``"P"``
+    or ``"J"``)."""
     point = fix_and_propagate(x, lower, upper, integrality, propagator)
-    return point, point is not None, None
+    if point is not None or not jump:
+        return point, point is not None, "P"
+    jump = dict(jump)
+    mip = jump.pop("mip")
+    deadline = time.time() + jump.pop("seconds")
+    if jump.get("deadline") is not None:
+        deadline = min(deadline, jump["deadline"])
+    jump["deadline"] = deadline
+    point, found, _ = feasibility_jump(
+        mip, x, lower, upper, stop=stop, backend="numba", improve=True, **jump
+    )
+    return point, bool(found), "J"
 
 
 def _jump_job(skip, *args, stop=None, **kwargs):
@@ -5654,6 +5716,14 @@ def _jump_job(skip, *args, stop=None, **kwargs):
 # Background jobs' kinds (``_HeuristicWorkers.submit``) and the source
 # their incumbents are marked with.
 _JOB_SOURCES = {"jump": "J", "fixprop": "P"}
+
+# ``batch_size="auto"``: nodes a batch on a GPU or TPU, and on a CPU.
+_AUTO_BATCH_ACCELERATOR = 128
+_AUTO_BATCH_CPU = 32
+
+# The epoch budget of a node LP outside batched search (the serial
+# search, dives, the pump) when ``node_max_epochs`` is ``None``.
+_NODE_MAX_EPOCHS = 200
 
 # Root cut rounds (``cut_age``): the rounds in a row a cut stays in the LP
 # while idle (slack, with a zero dual), as HiGHS's LP age limit.
@@ -5869,7 +5939,7 @@ class _BranchAndBound:
         bulk_rounding=True,
         bulk_starts=4,
         repair_share=0.2,
-        batch_epochs=10,
+        batch_epochs=2,
         children_backend="auto",
         batch_roundings=False,
         node_lp_options=None,
@@ -5894,6 +5964,8 @@ class _BranchAndBound:
         near_integral_tolerance=1e-2,
         tree_pool_every=1,
         parallel_rounding=True,
+        node_jump_seconds=1.0,
+        pipeline_batches=True,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
         self.settings = {
@@ -6274,17 +6346,40 @@ class _BranchAndBound:
             raise ValueError(f"plunge_gap must be in [0, 1], not {plunge_gap!r}")
         self.plunge_gap = float(plunge_gap)
         self.plunges_stopped = 0
+        if isinstance(batch_size, str):
+            if batch_size != "auto":
+                raise ValueError(
+                    f"batch_size must be 'auto' or a positive int, not {batch_size!r}"
+                )
+            # A GPU iteration costs about the same for 8 members as for 128:
+            # on ns1830653, 128 a batch ran 394 nodes a second against 298
+            # for 32 and 147 for 8. A CPU runs the members one after another.
+            platform = (self.device or jax.devices()[0]).platform
+            batch_size = _AUTO_BATCH_ACCELERATOR if platform != "cpu" else _AUTO_BATCH_CPU
         if int(batch_size) < 1:
             raise ValueError("batch_size must be at least 1")
         self.batch_size = int(batch_size)
         self.batches = 0
+        # Overlap the host's evaluation of one batch with the device's LPs
+        # for the next (``pipelined_step``).
+        self.pipeline_batches = bool(pipeline_batches) and self.batch_size > 1
         # Batched node LPs run at most this many epochs a call (``None``:
-        # ``node_max_epochs``); unfinished ones go back to the queue.
+        # ``node_max_epochs``). A node gets ``node_max_epochs`` in all
+        # when that is given, its unfinished LP going back to the queue
+        # between calls; by default (``None``) just the one call: it
+        # branches on its point after ``batch_epochs`` (truncated node
+        # LPs, for throughput; its Lagrangian bound holds at any duals).
+        given_node_epochs = node_max_epochs
+        if node_max_epochs is None:
+            node_max_epochs = _NODE_MAX_EPOCHS
         self.batch_epochs = int(
             node_max_epochs if batch_epochs is None else batch_epochs
         )
         if self.batch_epochs < 1:
             raise ValueError("batch_epochs must be at least 1")
+        self.batch_node_epochs = int(
+            self.batch_epochs if given_node_epochs is None else given_node_epochs
+        )
         self.batch_requeues = 0
         # Batched search on the device: the members' children are built,
         # propagated and bounded in one call (``_ChildKernels``), and their
@@ -6333,6 +6428,9 @@ class _BranchAndBound:
         self._child_kernels = None  # (mip, _ChildKernels)
         self.deferring = False  # a batch is being evaluated
         self.deferred_branches = []
+        self.in_flight = None  # the batch on the device (``pipeline_batches``)
+        self._device_thread = None  # dispatches its LPs (``on_device_thread``)
+        self.pending_children = None  # its children, on the device
         self.deferred_roundings = []
         self.batched_children = 0
         self.batched_roundings = 0
@@ -6388,6 +6486,12 @@ class _BranchAndBound:
         # (``parallel_rounding``, with ``parallel_heuristics``).
         self.use_parallel_rounding = bool(parallel_rounding)
         self.background_roundings = 0
+        if not node_jump_seconds >= 0:
+            raise ValueError(
+                f"node_jump_seconds must be at least 0, not {node_jump_seconds!r}"
+            )
+        self.node_jump_seconds = float(node_jump_seconds)
+        self.background_jumps = 0
         self.near_integral_seen = set()
         self.near_integral_tries = 0
         self.near_integral_finds = 0
@@ -6649,14 +6753,29 @@ class _BranchAndBound:
         if A.nnz > _SMALL_MIP_NNZ:
             key = (mip, objective)
             if self._bulk_data is None or self._bulk_data[0] != key:
+                # Padded to the kernels' capacity (and the objective row's
+                # nonzeros): a tree cut refresh changes the rows' nonzeros,
+                # and unpadded every one recompiled the bulk propagation.
+                capacity = self.kernel_nnz_capacity() + (
+                    mip.num_variables if objective else 0
+                )
                 with jax.enable_x64(True):
-                    rows = _propagation_data(A, row_lower, row_upper, self.is_int)
+                    rows = _propagation_data(
+                        A,
+                        row_lower,
+                        row_upper,
+                        self.is_int,
+                        nnz_capacity=1 << math.ceil(math.log2(capacity)),
+                    )
                 self._bulk_data = (key, rows)
             data = self._bulk_data[1]
             if objective:
-                # Only the cutoff moves between calls.
+                # Only the cutoff moves between calls (the padding row,
+                # last, stays free).
+                upper_rows = np.full(data["row_upper"].shape[0], np.inf)
+                upper_rows[: len(row_upper)] = row_upper
                 with jax.enable_x64(True):
-                    data = dict(data, row_upper=jnp.asarray(row_upper, jnp.float64))
+                    data = dict(data, row_upper=jnp.asarray(upper_rows, jnp.float64))
         return bulk_fix_and_propagate(
             starts,
             lower,
@@ -6727,6 +6846,9 @@ class _BranchAndBound:
         )
         bound = min(
             bound, min((node.bound for node in self.batch_waiting), default=np.inf)
+        )
+        bound = min(
+            bound, min((node.bound for node in self.pipeline_nodes()), default=np.inf)
         )
         bound = min(bound, self.closed_floor, self.active_bound)
         # The rounds before a restart bounded every solution below the
@@ -7091,10 +7213,14 @@ class _BranchAndBound:
         return self.root_lower.copy(), self.root_upper.copy()
 
     def close_all(self):
-        """Close every open node: none holds a solution below the cutoff."""
+        """Close every open node: none holds a solution below the cutoff.
+        So do the pipeline's (``pipeline_batches``): its batch on the device
+        is dropped, and its children are dropped unread."""
         self.close(self.cutoff_bound())
         self.open = []
         self.plunge_node = None
+        self.in_flight = None
+        self.pending_children = None
 
     def empty_root(self):
         """The result when the root box holds no solution below the cutoff
@@ -7742,6 +7868,7 @@ class _BranchAndBound:
                 self.strong_candidates,
                 self.node_dtype,
                 branch_implied=self.branch_implied_cols is not None,
+                nnz_capacity=self.kernel_nnz_capacity(),
             )
             self._strong_kernels = (self.mip, kernels)
         return self._strong_kernels[1]
@@ -8233,18 +8360,28 @@ class _BranchAndBound:
         bound = max(self.round_bound(raw), node.bound)
         self.active_bound = bound
         spent = node.epochs + result["epochs"]
+        # A node with every integer fixed has nothing to branch on: its LP
+        # gets the full ``node_max_epochs`` to converge, even when the
+        # others are truncated (``batch_epochs``), or it would close
+        # unproven ("unresolved").
+        budget = self.batch_node_epochs
+        if budget < self.node_max_epochs and np.all(
+            lower[self.is_int] == upper[self.is_int]
+        ):
+            budget = self.node_max_epochs
         if (
             not result["converged"]
             and bound < self.cutoff()
             and not self.out_of_time()
             and self.batch_size > 1
-            and spent < self.node_max_epochs
+            and spent < budget
         ):
             # Continuous batching: a batched node LP runs at most
             # ``batch_epochs`` a call, so one slow member cannot hold the
             # batch. An unfinished one goes back, warm-started where it
             # stopped, for its next epochs in a later batch (until
-            # ``node_max_epochs`` in all). Its Lagrangian bound holds
+            # ``node_max_epochs`` in all, when given; by default it
+            # branches after its first call). Its Lagrangian bound holds
             # whatever the duals, and an infeasible LP's bound passes the
             # cutoff along its Farkas ray (``node_bound_stop``).
             self.batch_requeues += 1
@@ -8281,8 +8418,14 @@ class _BranchAndBound:
             self.global_fix(terms)  # this LP's duals over the root box
         converged = result["converged"]
         x = np.asarray(result["solution"].primal, np.float64)
-        value = float(self.mip.c @ x) if converged else None
-        if node.branch is not None and converged:
+        if converged:
+            value = float(self.mip.c @ x)
+        else:
+            # A truncated LP (``batch_epochs``): its Lagrangian bound stands
+            # in for the LP value, for the pseudocosts and its children's
+            # parent value, which would otherwise rarely learn.
+            value = float(raw) if np.isfinite(raw) else None
+        if node.branch is not None and value is not None:
             # The gain of the branching alone: the LP before this node's
             # re-solve with new tree cuts (``refresh_cuts``), whose gain is
             # the cuts', not the branched variable's.
@@ -8352,8 +8495,13 @@ class _BranchAndBound:
         self.bound_rigorous &= rigorous
         self.try_near_integral(x, xi, warm)
         # Every node's LP point is rounded in the background, beside the
-        # node LPs (``parallel_rounding``).
-        rounding_queued = self.background_rounding(x, lower, upper, warm)
+        # node LPs (``parallel_rounding``), then jumped from if that fails
+        # (``node_jump_seconds``): node points are often far from integral
+        # (ns1830653: ~200 of 458 integers at 0.5), where rounding fails
+        # and the jump still finds better points.
+        rounding_queued = self.background_rounding(
+            x, lower, upper, warm, jump_seconds=self.node_jump_seconds
+        )
         if self.branch_implied_cols is not None:
             # Fractional implied integers join the candidates (not the
             # integrality test): on ns1830653 they carry the objective.
@@ -8553,6 +8701,7 @@ class _BranchAndBound:
             return 0.0
         nodes = list(self.open_nodes()) + list(self.batch_waiting)
         nodes += [entry["node"] for entry in self.deferred_branches]
+        nodes += self.pipeline_nodes()
         weight = math.fsum(0.5 ** node.depth for node in nodes)
         return min(1.0, max(0.0, 1.0 - weight))
 
@@ -8612,7 +8761,14 @@ class _BranchAndBound:
         rows.append(("", f"{self.heuristic_seconds:.2f} (heuristics)"))
         if self.strong_branch_seconds:
             rows.append(("", f"{self.strong_branch_seconds:.2f} (strong branching)"))
-        rows.append(("Nodes", str(self.nodes)))
+        tree = self.tree_elapsed()
+        rows.append(
+            (
+                "Nodes",
+                f"{self.nodes}"
+                + (f" ({self.nodes / tree:.1f}/s in the tree)" if tree > 0 else ""),
+            )
+        )
         rows.append(("LP epochs", f"{self.lp_epochs} (total)"))
         if self.cut_list or self.root_bound_before_cuts is not None:
             families = [cut["family"] for cut in self.cut_list]
@@ -8661,7 +8817,11 @@ class _BranchAndBound:
             )
         if self.background_roundings:
             rows.append(
-                ("Roundings", f"{self.background_roundings} in the background")
+                (
+                    "Roundings",
+                    f"{self.background_roundings} in the background "
+                    f"({self.background_jumps} with a jump)",
+                )
             )
         if self.near_integral_tries:
             rows.append(
@@ -8709,6 +8869,7 @@ class _BranchAndBound:
                 "finds": self.near_integral_finds,
             },
             "background_roundings": self.background_roundings,
+            "background_jumps": self.background_jumps,
             "inout_cuts": self.inout_cuts,
             "inout_rounds": self.inout_rounds,
             "tree_cut_refreshes": self.tree_cut_refreshes,
@@ -8722,6 +8883,7 @@ class _BranchAndBound:
             "global_redcost_fixed": self.global_redcost_fixed,
             "cut_pool_rows": len(self.cut_archive),
             "lp_epochs": self.lp_epochs,
+            "tree_seconds": self.tree_elapsed(),
             "seconds": time.time() - self.start,
             "history": self.history,
             "cuts": {
@@ -9102,13 +9264,17 @@ class _BranchAndBound:
                     self.try_incumbent(point, "B", warm)
         self.heuristic_seconds += time.time() - started
 
-    def background_rounding(self, x, lower, upper, warm):
+    def background_rounding(self, x, lower, upper, warm, jump_seconds=0.0):
         """With ``parallel_heuristics`` and ``parallel_rounding``: queue
         fix-and-propagate of ``x`` over ``lower``/``upper`` (with the
         objective row at the cutoff, ``heuristic_propagator``) on the
         background ``"round"`` lane, unless it is still busy with an
-        earlier point. Its point comes back through ``collect_heuristics``
-        (``"P"``). Returns whether it was queued."""
+        earlier point. If the rounding fails and ``jump_seconds`` is
+        positive (with the numba jump), the same job runs an improving
+        feasibility jump from ``x`` in that box, below the cutoff, for that
+        long (``_node_heuristic_job``). Its point comes back through
+        ``collect_heuristics`` (``"P"`` or ``"J"``). Returns whether it was
+        queued."""
         if (
             self.workers is None
             or not self.use_parallel_rounding
@@ -9116,15 +9282,30 @@ class _BranchAndBound:
             or self.out_of_time()
         ):
             return False
+        jump = None
+        if jump_seconds > 0 and self.use_jump and self.jump_backend == "numba":
+            cutoff = self.cutoff(box=False)
+            jump = dict(
+                mip=self.base,
+                seconds=float(jump_seconds),
+                deadline=self.deadline,
+                tol=self.feas_tol,
+                max_iterations=np.iinfo(np.int64).max,
+                seed=self.background_roundings,
+                cutoff=float(cutoff) if np.isfinite(cutoff) else None,
+                improve_step=self.objective_step,
+            )
+            self.background_jumps += 1
         self.workers.submit(
             "round",
             "fixprop",
-            _fix_and_propagate_job,
+            _node_heuristic_job,
             np.array(x, np.float64),
             np.array(lower, np.float64),
             np.array(upper, np.float64),
             self.is_int,
             self.heuristic_propagator(),
+            jump=jump,
             info=warm,
         )
         self.background_roundings += 1
@@ -9459,16 +9640,23 @@ class _BranchAndBound:
             or node.cut_version >= self.cut_version
         ):
             return warm
-        stale = [i for i, v in enumerate(self.slot_version) if v > node.cut_version]
+        return (self.stale_free(warm[0], node.cut_version), warm[1])
+
+    def stale_free(self, solution, version):
+        """``solution`` with the duals of the cut block's slots given a new
+        cut since ``version`` (``cut_version``) zeroed; kept cuts keep
+        theirs."""
+        if version >= self.cut_version:
+            return solution
+        stale = [i for i, v in enumerate(self.slot_version) if v > version]
         if not stale:
-            return warm
-        solution = warm[0]
+            return solution
         base_m = self.base.A.shape[0] - self.base.n_eq
         duals = np.array(solution.dual_ineq)
         if duals.shape[0] < base_m + len(self.slot_version):
-            return warm
+            return solution
         duals[[base_m + i for i in stale]] = 0.0
-        return (solution._replace(dual_ineq=jnp.asarray(duals)), warm[1])
+        return solution._replace(dual_ineq=duals)
 
     def tree_cuts_due(self):
         """The tree cut refresh due now: ``"full"`` (separation too) every
@@ -9673,10 +9861,13 @@ class _BranchAndBound:
                     pooled.add(_cut_key(cut))
         per_point = self.max_tree_cuts_per_round
         separated = []  # every violated candidate, for the pool
-        for sol in best_first[: self.tree_cut_points if separate else 0]:
+        points = [
+            np.asarray(sol.primal, np.float64)
+            for sol in best_first[: self.tree_cut_points if separate else 0]
+        ]
+        for x in points:
             if self.out_of_time():
                 break
-            x = np.asarray(sol.primal, np.float64)
             candidates = self.node_separated(x)
             candidates += self.zero_half(x, self.root_lower, self.root_upper, 2 * per_point)
             candidates = [c for c in candidates if c[1].size <= self.tree_cut_max_nnz]
@@ -10071,9 +10262,10 @@ class _BranchAndBound:
             before = None if self.incumbent is None else self.incumbent[0]
             self.worker_jobs += 1
             self.worker_seconds += seconds
-            x, feasible, _ = found
+            x, feasible, mark = found
             if feasible:
-                self.try_incumbent(x, _JOB_SOURCES[kind], warm)
+                source = mark if mark in ("P", "J") else _JOB_SOURCES[kind]
+                self.try_incumbent(x, source, warm)
             self.worker_finds += self.incumbent is not None and (
                 before is None or self.incumbent[0] < before
             )
@@ -10565,7 +10757,7 @@ class _BranchAndBound:
         return node
 
     def node_batch(
-        self, lp_lower, lp_upper, warm_starts, max_epochs=None, steps=None
+        self, lp_lower, lp_upper, warm_starts, max_epochs=None, steps=None, lp=None
     ):
         """The node LPs over the boxes ``lp_lower``/``lp_upper`` (``(batch,
         n)``), each warm-started from its row of ``warm_starts`` and of
@@ -10613,7 +10805,7 @@ class _BranchAndBound:
             target = np.inf if target is None else float(target)
         with self.node_settings():
             out = jl.solve_many(
-                self.node_mip_lp,
+                self.node_mip_lp if lp is None else lp,
                 lp_lower,
                 lp_upper,
                 initial_solutions=warm_starts,
@@ -10628,15 +10820,23 @@ class _BranchAndBound:
         return core, tuple(out["opt_state"])[:2]
 
     def solve_batch(self, boxes, solutions, opt_states, max_epochs, size):
-        """The node LPs of ``boxes`` in one vmapped call, each warm-started
+        """``read_batch`` of ``launch_batch``: the batch's results, waited
+        for."""
+        return self.read_batch(
+            self.launch_batch(boxes, solutions, opt_states, max_epochs, size)
+        )
+
+    def launch_batch(self, boxes, solutions, opt_states, max_epochs, size):
+        """Dispatch the node LPs of ``boxes`` to the device without waiting
+        (``read_batch`` reads them back): one vmapped call, each warm-started
         from its solution, padded to ``size`` members with copies of the
         last. With ``node_bound_stop``, a member also stops once its
         Lagrangian bound passes ``node_bound_target()`` (``stop_reason``
         ``"bound_target"``). Each member also starts from the step sizes
         ``(k, eta)`` of its ``opt_states`` entry (a member without one takes
         another's: they share the LP), so a child does not re-learn its
-        parent's. Returns a ``solve_lp``-style result per box, whose
-        ``opt_state`` is the member's final ``(k, eta)``."""
+        parent's. Returns a handle for ``read_batch``."""
+        count = len(opt_states)
         pad = size - len(boxes)
         boxes = list(boxes) + [boxes[-1]] * pad
         solutions = list(solutions) + [solutions[-1]] * pad
@@ -10649,8 +10849,19 @@ class _BranchAndBound:
         lp_upper = np.stack([self.lp_upper(up) for _, up in boxes])
         with self.node_settings():
             # Root and node points may differ in precision (``node_precision``).
-            solutions = [_cast_warm(s, self.node_dtype) for s in solutions]
-            warm_starts = jax.tree.map(lambda *leaves: jnp.stack(leaves), *solutions)
+            # The members' points are host arrays (each batch is read back
+            # whole), so they are stacked and cast on the host and sent in one
+            # transfer per leaf: casting and sending them member by member
+            # took half of ``solve_batch`` with batches of 128 (ns1830653).
+            node_dtype = np.dtype(self.node_dtype)
+
+            def stack(*leaves):
+                block = np.stack([np.asarray(leaf) for leaf in leaves])
+                if np.issubdtype(block.dtype, np.floating) and block.dtype != node_dtype:
+                    block = block.astype(node_dtype)
+                return jnp.asarray(block)
+
+            warm_starts = jax.tree.map(stack, *solutions)
             dtype = _wide(self.node_dtype)
             steps = (
                 tuple(
@@ -10660,10 +10871,58 @@ class _BranchAndBound:
                 if known
                 else None
             )
-        # One transfer for the whole batch, then slices on the host.
-        out, steps = jax.device_get(
-            self.node_batch(lp_lower, lp_upper, warm_starts, max_epochs, steps)
+        if self.pipeline_batches:
+            # XLA drives a data-dependent while loop (the epochs) from the
+            # host on a GPU, so the call only returns once the LPs are done:
+            # it runs on the device thread, while this one evaluates the
+            # previous batch. The LP is taken now, before a tree cut refresh
+            # here can replace it.
+            return (
+                count,
+                self.on_device_thread(
+                    self.node_batch,
+                    lp_lower,
+                    lp_upper,
+                    warm_starts,
+                    max_epochs,
+                    steps,
+                    self.node_mip_lp,
+                ),
+            )
+        return (
+            count,
+            self.node_batch(lp_lower, lp_upper, warm_starts, max_epochs, steps),
         )
+
+    def on_device_thread(self, fn, *args):
+        """Run ``fn(*args)`` on the search's device thread
+        (``pipeline_batches``), in submission order, under the search's
+        device. Returns a ``Future``."""
+        if self._device_thread is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._device_thread = ThreadPoolExecutor(
+                1, thread_name_prefix="jaddle-device"
+            )
+        device = self.device
+
+        def call():
+            if device is None:
+                return fn(*args)
+            with jax.default_device(device):
+                return fn(*args)
+
+        return self._device_thread.submit(call)
+
+    def read_batch(self, handle):
+        """The results of a ``launch_batch``, one ``solve_lp``-style result
+        per box (padding dropped), whose ``opt_state`` is the member's
+        final ``(k, eta)``. Waits for the device."""
+        count, launched = handle
+        if hasattr(launched, "result"):  # dispatched on the device thread
+            launched = launched.result()
+        # One transfer for the whole batch, then slices on the host.
+        out, steps = jax.device_get(launched)
         converged = np.asarray(out.converged)
         stop_code = np.asarray(out.stop_code)
         epochs = np.asarray(out.epochs)
@@ -10679,21 +10938,85 @@ class _BranchAndBound:
                 "epochs": int(epochs[i]),
                 "opt_state": (steps[0][i], steps[1][i]),
             }
-            for i in range(len(opt_states))
+            for i in range(count)
         ]
 
     def batch_step(self):
         """Solve up to ``batch_size`` open nodes in one batched device call,
         then evaluate them in order on the host exactly as the serial search
         does. A short batch is padded with copies of its last member, whose
-        results are ignored."""
+        results are ignored. With ``pipeline_batches``, ``pipelined_step``
+        instead."""
+        if self.pipeline_batches:
+            self.pipelined_step()
+            return
+        batch = self.launch_next()
+        if batch is None:
+            return
+        self.process_batch(batch)
+        self.flush_branches()
+
+    def pipelined_step(self):
+        """One step of the pipelined batch loop (``pipeline_batches``):
+
+        1. the children of the batch processed last step, built on the
+           device after the batch then in flight, are read and queued;
+        2. the next batch is picked (those children among the candidates)
+           and dispatched, without waiting;
+        3. the batch dispatched last step is read back and evaluated on the
+           host while the device solves the next one, and its children are
+           dispatched to follow it.
+
+        So the host's evaluation of one batch (bounds, cuts, heuristics,
+        branching) overlaps the device's LPs for the next, where the plain
+        loop left the device idle meanwhile. A node's children reach a
+        batch two steps after it."""
+        pending, self.pending_children = self.pending_children, None
+        if pending is not None:
+            self.finish_branches(pending)
+        current, self.in_flight = self.in_flight, self.launch_next()
+        if current is None:
+            return
+        self.process_batch(current)
+        self.pending_children = self.launch_branches()
+
+    def pipeline_nodes(self):
+        """The nodes the pipeline holds outside the queue
+        (``pipeline_batches``): those dispatched and not yet evaluated, and
+        those evaluated whose children are still on the device. The global
+        bound counts them."""
+        nodes = []
+        if self.in_flight is not None:
+            nodes += self.in_flight["members"]
+        if self.pending_children is not None:
+            nodes += [item["node"] for item in self.pending_children["items"]]
+        return nodes
+
+    def drain_pipeline(self):
+        """Empty the pipeline when the tree loop stops: the children on the
+        device are queued, and the dispatched batch's nodes go back to the
+        queue unevaluated (their LPs are dropped)."""
+        pending, self.pending_children = self.pending_children, None
+        batch, self.in_flight = self.in_flight, None
+        if pending is not None:
+            self.finish_branches(pending)
+        if batch is not None:
+            for node in batch["members"]:
+                self.push(node)
+
+    def launch_next(self):
+        """Pick up to ``batch_size`` open nodes and dispatch their LPs
+        (``launch_batch``). Returns the batch (members, boxes, the device
+        handle and the cut block version it was solved with), or ``None``
+        with no node to solve."""
         members, boxes = [], []
+        in_flight = 0 if self.in_flight is None else len(self.in_flight["members"])
         while len(members) < self.batch_size and (
             self.open or self.plunge_node is not None
         ):
             if (
                 self.max_nodes is not None
-                and self.nodes + len(members) >= self.max_nodes
+                and self.nodes + in_flight + len(members) >= self.max_nodes
             ):
                 break
             node = self.next_node()
@@ -10711,10 +11034,9 @@ class _BranchAndBound:
             members.append(node)
             boxes.append(box)
         if not members:
-            return
-        self.batch_waiting = members
+            return None
         warms = [self.fit_warm(node) for node in members]
-        results = self.solve_batch(
+        handle = self.launch_batch(
             boxes,
             [warm[0] for warm in warms],
             [warm[1] for warm in warms],
@@ -10722,6 +11044,25 @@ class _BranchAndBound:
             self.batch_size,
         )
         self.batches += 1
+        return dict(
+            members=members, boxes=boxes, handle=handle, version=self.cut_version
+        )
+
+    def process_batch(self, batch):
+        """Read back a dispatched batch (``launch_next``) and evaluate its
+        members in order on the host, as the serial search does. Members to
+        split on the device are left in ``deferred_branches``."""
+        members, boxes = batch["members"], batch["boxes"]
+        self.batch_waiting = members
+        results = self.read_batch(batch["handle"])
+        if batch["version"] < self.cut_version:
+            # Solved before a tree cut refresh changed slots of the cut
+            # block: those slots' duals are zeroed (a zero multiplier is
+            # valid), so the bounds hold for the rows as they are now.
+            results = [
+                dict(result, solution=self.stale_free(result["solution"], batch["version"]))
+                for result in results
+            ]
         results, requeued = self.after_node_solves(members, boxes, results)
         self.deferring = self.batch_on_device()
         try:
@@ -10750,7 +11091,6 @@ class _BranchAndBound:
             self.deferring = False
             self.batch_waiting = []
         self.flush_roundings()
-        self.flush_branches()
 
     def batch_on_device(self):
         """Whether batched search splits and rounds its members on the
@@ -10762,6 +11102,17 @@ class _BranchAndBound:
         width = max(self.mip.num_variables, self.mip.A.nnz)
         return self.mip.A.nnz > _SMALL_MIP_NNZ and 2 * self.batch_size * width <= 2**25
 
+    def kernel_nnz_capacity(self):
+        """The nonzeros the device kernels (``_ChildKernels``,
+        ``_StrongKernels``) are padded to: enough for the searched rows
+        with a full tree cut block (``tree_nnz_cap``), to a power of two.
+        Tree cut refreshes change the block's nonzeros; unpadded, each one
+        recompiled the kernels (on ns1830653, 14 times a minute)."""
+        nnz = self.mip.A.nnz
+        if self.use_tree_cuts and self.slot_version:
+            nnz = max(nnz, self.base.A.nnz + self.tree_nnz_cap)
+        return 1 << max(8, math.ceil(math.log2(max(nnz, 1))))
+
     def child_kernels(self):
         held = self._child_kernels
         if held is not None and held[0] is not self.mip and held[1].set_mip(self.mip):
@@ -10772,6 +11123,7 @@ class _BranchAndBound:
                 self.propagator is not None,
                 self.reduced_cost_tol,
                 self.batch_size,
+                nnz_capacity=self.kernel_nnz_capacity(),
             )
             self._child_kernels = (self.mip, kernels)
         return self._child_kernels[1]
@@ -10801,9 +11153,17 @@ class _BranchAndBound:
         """Split the batch's deferred nodes: their children propagated and
         bounded in one ``_ChildKernels`` call, then ``branch`` on the host
         for the conflict pool, pruning and the queue."""
+        pending = self.launch_branches()
+        if pending is not None:
+            self.finish_branches(pending)
+
+    def launch_branches(self):
+        """Dispatch the children of the batch's deferred nodes
+        (``deferred_branches``) to the device without waiting. Returns the
+        handle for ``finish_branches`` (``None`` with nothing deferred)."""
         pending, self.deferred_branches = self.deferred_branches, []
         if not pending:
-            return
+            return None
         kernels = self.child_kernels()
         size, n = kernels.size, self.mip.num_variables
         lower = np.zeros((size, n))
@@ -10826,9 +11186,24 @@ class _BranchAndBound:
                 r[0],
                 constant[0],
             )
-        out = kernels(lower, upper, var, xv, r, constant)
+        if self.pipeline_batches:
+            # After the next batch's LPs, on the device thread (the
+            # propagation is a device while loop too).
+            out = self.on_device_thread(kernels.launch, lower, upper, var, xv, r, constant)
+        else:
+            out = kernels.launch(lower, upper, var, xv, r, constant)
+        return {"items": pending, "out": out}
+
+    def finish_branches(self, pending):
+        """Read back a ``launch_branches`` and ``branch`` each node on the
+        host (conflict pool, pruning, the queue)."""
+        out = pending["out"]
+        if hasattr(out, "result"):  # dispatched on the device thread
+            out = out.result()
+        with jax.enable_x64(True):
+            out = jax.device_get(out)
         self.batched_children += 1
-        for i, item in enumerate(pending):
+        for i, item in enumerate(pending["items"]):
             row = {key: value[i] for key, value in out.items()}
             self.branch(**item, precomputed=row)
 
@@ -10891,6 +11266,9 @@ class _BranchAndBound:
         finally:
             if self.workers is not None:
                 self.workers.shutdown()
+            if self._device_thread is not None:
+                self._device_thread.shutdown(wait=True)
+                self._device_thread = None
 
     def _run(self):
         """Rounds of the search: prepare the root box, solve the root, search
@@ -11195,7 +11573,12 @@ class _BranchAndBound:
         # summed over the rounds between restarts.
         self.tree_clock = (time.time(), self.strong_branch_seconds)
         try:
-            while self.open or self.plunge_node is not None:
+            while (
+                self.open
+                or self.plunge_node is not None
+                or self.in_flight is not None
+                or self.pending_children is not None
+            ):
                 self.collect_heuristics()
                 if self.out_of_time():
                     status = "time_limit"
@@ -11252,6 +11635,9 @@ class _BranchAndBound:
         except KeyboardInterrupt:
             status = "interrupted"
         finally:
+            # The pipeline's nodes back in the queue (``pipeline_batches``),
+            # so the bound and a restart see them.
+            self.drain_pipeline()
             started, strong_before = self.tree_clock
             self.tree_seconds += time.time() - started
             self.tree_strong_seconds += self.strong_branch_seconds - strong_before
@@ -11270,7 +11656,7 @@ def solve(
     integrality_tolerance=1e-5,
     feasibility_tolerance=1e-6,
     lp_tolerance=1e-4,
-    node_max_epochs=200,
+    node_max_epochs=None,
     root_max_epochs=None,
     infeasibility_tolerance=1e-8,
     heuristic_every=5,
@@ -11333,7 +11719,7 @@ def solve(
     dive_every=50,
     dive_depth=20,
     plunge_depth=8,
-    batch_size=32,
+    batch_size="auto",
     feasibility_pump=True,
     pump_iterations=30,
     pump_tolerance=1e-4,
@@ -11347,7 +11733,7 @@ def solve(
     bulk_rounding=True,
     bulk_starts=4,
     repair_share=0.2,
-    batch_epochs=10,
+    batch_epochs=2,
     children_backend="auto",
     batch_roundings=False,
     tree_heuristics=True,
@@ -11383,6 +11769,8 @@ def solve(
     near_integral_tolerance=1e-2,
     tree_pool_every=1,
     parallel_rounding=True,
+    node_jump_seconds=1.0,
+    pipeline_batches=True,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -11739,10 +12127,28 @@ def solve(
       over the nodes' bounds and warm starts, with the LP's rows as data,
       so it compiles once per shape and tree cut refreshes reuse it). The
       nodes are then evaluated in order on
-      the host exactly as in the serial search. Members run in lockstep, so
-      a node that will not converge holds its batch to ``node_max_epochs``.
+      the host exactly as in the serial search. Members run in lockstep,
+      for at most ``batch_epochs`` (default 2) epochs a call. By default
+      (``node_max_epochs=None``) a node LP gets that one call and branches
+      on its point (truncated node LPs; its Lagrangian bound holds at any
+      duals, and its pseudocost gains use that bound when the LP did not
+      converge); only a node with every integer fixed gets up to 200
+      epochs, so it closes proven. With ``node_max_epochs`` given, an
+      unfinished node goes back to the queue, warm-started, until that many
+      in all. On ns1830653 (GPU, batches of 8) the truncated LPs took the
+      tree from 16 to 147 nodes a second, with a higher bound at 60 s.
       Worth it on a GPU; on a CPU the members run one after another. The
-      default is 32 (``1``: the serial search).
+      default, ``"auto"``, is 128 on a GPU or TPU and 32 on a CPU (``1``:
+      the serial search). With ``pipeline_batches`` (default ``True``) the
+      batches overlap: while the device solves one batch's LPs, the host
+      evaluates the batch before (bounds, tree cuts, heuristics, branching),
+      and its children are built on the device after the batch in flight,
+      reaching a batch two steps later. The LP and child calls run on a
+      device thread: XLA drives their data-dependent loops from the host on
+      a GPU, so a call returns only once its work is done. A batch solved
+      before a tree cut refresh has the replaced slots' duals zeroed
+      (``stale_free``). On ns1830653 (GPU, 128 a batch, repeatable runs)
+      the overlap took 440 to 523 nodes a second.
     * **Device** (``device``). ``"auto"`` (default) runs MIPs with at
       most 10,000 nonzeros on the CPU: their node LPs are latency-bound
       on an accelerator (flugpl: 3s on the CPU, 18s on a GPU).
@@ -11945,7 +12351,14 @@ def solve(
       ``parallel_rounding`` (on by default, whatever ``fix_and_propagate``
       says) every node's LP point is rounded the same way beside the node
       LPs (``"P"``; a point is skipped while the thread is still busy with
-      an earlier one; ``result["background_roundings"]``). Each slice runs 5 s from the incumbent of its
+      an earlier one; ``result["background_roundings"]``). When the
+      rounding fails, the same job runs an improving feasibility jump
+      from the node point in its box, below the cutoff, for
+      ``node_jump_seconds`` (default 1; ``0``: off; ``"J"``;
+      ``result["background_jumps"]``): node points are often far from
+      integral (ns1830653: about 200 of 458 integers at 0.5), where
+      rounding always failed but a 1 s jump beat the incumbent from 2 of
+      30. Each slice runs 5 s from the incumbent of its
       time; a slice that finds nothing better is not repeated until the
       incumbent changes. The device heuristics (bulk rounding, the pump,
       the tree heuristics) and RINS (a Jaddle sub-search) stay on the main
@@ -12211,6 +12624,8 @@ def solve(
         near_integral_tolerance=near_integral_tolerance,
         tree_pool_every=tree_pool_every,
         parallel_rounding=parallel_rounding,
+        node_jump_seconds=node_jump_seconds,
+        pipeline_batches=pipeline_batches,
     )
     return _solve_model(
         model, presolve, precision, highs_options, feasibility_tolerance, settings
@@ -12282,6 +12697,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "integral_splits": 0,
             "near_integral": {"tries": 0, "finds": 0},
             "background_roundings": 0,
+            "background_jumps": 0,
             "inout_cuts": 0,
             "inout_rounds": 0,
             "tree_cut_refreshes": 0,
@@ -12295,6 +12711,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "global_redcost_fixed": 0,
             "cut_pool_rows": 0,
             "lp_epochs": 0,
+            "tree_seconds": 0.0,
             "seconds": time.time() - start,
             "history": [],
             "cuts": {
