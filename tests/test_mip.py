@@ -2369,6 +2369,62 @@ def test_node_heuristic_job_jumps_when_rounding_fails():
     assert mip.is_feasible(point, 1e-6)
 
 
+def test_background_jumps_fill_every_lane_with_restarts(monkeypatch):
+    """With ``jump_threads`` lanes, a new incumbent gets one improving
+    slice and every other idle lane a restart (``jump_restarts``) from a
+    perturbed incumbent or a node point; none sits idle."""
+    pytest.importorskip("numba")
+    mip = knapsack()
+    search = search_for(
+        mip, monkeypatch, parallel_heuristics=True, jump_backend="numba", jump_threads=3
+    )
+    assert search.workers.LANES == ("jump", "jump1", "jump2", "round")
+    submitted = []
+    monkeypatch.setattr(
+        search.workers, "submit", lambda lane, kind, *a, **k: submitted.append((lane, kind))
+    )
+    x = np.zeros(mip.num_variables)  # the empty knapsack: feasible
+    search.incumbent = (float(mip.c @ x), x)
+    search.schedule_improve_jump()
+    assert sorted(kind for _, kind in submitted) == ["jump", "jumprestart", "jumprestart"]
+    assert {lane for lane, _ in submitted} == {"jump", "jump1", "jump2"}
+    # The same incumbent again: restarts only.
+    submitted.clear()
+    search.schedule_improve_jump()
+    assert [kind for _, kind in submitted] == ["jumprestart"] * 3
+    off = search_for(
+        mip, monkeypatch, parallel_heuristics=True, jump_backend="numba",
+        jump_threads=2, jump_restarts=False,
+    )
+    submitted.clear()
+    monkeypatch.setattr(
+        off.workers, "submit", lambda lane, kind, *a, **k: submitted.append((lane, kind))
+    )
+    off.incumbent = (float(mip.c @ x), x)
+    off.schedule_improve_jump()
+    off.schedule_improve_jump()
+    assert [kind for _, kind in submitted] == ["jump"]
+    with pytest.raises(ValueError, match="jump_threads"):
+        solve(mip, jump_threads=0)
+
+
+def test_jump_restart_starts_move_part_of_the_incumbent(monkeypatch):
+    mip = general_integer()
+    search = search_for(mip, monkeypatch)
+    x = np.clip(np.round(_optimum(mip)), mip.lower, mip.upper)
+    ints = np.flatnonzero(mip.integrality)
+    for k in range(4):
+        search.jump_slices, search.jump_restarts = k, 0  # even: perturbed
+        start = search.jump_restart_start(x, mip.lower, mip.upper)
+        assert np.all(start >= mip.lower) and np.all(start <= mip.upper)
+        moved = np.flatnonzero(start != x)
+        assert 1 <= moved.size <= max(1, int(0.2 * ints.size))
+        assert np.isin(moved, ints).all()
+    search.recent_points.append(np.full(mip.num_variables, 0.5))
+    search.jump_restarts = 1  # odd: a node point
+    assert np.all(search.jump_restart_start(x, mip.lower, mip.upper) == 0.5)
+
+
 def test_near_integral_points_are_tried_once(monkeypatch):
     """A node point whose integers are all within
     ``near_integral_tolerance`` of integers (though not within
@@ -5430,6 +5486,181 @@ def test_implied_bound_cuts_link_flows_to_openings():
     assert_solved(result, mip, reference(mip))
     assert result["cuts"]["impliedbound"] > 0
     assert solve(mip, implied_bound_cuts=False)["cuts"]["impliedbound"] == 0
+
+
+def coverage_chains(seed=0, sites=5, depth=8, targets=6):
+    """map06 in miniature: binaries ``z`` (open a site) within a budget, each
+    with a chain of continuous ``x_{s,0} <= z_s``, ``x_{s,i} <= x_{s,i−1}``
+    ``depth`` rows long, and targets ``v_t <= x_{a,end} + x_{c,end}``
+    (covered by either of two sites) that the objective rewards. All in
+    [0, 1]. Columns: ``z``, the chains, then ``v``."""
+    rng = np.random.default_rng(seed)
+    n = sites + sites * depth + targets
+    chain = lambda s, i: sites + s * depth + i
+    entries, b = [], []
+    w = rng.integers(3, 9, sites).astype(float)
+    entries.append({s: w[s] for s in range(sites)})
+    b.append(np.floor(0.45 * w.sum()))
+    for s in range(sites):
+        entries.append({chain(s, 0): 1.0, s: -1.0})
+        b.append(0.0)
+        for i in range(1, depth):
+            entries.append({chain(s, i): 1.0, chain(s, i - 1): -1.0})
+            b.append(0.0)
+    for t in range(targets):
+        a, c = rng.choice(sites, 2, replace=False)
+        end_a, end_c = chain(a, depth - 1), chain(c, depth - 1)
+        entries.append({sites * (depth + 1) + t: 1.0, end_a: -1.0, end_c: -1.0})
+        b.append(0.0)
+    A = sp.lil_matrix((len(entries), n))
+    for r, row in enumerate(entries):
+        for j, v in row.items():
+            A[r, j] = v
+    cost = np.zeros(n)
+    cost[sites * (depth + 1) :] = -rng.integers(1, 4, targets)
+    A_eq, b_eq = no_rows(n)
+    lp = jl.LP(
+        c=cost,
+        A_eq=A_eq,
+        b_eq=b_eq,
+        A_ineq=sp.csc_matrix(A),
+        b_ineq=np.array(b),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    integrality = np.zeros(n, bool)
+    integrality[:sites] = True
+    return jm.MIP(lp, integrality)
+
+
+def highs_vertex(mip):
+    """The LP relaxation's vertex from HiGHS's simplex (PDHG grinds on the
+    degenerate chain rows of ``coverage_chains``)."""
+    model = jm.to_highs(mip)
+    model.integrality_ = [highspy.HighsVarType.kContinuous] * model.num_col_
+    highs = highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.passModel(model)
+    highs.run()
+    return np.array(highs.getSolution().col_value)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "jax"])
+def test_probing_follows_chains_past_five_passes(backend):
+    # z_0 = 0 empties the chain under it only after ``depth`` passes.
+    depth = 8
+    mip = coverage_chains(depth=depth)
+    end = 5 + depth - 1  # the last column of site 0's chain
+    args = (mip.A, mip.row_lower, mip.row_upper, mip.integrality, mip.lower, mip.upper)
+    short = jm.probe(*args, backend=backend, max_passes=5)
+    full = jm.probe(*args, backend=backend)
+    for probed, reaches in ((short, False), (full, True)):
+        lower, upper = mip.lower.copy(), mip.upper.copy()
+        assert probed.cache.implied(0, 0.0, lower, upper)
+        assert (upper[end] == 0.0) == reaches
+    implied = jm.ImpliedBounds(full.cache, full.lower, full.upper, mip.integrality)
+    assert (0, 1.0, 0.0) in implied.variable_bounds()[end]["ub"]  # x_end <= z_0
+    # The device backend keeps every implication unless capped.
+    capped = jm.probe(*args, backend=backend, max_implications=2)
+    kept = max(len(side[0]) for sides in capped.cache.sides.values() for side in sides if side)
+    assert kept <= 2 if backend == "jax" else kept > 2
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_cuts_over_implied_variable_bounds_are_valid(seed):
+    mip = coverage_chains(seed)
+    probed = jm.probe(
+        mip.A, mip.row_lower, mip.row_upper, mip.integrality, mip.lower, mip.upper
+    )
+    implied = jm.ImpliedBounds(probed.cache, probed.lower, probed.upper, mip.integrality)
+    separator = jm.CutSeparator(
+        mip, probed.lower, probed.upper, max_aggregation=6, implied_bounds=implied
+    )
+    # Every chain column now has a variable bound on its site (the rows
+    # give one only to the first of each chain).
+    sites, depth = 5, 8
+    chains = np.arange(sites, sites * (depth + 1))
+    assert all(int(j) in separator.variable_bounds for j in chains)
+    x = highs_vertex(mip)
+    rng = np.random.default_rng(seed)
+    points = [x, np.clip(x + rng.uniform(-0.3, 0.3, x.size), 0.0, 1.0)]
+    for point in points:
+        for _, idx, coef, rhs in separator(point):
+            assert max_over_mip(mip, idx, coef) <= rhs + 1e-7 * (1 + abs(rhs))
+
+
+def test_warm_start_from_an_lp_with_other_rows():
+    # A background heuristic's warm start comes from the root LP of when its
+    # job was queued; cut rounds may have changed the rows since.
+    mip = facility_location()
+    result = jl.solve(mip.lp)
+    warm = (result["solution"], result["opt_state"])
+    assert jm._fit_warm(warm, mip.lp) is warm
+    for more in (mip.with_rows(np.ones((3, mip.num_variables)), np.full(3, 1e3)),):
+        solution, opt_state = jm._fit_warm(warm, more.lp)
+        np.testing.assert_array_equal(solution.primal, result["solution"].primal)
+        assert solution.dual_ineq.shape[0] == more.lp.A_ineq.shape[0]
+        assert not np.any(solution.dual_ineq)
+        out = jl.solve(more.lp, initial_solution=solution, initial_opt_state=opt_state)
+        assert out["solution"].primal.shape == result["solution"].primal.shape
+
+
+@pytest.mark.parametrize("make", [facility_location, lambda: coverage_chains(1)])
+def test_exact_node_lp_duals_bound_the_lp(make):
+    mip = make()
+    highs = jm._highs_rows(mip)
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    ints = np.flatnonzero(mip.integrality)
+    for fixed in (None, 0.0, 1.0):
+        if fixed is not None:
+            lower[ints[0]] = upper[ints[0]] = fixed
+        status, x, y_eq, y_ineq = jm._exact_node_lp(highs, mip, lower, upper, 10.0)
+        assert status == "optimal"
+        value = mip.c @ x
+        # The duals' Lagrangian bound is the LP's optimum, and rigorous.
+        terms = jm.lagrangian_terms(
+            mip.c, mip.A, mip.b, mip.n_eq, np.concatenate([y_eq, y_ineq])
+        )
+        bound, rigorous = jm.box_bound(*terms, lower, upper)
+        assert rigorous
+        assert bound <= value + 1e-7 * (1 + abs(value))
+        assert bound == pytest.approx(value, rel=1e-6, abs=1e-6)
+        assert restricted_optimum(mip, lower, upper) >= bound - 1e-6
+
+
+def test_exact_node_lp_proves_an_empty_box_infeasible():
+    mip = coverage_chains(1)
+    highs = jm._highs_rows(mip)
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    lower[:5] = 1.0  # every site open: over the budget
+    status, *_ = jm._exact_node_lp(highs, mip, lower, upper, 10.0)
+    assert status == "infeasible"
+
+
+@pytest.mark.parametrize(
+    "make", [facility_location, generalised_assignment, lambda: coverage_chains(1)]
+)
+def test_exact_lane_solves_to_the_optimum(make):
+    # Without cuts and probing they branch, so the lane gets nodes.
+    mip = make()
+    ref = reference(mip)
+    options = dict(batch_size=4, cuts=False, probing=False)
+    for band in (0.005, 0.5, 0.0):  # the band kept for the lane; 0: none
+        result = solve(mip, exact_nodes=2, exact_band=band, **options)
+        assert_solved(result, mip, ref)
+        stats = result["exact_nodes"]
+        assert stats["solved"] > 0 and stats["bound_gain"] >= 0.0
+    assert solve(mip, **options)["exact_nodes"]["solved"] == 0
+
+
+def test_solve_with_implied_variable_bounds_and_long_aggregation():
+    mip = coverage_chains(1)
+    ref = reference(mip)
+    for options in (
+        dict(max_aggregation=6),
+        dict(implied_variable_bounds=False, max_aggregation=0),
+    ):
+        assert_solved(solve(mip, **options), mip, ref)
 
 
 # -- 1-opt ---------------------------------------------------------------------

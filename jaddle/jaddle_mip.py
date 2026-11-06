@@ -775,6 +775,18 @@ def _probe_split(lower, upper):
     )
 
 
+# Probing (``probe``): propagation passes per side, and the implications the
+# device backend keeps per side. On map06 a binary's implications reach
+# continuous variables down chains of rows up to about 50 passes deep: 5
+# passes found 897 of the 2,013 a fixed point finds for one binary, and the
+# implied-bound cuts (exact LPs, with Gomory cuts) reached −401.8 at 5 passes
+# and 64 implications against −395.8 at a fixed point with all of them.
+_PROBE_MAX_PASSES = 100
+# ``None``: every implication; the outputs are no larger than the propagated
+# boxes the chunk holds anyway.
+_PROBE_MAX_IMPLICATIONS = None
+
+
 def probe(
     A,
     row_lower,
@@ -785,9 +797,10 @@ def probe(
     max_variables=None,
     deadline=None,
     backend="auto",
-    max_implications=64,
+    max_implications=_PROBE_MAX_IMPLICATIONS,
     tol=1e-6,
     max_useless=None,
+    max_passes=_PROBE_MAX_PASSES,
 ):
     """
     Probing on the integer variables (Savelsbergh, 1994), as in cuOpt's
@@ -807,6 +820,10 @@ def probe(
     from the box tightened so far), ``"jax"`` (chunks of variables at once,
     both sides of each propagated by ``_propagate_jax`` in one vmapped call
     of fixed shape) or ``"auto"`` (numpy up to 10,000 nonzeros).
+    Propagation runs at most ``max_passes`` passes (it stops sooner at a
+    fixed point), and the device backend keeps at most ``max_implications``
+    implications per side in the cache (``None``: all; the box tightenings
+    use them all either way).
 
     Returns a ``ProbeResult``.
     """
@@ -815,7 +832,10 @@ def probe(
     integrality = np.asarray(integrality, bool)
     start_lower, start_upper = lower.copy(), upper.copy()
     cache = ProbingCache()
-    propagator = BoundPropagator(A, row_lower, row_upper, integrality, tol=tol)
+    propagator = functools.partial(
+        BoundPropagator(A, row_lower, row_upper, integrality, tol=tol),
+        max_passes=max_passes,
+    )
     lower, upper, infeasible = propagator(lower, upper)
 
     def result(infeasible, probed):
@@ -890,10 +910,12 @@ def probe(
     size = 1
     while size < 256 and 4 * size * width <= 2**24:
         size *= 2
-    k = int(min(max_implications, n))
+    k = n if max_implications is None else int(min(max_implications, n))
     with jax.enable_x64(True):
         data = _propagation_data(A, row_lower, row_upper, integrality)
-        chunk = jax.jit(functools.partial(_probe_chunk_jax, m=m, k=k))
+        chunk = jax.jit(
+            functools.partial(_probe_chunk_jax, m=m, k=k, max_passes=int(max_passes))
+        )
         for top in range(0, order.size, size):
             if deadline is not None and time.time() >= deadline:
                 break
@@ -946,11 +968,11 @@ def probe(
     return result(False, probed)
 
 
-def _probe_chunk_jax(data, lower, upper, cols, split, valid, m, k):
-    """Both sides of each variable in ``cols`` propagated at once; returns
-    the box that all of them together imply, whether some variable has both
-    sides empty, and each side's emptiness and (at most ``k``) implied
-    bounds. Runs under x64."""
+def _probe_chunk_jax(data, lower, upper, cols, split, valid, m, k, max_passes=5):
+    """Both sides of each variable in ``cols`` propagated at once (at most
+    ``max_passes`` passes); returns the box that all of them together
+    imply, whether some variable has both sides empty, and each side's
+    emptiness and (at most ``k``) implied bounds. Runs under x64."""
     n = lower.shape[0]
 
     def sides(j, s):
@@ -961,7 +983,9 @@ def _probe_chunk_jax(data, lower, upper, cols, split, valid, m, k):
     lo, up = jax.vmap(sides)(cols, split)
     lo, up = lo.reshape(-1, n), up.reshape(-1, n)
     empty0 = jnp.any(lo > up, axis=1)
-    lo, up, empty = jax.vmap(lambda a, b: _propagate_jax(data, a, b, m))(lo, up)
+    lo, up, empty = jax.vmap(lambda a, b: _propagate_jax(data, a, b, m, max_passes))(
+        lo, up
+    )
     empty = (empty | empty0).reshape(-1, 2) & valid[:, None]
     lo, up = lo.reshape(-1, 2, n), up.reshape(-1, 2, n)
     e0, e1 = empty[:, 0][:, None], empty[:, 1][:, None]
@@ -3463,9 +3487,38 @@ class ImpliedBounds:
         self.coef_z = cat(a_all, np.float64)  # z's coefficient
         self.rhs = cat(b_all, np.float64)
         self.sense = cat(sense_all, np.float64)  # x_j's coefficient
+        self.is_int = is_int
+        self._variable_bounds = None  # ``variable_bounds()``, once built
 
     def __len__(self):
         return int(self.z.size)
+
+    def variable_bounds(self):
+        """The implied bounds of continuous columns in ``variable_bounds``'s
+        form, ``{x_j: {"ub": [(z, c, d), ...], "lb": [...]}}`` for
+        ``x_j <= d + c·z`` and ``x_j >= d + c·z``, so c-MIR and flow cover
+        separation can shift ``x_j`` to them as to the rows' own variable
+        bounds. On map06 the rows bound a continuous ``x`` by its binary
+        only through chains of continuous rows; probing finds ``x <= z``.
+        Built once; callers must not change it."""
+        if self._variable_bounds is not None:
+            return self._variable_bounds
+        out = self._variable_bounds = {}
+        for z, j, coef_z, rhs, sense in zip(
+            self.z.tolist(),
+            self.j.tolist(),
+            self.coef_z.tolist(),
+            self.rhs.tolist(),
+            self.sense.tolist(),
+        ):
+            if self.is_int[j]:
+                continue
+            bounds = out.setdefault(j, {"ub": [], "lb": []})
+            if sense > 0:  # x_j + coef_z·z <= rhs
+                bounds["ub"].append((z, -coef_z, rhs))
+            else:  # −x_j + coef_z·z <= rhs
+                bounds["lb"].append((z, coef_z, -rhs))
+        return out
 
     def cuts(self, x, max_cuts=200, min_violation=1e-6):
         """The most efficacious implied-bound cuts violated by ``x``, as
@@ -3673,10 +3726,13 @@ class CutSeparator:
         conflict_graph=None,
         integrality=None,
         implied_bounds=None,
+        implied_variable_bounds=True,
     ):
         self.flow_covers = flow_covers  # also flow cover cuts (``flow_cover_cut``)
         # Also implied-bound cuts from this ``ImpliedBounds`` (built over
-        # bounds no looser than ``lower``/``upper``).
+        # bounds no looser than ``lower``/``upper``), and with
+        # ``implied_variable_bounds`` its bounds on continuous columns as
+        # variable bounds for c-MIR and flow cover cuts.
         self.implied_bounds = implied_bounds
         # Also clique cuts from this ``ConflictGraph`` (built over bounds no
         # looser than ``lower``/``upper``).
@@ -3704,8 +3760,16 @@ class CutSeparator:
         )
         self.is_binary = self.is_int & (self.lower == 0.0) & (self.upper == 1.0)
         # Variable bounds for c-MIR (``None`` without any, as on a pure
-        # integer MIP).
-        self.variable_bounds = variable_bounds(mip) or None
+        # integer MIP): the rows' own, then probing's.
+        bounds = variable_bounds(mip)
+        if implied_bounds is not None and implied_variable_bounds:
+            for j, implied in implied_bounds.variable_bounds().items():
+                if self.is_int[j]:
+                    continue
+                kinds = bounds.setdefault(j, {"ub": [], "lb": []})
+                for kind in ("ub", "lb"):
+                    kinds[kind] += [b for b in implied[kind] if self.is_int[b[0]]]
+        self.variable_bounds = bounds or None
 
     def row(self, r):
         start, end = self.A.indptr[r], self.A.indptr[r + 1]
@@ -5469,6 +5533,26 @@ def _cast_warm(warm, dtype):
     return jax.tree.map(cast, warm)
 
 
+def _fit_warm(warm, lp):
+    """``warm`` for ``lp``: as it is when its duals match ``lp``'s rows,
+    else its primal point with zero duals and only the step sizes of its
+    optimiser state (its Halpern anchor is sized to the old rows). A
+    background heuristic's warm start is the root LP's from when the job
+    was queued; the cut rounds may have changed the rows since (on map06,
+    31,286 duals for 30,262 rows)."""
+    solution, opt_state = warm
+    rows = (lp.A_eq.shape[0], lp.A_ineq.shape[0])
+    have = (np.shape(solution.dual_eq)[0], np.shape(solution.dual_ineq)[0])
+    # ``jl.solve`` itself gives a zero dual to an empty block's padding row.
+    if all(h == r or (h == 0 and r == 1) for h, r in zip(have, rows)):
+        return warm
+    dtype = jnp.asarray(solution.primal).dtype
+    solution = solution._replace(
+        dual_eq=jnp.zeros(rows[0], dtype), dual_ineq=jnp.zeros(rows[1], dtype)
+    )
+    return solution, None if opt_state is None else tuple(opt_state)[:2]
+
+
 def _step_sizes(opt_state):
     """The step sizes ``(k, eta)`` of a solve's ``opt_state`` as host
     floats (``None`` without one): what a batched node LP takes, without
@@ -5574,6 +5658,7 @@ class _Node:
         "cut_version",
         "cut_rounds",
         "branch_value",
+        "exact_tried",
     )
 
     def __init__(
@@ -5599,6 +5684,8 @@ class _Node:
         self.cut_version = None
         self.cut_rounds = cut_rounds
         self.branch_value = branch_value
+        # Whether the exact lane (``exact_nodes``) has taken its LP once.
+        self.exact_tried = False
 
 
 _LP_RESERVED = (
@@ -5615,6 +5702,168 @@ _LP_RESERVED = (
 # many seconds, each from the incumbent of its time (see
 # ``_BranchAndBound.schedule_improve_jump``).
 _JUMP_SLICE_SECONDS = 5.0
+# A restart slice from a perturbed incumbent or a node point (``jump_restarts``).
+_JUMP_RESTART_SECONDS = 2.0
+
+
+def _exact_node_lp(highs, mip, lower, upper, seconds):
+    """The LP of ``mip``'s rows over ``[lower, upper]`` solved by HiGHS's
+    dual simplex in ``highs`` (which holds ``mip``'s rows and keeps its
+    basis from the last call, so a node near the last one re-solves in a
+    few pivots). Returns ``(status, x, y_eq, y_ineq)``: ``status`` is
+    ``"optimal"``, ``"infeasible"`` or ``"failed"`` (time limit or another
+    status), and the duals are in Jaddle's convention (``L = cᵀx +
+    yᵀ(Ax − b)``, inequality duals ``>= 0``)."""
+    import highspy
+
+    n = lower.size
+    highs.changeColsBounds(
+        n,
+        np.arange(n, dtype=np.int32),
+        np.asarray(lower, np.float64),
+        np.asarray(upper, np.float64),
+    )
+    # ``time_limit`` counts the instance's whole run time.
+    highs.setOptionValue("time_limit", highs.getRunTime() + float(seconds))
+    highs.run()
+    status = highs.getModelStatus()
+    MS = highspy.HighsModelStatus
+    if status == MS.kInfeasible:
+        return "infeasible", None, None, None
+    if status != MS.kOptimal:
+        return "failed", None, None, None
+    solution = highs.getSolution()
+    row_dual = np.asarray(solution.row_dual, np.float64)
+    y_eq = -row_dual[: mip.n_eq]
+    y_ineq = np.maximum(-row_dual[mip.n_eq :], 0.0)
+    return "optimal", np.asarray(solution.col_value, np.float64), y_eq, y_ineq
+
+
+def _highs_rows(mip):
+    """A ``highspy.Highs`` holding ``mip``'s rows (equalities, then ``<=``
+    rows) for ``_exact_node_lp``: dual simplex, no presolve (it would drop
+    the basis between calls), one thread, silent. The tree cut block's
+    explicit zero entries (its padding) are dropped."""
+    import highspy
+
+    A = sp.csc_matrix(mip.A, dtype=np.float64, copy=True)
+    A.eliminate_zeros()
+    A.sort_indices()
+    lp = highspy.HighsLp()
+    lp.num_col_, lp.num_row_ = A.shape[1], A.shape[0]
+    lp.col_cost_ = np.asarray(mip.c, np.float64)
+    lp.col_lower_ = np.asarray(mip.lower, np.float64)
+    lp.col_upper_ = np.asarray(mip.upper, np.float64)
+    b = np.asarray(mip.b, np.float64)
+    lp.row_lower_ = np.concatenate([b[: mip.n_eq], np.full(b.size - mip.n_eq, -np.inf)])
+    lp.row_upper_ = b
+    lp.a_matrix_.format_ = highspy.MatrixFormat.kColwise
+    lp.a_matrix_.start_ = A.indptr
+    lp.a_matrix_.index_ = A.indices
+    lp.a_matrix_.value_ = A.data
+    highs = highspy.Highs()
+    for option, value in (
+        ("output_flag", False),
+        ("presolve", "off"),
+        ("solver", "simplex"),
+        ("simplex_strategy", 1),  # dual
+        ("parallel", "off"),
+    ):
+        highs.setOptionValue(option, value)
+    highs.passModel(lp)
+    return highs
+
+
+class _ExactLane:
+    """
+    Exact node LPs on CPU threads (``exact_nodes``): HiGHS's dual simplex
+    solves the LPs of the nodes that hold the global bound while the device
+    solves the rest in batches. A truncated PDHG node LP gives a valid
+    Lagrangian bound, but often one no higher than its parent's, so the
+    nodes at the bottom of the queue never lift the global bound (map06:
+    7,800 nodes moved it 3 units). An exact LP's duals give the node its
+    LP bound, its children their bounds over their boxes, and a vertex to
+    branch on.
+
+    Each thread keeps one HiGHS instance for the rows it last solved (a tree
+    cut refresh changes them) and re-solves from its last basis: on map06 a
+    node took 1.1–1.6 s (about 5,500 pivots), where the root LP takes 3.6 s.
+    HiGHS releases the GIL while it solves. Jobs are functions of NumPy and
+    SciPy arrays only (JAX's settings are per thread).
+    """
+
+    def __init__(self, threads, seconds):
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.threads = max(1, int(threads))
+        self.seconds = float(seconds)
+        self.pool = ThreadPoolExecutor(self.threads, thread_name_prefix="jaddle-exact")
+        self.local = threading.local()  # each thread's (mip, Highs)
+        # Queued and running jobs, in order: (future, node, box, cut version).
+        self.jobs = []
+
+    def room(self):
+        """Whether another node may be queued: up to two a thread, so a
+        thread never waits for the search to hand it the next."""
+        return len(self.jobs) < 2 * self.threads
+
+    def nodes(self):
+        return [job[1] for job in self.jobs]
+
+    def submit(self, node, box, lp_box, mip, version):
+        """Queue ``node``'s LP over ``lp_box`` (the LP's bounds over its box
+        ``box``) for ``mip``'s rows as of cut block ``version``."""
+        lower, upper = (np.array(b, np.float64) for b in lp_box)
+
+        def job():
+            started = time.time()
+            held = getattr(self.local, "held", None)
+            if held is None or held[0] is not mip:
+                held = self.local.held = (mip, _highs_rows(mip))
+            out = _exact_node_lp(held[1], mip, lower, upper, self.seconds)
+            return out, time.time() - started
+
+        self.jobs.append((self.pool.submit(job), node, box, version))
+
+    def finished(self):
+        """The jobs done since the last call, as ``(node, box, version,
+        (status, x, y_eq, y_ineq), seconds)``. A job that raised comes back
+        ``"failed"``."""
+        out, waiting = [], []
+        for future, node, box, version in self.jobs:
+            if not future.done():
+                waiting.append((future, node, box, version))
+                continue
+            try:
+                result, seconds = future.result()
+            except Exception:
+                result, seconds = ("failed", None, None, None), 0.0
+            out.append((node, box, version, result, seconds))
+        self.jobs = waiting
+        return out
+
+    def wait(self, timeout):
+        """Block until a job finishes or ``timeout`` seconds pass."""
+        from concurrent.futures import FIRST_COMPLETED, wait
+
+        if self.jobs:
+            wait([job[0] for job in self.jobs], timeout, FIRST_COMPLETED)
+
+    def drop(self):
+        """Forget every job (queued ones are cancelled; running ones finish
+        on their own) and return their nodes, unsolved."""
+        nodes = []
+        for future, node, _, _ in self.jobs:
+            future.cancel()
+            nodes.append(node)
+        self.jobs = []
+        return nodes
+
+    def shutdown(self):
+        self.drop()
+        self.pool.shutdown(wait=False, cancel_futures=True)
+
+
 class _HeuristicWorkers:
     """Background threads for the CPU heuristics (``parallel_heuristics``),
     so they run while the main thread keeps the device busy with node LPs.
@@ -5630,9 +5879,15 @@ class _HeuristicWorkers:
 
     LANES = ("jump", "round")
 
-    def __init__(self):
+    def __init__(self, jump_lanes=1):
         from concurrent.futures import ThreadPoolExecutor
 
+        # ``jump_lanes`` jump threads (``jump_threads``): ``"jump"``, then
+        # ``"jump1"``, ``"jump2"``, ...
+        self.jump_lanes = ("jump",) + tuple(
+            f"jump{i}" for i in range(1, max(1, int(jump_lanes)))
+        )
+        self.LANES = self.jump_lanes + ("round",)
         self.pools = {
             lane: ThreadPoolExecutor(1, thread_name_prefix=f"jaddle-{lane}")
             for lane in self.LANES
@@ -5715,7 +5970,7 @@ def _jump_job(skip, *args, stop=None, **kwargs):
 
 # Background jobs' kinds (``_HeuristicWorkers.submit``) and the source
 # their incumbents are marked with.
-_JOB_SOURCES = {"jump": "J", "fixprop": "P"}
+_JOB_SOURCES = {"jump": "J", "jumprestart": "J", "fixprop": "P"}
 
 # ``batch_size="auto"``: nodes a batch on a GPU or TPU, and on a CPU.
 _AUTO_BATCH_ACCELERATOR = 128
@@ -5936,6 +6191,8 @@ class _BranchAndBound:
         probing_max_variables=None,
         probing_backend="auto",
         probing_max_useless=1000,
+        probing_passes=_PROBE_MAX_PASSES,
+        probing_max_implications=_PROBE_MAX_IMPLICATIONS,
         bulk_rounding=True,
         bulk_starts=4,
         repair_share=0.2,
@@ -5957,6 +6214,11 @@ class _BranchAndBound:
         restarts=5,
         mip_start=None,
         implied_bound_cuts=True,
+        implied_variable_bounds=True,
+        max_aggregation=None,
+        exact_nodes=0,
+        exact_node_seconds=10.0,
+        exact_band=0.005,
         one_opt=True,
         objective_propagation=False,
         plunge_gap=0.25,
@@ -5966,6 +6228,17 @@ class _BranchAndBound:
         parallel_rounding=True,
         node_jump_seconds=1.0,
         pipeline_batches=True,
+        gpu_dive_every=0,
+        gpu_dive_steps=30,
+        gpu_dive_epochs=8,
+        gpu_dive_share=0.2,
+        gpu_dive_snap=0.1,
+        gpu_dive_fix_share=0.1,
+        gpu_dive_crossover=4,
+        exact_plunges=False,
+        exact_plunge_share=0.25,
+        jump_threads=4,
+        jump_restarts=True,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
         self.settings = {
@@ -6112,6 +6385,13 @@ class _BranchAndBound:
         self.aggregate_integers = (
             small if aggregate_integers == "auto" else bool(aggregate_integers)
         )
+        # Rows added to a c-MIR aggregate (``max_aggregation``; ``None``: 4
+        # with integer aggregation, else ``_CUT_MAX_AGGREGATION``).
+        self.max_aggregation = (
+            (4 if self.aggregate_integers else _CUT_MAX_AGGREGATION)
+            if max_aggregation is None
+            else int(max_aggregation)
+        )
         # Rounds are cheap with Gomory cuts on (slack ones are dropped every
         # round), and the bound keeps climbing past five on larger MIPs.
         many_rounds = self.gomory
@@ -6132,6 +6412,9 @@ class _BranchAndBound:
         self.use_zero_half = bool(zero_half_cuts)
         # Implied-bound cuts (``implied_bound_cuts``) from what probing learnt.
         self.use_implied_bound_cuts = bool(implied_bound_cuts)
+        # Probing's bounds on continuous columns as variable bounds for c-MIR
+        # and flow cover cuts (``implied_variable_bounds``).
+        self.use_implied_variable_bounds = bool(implied_variable_bounds)
         self._implied_bounds = None  # (ProbingCache, ImpliedBounds)
         # 1-opt (``one_opt``) on each new incumbent.
         self.use_one_opt = bool(one_opt)
@@ -6300,11 +6583,38 @@ class _BranchAndBound:
         numba = self.jump_backend == "numba"
         # CPU heuristics on background threads (``_HeuristicWorkers``); their
         # threads start with the first job.
-        self.workers = _HeuristicWorkers() if parallel_heuristics else None
+        self.workers = (
+            _HeuristicWorkers(jump_threads) if parallel_heuristics else None
+        )
+        # Exact node LPs on CPU threads (``exact_nodes``) for the nodes
+        # that hold the global bound; batched search only.
+        self.exact_lane = (
+            _ExactLane(exact_nodes, exact_node_seconds)
+            if exact_nodes and batch_size != 1
+            else None
+        )
+        self.exact_solved = 0
+        self.exact_infeasible = 0
+        self.exact_failed = 0
+        self.exact_seconds = 0.0
+        self.exact_gain = 0.0  # bound gained over the nodes' own, summed
+        # The band of the queue kept for the lane (``exact_band``): nodes
+        # within this share of the gap above the global bound wait in
+        # ``exact_reserved`` (a heap like ``open``) for an exact LP, and the
+        # device never takes them. ``0``: the lane takes the heap's top
+        # whenever it has room, and the device the rest.
+        self.exact_band = float(exact_band)
+        self.exact_reserved = []
         self.worker_jobs = 0
         self.worker_seconds = 0.0
         self.worker_finds = 0
         self.jump_slices = 0
+        if int(jump_threads) < 1:
+            raise ValueError(f"jump_threads must be at least 1, not {jump_threads!r}")
+        self.use_jump_restarts = bool(jump_restarts)
+        self.jump_restarts = 0
+        self.jump_restart_finds = 0
+        self.recent_points = collections.deque(maxlen=64)
         # The incumbent value the last improving-jump slice started from, and
         # the slices' box and warm start (the root's, once it has one).
         self.jump_slice_from = None
@@ -6428,6 +6738,7 @@ class _BranchAndBound:
         self._child_kernels = None  # (mip, _ChildKernels)
         self.deferring = False  # a batch is being evaluated
         self.deferred_branches = []
+        self.dive_starts = None  # this batch's GPU dive starts, when due
         self.in_flight = None  # the batch on the device (``pipeline_batches``)
         self._device_thread = None  # dispatches its LPs (``on_device_thread``)
         self.pending_children = None  # its children, on the device
@@ -6459,6 +6770,10 @@ class _BranchAndBound:
         self.probing_max_variables = probing_max_variables
         self.probing_backend = probing_backend
         self.probing_max_useless = probing_max_useless
+        self.probing_passes = int(probing_passes)
+        self.probing_max_implications = (
+            None if probing_max_implications is None else int(probing_max_implications)
+        )
         self.probe_cache = None
         # Bulk fix-and-propagate (``bulk_fix_and_propagate``) from
         # ``bulk_starts`` starts at once, after the classic one at the root
@@ -6486,6 +6801,48 @@ class _BranchAndBound:
         # (``parallel_rounding``, with ``parallel_heuristics``).
         self.use_parallel_rounding = bool(parallel_rounding)
         self.background_roundings = 0
+        # Batched GPU dives (``gpu_dives``).
+        for name, value, low in (
+            ("gpu_dive_every", gpu_dive_every, 0),
+            ("gpu_dive_steps", gpu_dive_steps, 1),
+            ("gpu_dive_epochs", gpu_dive_epochs, 1),
+            ("gpu_dive_crossover", gpu_dive_crossover, 0),
+        ):
+            if int(value) < low:
+                raise ValueError(f"{name} must be at least {low}, not {value!r}")
+        for name, value in (
+            ("gpu_dive_share", gpu_dive_share),
+            ("gpu_dive_snap", gpu_dive_snap),
+            ("gpu_dive_fix_share", gpu_dive_fix_share),
+        ):
+            if not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], not {value!r}")
+        self.gpu_dive_every = int(gpu_dive_every)
+        self.gpu_dive_steps = int(gpu_dive_steps)
+        self.gpu_dive_epochs = int(gpu_dive_epochs)
+        self.gpu_dive_share = float(gpu_dive_share)
+        self.gpu_dive_snap = float(gpu_dive_snap)
+        self.gpu_dive_fix_share = float(gpu_dive_fix_share)
+        self.gpu_dive_crossover = int(gpu_dive_crossover)
+        # Exact plunges beside the batches (``exact_plunge``).
+        if not 0.0 <= float(exact_plunge_share) <= 1.0:
+            raise ValueError(
+                f"exact_plunge_share must be in [0, 1], not {exact_plunge_share!r}"
+            )
+        self.use_exact_plunges = bool(exact_plunges) and float(exact_plunge_share) > 0
+        self.exact_plunge_share = float(exact_plunge_share)
+        self.exact_plunge_active = False
+        self.exact_plunge_seconds = 0.0
+        self.exact_plunge_stats = collections.Counter(
+            plunges=0, nodes=0, **{"max depth": 0}
+        )
+        self.gpu_dive_seconds = 0.0
+        self.gpu_dive_crossover_seconds = 0.0
+        self.gpu_dive_stats = collections.Counter(
+            runs=0, dives=0, steps=0, leaves=0, finds=0, fixed=0, infeasible=0,
+            backtracks=0, flips=0, crossovers=0,
+            **{"cut off": 0, "out of steps": 0},
+        )
         if not node_jump_seconds >= 0:
             raise ValueError(
                 f"node_jump_seconds must be at least 0, not {node_jump_seconds!r}"
@@ -6568,6 +6925,7 @@ class _BranchAndBound:
         self.integral_splits = 0
         self.history = []
         self.open = []
+        self.exact_reserved = []
         self.counter = itertools.count()
         self.pc_sum = np.zeros((2, mip.num_variables))  # [down, up]
         self.pc_count = np.zeros((2, mip.num_variables))
@@ -6899,6 +7257,10 @@ class _BranchAndBound:
         nodes = [entry[2] for entry in self.open]
         if self.plunge_node is not None:
             nodes.append(self.plunge_node)
+        # The exact lane's (``exact_nodes``): reserved, and queued or running.
+        if self.exact_lane is not None:
+            nodes += [entry[2] for entry in self.exact_reserved]
+            nodes += self.exact_lane.nodes()
         return iter(nodes)
 
     def plunging(self):
@@ -6964,6 +7326,7 @@ class _BranchAndBound:
     def solve_lp(self, lp, warm, max_epochs, **overrides):
         kwargs = dict(self.lp_kwargs, **overrides)
         if warm is not None:
+            warm = _fit_warm(warm, lp)
             # A warm start from an LP at another precision (root or node).
             with jo.local_settings(precision=kwargs.get("precision")):
                 warm = _cast_warm(warm, _wide(lp.c.dtype))
@@ -7193,6 +7556,7 @@ class _BranchAndBound:
             )
         # The old tree.
         self.open = []
+        self.exact_reserved = []
         self.plunge_node = None
         self.plunge_left = 0
         self.deferring = False
@@ -7215,12 +7579,16 @@ class _BranchAndBound:
     def close_all(self):
         """Close every open node: none holds a solution below the cutoff.
         So do the pipeline's (``pipeline_batches``): its batch on the device
-        is dropped, and its children are dropped unread."""
+        is dropped, and its children are dropped unread; so are the exact
+        lane's (``exact_nodes``)."""
         self.close(self.cutoff_bound())
         self.open = []
         self.plunge_node = None
         self.in_flight = None
         self.pending_children = None
+        self.exact_reserved = []
+        if self.exact_lane is not None:
+            self.exact_lane.drop()
 
     def empty_root(self):
         """The result when the root box holds no solution below the cutoff
@@ -8317,7 +8685,7 @@ class _BranchAndBound:
                     children.reverse()
         if (
             children
-            and self.plunging()
+            and (self.plunging() or self.exact_plunge_active)
             and self.plunge_left > 0
             and self.plunge_node is None
         ):
@@ -8341,6 +8709,9 @@ class _BranchAndBound:
             return True  # children at or past the cutoff are pruned already
         cutoff = self.cutoff()
         best = min(self.open[0][2].bound if self.open else np.inf, bound)
+        reserved = getattr(self, "exact_reserved", None)  # (``exact_band``)
+        if reserved:
+            best = min(best, reserved[0][2].bound)
         if not (np.isfinite(cutoff) and np.isfinite(best)):
             return True
         return child.bound <= best + self.plunge_gap * max(cutoff - best, 0.0)
@@ -8374,6 +8745,7 @@ class _BranchAndBound:
             and bound < self.cutoff()
             and not self.out_of_time()
             and self.batch_size > 1
+            and not self.exact_plunge_active
             and spent < budget
         ):
             # Continuous batching: a batched node LP runs at most
@@ -8648,6 +9020,11 @@ class _BranchAndBound:
                 self.close(bound, rigorous)
                 return
         self.active_bound = bound
+        # Recent node points, restarts for the background jumps.
+        self.recent_points.append(x)
+        if self.dive_starts is not None:
+            # A start for this batch's GPU dives (``gpu_dives``).
+            self.dive_starts.append((bound, x, lower, upper, warm))
         if self.deferring:
             # Batched on the device: split with the batch's other members.
             self.deferred_branches.append(
@@ -8733,7 +9110,7 @@ class _BranchAndBound:
         leaves = max(0, self.nodes - self.branched_nodes)
         conflicts = 0 if self.conflicts is None else len(self.conflicts)
         print(
-            f" {source:1.1} {_log_count(self.nodes):>7} {_log_count(len(self.open)):>7}"
+            f" {source:1.1} {_log_count(self.nodes):>7} {_log_count(len(self.open) + len(self.exact_reserved)):>7}"
             f"   {_log_count(leaves):>7} {100 * self.explored():6.2f}%"
             f"   {_log_value(self.model_value(bound)):<15}"
             f" {_log_value(self.model_value(best)):<15} {gap_text:>8}"
@@ -8823,6 +9200,25 @@ class _BranchAndBound:
                     f"({self.background_jumps} with a jump)",
                 )
             )
+        if self.exact_plunge_stats["nodes"]:
+            stats = self.exact_plunge_stats
+            rows.append(
+                (
+                    "Exact plunges",
+                    f"{stats['nodes']} nodes in {stats['plunges']} plunges, depth "
+                    f"to {stats['max depth']}, {self.exact_plunge_seconds:.1f}s",
+                )
+            )
+        if self.gpu_dive_stats["runs"]:
+            stats = self.gpu_dive_stats
+            rows.append(
+                (
+                    "GPU dives",
+                    f"{stats['dives']} in {stats['runs']} runs, {stats['steps']} "
+                    f"steps, {stats['leaves']} leaves, {stats['finds']} improved, "
+                    f"{self.gpu_dive_seconds:.1f}s",
+                )
+            )
         if self.near_integral_tries:
             rows.append(
                 (
@@ -8870,6 +9266,14 @@ class _BranchAndBound:
             },
             "background_roundings": self.background_roundings,
             "background_jumps": self.background_jumps,
+            "exact_plunges": dict(
+                self.exact_plunge_stats, seconds=self.exact_plunge_seconds
+            ),
+            "gpu_dives": dict(
+                self.gpu_dive_stats,
+                seconds=self.gpu_dive_seconds,
+                crossover_seconds=self.gpu_dive_crossover_seconds,
+            ),
             "inout_cuts": self.inout_cuts,
             "inout_rounds": self.inout_rounds,
             "tree_cut_refreshes": self.tree_cut_refreshes,
@@ -8932,6 +9336,8 @@ class _BranchAndBound:
                 "seconds": self.worker_seconds,
                 "improvements": self.worker_finds,
                 "jump_slices": self.jump_slices,
+                "jump_restarts": self.jump_restarts,
+                "jump_restart_finds": self.jump_restart_finds,
             },
             "strong_branch_nodes": self.strong_branch_nodes,
             "strong_branch_lps": self.strong_branch_lps,
@@ -8956,6 +9362,13 @@ class _BranchAndBound:
             "node_crossover_vertices": self.node_crossover_vertices,
             "node_crossover_integral": self.node_crossover_integral,
             "node_crossover_seconds": self.node_crossover_seconds,
+            "exact_nodes": {
+                "solved": self.exact_solved,
+                "infeasible": self.exact_infeasible,
+                "failed": self.exact_failed,
+                "seconds": self.exact_seconds,
+                "bound_gain": self.exact_gain,
+            },
             "mip_start_accepted": self.mip_start_accepted,
             "one_opt_finds": self.one_opt_finds,
             "plunges_stopped": self.plunges_stopped,
@@ -8965,6 +9378,8 @@ class _BranchAndBound:
     def node_crossover_due(self):
         """Whether this node's LP point is crossed over (``node_crossover``,
         every ``node_crossover_every`` nodes, time permitting)."""
+        if self.exact_plunge_active:
+            return not self.out_of_time()  # exact plunges cross every node over
         return (
             self.use_node_crossover
             and self.nodes % self.node_crossover_every == 0
@@ -9570,12 +9985,13 @@ class _BranchAndBound:
             lower,
             upper,
             aggregate_integers=self.aggregate_integers,
-            max_aggregation=4 if self.aggregate_integers else _CUT_MAX_AGGREGATION,
+            max_aggregation=self.max_aggregation,
             flow_covers=self.use_flow_covers,
             backend=self.separation_backend,
             conflict_graph=graph,
             integrality=self.cut_int,
             implied_bounds=implied,
+            implied_variable_bounds=self.use_implied_variable_bounds,
         )
 
     def reserve_tree_cuts(self, result):
@@ -10204,52 +10620,87 @@ class _BranchAndBound:
         return self.round_repair_seconds <= self.heuristic_effort * elapsed
 
     def schedule_improve_jump(self):
-        """With ``parallel_heuristics`` and the numba jump: an improving
-        jump (``improve_jump``) of ``_JUMP_SLICE_SECONDS`` from the
-        incumbent, on the background jump lane when it is idle. A slice that
-        finds nothing better is not repeated until the incumbent changes
-        (by the tree, RINS or anything else)."""
+        """With ``parallel_heuristics`` and the numba jump: improving jumps
+        (``feasibility_jump(improve=True)`` below the cutoff) on every idle
+        jump lane (``jump_threads``). A new incumbent gets one slice of
+        ``_JUMP_SLICE_SECONDS`` from it; every other idle lane restarts
+        (``jump_restarts``) for ``_JUMP_RESTART_SECONDS`` from a perturbed
+        incumbent or a recent node's LP point (``jump_restart_start``).
+        Before, a slice that found nothing was not repeated until the
+        incumbent changed, and the lane sat idle: on ns1830653 the jump
+        found nearly every incumbent, and was idle most of the time."""
         if (
             self.workers is None
             or not self.use_jump
             or self.jump_backend != "numba"
             or self.incumbent is None
-            or not self.workers.idle("jump")
             or self.out_of_time()
         ):
             return
         value, x = self.incumbent
-        if self.jump_slice_from is not None and value >= self.jump_slice_from:
-            return
-        seconds = _JUMP_SLICE_SECONDS
-        if self.deadline is not None:
-            seconds = min(seconds, self.deadline - time.time())
-        if seconds <= 0:
-            return
-        self.jump_slice_from = value
+        fresh = self.jump_slice_from is None or value < self.jump_slice_from
         lower, upper, warm = self.jump_box or (self.base.lower, self.base.upper, None)
         limit = self.jump_iterations
         if limit is None:
             limit = np.iinfo(np.int64).max
-        self.jump_slices += 1
-        self.workers.submit(
-            "jump",
-            "jump",
-            feasibility_jump,
-            self.base,
-            x.copy(),
-            lower,
-            upper,
-            tol=self.feas_tol,
-            max_iterations=limit,
-            deadline=time.time() + seconds,
-            seed=2 + self.jump_slices,
-            cutoff=self.cutoff(box=False),
-            backend="numba",
-            improve=True,
-            improve_step=self.objective_step,
-            info=warm,
-        )
+        for lane in self.workers.jump_lanes:
+            if not self.workers.idle(lane):
+                continue
+            if fresh:
+                start, seconds, kind = x.copy(), _JUMP_SLICE_SECONDS, "jump"
+                self.jump_slice_from = value
+                fresh = False
+            elif self.use_jump_restarts:
+                start = self.jump_restart_start(x, lower, upper)
+                seconds, kind = _JUMP_RESTART_SECONDS, "jumprestart"
+                self.jump_restarts += 1
+            else:
+                continue
+            if self.deadline is not None:
+                seconds = min(seconds, self.deadline - time.time())
+            if seconds <= 0:
+                return
+            self.jump_slices += 1
+            self.workers.submit(
+                lane,
+                kind,
+                feasibility_jump,
+                self.base,
+                start,
+                lower,
+                upper,
+                tol=self.feas_tol,
+                max_iterations=limit,
+                deadline=time.time() + seconds,
+                seed=2 + self.jump_slices,
+                cutoff=self.cutoff(box=False),
+                backend="numba",
+                improve=True,
+                improve_step=self.objective_step,
+                info=warm,
+            )
+
+    def jump_restart_start(self, x, lower, upper):
+        """A restart point for a background jump (``jump_restarts``),
+        alternating between the incumbent ``x`` with a random 5-20% of its
+        integers moved (a binary flipped, another integer one step, within
+        ``lower``/``upper``) and a recent node's LP point (the tree's view
+        near the bound), when there is one."""
+        rng = np.random.default_rng(self.jump_slices)
+        if self.recent_points and self.jump_restarts % 2:
+            return np.array(self.recent_points[rng.integers(len(self.recent_points))])
+        start = x.copy()
+        ints = np.flatnonzero(self.is_int & (lower < upper))
+        if ints.size:
+            count = max(1, int(rng.uniform(0.05, 0.2) * ints.size))
+            cols = rng.choice(ints, size=count, replace=False)
+            step = np.where(rng.random(count) < 0.5, -1.0, 1.0)
+            moved = np.clip(start[cols] + step, lower[cols], upper[cols])
+            # A step that hit a bound goes the other way instead.
+            stuck = moved == start[cols]
+            moved[stuck] = np.clip(start[cols][stuck] - step[stuck], lower[cols][stuck], upper[cols][stuck])
+            start[cols] = moved
+        return start
 
     def collect_heuristics(self, schedule=True):
         """Check the points of finished background jobs
@@ -10266,9 +10717,12 @@ class _BranchAndBound:
             if feasible:
                 source = mark if mark in ("P", "J") else _JOB_SOURCES[kind]
                 self.try_incumbent(x, source, warm)
-            self.worker_finds += self.incumbent is not None and (
+            improved = self.incumbent is not None and (
                 before is None or self.incumbent[0] < before
             )
+            self.worker_finds += improved
+            if kind == "jumprestart":
+                self.jump_restart_finds += improved
         if schedule:
             self.schedule_improve_jump()
 
@@ -10325,6 +10779,7 @@ class _BranchAndBound:
         settings["root_strong_candidates"] = 0
         settings["root_crossover"] = False
         settings["round_repair"] = False
+        settings["exact_nodes"] = 0
         settings["mip_start"] = None
         # A sub-MIP's cutoff is its parent's, not a solution of its own:
         # it dives for one (and needs no node cuts in its short budget).
@@ -10488,6 +10943,246 @@ class _BranchAndBound:
             self.try_incumbent(x, "D", warm)
         finally:
             self.heuristic_seconds += time.time() - started
+
+    def gpu_dive_due(self):
+        """Whether the GPU dives run after this batch: on, every
+        ``gpu_dive_every`` batches, within ``gpu_dive_share`` of the tree's
+        time (after its first seconds)."""
+        if not self.gpu_dive_every or self.batch_size < 2 or self.out_of_time():
+            return False
+        if self.batches % self.gpu_dive_every:
+            return False
+        tree = self.tree_elapsed()
+        return tree <= _TREE_CUT_GRACE_SECONDS or (
+            self.gpu_dive_seconds < self.gpu_dive_share * tree
+        )
+
+    def gpu_dives(self, starts):
+        """
+        Batched LP dives on the device, for incumbents: up to ``batch_size``
+        dives at once, from the lowest-bound ``starts`` (``(bound, x, lower,
+        upper, warm)`` of nodes that branched), each step one batched call
+        (``solve_batch``) for every dive still alive.
+
+        A step fixes, in each dive, every free integer within
+        ``gpu_dive_snap`` of an integer, or else the least fractional
+        ``gpu_dive_fix_share`` of the fractional ones (at least one), to
+        its nearest integer, or towards the incumbent in every other dive
+        (guided diving); propagates (objective-aware,
+        ``heuristic_propagator``), halving a rejected chunk down to one
+        variable, whose other rounding is tried last; a chunk whose LP bound
+        then reaches the cutoff is undone and the next is a quarter its
+        size (growing back twofold a step after); then re-solves the dives' LPs warm for
+        ``gpu_dive_epochs``. A dive ends at an integral LP point (tried as
+        an incumbent, ``"D"``), an infeasible box, a bound at the cutoff, or
+        after ``gpu_dive_steps``. Truncated node LPs leave most integers
+        fractional (ns1830653: a median of 263 of 458, never under 122, at
+        depths to 26), and a node's children reach a batch two steps later,
+        so the tree itself reaches no integral leaf; fixing chunks, the
+        dives reach one in a few dozen batched calls.
+        """
+        started = time.time()
+        ints = self.is_int
+        starts = sorted(starts, key=lambda start: start[0])[: self.batch_size]
+        guided = self.incumbent is not None
+        dives = [
+            dict(
+                x=np.asarray(x, np.float64),
+                lower=np.array(lower, np.float64),
+                upper=np.array(upper, np.float64),
+                warm=warm,
+                guide=guided and i % 2 == 1,
+                # The lowest-bound few cross each LP over to a vertex.
+                crossover=i < self.gpu_dive_crossover,
+                limit=None,  # the most integers a step fixes (None: no limit)
+                last=None,  # the last step's single fix (column, value)
+                fixed=0,  # how many the last step fixed
+                previous=None,  # the box before the last step
+            )
+            for i, (_, x, lower, upper, warm) in enumerate(starts)
+        ]
+        self.gpu_dive_stats["runs"] += 1
+        self.gpu_dive_stats["dives"] += len(dives)
+        before = None if self.incumbent is None else self.incumbent[0]
+        try:
+            for _ in range(self.gpu_dive_steps):
+                alive = []
+                for dive in dives:
+                    if self.fix_dive_chunk(dive, ints):
+                        alive.append(dive)
+                if not alive or self.out_of_time():
+                    break
+                self.gpu_dive_stats["steps"] += 1
+                results = self.solve_batch(
+                    [(dive["lower"], dive["upper"]) for dive in alive],
+                    [dive["warm"][0] for dive in alive],
+                    [dive["warm"][1] for dive in alive],
+                    self.gpu_dive_epochs,
+                    self.batch_size,
+                )
+                dives = []
+                cutoff = self.cutoff()
+                for dive, result in zip(alive, results):
+                    raw, _ = self.bound_over(
+                        self.result_terms(result, dive["lower"], dive["upper"]),
+                        dive["lower"],
+                        dive["upper"],
+                    )
+                    if self.round_bound(raw) >= cutoff:
+                        if dive["fixed"] > 1 and dive["previous"] is not None:
+                            # The chunk cost too much: back to the box
+                            # before it, a quarter of it next time.
+                            self.gpu_dive_stats["backtracks"] += 1
+                            dive["lower"], dive["upper"] = dive["previous"]
+                            dive["limit"] = max(1, dive["fixed"] // 4)
+                            dive["fixed"], dive["previous"] = 0, None
+                            dives.append(dive)
+                            continue
+                        last = dive.get("last")
+                        if last is not None and dive["previous"] is not None:
+                            # One variable's rounding cut it off: its other
+                            # rounding, once, from the box before it.
+                            j, value = last
+                            lower, upper = dive["previous"]
+                            other = value - 1.0 if value > dive["x"][j] else value + 1.0
+                            if lower[j] <= other <= upper[j]:
+                                self.gpu_dive_stats["flips"] += 1
+                                dive["lower"], dive["upper"] = lower, upper
+                                dive["flip"] = (j, other)
+                                dive["previous"] = dive["last"] = None
+                                dives.append(dive)
+                                continue
+                        self.gpu_dive_stats["cut off"] += 1
+                        continue  # no better point below
+                    dive["x"] = np.asarray(result["solution"].primal, np.float64)
+                    dive["warm"] = (result["solution"], result["opt_state"])
+                    if dive["crossover"]:
+                        self.cross_over_dive(dive)
+                    if dive["limit"] is not None:
+                        dive["limit"] *= 2  # it held: grow again
+                    dives.append(dive)
+                if not dives:
+                    break
+            for dive in dives:  # out of steps: the last points, rounded
+                self.gpu_dive_stats["out of steps"] += 1
+                self.try_incumbent(dive["x"], "D", dive["warm"])
+        finally:
+            elapsed = time.time() - started
+            self.gpu_dive_seconds += elapsed
+            self.heuristic_seconds += elapsed
+            self.gpu_dive_stats["finds"] += self.incumbent is not None and (
+                before is None or self.incumbent[0] < before
+            )
+
+    def cross_over_dive(self, dive):
+        """Cross a GPU dive's LP point over to an optimal vertex with HiGHS
+        (``jaddle_linear.crossover``, on the host): the dive then fixes from
+        the vertex, where far more integers are exactly integral (on
+        ns1830653's dive LPs about half as many fractional as at the PDHG
+        point, in 50-90 ms), and warm-starts its next LP there. Kept as is
+        when HiGHS does not prove the vertex optimal in time."""
+        started = time.time()
+        limit = 10.0
+        if self.deadline is not None:
+            limit = min(limit, max(self.seconds_left(), 0.0))
+        try:
+            crossed = jl.crossover(
+                self.node_lp(dive["lower"], dive["upper"]),
+                dive["warm"][0],
+                highs_options={"time_limit": limit},
+            )
+        finally:
+            self.gpu_dive_stats["crossovers"] += 1
+            self.gpu_dive_crossover_seconds += time.time() - started
+        if not crossed["converged"]:
+            return
+        dive["x"] = np.asarray(crossed["solution"].primal, np.float64)
+        dive["warm"] = (crossed["solution"], dive["warm"][1])
+
+    def fix_dive_chunk(self, dive, ints):
+        """One step of a GPU dive (``gpu_dives``) on the host: fix a chunk of
+        its free integers in its box and propagate. Returns whether the dive
+        goes on to a re-solve; a dive at an integral point is tried as an
+        incumbent and ends."""
+        x, lower, upper = dive["x"], dive["lower"], dive["upper"]
+        free = ints & (lower < upper)
+        distance = np.abs(x - np.round(x))
+        fractional = free & (distance > self.int_tol)
+        if not fractional.any():
+            self.gpu_dive_stats["leaves"] += 1
+            self.try_incumbent(x, "D", dive["warm"])
+            return False
+        if dive.get("flip") is not None:
+            # The other rounding of a single fix whose LP was cut off.
+            j, value = dive.pop("flip")
+            lo, up = lower.copy(), upper.copy()
+            lo[j] = up[j] = value
+            lo, up, infeasible = self.heuristic_propagator()(lo, up)
+            if infeasible:
+                self.gpu_dive_stats["infeasible"] += 1
+                return False
+            dive["fixed"], dive["previous"], dive["last"] = 1, None, None
+            dive["lower"], dive["upper"] = lo, up
+            return True
+        target = np.clip(np.round(x), lower, upper)
+        if dive["guide"] and self.incumbent is not None:
+            # Towards the incumbent: its value, or the nearer integer on its
+            # side of x.
+            incumbent = self.incumbent[1]
+            target = np.clip(
+                np.where(incumbent > x, np.ceil(x), np.floor(x)), lower, upper
+            )
+        chunk = free & (distance <= self.gpu_dive_snap)
+        if not (chunk & fractional).any():
+            cand = np.flatnonzero(fractional)
+            count = max(1, math.ceil(self.gpu_dive_fix_share * cand.size))
+            chunk = np.zeros_like(free)
+            chunk[cand[np.argsort(distance[cand], kind="stable")[:count]]] = True
+        if dive["limit"] is not None and chunk.sum() > dive["limit"]:
+            # After a backtrack: the most nearly integral few only.
+            cand = np.flatnonzero(chunk)
+            chunk = np.zeros_like(free)
+            chunk[cand[np.argsort(distance[cand], kind="stable")[: dive["limit"]]]] = True
+        propagator = self.heuristic_propagator()
+        # The chunk, most nearly integral first; one propagation rejects
+        # it: its first half, and so on down to one variable, which then
+        # tries its other rounding (as ``fix_and_propagate`` splits).
+        order = np.flatnonzero(chunk)
+        order = order[np.argsort(distance[order], kind="stable")]
+        size = order.size
+        tries = []
+        while size >= 1:
+            tries.append((order[:size], target[order[:size]]))
+            if size == 1:
+                break
+            size //= 2
+        j = order[0]
+        if fractional[j]:
+            other = np.floor(x[j]) if target[j] > x[j] else np.ceil(x[j])
+            if lower[j] <= other <= upper[j] and other != target[j]:
+                tries.append((order[:1], np.array([other])))
+        for cols, values in tries:
+            lo, up = lower.copy(), upper.copy()
+            lo[cols] = values
+            up[cols] = values
+            lo, up, infeasible = propagator(lo, up)
+            if not infeasible:
+                dive["fixed"] = int(cols.size)
+                self.gpu_dive_stats["fixed"] += dive["fixed"]
+                dive["previous"] = (lower, upper)
+                dive["last"] = (int(cols[0]), float(values[0])) if cols.size == 1 else None
+                dive["lower"], dive["upper"] = lo, up
+                return True
+        if dive["previous"] is not None and dive["fixed"] > 1:
+            # Every try is rejected: the last chunk left no room. Undo it
+            # and fix a quarter as many next time.
+            self.gpu_dive_stats["backtracks"] += 1
+            dive["lower"], dive["upper"] = dive["previous"]
+            dive["limit"] = max(1, dive["fixed"] // 4)
+            dive["fixed"], dive["previous"] = 0, None
+            return True
+        self.gpu_dive_stats["infeasible"] += 1
+        return False
 
     def jaddle_rins(self, x, seconds, warm=None, min_fixed=0.3):
         """
@@ -10748,8 +11443,10 @@ class _BranchAndBound:
 
     def next_node(self):
         """The next node to solve: the pending plunge child, or else the top
-        of the heap (which starts a new plunge)."""
-        if self.plunge_node is not None:
+        of the heap (which starts a new plunge). With exact plunges
+        (``exact_plunges``) the plunge child is theirs: the batches take the
+        heap's top."""
+        if self.plunge_node is not None and not self.exact_plunges_on():
             node, self.plunge_node = self.plunge_node, None
             return node
         _, _, node = heapq.heappop(self.open)
@@ -10951,10 +11648,11 @@ class _BranchAndBound:
             self.pipelined_step()
             return
         batch = self.launch_next()
-        if batch is None:
-            return
-        self.process_batch(batch)
-        self.flush_branches()
+        if batch is not None:
+            self.process_batch(batch)
+            self.flush_branches()
+        if self.exact_plunges_on():
+            self.exact_plunge(force=batch is None)
 
     def pipelined_step(self):
         """One step of the pipelined batch loop (``pipeline_batches``):
@@ -10975,10 +11673,91 @@ class _BranchAndBound:
         if pending is not None:
             self.finish_branches(pending)
         current, self.in_flight = self.in_flight, self.launch_next()
-        if current is None:
+        if current is not None:
+            self.process_batch(current)
+            self.pending_children = self.launch_branches()
+        if self.exact_plunges_on():
+            # With nothing else to do (only the plunge child left), the
+            # plunge runs whatever its share, or the loop would stall.
+            idle = (
+                current is None
+                and self.in_flight is None
+                and self.pending_children is None
+            )
+            self.exact_plunge(force=idle)
+
+    def exact_plunges_on(self):
+        """Whether exact plunges (``exact_plunges``) run beside the batches."""
+        return self.use_exact_plunges and self.batch_size > 1
+
+    def exact_plunge(self, force=False):
+        """
+        Exact plunges beside the batched search (``exact_plunges``): the
+        plunge child (or, with none, the heap's top, starting a new plunge)
+        is solved alone to convergence (``solve_node_lp``,
+        ``node_max_epochs``), crossed over to a vertex (``cross_over_node``)
+        and evaluated as any node, so an integral vertex is an incumbent
+        (``"T"``) and the plunge goes on into its preferred child, the other
+        one queued: depth-first search with the tree's own backtracking,
+        propagation and conflicts, as HiGHS's dives. The batches' truncated
+        LPs (``batch_epochs``) raise the bound but reach no integral leaf
+        (ns1830653: at least 122 of 458 integers fractional at every node to
+        depth 26), and LP dives with fixed chunks die there (every free
+        integer fractional even at the vertex). Runs while the plunges have
+        taken at most ``exact_plunge_share`` of the tree's time; with
+        ``force`` (nothing else can go on), at least one node whatever.
+        """
+        started = time.time()
+        tree = self.tree_elapsed()
+        if (
+            not force
+            and tree > _TREE_CUT_GRACE_SECONDS
+            and self.exact_plunge_seconds > self.exact_plunge_share * tree
+        ):
             return
-        self.process_batch(current)
-        self.pending_children = self.launch_branches()
+        budget = started + max(
+            0.05, self.exact_plunge_share * (tree + 1.0) - self.exact_plunge_seconds
+        )
+        self.exact_plunge_active = True
+        first = force
+        try:
+            while not self.out_of_time() and (first or time.time() < budget):
+                first = False
+                if self.plunge_node is not None:
+                    node, self.plunge_node = self.plunge_node, None
+                elif self.open:
+                    _, _, node = heapq.heappop(self.open)
+                    self.plunge_left = self.plunge_depth
+                    self.exact_plunge_stats["plunges"] += 1
+                else:
+                    break
+                if node.bound >= self.cutoff():
+                    self.close(node.bound)
+                    continue
+                lower, upper = self.expand(node.changes)
+                if np.any(lower > upper):
+                    self.close(max(node.bound, self.cutoff_bound()))
+                    continue
+                box = self.prune_by_conflicts(node, lower, upper)
+                if box is None:
+                    continue
+                lower, upper = box
+                result = self.solve_node_lp(
+                    lower, upper, self.fit_warm(node), self.node_max_epochs
+                )
+                if result["stop_reason"] in ("interrupted", "time_limit"):
+                    self.push(node)
+                    break
+                self.nodes += 1
+                self.exact_plunge_stats["nodes"] += 1
+                self.exact_plunge_stats["max depth"] = max(
+                    self.exact_plunge_stats["max depth"], node.depth
+                )
+                self.evaluate(node, lower, upper, None, result)
+                self.log(" ", None)
+        finally:
+            self.exact_plunge_active = False
+            self.exact_plunge_seconds += time.time() - started
 
     def pipeline_nodes(self):
         """The nodes the pipeline holds outside the queue
@@ -11004,6 +11783,124 @@ class _BranchAndBound:
             for node in batch["members"]:
                 self.push(node)
 
+    def exact_eligible(self, node):
+        """Whether the exact lane may take ``node``: not taken before, below
+        the root, with a warm start (whose shapes its exact solution
+        takes), once the heap is in bound order (not the dive before the
+        first incumbent)."""
+        return (
+            self.exact_lane is not None
+            and not node.exact_tried
+            and node.depth > 0
+            and node.warm is not None
+            and node.warm[0] is not None
+            and not self.diving()
+            and not self.out_of_time()
+        )
+
+    def exact_band_top(self):
+        """The top of the band the lane keeps (``exact_band``): the global
+        bound plus ``exact_band`` of the gap to the cutoff; ``-inf`` (no
+        band) without the lane, a band or a cutoff."""
+        if self.exact_lane is None or self.exact_band <= 0.0:
+            return -np.inf
+        cutoff = self.cutoff()
+        bound = self.global_bound()
+        if not (np.isfinite(cutoff) and np.isfinite(bound)):
+            return -np.inf
+        return bound + self.exact_band * max(cutoff - bound, 0.0)
+
+    def feed_exact(self):
+        """Hand the lane the lowest reserved nodes while it has room."""
+        lane = self.exact_lane
+        while lane is not None and self.exact_reserved and lane.room():
+            _, _, node = heapq.heappop(self.exact_reserved)
+            if node.bound >= self.cutoff():
+                self.close(node.bound)
+                continue
+            box = self.expand(node.changes)
+            if np.any(box[0] > box[1]):
+                self.close(max(node.bound, self.cutoff_bound()))
+                continue
+            box = self.prune_by_conflicts(node, *box)
+            if box is None:
+                continue
+            self.submit_exact(node, box)
+
+    def wants_exact(self, node):
+        """Without a band (``exact_band=0``): whether the lane takes
+        ``node``, popped from the top of the heap, now. Once the heap is in
+        bound order its top holds the global bound, so the lane takes the
+        lowest-bound nodes whenever it has room."""
+        return self.exact_eligible(node) and self.exact_lane.room()
+
+    def submit_exact(self, node, box):
+        node.exact_tried = True
+        lower, upper = box
+        self.exact_lane.submit(
+            node,
+            box,
+            (self.lp_lower(lower), self.lp_upper(upper)),
+            self.mip,
+            self.cut_version,
+        )
+
+    def collect_exact(self):
+        """Evaluate the nodes the exact lane has solved, as batch members
+        are evaluated: the HiGHS solution stands in for the PDHG one, so
+        the node's bound is its exact duals' Lagrangian bound (rigorous at
+        any duals), it branches on the vertex, and its children's bounds
+        come from those duals over their boxes. A node HiGHS proves
+        infeasible is closed; one it did not finish goes back to the queue
+        for the device."""
+        lane = self.exact_lane
+        if lane is None:
+            return
+        for node, box, version, outcome, seconds in lane.finished():
+            self.exact_seconds += seconds
+            status, x, y_eq, y_ineq = outcome
+            if node.bound >= self.cutoff():
+                self.close(node.bound)
+                continue
+            if status == "infeasible":
+                self.exact_infeasible += 1
+                self.close(max(node.bound, self.cutoff_bound()))
+                continue
+            template = node.warm[0]
+            if (
+                status != "optimal"
+                or version > self.cut_version
+                or y_ineq.size != np.shape(template.dual_ineq)[0]
+                or y_eq.size > np.shape(template.dual_eq)[0]
+            ):
+                # Unsolved, or for rows the search no longer has (a restart).
+                self.exact_failed += 1
+                self.push(node)
+                continue
+            dual_eq = np.zeros(np.shape(template.dual_eq)[0])
+            dual_eq[: y_eq.size] = y_eq
+            solution = template._replace(
+                primal=x, dual_eq=dual_eq, dual_ineq=y_ineq
+            )
+            if version < self.cut_version:
+                # Tree cut refreshes since: the replaced slots' duals go.
+                solution = self.stale_free(solution, version)
+            lower, upper = box
+            raw, _ = self.lp_bound(solution, lower, upper)
+            if np.isfinite(raw):
+                self.exact_gain += max(raw - node.bound, 0.0)
+            self.exact_solved += 1
+            self.nodes += 1
+            result = dict(
+                solution=solution,
+                converged=True,
+                stop_reason="exact",
+                epochs=0,
+                opt_state=node.warm[1],
+            )
+            self.evaluate(node, lower, upper, None, result)
+            self.log(" ", None)
+
     def launch_next(self):
         """Pick up to ``batch_size`` open nodes and dispatch their LPs
         (``launch_batch``). Returns the batch (members, boxes, the device
@@ -11011,17 +11908,27 @@ class _BranchAndBound:
         with no node to solve."""
         members, boxes = [], []
         in_flight = 0 if self.in_flight is None else len(self.in_flight["members"])
-        while len(members) < self.batch_size and (
-            self.open or self.plunge_node is not None
-        ):
+        self.feed_exact()
+        band_top = self.exact_band_top()
+        plunge_child = self.plunge_node is not None and not self.exact_plunges_on()
+        while len(members) < self.batch_size and (self.open or plunge_child):
+            plunge_child = False
             if (
                 self.max_nodes is not None
                 and self.nodes + in_flight + len(members) >= self.max_nodes
             ):
                 break
+            from_heap = self.plunge_node is None or self.exact_plunges_on()
             node = self.next_node()
             if node.bound >= self.cutoff():
                 self.close(node.bound)
+                continue
+            if from_heap and node.bound <= band_top and self.exact_eligible(node):
+                # In the band the lane keeps (``exact_band``): it waits for
+                # an exact LP instead of a truncated one.
+                heapq.heappush(
+                    self.exact_reserved, (node.bound, next(self.counter), node)
+                )
                 continue
             box = self.expand(node.changes)
             if np.any(box[0] > box[1]):
@@ -11030,6 +11937,9 @@ class _BranchAndBound:
                 continue
             box = self.prune_by_conflicts(node, *box)
             if box is None:
+                continue
+            if from_heap and self.exact_band <= 0.0 and self.wants_exact(node):
+                self.submit_exact(node, box)
                 continue
             members.append(node)
             boxes.append(box)
@@ -11051,7 +11961,18 @@ class _BranchAndBound:
     def process_batch(self, batch):
         """Read back a dispatched batch (``launch_next``) and evaluate its
         members in order on the host, as the serial search does. Members to
-        split on the device are left in ``deferred_branches``."""
+        split on the device are left in ``deferred_branches``. When due, the
+        GPU dives (``gpu_dives``) then start from the members that
+        branched."""
+        self.dive_starts = [] if self.gpu_dive_due() else None
+        try:
+            self._process_batch(batch)
+        finally:
+            starts, self.dive_starts = self.dive_starts, None
+        if starts:
+            self.gpu_dives(starts)
+
+    def _process_batch(self, batch):
         members, boxes = batch["members"], batch["boxes"]
         self.batch_waiting = members
         results = self.read_batch(batch["handle"])
@@ -11266,6 +12187,8 @@ class _BranchAndBound:
         finally:
             if self.workers is not None:
                 self.workers.shutdown()
+            if self.exact_lane is not None:
+                self.exact_lane.shutdown()
             if self._device_thread is not None:
                 self._device_thread.shutdown(wait=True)
                 self._device_thread = None
@@ -11335,6 +12258,8 @@ class _BranchAndBound:
                 deadline=started + self.probing_budget,
                 backend=self.probing_backend,
                 max_useless=self.probing_max_useless,
+                max_passes=self.probing_passes,
+                max_implications=self.probing_max_implications,
             )
             for key, value in (
                 ("probed", probed.probed),
@@ -11578,8 +12503,28 @@ class _BranchAndBound:
                 or self.plunge_node is not None
                 or self.in_flight is not None
                 or self.pending_children is not None
+                or (
+                    self.exact_lane is not None
+                    and (self.exact_lane.jobs or self.exact_reserved)
+                )
             ):
                 self.collect_heuristics()
+                self.collect_exact()
+                self.feed_exact()
+                if (
+                    self.exact_lane is not None
+                    and (self.exact_lane.jobs or self.exact_reserved)
+                    and not self.open
+                    and self.plunge_node is None
+                    and self.in_flight is None
+                    and self.pending_children is None
+                ):
+                    # Only the lane's nodes are left: wait for one.
+                    if self.out_of_time():
+                        status = "time_limit"
+                        break
+                    self.exact_lane.wait(0.05)
+                    continue
                 if self.out_of_time():
                     status = "time_limit"
                     break
@@ -11636,8 +12581,13 @@ class _BranchAndBound:
             status = "interrupted"
         finally:
             # The pipeline's nodes back in the queue (``pipeline_batches``),
-            # so the bound and a restart see them.
+            # so the bound and a restart see them; likewise the exact
+            # lane's, unsolved.
             self.drain_pipeline()
+            if self.exact_lane is not None:
+                for node in self.exact_lane.drop():
+                    node.exact_tried = False
+                    self.push(node)
             started, strong_before = self.tree_clock
             self.tree_seconds += time.time() - started
             self.tree_strong_seconds += self.strong_branch_seconds - strong_before
@@ -11730,6 +12680,8 @@ def solve(
     probing_max_variables=None,
     probing_backend="auto",
     probing_max_useless=1000,
+    probing_passes=_PROBE_MAX_PASSES,
+    probing_max_implications=_PROBE_MAX_IMPLICATIONS,
     bulk_rounding=True,
     bulk_starts=4,
     repair_share=0.2,
@@ -11762,6 +12714,11 @@ def solve(
     restarts=5,
     mip_start=None,
     implied_bound_cuts=True,
+    implied_variable_bounds=True,
+    max_aggregation=None,
+    exact_nodes=0,
+    exact_node_seconds=10.0,
+    exact_band=0.005,
     one_opt=True,
     objective_propagation=False,
     plunge_gap=0.25,
@@ -11771,6 +12728,17 @@ def solve(
     parallel_rounding=True,
     node_jump_seconds=1.0,
     pipeline_batches=True,
+    gpu_dive_every=0,
+    gpu_dive_steps=30,
+    gpu_dive_epochs=8,
+    gpu_dive_share=0.2,
+    gpu_dive_snap=0.1,
+    gpu_dive_fix_share=0.1,
+    gpu_dive_crossover=4,
+    exact_plunges=False,
+    exact_plunge_share=0.25,
+    jump_threads=4,
+    jump_restarts=True,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -11937,7 +12905,12 @@ def solve(
       (``"auto"``, the default: on for MIPs with at most 10,000 nonzeros),
       aggregates of up to five rows also cancel the most fractional integer
       term, so pure-integer rows combine. On lseu that lifts the root bound
-      (exact LPs) from 1,061 to 1,100. Cover and MIR cuts are separated by
+      (exact LPs) from 1,061 to 1,100. ``max_aggregation`` sets the rows
+      added to an aggregate instead (``None``: 2, or 4 with
+      ``aggregate_integers``); on map06, whose rows bound continuous
+      variables through chains of other continuous variables, 6 with
+      probing's variable bounds (below) takes the root bound (exact LPs)
+      from −395.8 to −393.9. Cover and MIR cuts are separated by
       ``CutSeparator``:
       up to three covers per row (``cover_cuts``), each lifted exactly by
       a dynamic program over the knapsack. With coefficient tightening,
@@ -11997,7 +12970,9 @@ def solve(
       ``z = 0`` implies ``x_j <= u0`` and ``z = 1`` implies ``x_j <= u1``
       for a binary ``z``, the cut is ``x_j <= u0 + (u1 − u0)·z`` (likewise
       for lower bounds); the most violated go to cut selection with the
-      other families.
+      other families. With ``implied_variable_bounds`` (on by default) the
+      ones on continuous columns also join the rows' variable bounds for
+      c-MIR and flow cover cuts.
       Zero-half cuts (``zero_half_cuts``, on by default; family
       ``"zerohalf"``) are {0, ½}-Chvátal–Gomory cuts: half the sum of a set
       of rows with integer coefficients, rounded down
@@ -12257,8 +13232,13 @@ def solve(
       ``max_seconds`` up to 30 s, 10 s without a limit), and it stops after
       ``probing_max_useless`` variables in a row that change nothing. Models with more
       than 10,000 nonzeros probe chunks of variables at once in one vmapped
-      JAX call (``probing_backend``). What each side implies is kept as a
-      ``ProbingCache`` for bulk rounding.
+      JAX call (``probing_backend``). Each side propagates for up to
+      ``probing_passes`` passes (default 100; it stops sooner at a fixed
+      point): on map06 a binary reaches continuous variables down chains
+      about 50 rows deep, and 5 passes found under half of what it implies.
+      What each side implies is kept as a ``ProbingCache`` for bulk
+      rounding and implied-bound cuts; the JAX backend keeps at most
+      ``probing_max_implications`` per side (``None``, the default: all).
     * **Primal heuristics.** On the first root LP, before the cut rounds
       (which then judge progress against the gap, with the background
       improving jump running beside them), and again after them, sharing
@@ -12383,6 +13363,34 @@ def solve(
       once it has used the share left (but gets at least 1 s), and they skip a
       rounding of the LP point already tried at the same cutoff. A find
       also triggers RINS at the next node.
+    * **Exact nodes** (``exact_nodes``, off by default: ``0``). With
+      batched search, ``exact_nodes`` CPU threads solve the LPs of the
+      nodes that hold the global bound exactly with HiGHS's dual simplex,
+      while the device solves the rest in batches (``_ExactLane``). Once
+      the heap is in bound order (after the first incumbent), the nodes
+      within ``exact_band`` (default 0.005) of the gap above the global
+      bound are kept for the threads, lowest first (two queued a thread),
+      and the device never takes them: a truncated LP rarely lifts such a
+      node's bound, and splitting it only doubles the nodes that hold the
+      global bound (on map06 with the lane taking only the heap's top, the
+      device split the bottom of the queue faster than the lane solved it,
+      and the bound did not move). The device takes the rest of the queue,
+      which feeds the heuristics and prunes near the cutoff. With
+      ``exact_band=0`` a thread instead takes the heap's top whenever it has
+      room, and the device the rest. A node goes to the lane at most once.
+      HiGHS re-solves from its last basis, within ``exact_node_seconds``
+      (10) a node; the node is then evaluated as a batch member, with the
+      exact solution in place of the PDHG one: its bound is the exact
+      duals' Lagrangian bound (rigorous at any duals), it branches on the
+      vertex, and its children's bounds come from those duals over their
+      boxes. A node HiGHS proves infeasible closes; one it does not finish
+      goes back to the queue for the device. Truncated PDHG node LPs rarely
+      lift a node's bound above its parent's, so without exact LPs the
+      global bound can stall while the tree grows (map06: 7,800 nodes
+      moved it 3 units); a map06 node took HiGHS 1.1–1.6 s.
+      ``result["exact_nodes"]`` holds the nodes solved, proved infeasible
+      and not finished, the threads' seconds and the bound they gained
+      over the nodes' own bounds.
     * **Node crossover** (``node_crossover``, off by default). Every
       ``node_crossover_every`` (1) nodes that the LP bound does not close,
       HiGHS crosses the node LP's PDHG point over to an optimal vertex
@@ -12559,6 +13567,8 @@ def solve(
         probing_max_variables=probing_max_variables,
         probing_backend=probing_backend,
         probing_max_useless=probing_max_useless,
+        probing_passes=probing_passes,
+        probing_max_implications=probing_max_implications,
         bulk_rounding=bulk_rounding,
         bulk_starts=bulk_starts,
         repair_share=repair_share,
@@ -12617,6 +13627,11 @@ def solve(
         round_repair_seconds=round_repair_seconds,
         mip_start=mip_start,
         implied_bound_cuts=implied_bound_cuts,
+        implied_variable_bounds=implied_variable_bounds,
+        max_aggregation=max_aggregation,
+        exact_nodes=exact_nodes,
+        exact_node_seconds=exact_node_seconds,
+        exact_band=exact_band,
         one_opt=one_opt,
         objective_propagation=objective_propagation,
         plunge_gap=plunge_gap,
@@ -12626,6 +13641,17 @@ def solve(
         parallel_rounding=parallel_rounding,
         node_jump_seconds=node_jump_seconds,
         pipeline_batches=pipeline_batches,
+        gpu_dive_every=gpu_dive_every,
+        gpu_dive_steps=gpu_dive_steps,
+        gpu_dive_epochs=gpu_dive_epochs,
+        gpu_dive_share=gpu_dive_share,
+        gpu_dive_snap=gpu_dive_snap,
+        gpu_dive_fix_share=gpu_dive_fix_share,
+        gpu_dive_crossover=gpu_dive_crossover,
+        exact_plunges=exact_plunges,
+        exact_plunge_share=exact_plunge_share,
+        jump_threads=jump_threads,
+        jump_restarts=jump_restarts,
     )
     return _solve_model(
         model, presolve, precision, highs_options, feasibility_tolerance, settings
@@ -12698,6 +13724,18 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "near_integral": {"tries": 0, "finds": 0},
             "background_roundings": 0,
             "background_jumps": 0,
+            "gpu_dives": {
+                "runs": 0, "dives": 0, "steps": 0, "leaves": 0, "finds": 0,
+                "seconds": 0.0,
+            },
+            "exact_plunges": {"plunges": 0, "nodes": 0, "max depth": 0, "seconds": 0.0},
+            "exact_nodes": {
+                "solved": 0,
+                "infeasible": 0,
+                "failed": 0,
+                "seconds": 0.0,
+                "bound_gain": 0.0,
+            },
             "inout_cuts": 0,
             "inout_rounds": 0,
             "tree_cut_refreshes": 0,
