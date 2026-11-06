@@ -48,6 +48,42 @@ PINNED = dict(
     tree_heuristics=False,
     tree_heuristic_every=20,
     batch_size=1,
+    # solve()'s defaults before they became the map06 setup (cuts, probing
+    # and most heuristics off, exact nodes on): the tests were written
+    # against these, and each feature's tests turn it on or off themselves.
+    cuts=True,
+    cut_rounds=None,
+    cut_age=10,
+    max_cut_rows=None,
+    gomory_candidates=None,
+    max_aggregation=None,
+    max_tree_cuts_per_round=10,
+    tree_cut_rows=None,
+    inout_separation=None,
+    root_redcost_propagation=False,
+    global_redcost_fixing=False,
+    cut_pool_propagation=False,
+    objective_propagation=False,
+    branch_implied=False,
+    probing=True,
+    plunge_depth=8,
+    plunge_child="score",
+    batch_epochs=2,
+    node_lp_tolerance=None,
+    root_strong_candidates="auto",
+    root_strong_epochs=None,
+    round_repair=True,
+    feasibility_pump=True,
+    bulk_rounding=True,
+    one_opt=True,
+    rins_seconds=None,
+    rens_seconds=None,
+    near_integral_tolerance=1e-2,
+    parallel_rounding=True,
+    exact_nodes=0,
+    exact_overflow_share=0,
+    submip_solver="jaddle",
+    crossover_seconds=0,
 )
 
 
@@ -1637,6 +1673,102 @@ def test_numba_jump_scores_match_a_fresh_computation(make):
 
 
 @NEEDS_NUMBA
+@pytest.mark.parametrize("rows", [1, 5, 31, 32, 33, 60])
+def test_numba_jump_value_minimises_the_weighted_violation(rows):
+    # A continuous column in ``rows`` rows: its jump value must reach the
+    # least weighted violation over its bounds, which a convex piecewise
+    # linear function takes at one of the rows' interval ends. Up to 32 rows
+    # (64 ends) they are sorted in place, past that by np.argsort.
+    from jaddle import _jump_numba
+
+    rng = np.random.default_rng(rows)
+    a = rng.uniform(0.5, 2.0, rows) * rng.choice([-1.0, 1.0], rows)
+    rest = rng.uniform(-3.0, 3.0, rows)  # the other variables' activity
+    width = rng.uniform(0.0, 2.0, rows)
+    row_lower = rng.uniform(-4.0, 4.0, rows)
+    row_upper = row_lower + width
+    w = rng.uniform(1.0, 5.0, rows)
+    xj = 0.3
+    act = rest + a * xj
+    col_ptr = np.array([0, rows])
+    col_row = np.arange(rows)
+    lower, upper = np.array([-10.0]), np.array([10.0])
+    buf = np.empty(2 * rows)
+    target, change = _jump_numba._jump(
+        0, np.array([xj]), act, w, col_ptr, col_row, a, row_lower, row_upper,
+        lower, upper, np.zeros(1, bool), buf, buf.copy(),
+    )
+
+    def violation(t):
+        new = rest + a * t
+        return float(w @ (np.maximum(new - row_upper, 0) + np.maximum(row_lower - new, 0)))
+
+    ends = np.clip(np.concatenate([(row_lower - rest) / a, (row_upper - rest) / a]), -10, 10)
+    best = min(violation(t) for t in ends)
+    assert violation(target) == pytest.approx(best, abs=1e-9)
+    assert change == pytest.approx(violation(target) - violation(xj), abs=1e-9)
+
+
+def test_root_jumps_start_before_the_root_lp_on_every_lane(monkeypatch):
+    pytest.importorskip("numba")
+    mip = knapsack()
+    search = search_for(
+        mip, monkeypatch, parallel_heuristics=True, jump_backend="numba", jump_threads=3
+    )
+    submitted = []
+    monkeypatch.setattr(
+        search.workers, "submit",
+        lambda lane, kind, fn, *a, **k: submitted.append((lane, kind, fn, k["seed"])),
+    )
+    assert search.launch_root_jumps(mip.lower, mip.upper)
+    assert [s[:3] for s in submitted] == [
+        (lane, "jump", jm._early_jump_job) for lane in ("jump", "jump1", "jump2")
+    ]
+    assert len({s[3] for s in submitted}) == 3  # a seed each
+    # The first incumbent stops them.
+    assert not search.early_jump.is_set()
+    x = np.zeros(mip.num_variables)
+    search.try_incumbent(x, "J", None)
+    assert search.early_jump.is_set()
+    # None with an incumbent, or with root_jump_seconds=0.
+    submitted.clear()
+    assert not search.launch_root_jumps(mip.lower, mip.upper) and not submitted
+    off = search_for(
+        mip, monkeypatch, parallel_heuristics=True, jump_backend="numba",
+        root_jump_seconds=0,
+    )
+    assert not off.launch_root_jumps(mip.lower, mip.upper)
+
+
+@NEEDS_NUMBA
+def test_early_jump_job_stops_when_done():
+    # An infeasible row: the jump would run to its deadline. With ``done``
+    # set it stops after its first chunk.
+    import threading
+
+    n = 6
+    lp = jl.LP(
+        c=np.arange(n, dtype=float),
+        A_eq=sp.csc_matrix(2.0 * np.ones((1, n))),
+        b_eq=np.array([3.0]),
+        A_ineq=sp.csc_matrix((0, n)),
+        b_ineq=np.zeros(0),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    mip = jm.MIP(lp, np.ones(n, bool))
+    done = threading.Event()
+    done.set()
+    started = time.time()
+    _, feasible, steps = jm._early_jump_job(
+        lambda: False, done, mip, np.zeros(n), deadline=time.time() + 30, backend="numba"
+    )
+    assert not feasible and steps <= 1000 and time.time() - started < 10
+    # Skipped outright once there is an incumbent.
+    assert jm._early_jump_job(lambda: True, done, mip, np.zeros(n)) == (None, False, None)
+
+
+@NEEDS_NUMBA
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_improving_jump_finds_better_points(seed):
     mip = generalised_assignment(seed)
@@ -2603,6 +2735,59 @@ def test_cover_cuts_skip_integral_points_only_inside_the_knapsack():
     assert jm.cover_cuts(np.arange(4), a, 12.0, np.array([1.0, 1.0, 0.0, 0.0]), *args) == []
     cuts = jm.cover_cuts(np.arange(4), a, 12.0, np.array([1.0, 1.0, 1.0, 0.0]), *args)
     assert cuts and all(coef @ np.array([1.0, 1.0, 1.0, 0.0])[idx] > rhs for idx, coef, rhs in cuts)
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_cover_cuts_hold_when_the_capacity_is_rounded_down(seed):
+    # A 0/1 point fills the row exactly, and the stored right-hand side is
+    # an ulp of float32 below it (as a cut's is after rounding to nearest).
+    # Every cover must still hold at every 0/1 point of the true row: a
+    # cover is a jump of a whole unit, so 1e-7 must not make one (this cut
+    # off a generalised-assignment optimum with precision="float32").
+    rng = np.random.default_rng(seed)
+    n = 8
+    a = rng.uniform(0.2, 2.0, n)
+    z = (rng.random(n) < 0.6).astype(float)
+    z[:2] = 1.0
+    b_true = float(a @ z)
+    # The largest float32 below the true right-hand side.
+    b_stored = np.float32(b_true)
+    if float(b_stored) >= b_true:
+        b_stored = np.nextafter(b_stored, np.float32(-np.inf))
+    b_stored = float(b_stored)
+    assert b_true - 1e-6 < b_stored < b_true
+    points = ((np.arange(2**n)[:, None] >> np.arange(n)) & 1).astype(float)
+    feasible = points[points @ a <= b_true]
+    args = (np.zeros(n), np.ones(n), np.ones(n, bool))
+    for x in (z, np.clip(z + rng.uniform(-0.2, 0.2, n), 0, 1)):
+        for idx, coef, rhs in jm.cover_cuts(np.arange(n), a, b_stored, x, *args):
+            assert np.all(feasible[:, idx] @ coef <= rhs + 1e-9)
+
+
+def test_round_up_only_loosens_rows():
+    values = np.array([5.480769230769231, 3.0, -1.1, 49.84, 1e-9])
+    up = jm._round_up(values, np.float32)
+    assert np.all(up >= values)
+    assert np.array_equal(up.astype(np.float32).astype(np.float64), up)
+    # The nearest such number: one ulp lower is below the value.
+    below = np.nextafter(up.astype(np.float32), np.float32(-np.inf)).astype(np.float64)
+    assert np.all(below < values)
+    assert np.array_equal(jm._round_up(values, np.float64), values)
+
+
+def test_with_rows_never_tightens_a_cut():
+    given = generalised_assignment()
+    mip = jm.MIP(
+        jl._cast_lp(given.lp, np.float32), given.integrality, given.offset,
+        given.maximise, given.implied,
+    )
+    assert mip.lp.c.dtype == np.float32
+    n = mip.num_variables
+    row = sp.csr_matrix(np.ones((1, n)))
+    rhs = 5.480769230769231  # rounds down at float32 to nearest
+    assert float(np.float32(rhs)) < rhs
+    assert mip.with_rows(row, [rhs]).b[-1] >= rhs
+    assert mip.rows_with(row, [rhs])[1][-1] >= rhs
 
 
 def test_lifting_beats_the_extended_cover():
@@ -4929,7 +5114,7 @@ def test_cut_pool_propagation_keeps_valid_cuts(make, monkeypatch):
         assert seen["pooled"]
 
 
-def test_cut_pool_is_off_by_default():
+def test_no_cut_pool_without_cut_pool_propagation():
     mip = generalised_assignment()
     out = solve(mip, batch_size=1, gomory_cuts=True)
     assert out["cut_pool_rows"] == 0
@@ -5312,7 +5497,10 @@ def test_parallel_heuristics_match_reference(make):
     )
     assert_solved(result, mip, reference(mip))
     stats = result["parallel_heuristics"]
-    assert set(stats) == {"jobs", "seconds", "improvements", "jump_slices"}
+    assert set(stats) == {
+        "jobs", "seconds", "improvements", "jump_slices", "jump_restarts",
+        "jump_restart_finds",
+    }
 
 
 def test_background_workers_run_jobs_in_order_and_stop():
@@ -5637,6 +5825,179 @@ def test_exact_node_lp_proves_an_empty_box_infeasible():
     assert status == "infeasible"
 
 
+@pytest.mark.parametrize("make", [knapsack, facility_location])
+def test_default_settings_solve_to_the_optimum(make):
+    # jm.solve itself, not the PINNED helper: float32 LPs, no cuts or
+    # probing, the jump as the only heuristic, and the exact lane.
+    mip = make()
+    result = jm.solve(mip, max_seconds=120)
+    assert_solved(result, mip, reference(mip))
+    assert result["exact_nodes"]["solved"] > 0
+
+
+@pytest.mark.parametrize("share", [0.5, 0.0])
+def test_band_overflow_takes_the_top_of_the_band(monkeypatch, share):
+    import heapq
+
+    search = search_for(
+        generalised_assignment(), monkeypatch, exact_nodes=2, batch_size=4,
+        exact_overflow_share=share,
+    )
+    nodes = [jm._Node(float(b), 1, (), None, None) for b in range(20)]
+    for node in nodes:
+        heapq.heappush(search.exact_reserved, (node.bound, next(search.counter), node))
+    taken = search.overflow_band(int(search.exact_overflow_share * search.batch_size))
+    if share == 0.0:
+        assert taken == [] and len(search.exact_reserved) == 20
+        return
+    # The lane keeps 4 a thread (8, the lowest); at most 2 of the 12 above
+    # go to the device a batch, the highest first taken, lowest first given.
+    assert [node.bound for node in taken] == [18.0, 19.0]
+    assert all(node.converge and node.exact_tried for node in taken)
+    assert sorted(entry[0] for entry in search.exact_reserved) == [float(b) for b in range(18)]
+    while len(search.exact_reserved) > 8:
+        search.overflow_band(2)
+    assert search.overflow_band(2) == []
+    assert sorted(entry[0] for entry in search.exact_reserved) == [float(b) for b in range(8)]
+    assert search.overflow_nodes == 12
+    # Still a heap: the lane pops the lowest.
+    assert heapq.heappop(search.exact_reserved)[0] == 0.0
+
+
+def test_band_overflow_in_the_search():
+    # One lane thread and a wide band: the band outgrows the lane, and its
+    # top goes to the device, solved to convergence, with the optimum kept.
+    mip = generalised_assignment(agents=10, jobs=40)
+    ref = reference(mip)
+    options = dict(
+        max_seconds=300, batch_size=4, exact_nodes=1, exact_band=0.5,
+        rins_seconds=0, crossover_seconds=0,
+    )
+    result = jm.solve(mip, exact_overflow_share=0.5, **options)
+    assert result["bound"] <= ref + 1e-6
+    if result["status"] == "optimal":
+        assert_solved(result, mip, ref)
+    stats = result["exact_nodes"]
+    assert stats["overflow_nodes"] > 0
+    assert 0 <= stats["overflow_converged"] <= stats["overflow_nodes"]
+    off = jm.solve(mip, exact_overflow_share=0.0, **dict(options, max_seconds=30))
+    assert off["exact_nodes"]["overflow_nodes"] == 0
+    assert off["bound"] <= ref + 1e-6
+
+
+@pytest.mark.parametrize("make", [facility_location, generalised_assignment])
+def test_highs_submip_finds_the_optimum_below_the_cutoff(make):
+    mip = make()
+    ref = reference(mip) - mip.offset
+    is_int = np.asarray(mip.integrality, bool)
+    highs = jm._highs_submip(mip, is_int)
+    x = jm._submip_job(highs, mip, mip.lower, mip.upper, np.inf, 30.0)
+    assert mip.is_feasible(x) and float(mip.c @ x) == pytest.approx(ref, abs=1e-6)
+    # Pruned at a cutoff below the optimum: nothing better to find.
+    assert jm._submip_job(highs, mip, mip.lower, mip.upper, ref - 1e-3, 30.0) is None
+    # Half the integers fixed at the optimum's values: the point stays in
+    # the box, and the optimum is still in it.
+    fixed = is_int & (np.arange(mip.num_variables) % 2 == 0)
+    lower = np.where(fixed, np.round(x), mip.lower)
+    upper = np.where(fixed, np.round(x), mip.upper)
+    y = jm._submip_job(highs, mip, lower, upper, np.inf, 30.0)
+    assert np.all(y >= lower - 1e-9) and np.all(y <= upper + 1e-9)
+    assert float(mip.c @ y) == pytest.approx(ref, abs=1e-6)
+
+
+def test_submip_lanes_run_beside_the_exact_lane():
+    # HiGHS instances on several threads at once: two sub-MIP lanes (MIP
+    # solves) and the exact lane (LPs) all finish with their answers.
+    mip = generalised_assignment()
+    is_int = np.asarray(mip.integrality, bool)
+    lanes = [jm._SubMipLane() for _ in range(2)]
+    exact = jm._ExactLane(2, 30.0)
+    try:
+        for lane in lanes:
+            lane.submit("rins", mip, is_int, mip.lower, mip.upper, np.inf, 30.0)
+        box = (mip.lower, mip.upper)
+        for _ in range(2):
+            exact.submit(None, box, box, mip, 0)
+        done, deadline = [], time.time() + 60
+        while (len(done) < 2 or exact.jobs) and time.time() < deadline:
+            for lane in lanes:
+                out = lane.finished()
+                if out is not None:
+                    done.append(out)
+            exact.wait(0.05)
+        finished = exact.finished()
+        assert len(done) == 2 and all(x is not None for _, x, _ in done)
+        assert all(float(mip.c @ x) == pytest.approx(reference(mip)) for _, x, _ in done)
+        assert not exact.jobs
+    finally:
+        for lane in lanes:
+            lane.shutdown()
+        exact.shutdown()
+
+
+def test_solution_pool_keeps_distinct_points_best_first(monkeypatch):
+    mip = generalised_assignment()
+    search = search_for(mip, monkeypatch, submip_solver="highs", crossover_seconds=5)
+    ints = search.is_int
+    rng = np.random.default_rng(0)
+    for k in range(15):
+        x = np.zeros(mip.num_variables)
+        x[ints] = rng.integers(0, 2, ints.sum())
+        search.remember_solution(float(k % 7), x)
+        search.remember_solution(float(k % 7) + 0.5, x)  # same integers: ignored
+    pool = search.solution_pool
+    assert len(pool) == jm._SOLUTION_POOL_SIZE
+    values = [value for value, _, _ in pool]
+    assert values == sorted(values) and all(v == int(v) for v in values)
+    assert len({key for _, key, _ in pool}) == len(pool)
+
+
+def test_crossover_fixes_where_the_points_agree(monkeypatch):
+    mip = generalised_assignment()
+    search = search_for(
+        mip, monkeypatch, submip_solver="highs", crossover_seconds=5,
+        crossover_solutions=3, crossover_min_fixed=0.5,
+    )
+    ints = search.is_int
+    rng = np.random.default_rng(1)
+    first = np.zeros(mip.num_variables)
+    first[ints] = rng.integers(0, 2, ints.sum())
+    # Two others that each differ from the first on a few integers.
+    cols = np.flatnonzero(ints)
+    others = []
+    for flip in (cols[:3], cols[3:7]):
+        x = first.copy()
+        x[flip] = 1.0 - x[flip]
+        others.append(x)
+    search.incumbent = (float(mip.c @ first), first)
+    for value, x in [(0.0, first), (1.0, others[0]), (2.0, others[1])]:
+        search.remember_solution(value, x)
+    lower, upper = search.crossover_box(np.random.default_rng(0))
+    agree = ints.copy()
+    agree[cols[:7]] = False
+    fixed = lower == upper
+    assert np.array_equal(fixed & ints, agree)
+    assert np.array_equal(lower[agree], first[agree])
+    # The same neighbourhood at the same cutoff is not searched twice.
+    assert search.crossover_box(np.random.default_rng(0)) is None
+
+
+@pytest.mark.parametrize(
+    "make", [generalised_assignment, lambda: coverage_chains(1)]
+)
+def test_highs_rins_and_crossover_in_the_search(make):
+    mip = make()
+    result = jm.solve(
+        mip, max_seconds=120, batch_size=4, rins_seconds=5, crossover_seconds=5
+    )
+    assert_solved(result, mip, reference(mip))
+    assert result["rins_calls"] > 0
+    assert result["rins_finds"] <= result["rins_calls"]
+    assert result["crossover_finds"] <= result["crossover_calls"]
+    off = jm.solve(mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0)
+    assert off["rins_calls"] == off["crossover_calls"] == off["submip_lane_seconds"] == 0
+
+
 @pytest.mark.parametrize(
     "make", [facility_location, generalised_assignment, lambda: coverage_chains(1)]
 )
@@ -5651,6 +6012,84 @@ def test_exact_lane_solves_to_the_optimum(make):
         stats = result["exact_nodes"]
         assert stats["solved"] > 0 and stats["bound_gain"] >= 0.0
     assert solve(mip, **options)["exact_nodes"]["solved"] == 0
+
+
+def lp_optimum(mip, lower, upper):
+    """The LP relaxation's optimum over a box (``None`` when infeasible)."""
+    model = jm.to_highs(mip)
+    model.integrality_ = [highspy.HighsVarType.kContinuous] * model.num_col_
+    model.col_lower_, model.col_upper_ = np.asarray(lower, float), np.asarray(upper, float)
+    highs = highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.passModel(model)
+    highs.run()
+    if highs.getModelStatus() != highspy.HighsModelStatus.kOptimal:
+        return None
+    return highs.getInfo().objective_function_value - mip.offset
+
+
+@pytest.mark.parametrize(
+    "make", [facility_location, generalised_assignment, lambda: coverage_chains(1)]
+)
+@pytest.mark.parametrize("iterations", [100_000, 2])
+def test_exact_strong_children_have_valid_bounds(make, iterations):
+    # Converged sides and sides stopped after 2 pivots: their duals'
+    # Lagrangian bound never passes the side's LP optimum.
+    mip = make()
+    n = mip.num_variables
+    highs = jm._highs_rows(mip)
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    status, x, _, _ = jm._exact_node_lp(highs, mip, lower, upper, 10.0)
+    assert status == "optimal"
+    request = (mip.integrality, 1e-6, np.zeros((2, n)), np.zeros((2, n)), 4, iterations, 4)
+    children = jm._exact_strong(highs, mip, lower, upper, x, request)
+    assert children  # the root vertices are fractional
+    for var, down, side_status, cx, y_eq, y_ineq in children:
+        lo, up = lower.copy(), upper.copy()
+        if down:
+            up[var] = np.floor(x[var])
+        else:
+            lo[var] = np.ceil(x[var])
+        optimum = lp_optimum(mip, lo, up)
+        if side_status == "infeasible":
+            assert optimum is None
+            continue
+        assert side_status in ("optimal", "partial")
+        if iterations > 1000:
+            assert side_status == "optimal"
+        constant, r = jm.lagrangian_terms(
+            mip.c, mip.A, mip.b, mip.n_eq, np.concatenate([y_eq, y_ineq])
+        )
+        # Round-off in c + Aᵀy at infinite bounds, zeroed as the search does
+        # (``vertex_terms``): facility_location's down side of x0 has one.
+        roundoff = (((r > 0) & np.isinf(lo)) | ((r < 0) & np.isinf(up))) & (
+            np.abs(r) <= 1e-9 * (1 + np.abs(mip.c).max())
+        )
+        bound, rigorous = jm.box_bound(constant, np.where(roundoff, 0.0, r), lo, up)
+        assert rigorous
+        assert bound <= optimum + 1e-6 * (1 + abs(optimum))
+        if side_status == "optimal":
+            assert bound == pytest.approx(optimum, rel=1e-6, abs=1e-6)
+    # The node's bounds and basis are back: it re-solves to the same vertex.
+    again = jm._exact_node_lp(highs, mip, lower, upper, 10.0)
+    assert mip.c @ again[1] == pytest.approx(mip.c @ x, rel=1e-9, abs=1e-9)
+
+
+def test_exact_strong_branching_in_the_search():
+    totals = dict(strong_lps=0, children_reused=0)
+    options = dict(batch_size=4, cuts=False, probing=False, exact_nodes=2)
+    for make in (facility_location, generalised_assignment, lambda: coverage_chains(1)):
+        mip = make()
+        ref = reference(mip)
+        result = solve(mip, **options)
+        assert_solved(result, mip, ref)
+        for key in totals:
+            totals[key] += result["exact_nodes"][key]
+        off = solve(mip, exact_strong_candidates=0, **options)
+        assert_solved(off, mip, ref)
+        assert off["exact_nodes"]["strong_lps"] == 0
+        assert off["exact_nodes"]["children_reused"] == 0
+    assert totals["strong_lps"] > 0 and totals["children_reused"] > 0
 
 
 def test_solve_with_implied_variable_bounds_and_long_aggregation():

@@ -24,6 +24,7 @@ import numba as nb
 import numpy as np
 
 _SAMPLE = 25  # improving variables sampled per step, as in HiGHS
+_INSERTION_SORT_MAX = 64  # interval ends sorted in place up to this many
 _EPS = 1e-12
 
 
@@ -74,12 +75,35 @@ def _jump(
         buf_w[2 * q + 1] = wt
         half += wt
     best = xj
-    if k > 0:
-        # The weighted median of the interval ends.
-        order = np.argsort(buf_v[: 2 * k])
+    size = 2 * k
+    if 0 < size <= _INSERTION_SORT_MAX:
+        # The weighted median of the interval ends, sorted in place with
+        # their weights: no allocation. A move refreshes every variable of
+        # its rows (on neos-5106984-jizera about 300, each with about 10
+        # ends), and np.argsort's allocation took a third of the time.
+        for q in range(1, size):
+            v = buf_v[q]
+            wv = buf_w[q]
+            r = q - 1
+            while r >= 0 and buf_v[r] > v:
+                buf_v[r + 1] = buf_v[r]
+                buf_w[r + 1] = buf_w[r]
+                r -= 1
+            buf_v[r + 1] = v
+            buf_w[r + 1] = wv
         running = 0.0
         threshold = half * (1.0 - 1e-12)
-        for q in range(2 * k):
+        for q in range(size):
+            running += buf_w[q]
+            if running >= threshold:
+                best = buf_v[q]
+                break
+    elif size > 0:
+        # Long columns: insertion sort would be quadratic.
+        order = np.argsort(buf_v[:size])
+        running = 0.0
+        threshold = half * (1.0 - 1e-12)
+        for q in range(size):
             o = order[q]
             running += buf_w[o]
             if running >= threshold:

@@ -168,13 +168,16 @@ class MIP:
     def with_rows(self, A_rows, b_rows):
         """A ``MIP`` with the rows ``A_rows x <= b_rows`` appended to the
         inequality rows. Explicit zero entries of ``A_rows`` are kept in the
-        device LP (they pad its shape)."""
+        device LP (they pad its shape). The new right-hand sides are rounded
+        up to the LP's dtype (``_round_up``), so a cut stored at float32 is
+        never tighter than the cut."""
+        b_rows = _round_up(b_rows, self.lp.c.dtype)
         lp = LP(
             self.c,
             self.A[: self.n_eq].tocsc(),
             self.b[: self.n_eq],
             sp.vstack([self.A[self.n_eq :], sp.csr_matrix(A_rows)], format="csr"),
-            np.concatenate([self.b[self.n_eq :], np.asarray(b_rows, np.float64)]),
+            np.concatenate([self.b[self.n_eq :], b_rows]),
             self.lower,
             self.upper,
         )
@@ -190,12 +193,26 @@ class MIP:
         rows.data = np.asarray(rows.data, dtype).astype(np.float64)
         A = sp.vstack([self.A, rows], format="csr")
         A.eliminate_zeros()
-        b_rows = np.asarray(np.asarray(b_rows, np.float64), dtype).astype(np.float64)
-        return A, np.concatenate([self.b, b_rows])
+        return A, np.concatenate([self.b, _round_up(b_rows, dtype)])
 
     def is_feasible(self, x, tol=1e-6):
         """Whether every entry of ``violation(x)`` is at most ``tol``."""
         return all(v <= tol for v in self.violation(x).values())
+
+
+def _round_up(values, dtype):
+    """``values`` (float64) rounded up to the nearest numbers ``dtype``
+    holds, as float64: a right-hand side stored at float32 then only
+    loosens its row. Rounding to nearest can tighten a cut by an ulp, and
+    an integer-rounding cut separated from that row (a cover) can then cut
+    off a point that fills the true row exactly."""
+    values = np.asarray(values, np.float64)
+    if np.dtype(dtype) == np.float64:
+        return values.copy()
+    stored = values.astype(dtype)
+    low = stored.astype(np.float64) < values
+    stored[low] = np.nextafter(stored[low], np.array(np.inf, dtype))
+    return stored.astype(np.float64)
 
 
 def _mip_from_highs_lp(highs_lp, maximise=None):
@@ -1764,6 +1781,9 @@ _CUT_TINY = 1e-6
 # Rows whose slack at the LP point is within this fraction of 1 + |b| start
 # a separation.
 _CUT_TIGHT_ROWS = 0.05
+# Knapsack covers (``_knapsack``): slack on a row's capacity relative to
+# ``1 + |b|``, as the feasibility checks (``feasibility_tolerance``) allow.
+_KNAPSACK_TOL = 1e-6
 # At most this many rows start a separation per round.
 _CUT_MAX_ROWS = 2000
 # Rows aggregated into one c-MIR base inequality, beyond the first.
@@ -1810,7 +1830,14 @@ def _knapsack(idx, a, b, x, lower, upper, is_binary):
     variables moved to the bound that minimises the row, binaries with
     negative coefficients complemented (``z = 1 − x``). Returns
     ``(cols, w, complemented, z, capacity)`` with weights ``w > 0`` and the
-    LP point ``z`` in complemented form, or ``None`` when no cover exists."""
+    LP point ``z`` in complemented form, or ``None`` when no cover exists.
+
+    The capacity has ``_KNAPSACK_TOL`` of slack, as the feasibility checks
+    allow, so a cover's items overfill the row by more than rounding. A
+    cover is a jump of a whole unit: rows stored at float32 (a cut's
+    right-hand side rounded down by 1e-7) once made a set the optimum
+    fills exactly into a cover, and cut off the optimum (a
+    generalised-assignment knapsack, ``precision="float32"``)."""
     binary = is_binary[idx]
     if binary.sum() < 2:
         return None
@@ -1826,6 +1853,7 @@ def _knapsack(idx, a, b, x, lower, upper, is_binary):
     complemented = w < 0
     w = np.abs(w)
     capacity = b - low.sum() + w[complemented].sum()
+    capacity += _KNAPSACK_TOL * (1.0 + max(abs(b), abs(capacity)))
     z = np.clip(np.where(complemented, 1.0 - x[cols], x[cols]), 0.0, 1.0)
     useful = w > 1e-12
     cols, w, complemented, z = cols[useful], w[useful], complemented[useful], z[useful]
@@ -5585,7 +5613,7 @@ def _batch_member(tree, i):
 
 class _StrongChild(
     collections.namedtuple(
-        "_StrongChild", "bound closed solution raw", defaults=(None,)
+        "_StrongChild", "bound closed solution raw exact", defaults=(None, False)
     )
 ):
     """A strong-branching child: its bound (rounded as node bounds are),
@@ -5593,7 +5621,8 @@ class _StrongChild(
     warm start (``None`` when closed or not solved, or a function giving it)
     and its unrounded bound, for scores and pseudocosts (``None``: the
     bound). Rounding to an objective step would make most gains 0 or one
-    step."""
+    step. ``exact``: its solution is an optimal vertex of its LP (the exact
+    lane's strong branching), so its node needs no LP solve of its own."""
 
     __slots__ = ()
 
@@ -5603,7 +5632,7 @@ _LOG_LEGEND = (
     "Src: B => Bulk rounding; D => Dive; E => RENS; F => Feasibility pump;\n"
     "     H => Rounding; J => Feasibility jump; N => RINS; P => Fix-and-propagate;\n"
     "     R => Repair; S => User start; T => Evaluate node; U => Round and repair;\n"
-    "     1 => 1-opt"
+    "     C => Crossover; 1 => 1-opt"
 )
 _LOG_HEADER = (
     "        Nodes      |    B&B Tree     |            Objective Bounds"
@@ -5659,6 +5688,8 @@ class _Node:
         "cut_rounds",
         "branch_value",
         "exact_tried",
+        "exact_known",
+        "converge",
     )
 
     def __init__(
@@ -5686,6 +5717,12 @@ class _Node:
         self.branch_value = branch_value
         # Whether the exact lane (``exact_nodes``) has taken its LP once.
         self.exact_tried = False
+        # Whether ``warm`` is an optimal vertex of its LP (from the exact
+        # lane's strong branching): the lane evaluates it without a solve.
+        self.exact_known = False
+        # Whether its LP runs to convergence on the device, over batches,
+        # instead of being truncated (``exact_overflow_share``).
+        self.converge = False
 
 
 _LP_RESERVED = (
@@ -5704,6 +5741,30 @@ _LP_RESERVED = (
 _JUMP_SLICE_SECONDS = 5.0
 # A restart slice from a perturbed incumbent or a node point (``jump_restarts``).
 _JUMP_RESTART_SECONDS = 2.0
+
+
+def _pseudocost_estimates(pc_sum, pc_count, x, candidates):
+    """Each candidate's estimated down and up bound gains: fraction times
+    pseudocost (``pc_sum / pc_count``, shape ``(2, n)``: down, up), the mean
+    pseudocost where a direction has no observation yet."""
+    f = x[candidates] - np.floor(x[candidates])
+    known = pc_count > 0
+    mean = np.array(
+        [
+            (
+                pc_sum[d][known[d]].sum() / pc_count[d][known[d]].sum()
+                if known[d].any()
+                else 1.0
+            )
+            for d in range(2)
+        ]
+    )
+    pc = np.where(
+        known[:, candidates],
+        pc_sum[:, candidates] / np.maximum(pc_count[:, candidates], 1),
+        mean[:, None],
+    )
+    return f * pc[0], (1.0 - f) * pc[1]
 
 
 def _exact_node_lp(highs, mip, lower, upper, seconds):
@@ -5732,11 +5793,86 @@ def _exact_node_lp(highs, mip, lower, upper, seconds):
         return "infeasible", None, None, None
     if status != MS.kOptimal:
         return "failed", None, None, None
-    solution = highs.getSolution()
-    row_dual = np.asarray(solution.row_dual, np.float64)
-    y_eq = -row_dual[: mip.n_eq]
-    y_ineq = np.maximum(-row_dual[mip.n_eq :], 0.0)
-    return "optimal", np.asarray(solution.col_value, np.float64), y_eq, y_ineq
+    y_eq, y_ineq = _jaddle_duals(highs, mip)
+    x = np.asarray(highs.getSolution().col_value, np.float64)
+    return "optimal", x, y_eq, y_ineq
+
+
+def _jaddle_duals(highs, mip):
+    """HiGHS's row duals in Jaddle's convention: ``(y_eq, y_ineq)``."""
+    row_dual = np.asarray(highs.getSolution().row_dual, np.float64)
+    return -row_dual[: mip.n_eq], np.maximum(-row_dual[mip.n_eq :], 0.0)
+
+
+def _exact_strong(highs, mip, lower, upper, x, request):
+    """
+    Strong branching on a node HiGHS has just solved in ``highs`` (box
+    ``[lower, upper]``, vertex ``x``), for ``_ExactLane``. ``request`` is
+    ``(is_int, tol, pc_sum, pc_count, k, iterations, reliable)``: of the
+    fractional integers whose exact pseudocosts (``pc_sum``/``pc_count``)
+    have fewer than ``reliable`` observations a side, the ``k`` with the
+    largest pseudocost product are split, and each side is re-solved from
+    the node's basis for at most ``iterations`` dual simplex pivots. Dual
+    simplex keeps its duals feasible, so a side stopped early still has
+    duals whose Lagrangian bound holds (lower than the side's LP value).
+
+    Returns ``[(var, down, status, x, y_eq, y_ineq), ...]``, ``status``
+    ``"optimal"``, ``"partial"`` (stopped early), ``"infeasible"`` or
+    ``"failed"``; ``highs`` is left with the node's bounds and basis.
+    """
+    import highspy
+
+    is_int, tol, pc_sum, pc_count, k, iterations, reliable = request
+    frac = x - np.floor(x)
+    candidates = np.flatnonzero(
+        is_int & (frac > tol) & (frac < 1.0 - tol) & (lower < upper)
+    )
+    if k <= 0 or candidates.size == 0:
+        return []
+    unreliable = candidates[pc_count[:, candidates].min(axis=0) < reliable]
+    if unreliable.size == 0:
+        return []
+    down, up = _pseudocost_estimates(pc_sum, pc_count, x, unreliable)
+    score = np.maximum(down, 1e-6) * np.maximum(up, 1e-6)
+    chosen = unreliable[np.argsort(-score, kind="stable")[:k]]
+    MS = highspy.HighsModelStatus
+    basis = highs.getBasis()
+    _, limit = highs.getOptionValue("simplex_iteration_limit")
+    highs.setOptionValue("simplex_iteration_limit", int(iterations))
+    out = []
+    try:
+        for var in chosen.tolist():
+            lo, up = float(lower[var]), float(upper[var])
+            for is_down in (True, False):
+                side = (lo, math.floor(x[var])) if is_down else (math.ceil(x[var]), up)
+                highs.changeColBounds(var, *side)
+                highs.setBasis(basis)
+                highs.run()
+                status = highs.getModelStatus()
+                if status == MS.kInfeasible:
+                    out.append((var, is_down, "infeasible", None, None, None))
+                elif (
+                    status in (MS.kOptimal, MS.kIterationLimit)
+                    and highs.getSolution().dual_valid
+                ):
+                    y_eq, y_ineq = _jaddle_duals(highs, mip)
+                    out.append(
+                        (
+                            var,
+                            is_down,
+                            "optimal" if status == MS.kOptimal else "partial",
+                            np.asarray(highs.getSolution().col_value, np.float64),
+                            y_eq,
+                            y_ineq,
+                        )
+                    )
+                else:
+                    out.append((var, is_down, "failed", None, None, None))
+                highs.changeColBounds(var, lo, up)
+    finally:
+        highs.setOptionValue("simplex_iteration_limit", limit)
+        highs.setBasis(basis)
+    return out
 
 
 def _highs_rows(mip):
@@ -5772,6 +5908,114 @@ def _highs_rows(mip):
         highs.setOptionValue(option, value)
     highs.passModel(lp)
     return highs
+
+
+def _highs_submip(mip, is_int):
+    """A ``highspy.Highs`` holding ``mip`` as a MIP over the integers
+    ``is_int`` for ``_submip_job``: ``_highs_rows``'s rows with HiGHS's
+    presolve and MIP solver, one thread, silent. Implied integers stay
+    continuous. ``cancelSolve`` stops a run (``_SubMipLane.shutdown``)."""
+    import highspy
+
+    highs = _highs_rows(mip)
+    cols = np.flatnonzero(is_int).astype(np.int32)
+    if cols.size:
+        highs.changeColsIntegrality(
+            cols.size, cols, np.full(cols.size, highspy.HighsVarType.kInteger)
+        )
+    highs.setOptionValue("presolve", "on")
+    highs.setOptionValue("solver", "choose")
+    highs.HandleUserInterrupt = True
+    return highs
+
+
+def _submip_job(highs, mip, lower, upper, cutoff, seconds):
+    """Search the MIP in ``highs`` (``_highs_submip``) over the box
+    ``[lower, upper]`` for up to ``seconds``, pruned at ``cutoff``
+    (HiGHS's ``objective_bound``, in ``mip.c``'s units, offset excluded), so
+    only points better than the cutoff come back. Returns HiGHS's best
+    point, or ``None`` when it found none."""
+    n = lower.size
+    highs.changeColsBounds(n, np.arange(n, dtype=np.int32), lower, upper)
+    highs.setOptionValue("objective_bound", float(cutoff))
+    highs.setOptionValue("time_limit", highs.getRunTime() + float(seconds))
+    highs.run()
+    if highs.getInfo().primal_solution_status != 2:  # kSolutionStatusFeasible
+        return None
+    x = np.array(highs.getSolution().col_value, np.float64)
+    if float(np.asarray(mip.c, np.float64) @ x) >= cutoff:
+        return None
+    return x
+
+
+# The solutions crossover draws from (``_BranchAndBound.solution_pool``).
+_SOLUTION_POOL_SIZE = 10
+
+
+class _SubMipLane:
+    """
+    HiGHS sub-MIPs on a CPU thread (``submip_solver="highs"``): RINS's and
+    crossover's neighbourhoods, a box with most integers fixed, searched by
+    HiGHS's branch and cut while the device keeps solving node LPs. Jaddle's
+    own sub-search solves its node LPs one at a time by PDHG, the slowest
+    way to use it; HiGHS's dual simplex is at home on a small sub-MIP. One
+    job at a time; the thread keeps one HiGHS instance for the rows it last
+    searched (``self.base`` changes after cut rounds and restarts). HiGHS
+    releases the GIL while it solves. Jobs are functions of NumPy and SciPy
+    arrays only.
+    """
+
+    def __init__(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.pool = ThreadPoolExecutor(1, thread_name_prefix="jaddle-submip")
+        self.held = None  # (mip, Highs), used on the lane's thread only
+        self.job = None  # (future, kind)
+
+    def busy(self):
+        return self.job is not None
+
+    def submit(self, kind, mip, is_int, lower, upper, cutoff, seconds):
+        """Queue ``kind``'s (``"rins"`` or ``"crossover"``) search of
+        ``mip`` over ``[lower, upper]`` (``_submip_job``)."""
+        lower, upper = np.array(lower, np.float64), np.array(upper, np.float64)
+        is_int = np.array(is_int, bool)
+
+        def job():
+            started = time.time()
+            if self.held is None or self.held[0] is not mip:
+                self.held = (mip, _highs_submip(mip, is_int))
+            x = _submip_job(self.held[1], mip, lower, upper, cutoff, seconds)
+            return x, time.time() - started
+
+        self.job = (self.pool.submit(job), kind)
+
+    def finished(self):
+        """The finished job as ``(kind, x, seconds)`` (``x`` ``None`` when
+        it found nothing or raised), or ``None`` while it runs or with no
+        job."""
+        if self.job is None or not self.job[0].done():
+            return None
+        future, kind = self.job
+        self.job = None
+        try:
+            x, seconds = future.result()
+        except Exception:
+            x, seconds = None, 0.0
+        return kind, x, seconds
+
+    def shutdown(self):
+        """Stop: a running HiGHS search is cancelled, a queued one dropped."""
+        if self.job is not None:
+            self.job[0].cancel()
+            self.job = None
+        held = self.held
+        if held is not None:
+            try:
+                held[1].cancelSolve()
+            except Exception:
+                pass
+        self.pool.shutdown(wait=False, cancel_futures=True)
 
 
 class _ExactLane:
@@ -5810,9 +6054,10 @@ class _ExactLane:
     def nodes(self):
         return [job[1] for job in self.jobs]
 
-    def submit(self, node, box, lp_box, mip, version):
+    def submit(self, node, box, lp_box, mip, version, strong=None):
         """Queue ``node``'s LP over ``lp_box`` (the LP's bounds over its box
-        ``box``) for ``mip``'s rows as of cut block ``version``."""
+        ``box``) for ``mip``'s rows as of cut block ``version``, then, with
+        a ``strong`` request, strong branching on it (``_exact_strong``)."""
         lower, upper = (np.array(b, np.float64) for b in lp_box)
 
         def job():
@@ -5821,13 +6066,19 @@ class _ExactLane:
             if held is None or held[0] is not mip:
                 held = self.local.held = (mip, _highs_rows(mip))
             out = _exact_node_lp(held[1], mip, lower, upper, self.seconds)
-            return out, time.time() - started
+            children, strong_seconds = [], 0.0
+            if strong is not None and out[0] == "optimal":
+                strong_started = time.time()
+                children = _exact_strong(held[1], mip, lower, upper, out[1], strong)
+                strong_seconds = time.time() - strong_started
+            return out, children, strong_seconds, time.time() - started
 
         self.jobs.append((self.pool.submit(job), node, box, version))
 
     def finished(self):
         """The jobs done since the last call, as ``(node, box, version,
-        (status, x, y_eq, y_ineq), seconds)``. A job that raised comes back
+        (status, x, y_eq, y_ineq), children, strong_seconds, seconds)``
+        (``children`` from ``_exact_strong``). A job that raised comes back
         ``"failed"``."""
         out, waiting = [], []
         for future, node, box, version in self.jobs:
@@ -5835,10 +6086,12 @@ class _ExactLane:
                 waiting.append((future, node, box, version))
                 continue
             try:
-                result, seconds = future.result()
+                result, children, strong_seconds, seconds = future.result()
             except Exception:
-                result, seconds = ("failed", None, None, None), 0.0
-            out.append((node, box, version, result, seconds))
+                result, children, strong_seconds, seconds = (
+                    ("failed", None, None, None), [], 0.0, 0.0
+                )
+            out.append((node, box, version, result, children, strong_seconds, seconds))
         self.jobs = waiting
         return out
 
@@ -5968,6 +6221,26 @@ def _jump_job(skip, *args, stop=None, **kwargs):
     return feasibility_jump(*args, stop=stop, **kwargs)
 
 
+class _EitherEvent:
+    """Set when either of two ``threading.Event``s is (``None`` never is)."""
+
+    def __init__(self, first, second):
+        self.events = [e for e in (first, second) if e is not None]
+
+    def is_set(self):
+        return any(e.is_set() for e in self.events)
+
+
+def _early_jump_job(skip, done, *args, stop=None, **kwargs):
+    """A root jump started before the root LP (``root_jump_seconds``): as
+    ``_jump_job``, and it also stops (between chunks) once ``done`` is set,
+    when the search has its first incumbent, so the lanes free up for the
+    improving jump."""
+    if skip():
+        return None, False, None
+    return feasibility_jump(*args, stop=_EitherEvent(stop, done), **kwargs)
+
+
 # Background jobs' kinds (``_HeuristicWorkers.submit``) and the source
 # their incumbents are marked with.
 _JOB_SOURCES = {"jump": "J", "jumprestart": "J", "fixprop": "P"}
@@ -5979,6 +6252,9 @@ _AUTO_BATCH_CPU = 32
 # The epoch budget of a node LP outside batched search (the serial
 # search, dives, the pump) when ``node_max_epochs`` is ``None``.
 _NODE_MAX_EPOCHS = 200
+# The exact lane's band (``exact_overflow_share``): reserved nodes kept for
+# each lane thread before the top of the band overflows to the device.
+_EXACT_OVERFLOW_KEEP = 4
 
 # Root cut rounds (``cut_age``): the rounds in a row a cut stays in the LP
 # while idle (slack, with a zero dual), as HiGHS's LP age limit.
@@ -6219,6 +6495,10 @@ class _BranchAndBound:
         exact_nodes=0,
         exact_node_seconds=10.0,
         exact_band=0.005,
+        exact_strong_candidates=4,
+        exact_strong_iterations=1000,
+        exact_overflow_share=0.5,
+        exact_overflow_epochs=None,
         one_opt=True,
         objective_propagation=False,
         plunge_gap=0.25,
@@ -6239,6 +6519,12 @@ class _BranchAndBound:
         exact_plunge_share=0.25,
         jump_threads=4,
         jump_restarts=True,
+        root_jump_seconds=60.0,
+        submip_solver="highs",
+        rins_tolerance=0.1,
+        crossover_seconds=10.0,
+        crossover_solutions=3,
+        crossover_min_fixed=0.5,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
         self.settings = {
@@ -6605,6 +6891,27 @@ class _BranchAndBound:
         # whenever it has room, and the device the rest.
         self.exact_band = float(exact_band)
         self.exact_reserved = []
+        # Strong branching in the lane (``exact_strong_candidates``,
+        # ``exact_strong_iterations``).
+        self.exact_strong_candidates = int(exact_strong_candidates)
+        self.exact_strong_iterations = int(exact_strong_iterations)
+        self.exact_strong_lps = 0
+        self.exact_strong_seconds = 0.0
+        self.exact_reused = 0
+        # The band's overflow (``exact_overflow_share``): past
+        # ``_EXACT_OVERFLOW_KEEP`` nodes a lane thread, the top of the band
+        # goes to the device, solved to convergence within
+        # ``exact_overflow_epochs`` (``None``: ``_NODE_MAX_EPOCHS``).
+        if not 0.0 <= float(exact_overflow_share) <= 1.0:
+            raise ValueError(
+                f"exact_overflow_share must be in [0, 1], not {exact_overflow_share!r}"
+            )
+        self.exact_overflow_share = float(exact_overflow_share)
+        self.exact_overflow_epochs = int(
+            _NODE_MAX_EPOCHS if exact_overflow_epochs is None else exact_overflow_epochs
+        )
+        self.overflow_nodes = 0
+        self.overflow_converged = 0
         self.worker_jobs = 0
         self.worker_seconds = 0.0
         self.worker_finds = 0
@@ -6612,6 +6919,10 @@ class _BranchAndBound:
         if int(jump_threads) < 1:
             raise ValueError(f"jump_threads must be at least 1, not {jump_threads!r}")
         self.use_jump_restarts = bool(jump_restarts)
+        # Jumps before the root LP (``root_jump_seconds``), one a jump lane,
+        # and the event that stops them at the first incumbent.
+        self.root_jump_seconds = float(root_jump_seconds or 0.0)
+        self.early_jump = None
         self.jump_restarts = 0
         self.jump_restart_finds = 0
         self.recent_points = collections.deque(maxlen=64)
@@ -6642,6 +6953,36 @@ class _BranchAndBound:
         self.submip_calls = 0
         self.rins_seconds, self.rins_every = rins_seconds, rins_every
         self.rins_pending = False  # a new incumbent asks for a RINS call
+        # HiGHS sub-MIPs on a CPU thread (``submip_solver="highs"``) for
+        # RINS and crossover; ``"jaddle"``: RINS by Jaddle's sub-search.
+        if submip_solver not in ("highs", "jaddle"):
+            raise ValueError(
+                f"submip_solver must be 'highs' or 'jaddle', not {submip_solver!r}"
+            )
+        if not 0.0 <= float(crossover_min_fixed) <= 1.0:
+            raise ValueError(
+                f"crossover_min_fixed must be in [0, 1], not {crossover_min_fixed!r}"
+            )
+        if int(crossover_solutions) < 2:
+            raise ValueError(
+                f"crossover_solutions must be at least 2, not {crossover_solutions!r}"
+            )
+        self.rins_tolerance = float(rins_tolerance)
+        self.crossover_seconds = float(crossover_seconds or 0.0)
+        self.crossover_solutions = int(crossover_solutions)
+        self.crossover_min_fixed = float(crossover_min_fixed)
+        self.submip_lane = (
+            _SubMipLane()
+            if submip_solver == "highs" and (rins_seconds or self.crossover_seconds)
+            else None
+        )
+        self.submip_last = None  # the kind of the lane's last job
+        self.submip_lane_seconds = 0.0
+        self.rins_finds = 0
+        self.crossover_calls = 0
+        self.crossover_finds = 0
+        # Feasible points with distinct integers, best first: (value, key, x).
+        self.solution_pool = []
         self.rens_seconds, self.rens_nodes = rens_seconds, rens_nodes
         self.dive_every, self.dive_depth = dive_every, dive_depth
         self.dives = 0
@@ -6928,6 +7269,10 @@ class _BranchAndBound:
         self.exact_reserved = []
         self.counter = itertools.count()
         self.pc_sum = np.zeros((2, mip.num_variables))  # [down, up]
+        # The exact lane's own pseudocosts (``exact_strong_candidates``):
+        # from exact LPs, which truncated node LPs underestimate.
+        self.exact_pc_sum = np.zeros((2, mip.num_variables))
+        self.exact_pc_count = np.zeros((2, mip.num_variables))
         self.pc_count = np.zeros((2, mip.num_variables))
         # Branching history beside the pseudocosts (``branching_scores``):
         # per variable and direction [down, up], the children made and those
@@ -7338,8 +7683,17 @@ class _BranchAndBound:
         return result
 
     def result_terms(self, result, lower, upper):
-        """The Lagrangian terms of a node LP's result (``dual_terms``)."""
+        """The Lagrangian terms of a node LP's result (``dual_terms``; an
+        exact lane result's as an exact vertex's, ``vertex_terms``)."""
+        if result.get("stop_reason") == "exact":
+            return self.vertex_terms(result["solution"], lower, upper)
         return self.dual_terms(result["solution"])
+
+    def exact_bound(self, solution, lower, upper):
+        """``lp_bound`` of a HiGHS solution (the exact lane's): its reduced
+        costs at infinite bounds that are round-off are zeroed first
+        (``vertex_terms``), or a −1e-17 one makes the bound −inf."""
+        return self.bound_over(self.vertex_terms(solution, lower, upper), lower, upper)
 
     def solve_node_lp(self, lower, upper, warm, max_epochs):
         """A node's LP over its box by PDHG at ``node_precision``, with the
@@ -7759,6 +8113,8 @@ class _BranchAndBound:
                 self.failed_roundings.add(candidate[self.is_int].tobytes())
                 return False
         value = float(mip.c @ candidate)
+        if self.crossover_seconds and self.submip_lane is not None:
+            self.remember_solution(value, candidate)
         if value >= self.initial_cutoff:
             return True  # feasible, but no better than the parent search's cutoff
         if self.incumbent is not None and value >= self.incumbent[0] - 1e-12 * (
@@ -7767,6 +8123,8 @@ class _BranchAndBound:
             return True
         switch = self.incumbent is None
         self.incumbent = (value, candidate)
+        if self.early_jump is not None:
+            self.early_jump.set()  # the early root jumps stop
         if source != "N":
             self.rins_pending = True
         bound = self.global_bound()
@@ -7803,27 +8161,9 @@ class _BranchAndBound:
         return np.maximum(down, 1e-6) * np.maximum(up, 1e-6)
 
     def pseudocost_estimates(self, x, candidates):
-        """Each candidate's estimated down and up bound gains: fraction times
-        pseudocost, the mean pseudocost where a direction has no observation
-        yet."""
-        f = x[candidates] - np.floor(x[candidates])
-        known = self.pc_count > 0
-        mean = np.array(
-            [
-                (
-                    self.pc_sum[d][known[d]].sum() / self.pc_count[d][known[d]].sum()
-                    if known[d].any()
-                    else 1.0
-                )
-                for d in range(2)
-            ]
-        )
-        pc = np.where(
-            known[:, candidates],
-            self.pc_sum[:, candidates] / np.maximum(self.pc_count[:, candidates], 1),
-            mean[:, None],
-        )
-        return f * pc[0], (1.0 - f) * pc[1]
+        """Each candidate's estimated down and up bound gains
+        (``_pseudocost_estimates`` over this search's pseudocosts)."""
+        return _pseudocost_estimates(self.pc_sum, self.pc_count, x, candidates)
 
     def choose_variable(self, x, fractional):
         candidates = np.flatnonzero(fractional)
@@ -7997,6 +8337,8 @@ class _BranchAndBound:
         bound,
         pending=None,
         raw=None,
+        exact_strong=None,
+        exact=False,
     ):
         """
         The branching variable for a node, by ``self.branching``. Returns
@@ -8019,6 +8361,23 @@ class _BranchAndBound:
         if raw is None or not np.isfinite(raw):
             raw = bound
         candidates = np.flatnonzero(fractional)
+        if exact:
+            # An exact lane node (``exact_nodes``): scored by the lane's
+            # exact pseudocosts, with its strong-branching children
+            # (``exact_strong``: ``({var: (down, up)}, solved)``) if it has
+            # any.
+            est_down, est_up = _pseudocost_estimates(
+                self.exact_pc_sum, self.exact_pc_count, x, candidates
+            )
+            score = np.maximum(est_down, 1e-6) * np.maximum(est_up, 1e-6)
+            if exact_strong is None:
+                best = np.argmax(self.branching_scores(candidates, score))
+                return candidates[best], None, lower, upper, bound
+            children, solved = exact_strong
+            return self.finish_choice(
+                node, children, solved, candidates, score, est_down, est_up,
+                x, lower, upper, warm, bound, raw,
+            )
         if not self.strong_branching_on(node):
             return self.choose_variable(x, fractional), None, lower, upper, bound
         est_down, est_up = self.pseudocost_estimates(x, candidates)
@@ -8052,7 +8411,19 @@ class _BranchAndBound:
             finally:
                 self.strong_branch_seconds += time.time() - started
             solved = set(chosen.tolist())
+        return self.finish_choice(
+            node, children, solved, candidates, score, est_down, est_up,
+            x, lower, upper, warm, bound, raw,
+        )
 
+    def finish_choice(
+        self, node, children, solved, candidates, score, est_down, est_up,
+        x, lower, upper, warm, bound, raw,
+    ):
+        """``choose_branch``'s end, given strong-branching ``children``
+        (``{var: (down, up)}`` of ``_StrongChild``) and the candidates they
+        solved: ``apply_strong``, then the best-scoring candidate. Returns
+        ``choose_branch``'s result."""
         applied = self.apply_strong(
             children,
             solved,
@@ -8642,16 +9013,17 @@ class _BranchAndBound:
                     self.learn(terms, lo, up)
                 continue
             distance = xv - math.floor(xv) if down else math.ceil(xv) - xv
-            children.append(
-                _Node(
-                    child_bound,
-                    node.depth + 1,
-                    self.compress(lo, up),
-                    child_warm,
-                    (var, down, distance, value),
-                    inferences=inferences,
-                )
+            child = _Node(
+                child_bound,
+                node.depth + 1,
+                self.compress(lo, up),
+                child_warm,
+                (var, down, distance, value),
+                inferences=inferences,
             )
+            # The exact lane's strong child solved its LP already.
+            child.exact_known = strong is not None and strong[down].exact
+            children.append(child)
         # The child to plunge into (``children.pop()``) or, in a dive, to pop
         # next (pushed last) sorts last: the higher ``(1 + inferences) /
         # (1 + cost / unit)`` (``_child_score``), the bounds its propagation
@@ -8740,6 +9112,11 @@ class _BranchAndBound:
             lower[self.is_int] == upper[self.is_int]
         ):
             budget = self.node_max_epochs
+        if node.converge:
+            # From the exact lane's band (``overflow_band``): solved to
+            # convergence over as many batches as it takes.
+            budget = max(budget, self.exact_overflow_epochs)
+            self.overflow_converged += bool(result["converged"])
         if (
             not result["converged"]
             and bound < self.cutoff()
@@ -8757,18 +9134,20 @@ class _BranchAndBound:
             # whatever the duals, and an infeasible LP's bound passes the
             # cutoff along its Farkas ray (``node_bound_stop``).
             self.batch_requeues += 1
-            self.push(
-                _Node(
-                    bound,
-                    node.depth,
-                    self.compress(lower, upper),
-                    (result["solution"], result["opt_state"]),
-                    node.branch,
-                    spent,
-                    cut_rounds=node.cut_rounds,
-                    branch_value=node.branch_value,
-                )
+            again = _Node(
+                bound,
+                node.depth,
+                self.compress(lower, upper),
+                (result["solution"], result["opt_state"]),
+                node.branch,
+                spent,
+                cut_rounds=node.cut_rounds,
+                branch_value=node.branch_value,
             )
+            if node.converge:
+                # Out of the lane's band for good, so it keeps its progress.
+                again.converge = again.exact_tried = True
+            self.push(again)
             return
         # An LP that did not converge keeps its Lagrangian bound (valid at
         # any duals) and branches on its point. An infeasible one has duals
@@ -8995,7 +9374,18 @@ class _BranchAndBound:
                 return
             candidates = inside
         choice = self.choose_branch(
-            node, x, candidates, lower, upper, warm, terms, bound, pending, raw
+            node,
+            x,
+            candidates,
+            lower,
+            upper,
+            warm,
+            terms,
+            bound,
+            pending,
+            raw,
+            exact_strong=result.get("exact_strong"),
+            exact=result.get("stop_reason") == "exact",
         )
         if choice is None:  # strong branching closed or requeued the node
             return
@@ -9321,6 +9711,10 @@ class _BranchAndBound:
             "restarts": len(self.restart_log),
             "restart_log": list(self.restart_log),
             "rins_calls": self.rins_calls,
+            "rins_finds": self.rins_finds,
+            "crossover_calls": self.crossover_calls,
+            "crossover_finds": self.crossover_finds,
+            "submip_lane_seconds": self.submip_lane_seconds,
             "conflicts": (
                 dict(self.conflicts.added)
                 if self.conflicts is not None
@@ -9368,6 +9762,11 @@ class _BranchAndBound:
                 "failed": self.exact_failed,
                 "seconds": self.exact_seconds,
                 "bound_gain": self.exact_gain,
+                "strong_lps": self.exact_strong_lps,
+                "strong_seconds": self.exact_strong_seconds,
+                "children_reused": self.exact_reused,
+                "overflow_nodes": self.overflow_nodes,
+                "overflow_converged": self.overflow_converged,
             },
             "mip_start_accepted": self.mip_start_accepted,
             "one_opt_finds": self.one_opt_finds,
@@ -9725,6 +10124,64 @@ class _BranchAndBound:
         )
         self.background_roundings += 1
         return True
+
+    def launch_root_jumps(self, lower, upper):
+        """The feasibility jump before the root LP (``root_jump_seconds``),
+        as HiGHS runs its jump before its first LP: with background workers,
+        the numba jump and no incumbent, each jump lane starts one from the
+        bounds nearest zero (its own seed), for up to ``root_jump_seconds``,
+        while the device solves the root LP. They need no LP point. They
+        stop at the search's first incumbent (``_early_jump_job``). On
+        neos-5106984-jizera (299k columns after presolve) the jump needs
+        about 30-45 s from zero, where the root's own jumps had about 5 s
+        each, after the root LP. Returns whether any started."""
+        if (
+            self.workers is None
+            or not self.use_jump
+            or self.jump_backend != "numba"
+            or self.incumbent is not None
+            or self.root_jump_seconds <= 0
+            or self.out_of_time()
+        ):
+            return False
+        lower = np.array(lower, np.float64)
+        upper = np.array(upper, np.float64)
+        start = np.clip(np.zeros(lower.shape), lower, upper)
+        deadline = time.time() + self.root_jump_seconds
+        if self.deadline is not None:
+            deadline = min(deadline, self.deadline)
+        self.early_jump = threading.Event()
+        started = False
+        for i, lane in enumerate(self.workers.jump_lanes):
+            if not self.workers.idle(lane):
+                continue
+            self.workers.submit(
+                lane,
+                "jump",
+                _early_jump_job,
+                lambda: self.incumbent is not None,
+                self.early_jump,
+                self.base,
+                start.copy(),
+                lower,
+                upper,
+                tol=self.feas_tol,
+                max_iterations=self.jump_iterations,
+                deadline=deadline,
+                seed=101 + i,
+                backend="numba",
+            )
+            started = True
+        return started
+
+    def early_jumps_running(self):
+        """Whether jumps started before the root LP are still at work."""
+        return (
+            self.early_jump is not None
+            and not self.early_jump.is_set()
+            and self.workers is not None
+            and any(not self.workers.idle(lane) for lane in self.workers.jump_lanes)
+        )
 
     def background_root_heuristics(self, lower, upper, result):
         """With ``parallel_heuristics``: the root heuristics on the first
@@ -10511,11 +10968,16 @@ class _BranchAndBound:
         return False
 
     def rins(self, x, warm):
-        """RINS around the incumbent and the node LP point ``x``, the
-        sub-MIP solved by a Jaddle sub-search (``jaddle_rins``). The node
-        limit (``rins_nodes``) doubles after a call that improves the
-        incumbent and halves after one that does not, within [50, 2000], as
-        HiGHS adapts its own sub-MIP effort."""
+        """RINS around the incumbent and the node LP point ``x``. With the
+        sub-MIP lane (``submip_solver="highs"``) the neighbourhood goes to
+        HiGHS on its thread (``submit_rins``). Otherwise a Jaddle sub-search
+        solves it (``jaddle_rins``), and its node limit (``rins_nodes``)
+        doubles after a call that improves the incumbent and halves after
+        one that does not, within [50, 2000], as HiGHS adapts its own
+        sub-MIP effort."""
+        if self.submip_lane is not None:
+            self.submit_rins(x)
+            return
         started = time.time()
         seconds = self.rins_seconds
         if self.deadline is not None:
@@ -10526,6 +10988,7 @@ class _BranchAndBound:
         if found is not None:
             self.try_incumbent(found, "N", warm)
         improved = self.incumbent[0] < before
+        self.rins_finds += improved
         self.rins_nodes = int(
             min(2000, max(50, self.rins_nodes * (2 if improved else 0.5)))
         )
@@ -10536,17 +10999,30 @@ class _BranchAndBound:
 
     def submip_budget_left(self):
         """Whether RINS is within ``heuristic_effort`` of the elapsed time
-        (never with ``heuristic_effort=0``)."""
+        (never with ``heuristic_effort=0``). RINS on the sub-MIP lane takes
+        no time from the search, so it always has budget."""
+        if self.submip_lane is not None:
+            return True
         return self.submip_seconds < self.heuristic_effort * (time.time() - self.start)
 
-    def rins_box(self, x, seconds, min_fixed=0.3):
+    def submip_seconds_left(self, seconds):
+        """``seconds``, cut to the time left before the deadline."""
+        if self.deadline is not None:
+            seconds = min(seconds, self.deadline - time.time())
+        return seconds
+
+    def rins_box(self, x, seconds, min_fixed=0.3, tolerance=None):
         """RINS's neighbourhood for HiGHS: the integers on which the
-        incumbent and ``x`` agree are fixed there. ``None`` when ``seconds``
-        is not positive, fewer than ``min_fixed`` of the integers agree, or
-        the same neighbourhood was searched at the same cutoff."""
+        incumbent and ``x`` agree, within ``tolerance`` (``None``: the
+        integrality tolerance), are fixed at the incumbent's values. A PDHG
+        point stops short of the vertex (a binary at 0.9997), so the lane
+        passes ``rins_tolerance``. ``None`` when ``seconds`` is not positive,
+        fewer than ``min_fixed`` of the integers agree, or the same
+        neighbourhood was searched at the same cutoff."""
         ints = self.is_int
         incumbent = self.incumbent[1]
-        agree = ints & (np.abs(np.asarray(x, np.float64) - incumbent) <= self.int_tol)
+        tol = self.int_tol if tolerance is None else tolerance
+        agree = ints & (np.abs(np.asarray(x, np.float64) - incumbent) <= tol)
         if seconds <= 0 or agree.sum() < min_fixed * ints.sum():
             return None
         key = (agree.tobytes(), incumbent[agree].tobytes(), self.cutoff())
@@ -10558,6 +11034,133 @@ class _BranchAndBound:
         upper = np.where(agree, incumbent, self.base.upper)
         return lower, upper
 
+    def submit_rins(self, x):
+        """RINS on the sub-MIP lane around the incumbent and the point
+        ``x`` (``rins_box`` at ``rins_tolerance``). With the lane busy the
+        call waits (``rins_pending``). Returns whether a job went in."""
+        if self.submip_lane.busy():
+            self.rins_pending = True
+            return False
+        seconds = self.submip_seconds_left(self.rins_seconds)
+        box = self.rins_box(x, seconds, tolerance=self.rins_tolerance)
+        if box is None:
+            return False
+        self.submit_submip("rins", box, seconds)
+        self.rins_calls += 1
+        return True
+
+    def submit_submip(self, kind, box, seconds):
+        """Hand ``box`` of ``self.base`` to the sub-MIP lane, pruned at the
+        cutoff."""
+        lower, upper = box
+        self.submip_lane.submit(
+            kind, self.base, self.is_int, lower, upper, self.cutoff(box=False), seconds
+        )
+        self.submip_last = kind
+        self.submip_calls += 1
+
+    def remember_solution(self, value, x):
+        """Keep the feasible point ``x`` in the solution pool (crossover's):
+        the best ``_SOLUTION_POOL_SIZE`` points with distinct integers, best
+        first."""
+        key = x[self.is_int].tobytes()
+        pool = self.solution_pool
+        if any(entry[1] == key for entry in pool):
+            return
+        pool.append((value, key, np.array(x, np.float64)))
+        pool.sort(key=lambda entry: entry[0])
+        del pool[_SOLUTION_POOL_SIZE:]
+
+    def crossover_box(self, rng, tries=5):
+        """Crossover's neighbourhood: the incumbent and
+        ``crossover_solutions − 1`` other pool points (drawn at random), with
+        the integers on which they all agree fixed there. Pool points outside
+        the base box (after a restart) are left out. ``None`` when no draw
+        of ``tries`` fixes at least ``crossover_min_fixed`` of the integers in
+        a neighbourhood not yet searched at this cutoff."""
+        base, ints = self.base, self.is_int
+        points = [
+            x
+            for _, _, x in self.solution_pool
+            if np.all(x[ints] >= base.lower[ints]) and np.all(x[ints] <= base.upper[ints])
+        ]
+        if self.incumbent is None or len(points) < self.crossover_solutions:
+            return None
+        first = self.incumbent[1]
+        others = [x for x in points if not np.array_equal(x[ints], first[ints])]
+        need = self.crossover_solutions - 1
+        if len(others) < need:
+            return None
+        for _ in range(tries):
+            picks = rng.choice(len(others), size=need, replace=False)
+            agree = ints.copy()
+            for i in picks:
+                agree &= others[i] == first
+            if agree.sum() < self.crossover_min_fixed * ints.sum():
+                continue
+            key = ("crossover", agree.tobytes(), first[agree].tobytes(), self.cutoff())
+            if key in self.rins_seen:
+                continue
+            self.rins_seen.add(key)
+            lower = np.where(agree, first, base.lower)
+            upper = np.where(agree, first, base.upper)
+            return lower, upper
+        return None
+
+    def crossover(self):
+        """Crossover on the sub-MIP lane (``crossover_box``), as SCIP's
+        crossover and cuOpt's recombiners: where several of the search's
+        solutions agree, the rest is searched by HiGHS. Needs no LP point,
+        so it suits PDHG's interior ones. Returns whether a job went in."""
+        seconds = self.submip_seconds_left(self.crossover_seconds)
+        if seconds <= 0:
+            return False
+        box = self.crossover_box(np.random.default_rng(self.crossover_calls))
+        if box is None:
+            return False
+        self.submit_submip("crossover", box, seconds)
+        self.crossover_calls += 1
+        return True
+
+    def feed_submip(self):
+        """Keep the sub-MIP lane busy between node solves: a pending RINS
+        call (around the latest node point) and crossover take turns, and
+        either fills the lane when the other has nothing to search."""
+        lane = self.submip_lane
+        if lane is None or lane.busy() or self.incumbent is None or self.out_of_time():
+            return
+        kinds = ("crossover", "rins") if self.submip_last == "rins" else ("rins", "crossover")
+        for kind in kinds:
+            if kind == "rins":
+                if self.rins_seconds and self.rins_pending and self.recent_points:
+                    self.rins_pending = False
+                    if self.submit_rins(self.recent_points[-1]):
+                        return
+            elif self.crossover_seconds and self.crossover():
+                return
+
+    def collect_submip(self):
+        """Check the point of the sub-MIP lane's finished job, if any, with
+        ``try_incumbent`` (RINS ``"N"``, crossover ``"C"``)."""
+        lane = self.submip_lane
+        if lane is None:
+            return
+        done = lane.finished()
+        if done is None:
+            return
+        kind, x, seconds = done
+        self.submip_lane_seconds += seconds
+        if x is None:
+            return
+        before = None if self.incumbent is None else self.incumbent[0]
+        self.try_incumbent(x, "N" if kind == "rins" else "C", None)
+        improved = self.incumbent is not None and (
+            before is None or self.incumbent[0] < before
+        )
+        if kind == "rins":
+            self.rins_finds += improved
+        else:
+            self.crossover_finds += improved
 
     def round_repair(self, x, lower, upper, warm, snap=None):
         """
@@ -10761,6 +11364,8 @@ class _BranchAndBound:
             feasibility_jump=False,
             rins_seconds=0.0,
             rens_seconds=0.0,
+            crossover_seconds=0.0,
+            submip_solver="jaddle",
             dive_every=0,
             tree_heuristics=False,
             node_crossover=False,
@@ -11406,8 +12011,11 @@ class _BranchAndBound:
                 if point is not None:
                     self.try_incumbent(point, "B", warm)
         if self.use_jump and self.incumbent is None:
-            # From the rounded LP point, then from the bounds nearest zero.
+            # From the rounded LP point, then from the bounds nearest zero
+            # (unless the early root jumps are still on it).
             starts = ((x, 0), (np.clip(np.zeros_like(x), lower, upper), 1))
+            if self.early_jumps_running():
+                starts = starts[:1]
             for start, seed in starts:
                 if self.incumbent is not None or time.time() >= deadline:
                     break
@@ -11825,6 +12433,9 @@ class _BranchAndBound:
             box = self.prune_by_conflicts(node, *box)
             if box is None:
                 continue
+            if node.exact_known:
+                self.evaluate_known(node, box)
+                continue
             self.submit_exact(node, box)
 
     def wants_exact(self, node):
@@ -11834,15 +12445,49 @@ class _BranchAndBound:
         lowest-bound nodes whenever it has room."""
         return self.exact_eligible(node) and self.exact_lane.room()
 
+    def overflow_band(self, limit):
+        """Up to ``limit`` of the highest-bound nodes reserved for the exact
+        lane past the ``_EXACT_OVERFLOW_KEEP`` a thread it keeps, taken out
+        of the band for the device to solve to convergence (``converge``),
+        lowest bound first. The lane keeps the lowest nodes."""
+        lane, reserved = self.exact_lane, self.exact_reserved
+        if lane is None or limit <= 0:
+            return []
+        excess = len(reserved) - _EXACT_OVERFLOW_KEEP * lane.threads
+        if excess <= 0:
+            return []
+        take = min(limit, excess)
+        reserved.sort()  # a sorted list is still a heap
+        nodes = [entry[2] for entry in reserved[-take:]]
+        del reserved[-take:]
+        for node in nodes:
+            node.exact_tried = node.converge = True
+        self.overflow_nodes += len(nodes)
+        return nodes
+
     def submit_exact(self, node, box):
         node.exact_tried = True
         lower, upper = box
+        strong = None
+        if self.exact_strong_candidates > 0:
+            # Strong branching in the job (``_exact_strong``), against a
+            # snapshot of the lane's exact pseudocosts.
+            strong = (
+                self.is_int,
+                self.int_tol,
+                self.exact_pc_sum.copy(),
+                self.exact_pc_count.copy(),
+                self.exact_strong_candidates,
+                self.exact_strong_iterations,
+                self.reliability_threshold,
+            )
         self.exact_lane.submit(
             node,
             box,
             (self.lp_lower(lower), self.lp_upper(upper)),
             self.mip,
             self.cut_version,
+            strong,
         )
 
     def collect_exact(self):
@@ -11850,14 +12495,20 @@ class _BranchAndBound:
         are evaluated: the HiGHS solution stands in for the PDHG one, so
         the node's bound is its exact duals' Lagrangian bound (rigorous at
         any duals), it branches on the vertex, and its children's bounds
-        come from those duals over their boxes. A node HiGHS proves
+        come from those duals over their boxes. With the lane's strong
+        branching (``exact_strong_candidates``), the node branches by its
+        strong children (``exact_strong_children``). A node HiGHS proves
         infeasible is closed; one it did not finish goes back to the queue
         for the device."""
         lane = self.exact_lane
         if lane is None:
             return
-        for node, box, version, outcome, seconds in lane.finished():
+        for node, box, version, outcome, children, strong_seconds, seconds in (
+            lane.finished()
+        ):
             self.exact_seconds += seconds
+            self.exact_strong_seconds += strong_seconds
+            self.exact_strong_lps += len(children)
             status, x, y_eq, y_ineq = outcome
             if node.bound >= self.cutoff():
                 self.close(node.bound)
@@ -11866,40 +12517,117 @@ class _BranchAndBound:
                 self.exact_infeasible += 1
                 self.close(max(node.bound, self.cutoff_bound()))
                 continue
-            template = node.warm[0]
-            if (
-                status != "optimal"
-                or version > self.cut_version
-                or y_ineq.size != np.shape(template.dual_ineq)[0]
-                or y_eq.size > np.shape(template.dual_eq)[0]
-            ):
+            solution = None
+            if status == "optimal" and version <= self.cut_version:
+                solution = self.exact_solution(node, x, y_eq, y_ineq, version)
+            if solution is None:
                 # Unsolved, or for rows the search no longer has (a restart).
                 self.exact_failed += 1
                 self.push(node)
                 continue
-            dual_eq = np.zeros(np.shape(template.dual_eq)[0])
-            dual_eq[: y_eq.size] = y_eq
-            solution = template._replace(
-                primal=x, dual_eq=dual_eq, dual_ineq=y_ineq
-            )
-            if version < self.cut_version:
-                # Tree cut refreshes since: the replaced slots' duals go.
-                solution = self.stale_free(solution, version)
-            lower, upper = box
-            raw, _ = self.lp_bound(solution, lower, upper)
-            if np.isfinite(raw):
-                self.exact_gain += max(raw - node.bound, 0.0)
             self.exact_solved += 1
-            self.nodes += 1
-            result = dict(
-                solution=solution,
-                converged=True,
-                stop_reason="exact",
-                epochs=0,
-                opt_state=node.warm[1],
+            strong = self.exact_strong_children(
+                node, box, version, solution, children
             )
-            self.evaluate(node, lower, upper, None, result)
-            self.log(" ", None)
+            self.evaluate_exact(node, box, solution, strong)
+
+    def exact_solution(self, node, x, y_eq, y_ineq, version):
+        """A HiGHS solution (Jaddle's dual convention) as a ``SaddleState``
+        shaped as ``node``'s warm start, with the duals of cut slots
+        replaced since ``version`` zeroed (``stale_free``); ``None`` when
+        the shapes do not fit the current rows."""
+        template = node.warm[0]
+        if (
+            y_ineq.size != np.shape(template.dual_ineq)[0]
+            or y_eq.size > np.shape(template.dual_eq)[0]
+        ):
+            return None
+        dual_eq = np.zeros(np.shape(template.dual_eq)[0])
+        dual_eq[: y_eq.size] = y_eq
+        solution = template._replace(primal=x, dual_eq=dual_eq, dual_ineq=y_ineq)
+        if version < self.cut_version:
+            solution = self.stale_free(solution, version)
+        return solution
+
+    def exact_strong_children(self, node, box, version, solution, children):
+        """The lane's strong-branching ``children`` (``_exact_strong``'s
+        list) as ``choose_branch``'s ``exact_strong``: ``({var: (down,
+        up)}, solved)`` of ``_StrongChild``, bounded by each side's duals
+        over its box (rigorous at any duals, so an iteration-limited side
+        counts too), or ``None`` without children. Each solved side also
+        records an exact pseudocost observation."""
+        if not children:
+            return None
+        lower, upper = box
+        x = np.asarray(solution.primal, np.float64)
+        node_raw, _ = self.exact_bound(solution, lower, upper)
+        sides = {}
+        for var, down, status, cx, cy_eq, cy_ineq in children:
+            lo, up = lower.copy(), upper.copy()
+            if down:
+                up[var] = min(up[var], math.floor(x[var]))
+            else:
+                lo[var] = max(lo[var], math.ceil(x[var]))
+            if status == "infeasible" or lo[var] > up[var]:
+                sides.setdefault(var, {})[down] = _StrongChild(np.inf, True, None)
+                continue
+            child = None
+            if status in ("optimal", "partial"):
+                child = self.exact_solution(node, cx, cy_eq, cy_ineq, version)
+            if child is None:  # failed: no information
+                sides.setdefault(var, {})[down] = None
+                continue
+            raw, rigorous = self.exact_bound(child, lo, up)
+            if not (rigorous and np.isfinite(raw)):
+                raw = node.bound
+            bound = max(self.round_bound(raw), node.bound)
+            closed = rigorous and bound >= self.cutoff()
+            sides.setdefault(var, {})[down] = _StrongChild(
+                bound,
+                closed,
+                None if closed else child,
+                raw,
+                status == "optimal" and not closed,
+            )
+            distance = x[var] - math.floor(x[var]) if down else math.ceil(x[var]) - x[var]
+            if distance > 0 and np.isfinite(node_raw) and np.isfinite(raw):
+                side = 0 if down else 1
+                self.exact_pc_sum[side, var] += max(raw - node_raw, 0.0) / distance
+                self.exact_pc_count[side, var] += 1
+        out, solved = {}, set()
+        for var, both in sides.items():
+            if both.get(True) is not None and both.get(False) is not None:
+                out[var] = (both[True], both[False])
+                solved.add(var)
+        return (out, solved) if out else None
+
+    def evaluate_exact(self, node, box, solution, strong=None):
+        """Evaluate ``node`` with an exact LP ``solution`` (and the lane's
+        strong children, ``strong``) as a batch member is evaluated."""
+        lower, upper = box
+        raw, _ = self.exact_bound(solution, lower, upper)
+        if np.isfinite(raw):
+            self.exact_gain += max(raw - node.bound, 0.0)
+        self.nodes += 1
+        result = dict(
+            solution=solution,
+            converged=True,
+            stop_reason="exact",
+            epochs=0,
+            opt_state=node.warm[1],
+            exact_strong=strong,
+        )
+        self.evaluate(node, lower, upper, None, result)
+        self.log(" ", None)
+
+    def evaluate_known(self, node, box):
+        """Evaluate a node whose warm start is already an optimal vertex of
+        its LP (``exact_known``: from the lane's strong branching) without
+        solving it again. Its box lies inside the strong child's, so the
+        duals' Lagrangian bound over it holds and is no lower."""
+        node.exact_tried = True
+        self.exact_reused += 1
+        self.evaluate_exact(node, box, self.fit_warm(node)[0])
 
     def launch_next(self):
         """Pick up to ``batch_size`` open nodes and dispatch their LPs
@@ -11910,6 +12638,24 @@ class _BranchAndBound:
         in_flight = 0 if self.in_flight is None else len(self.in_flight["members"])
         self.feed_exact()
         band_top = self.exact_band_top()
+        if self.exact_overflow_share > 0.0:
+            # The top of a band too deep for the lane, solved to convergence
+            # on the device (``overflow_band``).
+            for node in self.overflow_band(
+                int(self.exact_overflow_share * self.batch_size)
+            ):
+                if node.bound >= self.cutoff():
+                    self.close(node.bound)
+                    continue
+                box = self.expand(node.changes)
+                if np.any(box[0] > box[1]):
+                    self.close(max(node.bound, self.cutoff_bound()))
+                    continue
+                box = self.prune_by_conflicts(node, *box)
+                if box is None:
+                    continue
+                members.append(node)
+                boxes.append(box)
         plunge_child = self.plunge_node is not None and not self.exact_plunges_on()
         while len(members) < self.batch_size and (self.open or plunge_child):
             plunge_child = False
@@ -11937,6 +12683,10 @@ class _BranchAndBound:
                 continue
             box = self.prune_by_conflicts(node, *box)
             if box is None:
+                continue
+            if node.exact_known and self.exact_lane is not None:
+                # Solved already by the lane's strong branching.
+                self.evaluate_known(node, box)
                 continue
             if from_heap and self.exact_band <= 0.0 and self.wants_exact(node):
                 self.submit_exact(node, box)
@@ -12189,6 +12939,8 @@ class _BranchAndBound:
                 self.workers.shutdown()
             if self.exact_lane is not None:
                 self.exact_lane.shutdown()
+            if self.submip_lane is not None:
+                self.submip_lane.shutdown()
             if self._device_thread is not None:
                 self._device_thread.shutdown(wait=True)
                 self._device_thread = None
@@ -12345,6 +13097,7 @@ class _BranchAndBound:
         warm = None
         if self.root_warm is not None:
             warm = (self.root_warm["solution"], self.root_warm["opt_state"])
+        self.launch_root_jumps(lower, upper)
         result = self.solve_lp(lp, warm, self.root_max_epochs)
         if (
             not result["converged"]
@@ -12358,6 +13111,8 @@ class _BranchAndBound:
                 return self.result("unbounded_or_infeasible")
             result = detection["result"]
         self.nodes += 1
+        # Points the early root jumps found while the LP was solved.
+        self.collect_heuristics(schedule=False)
         if self.verbose:
             root_bound, _ = self.lp_bound(result["solution"], lower, upper)
             print(
@@ -12511,6 +13266,8 @@ class _BranchAndBound:
                 self.collect_heuristics()
                 self.collect_exact()
                 self.feed_exact()
+                self.collect_submip()
+                self.feed_submip()
                 if (
                     self.exact_lane is not None
                     and (self.exact_lane.jobs or self.exact_reserved)
@@ -12609,12 +13366,12 @@ def solve(
     node_max_epochs=None,
     root_max_epochs=None,
     infeasibility_tolerance=1e-8,
-    heuristic_every=5,
+    heuristic_every=0,
     propagate=True,
     coefficient_tightening=True,
-    cuts=True,
-    cut_rounds=None,
-    max_cuts_per_round=100,
+    cuts=False,
+    cut_rounds=10,
+    max_cuts_per_round=500,
     cut_min_progress=None,
     cut_round_epochs=10,
     gomory_cuts=True,
@@ -12622,18 +13379,18 @@ def solve(
     flow_covers=True,
     clique_cuts=True,
     zero_half_cuts=True,
-    cut_age=10,
-    max_cut_rows=None,
-    gomory_candidates=None,
-    inout_separation=None,
-    root_redcost_propagation=False,
-    global_redcost_fixing=False,
-    cut_pool_propagation=False,
-    plunge_child="score",
+    cut_age=100,
+    max_cut_rows=10000,
+    gomory_candidates=400,
+    inout_separation=0.5,
+    root_redcost_propagation=True,
+    global_redcost_fixing=True,
+    cut_pool_propagation=True,
+    plunge_child="rounding",
     implied_integer_cuts=True,
     separation_backend="jax",
     node_bound_stop=True,
-    node_lp_tolerance=None,
+    node_lp_tolerance=1e-3,
     heuristic_effort=0.3,
     reliability_threshold=4,
     strong_candidates=8,
@@ -12641,16 +13398,16 @@ def solve(
     strong_max_depth=None,
     strong_screen=32,
     strong_backend="jax",
-    root_strong_candidates="auto",
-    root_strong_epochs=None,
+    root_strong_candidates=4,
+    root_strong_epochs=5,
     root_crossover=False,
-    round_repair=True,
+    round_repair=False,
     round_repair_every=None,
     round_repair_seconds=10.0,
     tree_cuts=True,
     tree_cut_every=10,
-    max_tree_cuts_per_round=10,
-    tree_cut_rows=None,
+    max_tree_cuts_per_round=200,
+    tree_cut_rows=1000,
     tree_cut_nnz=None,
     tree_cut_points=4,
     tree_cut_rounds=1,
@@ -12661,34 +13418,34 @@ def solve(
     jump_iterations=None,
     repair=True,
     repair_max_epochs=20,
-    rins_seconds=None,
+    rins_seconds=10.0,
     rins_every=5,
     rins_nodes=200,
-    rens_seconds=None,
+    rens_seconds=0,
     rens_nodes=500,
-    dive_every=50,
+    dive_every=0,
     dive_depth=20,
-    plunge_depth=8,
-    batch_size="auto",
-    feasibility_pump=True,
+    plunge_depth=4,
+    batch_size=32,
+    feasibility_pump=False,
     pump_iterations=30,
     pump_tolerance=1e-4,
     pump_jump_iterations=3000,
     pump_jump_share=0.2,
-    probing=True,
+    probing=False,
     probing_seconds=None,
     probing_max_variables=None,
     probing_backend="auto",
     probing_max_useless=1000,
     probing_passes=_PROBE_MAX_PASSES,
     probing_max_implications=_PROBE_MAX_IMPLICATIONS,
-    bulk_rounding=True,
+    bulk_rounding=False,
     bulk_starts=4,
     repair_share=0.2,
-    batch_epochs=2,
+    batch_epochs=4,
     children_backend="auto",
     batch_roundings=False,
-    tree_heuristics=True,
+    tree_heuristics=False,
     tree_heuristic_every=10,
     tree_heuristic_share=0.05,
     tree_jump_iterations=None,
@@ -12706,26 +13463,30 @@ def solve(
     verbose=False,
     log_every_seconds=1.0,
     device="auto",
-    precision="float64",
+    precision="float32",
     node_precision="float32",
     jump_backend="auto",
     parallel_heuristics=True,
-    symmetry="auto",
+    symmetry=False,
     restarts=5,
     mip_start=None,
     implied_bound_cuts=True,
     implied_variable_bounds=True,
-    max_aggregation=None,
-    exact_nodes=0,
+    max_aggregation=6,
+    exact_nodes=8,
     exact_node_seconds=10.0,
     exact_band=0.005,
-    one_opt=True,
-    objective_propagation=False,
+    exact_strong_candidates=4,
+    exact_strong_iterations=1000,
+    exact_overflow_share=0.5,
+    exact_overflow_epochs=None,
+    one_opt=False,
+    objective_propagation=True,
     plunge_gap=0.25,
-    branch_implied=False,
-    near_integral_tolerance=1e-2,
+    branch_implied=True,
+    near_integral_tolerance=0,
     tree_pool_every=1,
-    parallel_rounding=True,
+    parallel_rounding=False,
     node_jump_seconds=1.0,
     pipeline_batches=True,
     gpu_dive_every=0,
@@ -12739,6 +13500,12 @@ def solve(
     exact_plunge_share=0.25,
     jump_threads=4,
     jump_restarts=True,
+    root_jump_seconds=60.0,
+    submip_solver="highs",
+    rins_tolerance=0.1,
+    crossover_seconds=10.0,
+    crossover_solutions=3,
+    crossover_min_fixed=0.5,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -12759,8 +13526,9 @@ def solve(
       limit, an infeasible root LP runs until ``max_seconds``. The checks
       between that call's chunks of doubling length cost a feasible root
       about 2.5× (bab5's: 0.8 s and 24 epochs against 0.3 s and 17).
-    * **Symmetry** (``symmetry``; ``"auto"``, the default: on when igraph
-      is installed, ``pip install jaddle[symmetry]``; ``True`` requires it).
+    * **Symmetry** (``symmetry``, off by default; ``"auto"``: on when
+      igraph is installed, ``pip install jaddle[symmetry]``; ``True``
+      requires it).
       After coefficient tightening, the column symmetries of the MIP over
       the propagated root box are found as graph automorphisms by bliss
       (``symmetry_generators``, each checked exactly), the ones that swap
@@ -12795,7 +13563,7 @@ def solve(
       solves it in about 530 s; Jaddle's root reduced-cost fixing there
       fixed 8 to 2,908 integers (up to 14%), depending on its root bound
       and incumbent.
-    * **More from the incumbent** (all off by default). Each holds for
+    * **More from the incumbent** (all on by default). Each holds for
       every solution better than the cutoff, which is all the search needs.
       ``root_redcost_propagation`` puts the root's reduced-cost row
       (``constant + r·x <= cutoff`` over the root box) in the conflict pool
@@ -12806,8 +13574,8 @@ def solve(
       with every node LP's duals, not only the root's: ``c·x >= constant +
       r·x`` holds for every feasible ``x`` whatever the duals. The result
       reports ``global_redcost_fixed``.
-    * **In-out separation** (``inout_separation``, off by default; a
-      value in (0, 1)). With an incumbent ``x̄``, the root's cut rounds and
+    * **In-out separation** (``inout_separation``, default 0.5;
+      ``None``: off; a value in (0, 1)). With an incumbent ``x̄``, the root's cut rounds and
       the tree's (``tree_cuts``) also separate at ``λ·x + (1 − λ)·x̄``.
       A valid cut violated there is violated at the LP point ``x`` by
       more, since ``x̄`` satisfies it. From a point nearer the feasible
@@ -12819,7 +13587,7 @@ def solve(
       changes. At the root an incumbent exists during the rounds after a
       ``mip_start`` and after a restart. Results: ``inout_cuts`` (in-out cuts kept) and
       ``inout_rounds``.
-    * **Branching on implied integers** (``branch_implied``, off by
+    * **Branching on implied integers** (``branch_implied``, on by
       default). Fractional implied integers (``MIP.implied``: continuous
       columns HiGHS's presolve showed some optimum has integral) join the
       branching candidates at nodes that branch, scored like the integers
@@ -12832,7 +13600,7 @@ def solve(
       columns cost 1,000 each and hold most of the objective, and
       branching on the binaries alone leaves the LP bound where it is.
       ``result["implied_branchings"]`` counts the branchings on them.
-    * **Objective propagation** (``objective_propagation``, off by
+    * **Objective propagation** (``objective_propagation``, on by
       default). The search's bound propagation (each node's box before its
       LP, every child after branching, strong branching's children, the
       root box at a restart) also runs the objective row
@@ -12845,7 +13613,7 @@ def solve(
       which only falls. The heuristics' propagation has always had the
       row. Batched device children (``children_backend``) and device
       strong branching (``strong_backend="jax"``) do not run it.
-    * **Cut pool propagation** (``cut_pool_propagation``, off by default).
+    * **Cut pool propagation** (``cut_pool_propagation``, on by default).
       Every cut the root and tree rounds select is kept, and the search's
       propagation runs them beside the rows at every node, after they have
       left the LP, as HiGHS propagates its cut pool. Cuts with more than
@@ -12866,7 +13634,7 @@ def solve(
       points better by more than ``mip_abs_gap``/``mip_rel_gap``, and the
       start is returned when none turns up (``"optimal"`` once the search
       proves there is none).
-    * **1-opt** (``one_opt``, on by default). Every new incumbent is
+    * **1-opt** (``one_opt``, off by default). Every new incumbent is
       passed to ``one_opt``: each integer with a nonzero cost moves in its
       improving direction as far as its bounds and the rows' slack allow,
       largest gains first, continuous variables fixed (source ``"1"``,
@@ -12879,8 +13647,8 @@ def solve(
       without changing the integer-feasible points; the search then runs on
       the tightened rows, and incumbents are still checked against the MIP
       as given.
-    * **Root cuts** (``cuts``). Up to ``cut_rounds`` rounds (default: 40
-      with Gomory cuts on, else 5) of
+    * **Root cuts** (``cuts``, off by default). Up to ``cut_rounds`` rounds
+      (default 10; ``None``: 40 with Gomory cuts on, else 5) of
       Gomory mixed-integer cuts (``gomory_cuts``, on by default; ``"auto"``
       turns them on only for MIPs with at most 10,000 nonzeros, whose
       crossovers take milliseconds), knapsack
@@ -12905,8 +13673,8 @@ def solve(
       (``"auto"``, the default: on for MIPs with at most 10,000 nonzeros),
       aggregates of up to five rows also cancel the most fractional integer
       term, so pure-integer rows combine. On lseu that lifts the root bound
-      (exact LPs) from 1,061 to 1,100. ``max_aggregation`` sets the rows
-      added to an aggregate instead (``None``: 2, or 4 with
+      (exact LPs) from 1,061 to 1,100. ``max_aggregation`` (default 6) sets the
+      rows added to an aggregate instead (``None``: 2, or 4 with
       ``aggregate_integers``); on map06, whose rows bound continuous
       variables through chains of other continuous variables, 6 with
       probing's variable bounds (below) takes the root bound (exact LPs)
@@ -12917,14 +13685,14 @@ def solve(
       they are separated from the rows as given as well as the tightened
       rows, since the original knapsacks can give stronger covers. A
       round keeps at most
-      ``max_cuts_per_round`` cuts (default 100) with efficacy (distance cut
+      ``max_cuts_per_round`` cuts (default 500) with efficacy (distance cut
       off) at least 1e-4 that are not near-parallel, retires cuts that are
       slack, and re-solves the LP warm. With 10 a round, the strongest
       covers took every slot on bab5 and no Gomory cut got in: 100 takes
       its root bound (with clique cuts) from −113,254 to −111,358, and
       ns1830653's from 10,621 to 11,622, HiGHS's root bound. A cut leaves
       the LP once it has been idle (slack, with a zero dual, at the
-      round's re-solve) for ``cut_age`` rounds in a row (default 10), and
+      round's re-solve) for ``cut_age`` rounds in a row (default 100), and
       stays in the global cut pool (below). On degenerate LPs a cut slack
       at one optimum is often binding again at the next, and dropped at
       once the rounds cycle between them (ns1830653 sat at 11,622). GMI
@@ -12982,11 +13750,11 @@ def solve(
       bab5, with exact LPs and 20 rounds, they take the root bound with
       the other families from −111,209 to −107,410, past HiGHS's root
       bound (−107,454); their separation takes about 4 s of it.
-      ``max_cut_rows`` (default ``None``: no limit) caps the cut rows in
+      ``max_cut_rows`` (default 10,000; ``None``: no limit) caps the cut rows in
       the root LP. A round that would pass it drops the kept cuts idle
       longest (never an active one), then takes fewer new cuts, and the
       rounds stop once the active cuts fill it. ``gomory_candidates``
-      (default ``None``: twice ``max_cuts_per_round``) is the number of
+      (default 400; ``None``: twice ``max_cuts_per_round``) is the number of
       tableau rows a round tries for Gomory cuts, nearest ½ first. Every
       candidate a root or tree round separates that its point violates,
       not only those chosen for the LP, joins the global cut pool
@@ -12995,8 +13763,8 @@ def solve(
     * **Tree cuts** (``tree_cuts``, on by default). After the root cuts,
       the LP's cut block gets a fixed capacity: ``tree_cut_rows`` cuts with
       ``tree_cut_nnz`` nonzeros between them (both rounded up to powers of
-      two; ``None``, the default: twice the root's cuts and nonzeros, and
-      room for at least two rounds). Every ``tree_cut_every`` nodes (default
+      two; ``tree_cut_rows`` defaults to 1,000; ``None``: twice the root's
+      cuts and nonzeros, and room for at least two rounds). Every ``tree_cut_every`` nodes (default
       10), between solving node LPs (a batch, or one node) and evaluating
       them, the block is refreshed (``refresh_cuts``) from all of their
       points. In between, every ``tree_pool_every`` nodes (default 1,
@@ -13014,7 +13782,7 @@ def solve(
          nodes, all over the root box, so they hold at every node; cuts
          with more than ``tree_cut_max_nnz`` nonzeros (default
          ``max(64, n / 8)``) are left out;
-      3. at most ``max_tree_cuts_per_round`` (default 10) of the most
+      3. at most ``max_tree_cuts_per_round`` (default 200) of the most
          efficacious go in, none a near-duplicate of another, each in a
          free slot or in place of the cut idle longest (at least two
          refreshes); ones that find no room are dropped
@@ -13103,7 +13871,7 @@ def solve(
       so it compiles once per shape and tree cut refreshes reuse it). The
       nodes are then evaluated in order on
       the host exactly as in the serial search. Members run in lockstep,
-      for at most ``batch_epochs`` (default 2) epochs a call. By default
+      for at most ``batch_epochs`` (default 4) epochs a call. By default
       (``node_max_epochs=None``) a node LP gets that one call and branches
       on its point (truncated node LPs; its Lagrangian bound holds at any
       duals, and its pseudocost gains use that bound when the LP did not
@@ -13113,8 +13881,8 @@ def solve(
       in all. On ns1830653 (GPU, batches of 8) the truncated LPs took the
       tree from 16 to 147 nodes a second, with a higher bound at 60 s.
       Worth it on a GPU; on a CPU the members run one after another. The
-      default, ``"auto"``, is 128 on a GPU or TPU and 32 on a CPU (``1``:
-      the serial search). With ``pipeline_batches`` (default ``True``) the
+      default is 32; ``"auto"`` gives 128 on a GPU or TPU and 32 on a CPU
+      (``1``: the serial search). With ``pipeline_batches`` (default ``True``) the
       batches overlap: while the device solves one batch's LPs, the host
       evaluates the batch before (bounds, tree cuts, heuristics, branching),
       and its children are built on the device after the batch in flight,
@@ -13129,7 +13897,7 @@ def solve(
       on an accelerator (flugpl: 3s on the CPU, 18s on a GPU).
       ``"cpu"``, ``"gpu"``, ``"tpu"`` or a ``jax.Device`` pick one;
       ``None`` keeps JAX's default device.
-    * **Precision** (``precision``). ``"float64"`` (default), ``"float32"``
+    * **Precision** (``precision``). ``"float32"`` (default), ``"float64"``
       or ``"float16"`` runs the whole search, node LPs included, at that
       profile (see ``jaddle_optimisers.configure_jax``); ``None`` keeps the
       global one. A ``MIP`` built at another precision is
@@ -13141,8 +13909,8 @@ def solve(
       stay at ``precision``. Warm starts are cast between the two, and
       node bounds stay valid at any precision (they are Lagrangian bounds,
       computed in float64 from the node's duals). The defaults,
-      ``precision="float64", node_precision="float32"``, get an accurate
-      root and cheap nodes; ``node_precision=None`` keeps the node LPs at
+      ``precision="float32", node_precision="float32"``, keep every LP
+      cheap; ``precision="float64"`` gets an accurate root; ``node_precision=None`` keeps the node LPs at
       ``precision``.
     * **Branching** (``branching``): ``"auto"`` (default) is
       ``"pseudocost"``: PDHG's truncated child LPs make strong branching in
@@ -13160,10 +13928,10 @@ def solve(
       SCIP and HiGHS do), and pseudocosts measure a child's LP before its
       re-solve with new tree cuts. With either pseudocost rule, the root
       first strong-branches its
-      ``root_strong_candidates`` (``"auto"``: ``strong_candidates``; ``0``
-      turns it off) fractional integers with the largest
+      ``root_strong_candidates`` (default 4; ``"auto"``: ``strong_candidates``;
+      ``0`` turns it off) fractional integers with the largest
       ``branching_impact · f(1 − f)`` (column length times relative cost) for
-      ``root_strong_epochs`` (``None``: ``strong_epochs``), in one vmapped
+      ``root_strong_epochs`` (default 5; ``None``: ``strong_epochs``), in one vmapped
       call. This seeds their pseudocosts, so the search sees which variables
       move the bound before it has branched on them. On buildingenergy one
       fractional sizing variable (35,000 rows) holds the whole root gap,
@@ -13196,7 +13964,7 @@ def solve(
       infeasible children are dropped without an LP solve.
     * **Node selection** (``node_selection``): ``"hybrid"`` (default) dives
       depth first until the first incumbent, then takes the best bound with
-      plunges: after each best-bound node, up to ``plunge_depth`` steps
+      plunges: after each best-bound node, up to ``plunge_depth`` (default 4) steps
       continue into its preferred child, so the search keeps reaching leaves
       (and new incumbents) while it raises the bound. A plunge also stops
       at a child whose bound is more than ``plunge_gap`` (default 0.25, as
@@ -13208,9 +13976,9 @@ def solve(
       ``"best_first"`` and ``"depth_first"`` do one throughout.
     * **Incumbents.** A node LP point with integral integers (within
       ``integrality_tolerance``), and the LP point rounded at every
-      ``heuristic_every``-th node, are rounded and checked. So is a node
+      ``heuristic_every``-th node (default 0: off), are rounded and checked. So is a node
       LP point whose integers are all within ``near_integral_tolerance``
-      (default 1e-2; ``0``: off) of integers, once per rounding, marked
+      (default 0: off) of integers, once per rounding, marked
       ``"T"``; the node still branches. A loose PDHG point (float32 nodes
       at 1e-4 without node crossover) rarely passes the integrality test
       even at an integral optimum (a binary at 0.9997)
@@ -13222,7 +13990,7 @@ def solve(
       ``repair_max_epochs`` epochs. The repair is skipped when the same
       integers already failed, when no violated row has a continuous
       variable, or when bound propagation shows the fixed box infeasible.
-    * **Probing** (``probing``, on by default). Before the root LP, every
+    * **Probing** (``probing``, off by default). Before the root LP, every
       integer variable is split in two (a binary into 0 and 1, a general
       integer at its midpoint) and both sides are propagated (``probe``):
       an empty side fixes the variable to the other one (with all it
@@ -13250,7 +14018,7 @@ def solve(
       ``fix_and_propagate``
       (off by default; the function of that name) rounds the root LP point in chunks with
       bound propagation after each; if that fails (or is off),
-      ``bulk_fix_and_propagate`` (``bulk_rounding``, independent of
+      ``bulk_fix_and_propagate`` (``bulk_rounding``, off by default; independent of
       ``fix_and_propagate``) rounds it from ``bulk_starts`` starts side by side
       (cuOpt's bulk rounding: bulks of √(free) variables, two random
       roundings per bulk propagated together, the probing cache screening
@@ -13270,7 +14038,7 @@ def solve(
       device; ``"auto"`` (default) uses numba when it is installed. On
       academictimetablesmall the numba jump finds a point in 0.1–1 s,
       against 12 s to over 90 s on a laptop GPU. Then the
-      objective feasibility pump (``feasibility_pump``) runs for up to
+      objective feasibility pump (``feasibility_pump``, off by default) runs for up to
       ``pump_iterations`` warm-started LP solves at ``pump_tolerance``,
       followed by one more jump from the pump's last rounded point. The
       pump is fused with the jump (cuOpt's extended pump): each rounding
@@ -13286,18 +14054,40 @@ def solve(
       history. A jump that ends near-feasible is handed to ``repair`` (a
       backtracking search with propagation over the variables around its
       violated rows), marked ``"R"``, for at most ``repair_share`` of the
-      heuristic time left. RINS (``rins_seconds``; ``None``, the default, gives
-      5s a call) runs once at the root and every ``rins_every`` nodes once
-      there is an incumbent, and after each new incumbent from another
-      source: the integers on which the incumbent and the node's LP point
-      agree are fixed, and the rest is searched for a better solution,
-      marked ``"N"``. This branch and bound searches it
-      (``_BranchAndBound.jaddle_rins``, reusing the compiled LP solver, up
-      to ``rins_nodes`` nodes). ``rins_nodes`` doubles after a call that improves the incumbent and
-      halves after one that does not (within 50–2000), and RINS calls stop
-      while they have taken more than ``heuristic_effort`` (0.3) of the
-      elapsed time (``heuristic_effort=0``: no RINS).
-    * **Round and repair** (``round_repair``, on by default). The root LP
+      heuristic time left. RINS (``rins_seconds``, default 10 s a call;
+      ``0``: off; ``None``: 5 s) runs once at the root and every
+      ``rins_every`` nodes once there is an incumbent, and after each new
+      incumbent from another source: the integers on which the incumbent
+      and the node's LP point agree are fixed, and the rest is searched for
+      a better solution, marked ``"N"``. With ``submip_solver="highs"``
+      (default) HiGHS searches it on a CPU thread (``_SubMipLane``, one
+      job at a time, pruned at the cutoff) while the device keeps solving
+      node LPs; an integer agrees when the point is within
+      ``rins_tolerance`` (default 0.1) of the incumbent, since a PDHG point
+      stops short of the vertex (a binary at 0.9997). A call that finds the
+      lane busy waits for it, and between nodes the lane takes the latest
+      node point. With ``submip_solver="jaddle"`` this branch and bound
+      searches it on the main thread (``_BranchAndBound.jaddle_rins``,
+      reusing the compiled LP solver, up to ``rins_nodes`` nodes, at the
+      integrality tolerance). ``rins_nodes`` doubles after a call that
+      improves the incumbent and halves after one that does not (within
+      50–2000), and those calls stop while they have taken more than
+      ``heuristic_effort`` (0.3) of the elapsed time
+      (``heuristic_effort=0``: no RINS).
+    * **Crossover** (``crossover_seconds``, default 10 s a call; ``0``:
+      off; needs ``submip_solver="highs"``). Every feasible point the
+      search checks, improving or not, joins a pool of the 10 best with
+      distinct integers (the background jumps give many). When the sub-MIP
+      lane is free, the incumbent and ``crossover_solutions − 1`` (default
+      2) other pool points drawn at random have the integers on which they
+      all agree fixed, and HiGHS searches the rest, marked ``"C"``, as
+      SCIP's crossover and cuOpt's recombiners do. A neighbourhood must fix
+      at least ``crossover_min_fixed`` (default 0.5) of the integers, and
+      none is searched twice at one cutoff. It needs no LP point, so PDHG's
+      interior points cost it nothing. RINS and crossover take turns on the
+      lane. Results: ``rins_calls``, ``rins_finds``, ``crossover_calls``,
+      ``crossover_finds`` and ``submip_lane_seconds``.
+    * **Round and repair** (``round_repair``, off by default). The root LP
       point (first its exact vertex, when the root is crossed over for RENS
       or ``root_crossover``), the LP points of the root's two strong
       children of the variable it branches on, and every
@@ -13311,14 +14101,23 @@ def solve(
       ``heuristic_effort``. Rounding up suits integers that count units
       for continuous variables (on buildingenergy the sizing variable's up
       child is where the good points are).
-    * **RENS** (``rens_seconds``; ``None``, the default, gives 5s for MIPs
-      with at most 10,000 nonzeros, else off). After the root heuristics,
+    * **RENS** (``rens_seconds``, default 0: off; ``None`` gives 5s for
+      MIPs with at most 10,000 nonzeros, else off). After the root heuristics,
       the integers that are integral at an exact root vertex (the cut
       loop's last crossover, else one crossed over for RENS when
       ``root_crossover`` allows) are fixed and the fractional ones
       restricted to their floor and ceiling, and that sub-MIP is searched
       by a Jaddle sub-search (``sub_search``, up to ``rens_nodes`` nodes),
       marked ``"E"``. It needs no incumbent.
+    * **Early root jumps** (``root_jump_seconds``, default 60; ``0``:
+      off). With background workers and the numba jump, each jump lane
+      (``jump_threads``) starts the feasibility jump from the bounds nearest
+      zero, with its own seed, before the root LP, as HiGHS jumps before its
+      first LP: the jump needs no LP point, and it runs on the CPU while the
+      device solves the root. They stop at the first incumbent. On
+      neos-5106984-jizera (299k columns, 391k rows after presolve) the jump
+      needs 30-45 s from zero, where the root's own jumps get about 5 s
+      each, and only after the root LP.
     * **Background heuristics** (``parallel_heuristics``, on by default).
       The numba improving jump runs on a background thread, beside the
       node LPs, instead of between them. The search hands a slice over when
@@ -13328,8 +14127,8 @@ def solve(
       jumps (LP point, bounds nearest zero), and each later round's
       fix-and-propagate, run on background threads beside the rounds
       (``"P"``, ``"J"``), and the rounds collect their points. With
-      ``parallel_rounding`` (on by default, whatever ``fix_and_propagate``
-      says) every node's LP point is rounded the same way beside the node
+      ``parallel_rounding`` (off by default; independent of
+      ``fix_and_propagate``) every node's LP point is rounded the same way beside the node
       LPs (``"P"``; a point is skipped while the thread is still busy with
       an earlier one; ``result["background_roundings"]``). When the
       rounding fails, the same job runs an improving feasibility jump
@@ -13345,12 +14144,12 @@ def solve(
       thread. The jobs use NumPy only, never JAX, and stop within about a
       second when the search ends. A run then depends on timing, so it is
       no longer repeatable; turn it off for that.
-    * **Dives** (``dive_every``; default 50, ``0``: off). LP-based dives
+    * **Dives** (``dive_every``; default 0: off). LP-based dives
       at the root and every ``dive_every`` nodes: round a fractional integer
       (fractional, guided or pseudocost rule), propagate, re-solve the LP
       warm, up to ``dive_depth`` times; an integral end point is marked
       ``"D"``.
-    * **GPU tree heuristics** (``tree_heuristics``, on by default). Once
+    * **GPU tree heuristics** (``tree_heuristics``, off by default). Once
       there is an incumbent, every ``tree_heuristic_every`` (10) nodes, the
       node's LP point is bulk rounded (``bulk_starts`` starts, in the node
       box, with the objective row at the cutoff), marked ``"B"``; if that
@@ -13363,7 +14162,7 @@ def solve(
       once it has used the share left (but gets at least 1 s), and they skip a
       rounding of the LP point already tried at the same cutoff. A find
       also triggers RINS at the next node.
-    * **Exact nodes** (``exact_nodes``, off by default: ``0``). With
+    * **Exact nodes** (``exact_nodes``, default 8; ``0``: off). With
       batched search, ``exact_nodes`` CPU threads solve the LPs of the
       nodes that hold the global bound exactly with HiGHS's dual simplex,
       while the device solves the rest in batches (``_ExactLane``). Once
@@ -13388,9 +14187,35 @@ def solve(
       lift a node's bound above its parent's, so without exact LPs the
       global bound can stall while the tree grows (map06: 7,800 nodes
       moved it 3 units); a map06 node took HiGHS 1.1–1.6 s.
+      Each lane node also chooses its branching variable by strong
+      branching in the same job (``exact_strong_candidates``, default 4;
+      ``0``: off): of the fractional integers whose exact pseudocosts have
+      fewer than ``reliability_threshold`` observations a side, those with
+      the largest pseudocost product are split, and each side is re-solved
+      from the node's basis for at most ``exact_strong_iterations`` (1,000)
+      dual simplex pivots. A side stopped early still has feasible duals,
+      so its Lagrangian bound holds. The children then go through
+      ``apply_strong`` as device strong branching's do (a side HiGHS proves
+      infeasible fixes the variable, and the node's bound rises to the best
+      lesser child bound), the gains feed the lane's own exact pseudocosts
+      (truncated node LPs underestimate gains), and a child whose side
+      solved to optimal keeps that vertex, so the lane evaluates it without
+      a solve. At map06's root, exact strong branching found +14.6 for the
+      best variable against +1.5 for the median one.
+      When the band holds more than ``_EXACT_OVERFLOW_KEEP`` (4) nodes a
+      thread, the device takes its top (``exact_overflow_share``, default
+      0.5: up to that share of each batch; ``0``: off): those nodes leave
+      the band and their LPs run to convergence over as many batches as it
+      takes (continuous batching, within ``exact_overflow_epochs``;
+      ``None``, the default: 200), instead of the truncated ``batch_epochs``,
+      so the device lifts band nodes' bounds many at a time while the
+      threads take the lowest.
       ``result["exact_nodes"]`` holds the nodes solved, proved infeasible
-      and not finished, the threads' seconds and the bound they gained
-      over the nodes' own bounds.
+      and not finished, the threads' seconds, the bound they gained over
+      the nodes' own bounds, the strong-branching LPs and their seconds,
+      the children evaluated from their strong-branching vertex, and the
+      band's nodes sent to the device (``overflow_nodes``) and those whose
+      LP converged there (``overflow_converged``).
     * **Node crossover** (``node_crossover``, off by default). Every
       ``node_crossover_every`` (1) nodes that the LP bound does not close,
       HiGHS crosses the node LP's PDHG point over to an optimal vertex
@@ -13414,7 +14239,7 @@ def solve(
     only, over ``lp_options`` and ``node_lp_tolerance``: serial node solves,
     batched ones (``jaddle_linear.make_solver`` options only; others raise)
     and strong branching's child LPs. Node LPs solve to ``node_lp_tolerance``
-    (``None``, the default: ``lp_tolerance``, by default 1e-4; at 1e-3 with
+    (default 1e-3; ``None``: ``lp_tolerance``, by default 1e-4; at 1e-3 with
     float32 node LPs, small MIPs can end ``"unresolved"``) and check
     convergence every 64 iterations (``node_lp_options=None`` means
     ``{"iterations_per_epoch": 64}`` unless ``lp_options`` sets it; ``{}``:
@@ -13632,6 +14457,10 @@ def solve(
         exact_nodes=exact_nodes,
         exact_node_seconds=exact_node_seconds,
         exact_band=exact_band,
+        exact_strong_candidates=exact_strong_candidates,
+        exact_strong_iterations=exact_strong_iterations,
+        exact_overflow_share=exact_overflow_share,
+        exact_overflow_epochs=exact_overflow_epochs,
         one_opt=one_opt,
         objective_propagation=objective_propagation,
         plunge_gap=plunge_gap,
@@ -13652,6 +14481,12 @@ def solve(
         exact_plunge_share=exact_plunge_share,
         jump_threads=jump_threads,
         jump_restarts=jump_restarts,
+        root_jump_seconds=root_jump_seconds,
+        submip_solver=submip_solver,
+        rins_tolerance=rins_tolerance,
+        crossover_seconds=crossover_seconds,
+        crossover_solutions=crossover_solutions,
+        crossover_min_fixed=crossover_min_fixed,
     )
     return _solve_model(
         model, presolve, precision, highs_options, feasibility_tolerance, settings
@@ -13735,6 +14570,11 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
                 "failed": 0,
                 "seconds": 0.0,
                 "bound_gain": 0.0,
+                "strong_lps": 0,
+                "strong_seconds": 0.0,
+                "children_reused": 0,
+                "overflow_nodes": 0,
+                "overflow_converged": 0,
             },
             "inout_cuts": 0,
             "inout_rounds": 0,
@@ -13776,6 +14616,10 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "restarts": 0,
             "restart_log": [],
             "rins_calls": 0,
+            "rins_finds": 0,
+            "crossover_calls": 0,
+            "crossover_finds": 0,
+            "submip_lane_seconds": 0.0,
             "mip_start_accepted": None if mip_start is None else start_x is not None,
             "one_opt_finds": 0,
             "plunges_stopped": 0,

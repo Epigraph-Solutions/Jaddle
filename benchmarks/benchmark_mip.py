@@ -65,145 +65,51 @@ print(
 
 # %% [markdown]
 # ## Branch and bound
-# Every LP of the search is Jaddle's (PDHG): the root and its cut rounds in
-# float64, node LPs `batch_size` at a time on the device (laptop GPUs run
-# float64 at a small fraction of float32 speed). HiGHS only reads the model,
-# presolves it (`presolve=True` works on HiGHS's reduced MIP and postsolves
-# the incumbent) and crosses PDHG points over to vertices (Gomory cut
-# rounds, `root_crossover`, `node_crossover`).
+# `jm.solve`'s defaults are the setup tuned on map06:
+# - float32 PDHG LPs, with node LPs 32 a batch on the device, each cut
+#   short after 4 epochs, and short plunges (4 steps), so batches stay full;
+# - no root cuts, probing or symmetry detection;
+# - the feasibility jump (at the root, then on 4 background threads), with
+#   repair of its near misses;
+# - RINS and crossover as HiGHS sub-MIPs on a CPU thread: the integers on
+#   which the incumbent and a node point (RINS) or several solutions
+#   (crossover) agree are fixed, and HiGHS searches the rest;
+# - 8 CPU threads that solve the nodes holding the global bound exactly
+#   with HiGHS's dual simplex and strong-branch them, while the device
+#   batches the rest.
 #
-# Every primal heuristic is on by default:
-# - root probing;
-# - round and repair: LP points rounded up, to nearest and down, the
-#   continuous rest solved by a PDHG LP (at the root, the root's strong
-#   children and every few nodes);
-# - bulk fix-and-propagate (several starts at once; the classic one is off);
-# - the feasibility jump, then an improving jump from each incumbent;
-# - the feasibility pump, with a short jump from each rounding it rejects;
-# - RENS at the root (small MIPs) and RINS in the tree, as Jaddle
-#   sub-searches;
-# - in the tree: LP dives every 50 nodes, and GPU bulk rounding and jumps
-#   from node points every 10.
-#
-# The log marks their incumbents `U` (round and repair), `P`
-# (fix-and-propagate), `B` (bulk), `J` (jump), `F` (pump), `R` (repair), `E`
-# (RENS), `N` (RINS) and `D` (dive). The numba improving jump runs on a
-# background thread beside the node LPs (`parallel_heuristics`), so runs are
-# not repeatable.
-#
-# Cuts: the root cut rounds keep a cut until it has been idle for
-# `cut_age` rounds, and every cut joins a global pool. Tree cuts
-# (`tree_cuts`) refresh the LP's cut block between node solves: pooled cuts
-# the batch's points violate come back, new ones are separated at the
-# lowest-bound points, and members a new cut cuts off are solved again
-# before they branch. The block keeps its shape, so the batched node solver
-# never recompiles.
-#
-# Also on here, though off by default: the root cut pool's limits
-# (`max_cut_rows`, `gomory_candidates`) and three uses of the incumbent for
-# the bound. `root_redcost_propagation` propagates the root's reduced-cost
-# row at every node. `global_redcost_fixing` fixes the root box with every
-# LP's duals, not only the root's. `inout_separation` also separates cuts at
-# a point between the LP point and the incumbent.
+# The log marks incumbents from the jump `J`, repair `R`, RINS `N` and
+# crossover `C`. The background threads make runs unrepeatable.
 
 # %%
 result = jm.solve(
     PATH_TO_MPS,
-    symmetry=False,
-    presolve=True,
-    max_seconds=MAX_SECONDS,
     verbose=True,
     log_every_seconds=10,
     device=DEVICE,
-    lp_tolerance=1e-4,
-    precision="float32",
-    root_crossover=False,
-    probing=False,
-    cut_rounds=10,
-    # 128 nodes a batch on a GPU, 32 on a CPU (ns1830653, GPU: 147 nodes a
-    # second with 8, 394 with 128). A short batch is padded to batch_size, so
-    # when plunging leaves one or two nodes a batch (map06: 19 batches for 19
-    # nodes, ~10 s each at 32 on a CPU), a small batch wastes far less.
-    batch_size=150,
-    # Truncated node LPs (the defaults, spelt out): each node LP runs at most
-    # 2 epochs and then branches on its point, with no requeue. On
-    # ns1830653 this took the tree from 16 to 147 nodes a second.
-    batch_epochs=4,
-    node_max_epochs=None,
-    node_lp_tolerance=1e-2,
-    node_crossover=False,
-    node_precision="float16",
-    cuts=False,
-    tree_cuts=True,
-    cut_pool_propagation=True,
-    # The default plunge depth: deep plunges leave the node holding the global
-    # bound unvisited (map06 stayed at -402.6 while plunged nodes reached -384).
-    plunge_depth=4,
-    plunge_child="rounding",
-    max_cuts_per_round=500,
-    max_tree_cuts_per_round=200,
-    max_cut_rows=1e4,
-    tree_cut_rows=1000,
-    tree_cut_every=10,
-    cut_age=100,
-    gomory_candidates=400,
-    # c-MIR aggregates of up to 7 rows. With probing's variable bounds (on by
-    # default) this took map06's root bound (exact LPs) from −395.8 to −393.9.
-    max_aggregation=6,
-    inout_separation=0.5,
-    root_redcost_propagation=True,
-    global_redcost_fixing=True,
-    implied_integer_cuts=True,
-    objective_propagation=True,
-    branch_implied=True,
-    # Longer, wider root strong branching: with the default 50 epochs no
-    # map06 child got past the parent's bound, so the pseudocosts learned
-    # nothing (an exact LP gives +14.6 for the best variable).
-    root_strong_candidates=4,
-    root_strong_epochs=5,
-    # Batched search (the defaults, spelt out): the host evaluates one batch
-    # while the device solves the next.
-    pipeline_batches=True,
-    # The only primal heuristic: the feasibility jump. At the root (from the
-    # LP point and from the bounds nearest zero), then on background threads:
-    # 4 lanes, never idle, one slice from each new incumbent and restarts
-    # from a perturbed incumbent or a node's LP point.
-    parallel_heuristics=True,
-    feasibility_jump=True,
-    jump_threads=4,
-    jump_restarts=True,
-    # Every other primal heuristic off.
-    fix_and_propagate=False,  # root rounding
-    bulk_rounding=False,  # root and tree bulk rounding
-    feasibility_pump=False,  # root pump
-    repair=True,  # sub-MIP repair of a jump's near miss
-    round_repair=False,  # rounding plus a PDHG repair LP
-    heuristic_every=0,  # rounding the node LP point every few nodes ("H")
-    near_integral_tolerance=0,  # rounding near-integral node points ("T")
-    parallel_rounding=False,  # node points: fix-and-propagate, then a 1 s jump
-    tree_heuristics=False,  # GPU bulk rounding and jump from node points
-    one_opt=False,  # 1-opt on each new incumbent
-    rins_seconds=0,  # RINS sub-searches
-    rens_seconds=0,  # RENS at the root
-    dive_every=0,  # serial LP dives
-    gpu_dive_every=0,  # batched GPU dives
-    exact_plunges=False,  # converged plunges with crossover
-    # Exact nodes: CPU threads solve the nodes that hold the global bound
-    # with HiGHS's dual simplex while the GPU batches the rest. Nodes within
-    # exact_band of the gap above the global bound are kept for the threads
-    # (0: the threads take the heap's top when they have room, the GPU the
-    # rest). On map06 a node takes HiGHS 1.1-1.6 s, and the exact vertices
-    # sped up the incumbent (-254 at 109 s, against -201 without).
-    exact_nodes=8,
-    exact_node_seconds=10,
-    exact_band=0.005,
+    batch_size=16,
+    presolve=True,
+    # HiGHS sub-MIPs on a CPU thread (the defaults, spelt out; 0 turns one
+    # off): RINS around the incumbent and the latest node point, and
+    # crossover of the pool's solutions, up to 10 s a call.
+    plunge_depth=2,
+    rins_seconds=10,
+    crossover_seconds=10,
+    tree_cut_rows=1e5,
 )
 print(f"Status: {result['status']}")
 exact = result["exact_nodes"]
 print(
     f"Exact nodes: {exact['solved']} solved, {exact['infeasible']} infeasible, "
     f"{exact['failed']} unfinished, {exact['seconds']:.1f}s in the threads, "
-    f"bound gained {exact['bound_gain']:.3g} in all"
+    f"bound gained {exact['bound_gain']:.3g} in all; strong branching "
+    f"{exact['strong_lps']} LPs in {exact['strong_seconds']:.1f}s, "
+    f"{exact['children_reused']} children reused"
+)
+print(
+    f"Sub-MIPs (HiGHS): RINS {result['rins_finds']} finds in {result['rins_calls']} "
+    f"calls, crossover {result['crossover_finds']} finds in "
+    f"{result['crossover_calls']} calls, {result['submip_lane_seconds']:.1f}s"
 )
 print(f"Bound: {result['bound']:.6g}")
 print(
