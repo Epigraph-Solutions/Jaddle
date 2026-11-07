@@ -5628,12 +5628,39 @@ class _StrongChild(
 
 
 # The progress table (``verbose``), laid out as HiGHS's MIP log.
-_LOG_LEGEND = (
-    "Src: B => Bulk rounding; D => Dive; E => RENS; F => Feasibility pump;\n"
-    "     H => Rounding; J => Feasibility jump; N => RINS; P => Fix-and-propagate;\n"
-    "     R => Repair; S => User start; T => Evaluate node; U => Round and repair;\n"
-    "     C => Crossover; 1 => 1-opt"
+_LOG_SOURCES = (
+    ("B", "Bulk rounding"),
+    ("D", "Dive"),
+    ("E", "RENS"),
+    ("F", "Feasibility pump"),
+    ("H", "Rounding"),
+    ("J", "Feasibility jump"),
+    ("N", "RINS"),
+    ("P", "Fix-and-propagate"),
+    ("R", "Repair"),
+    ("S", "User start"),
+    ("T", "Evaluate node"),
+    ("U", "Round and repair"),
+    ("C", "Crossover"),
+    ("1", "1-opt"),
 )
+
+
+def _log_legend(sources, width=80):
+    """The progress table's source legend, for the marks in ``sources``
+    only (the heuristics the solve has on), wrapped to ``width``."""
+    entries = [f"{mark} => {name}" for mark, name in _LOG_SOURCES if mark in sources]
+    lines, line = [], "Src:"
+    for i, entry in enumerate(entries):
+        entry += ";" if i < len(entries) - 1 else ""
+        if len(line) > 5 and len(line) + 1 + len(entry) > width:
+            lines.append(line)
+            line = "    "
+        line += " " + entry
+    lines.append(line)
+    return "\n".join(lines)
+
+
 _LOG_HEADER = (
     "        Nodes      |    B&B Tree     |            Objective Bounds"
     "              |  Dynamic Constraints |       Work      \n"
@@ -7251,6 +7278,7 @@ class _BranchAndBound:
         self.incumbent = None  # (min-form value, x)
         # The user's starting point (``mip_start``), tried at the first root.
         self.mip_start = check_mip_start(mip_start, mip)
+        self.has_mip_start = self.mip_start is not None  # for the log legend
         self.mip_start_accepted = None
         self.closed_floor = np.inf  # least bound of the nodes closed so far
         # Least bound of the nodes closed without proof: an LP that did not
@@ -9472,6 +9500,31 @@ class _BranchAndBound:
         weight = math.fsum(0.5 ** node.depth for node in nodes)
         return min(1.0, max(0.0, 1.0 - weight))
 
+    def log_sources(self):
+        """The progress table's source marks this solve can produce: those
+        of the heuristics its options turn on (``"T"``, the node LP points,
+        always)."""
+        background = self.workers is not None
+        on = {
+            "B": self.use_bulk_rounding,
+            "D": bool(self.dive_every)
+            or bool(self.gpu_dive_every and self.batch_size > 1),
+            "E": bool(self.rens_seconds),
+            "F": bool(self.use_pump),
+            "H": bool(self.heuristic_every),
+            "J": bool(self.use_jump),
+            "N": bool(self.rins_seconds),
+            "P": bool(self.use_fix_and_propagate)
+            or (background and self.use_parallel_rounding),
+            "R": bool(self.use_repair and self.use_jump),
+            "S": self.has_mip_start,
+            "T": True,
+            "U": self.use_round_repair,
+            "C": bool(self.crossover_seconds and self.submip_lane is not None),
+            "1": self.use_one_opt,
+        }
+        return {mark for mark, enabled in on.items() if enabled}
+
     def log(self, source, bound, force=False):
         """A progress line, as HiGHS's (``bound=None``: the global bound).
         The first one prints the source legend and the header."""
@@ -9483,7 +9536,7 @@ class _BranchAndBound:
         self.last_log = now
         if not self.log_header_printed:
             self.log_header_printed = True
-            print(_LOG_LEGEND)
+            print(_log_legend(self.log_sources()))
             print()
             print(_LOG_HEADER)
             print()
@@ -13113,14 +13166,6 @@ class _BranchAndBound:
         self.nodes += 1
         # Points the early root jumps found while the LP was solved.
         self.collect_heuristics(schedule=False)
-        if self.verbose:
-            root_bound, _ = self.lp_bound(result["solution"], lower, upper)
-            print(
-                f"Root LP: {result['stop_reason']}, objective "
-                f"{self.model_value(float(mip.c @ np.asarray(result['solution'].primal))):.6e}, "
-                f"bound {self.model_value(root_bound):.6e}, "
-                f"{time.time() - self.start:.1f}s"
-            )
         if result["stop_reason"] == "interrupted":
             return self.result("interrupted")
         self.root_heuristic_used = 0.0
@@ -13381,6 +13426,7 @@ def solve(
     zero_half_cuts=True,
     cut_age=100,
     max_cut_rows=10000,
+    cut_pool_size=_CUT_POOL_SIZE,
     gomory_candidates=400,
     inout_separation=0.5,
     root_redcost_propagation=True,
@@ -14427,6 +14473,7 @@ def solve(
         zero_half_cuts=zero_half_cuts,
         cut_age=cut_age,
         max_cut_rows=max_cut_rows,
+        cut_pool_size=cut_pool_size,
         gomory_candidates=gomory_candidates,
         inout_separation=inout_separation,
         root_redcost_propagation=root_redcost_propagation,

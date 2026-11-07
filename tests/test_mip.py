@@ -361,7 +361,7 @@ def test_verbose_log(capsys):
     """The progress table and the end of the log follow HiGHS's layout."""
     solve(knapsack(), verbose=True)
     out = capsys.readouterr().out
-    assert "Root LP" in out
+    assert "Root LP:" not in out
     assert "Src  Proc. InQueue |  Leaves   Expl. | BestBound" in out
     assert "Solving report" in out
     assert re.search(r"^  Status +Optimal$", out, re.M)
@@ -370,6 +370,19 @@ def test_verbose_log(capsys):
     assert re.search(r"^ . +\d+ +\d+ +\d+ +[\d.]+% ", out, re.M)
     for noise in ("Root heuristics:", "Root dives:", "Tree cuts: room"):
         assert noise not in out
+
+
+def test_verbose_legend_lists_enabled_heuristics(capsys):
+    """The source legend names only the heuristics the solve has on."""
+    solve(knapsack(), verbose=True, feasibility_pump=False, bulk_rounding=False)
+    legend = capsys.readouterr().out.split("\n\n")[0]
+    assert "T => Evaluate node" in legend
+    assert "J => Feasibility jump" in legend
+    for off in ("F => Feasibility pump", "B => Bulk rounding", "S => User start"):
+        assert off not in legend
+    solve(knapsack(), verbose=True, feasibility_pump=True, bulk_rounding=True)
+    out = capsys.readouterr().out
+    assert "F => Feasibility pump" in out and "B => Bulk rounding" in out
 
 
 def test_rejects_bad_options():
@@ -2952,6 +2965,19 @@ def test_the_pool_keeps_every_violated_root_candidate(monkeypatch):
     assert set(chosen) <= set(pooled)
     assert len(set(pooled)) > len(set(chosen)) > 0
     assert result["cut_pool"] > len(set(chosen)) // 2
+
+
+def test_solve_caps_the_cut_pool_at_cut_pool_size():
+    """``solve``'s ``cut_pool_size`` reaches the global cut pool."""
+    mip = general_integer()
+    full = solve(mip, max_cuts_per_round=2, max_nodes=1, tree_cuts=False)
+    assert full["cut_pool"] > 2
+    capped = solve(
+        mip, max_cuts_per_round=2, max_nodes=1, tree_cuts=False, cut_pool_size=2
+    )
+    assert capped["cut_pool"] <= 2
+    with pytest.raises(ValueError, match="cut_pool_size"):
+        solve(knapsack(), cut_pool_size=-1)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])

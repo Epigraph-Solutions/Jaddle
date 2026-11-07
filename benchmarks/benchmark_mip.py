@@ -87,15 +87,15 @@ result = jm.solve(
     verbose=True,
     log_every_seconds=10,
     device=DEVICE,
-    batch_size=16,
+    batch_size=32,
     presolve=True,
     # HiGHS sub-MIPs on a CPU thread (the defaults, spelt out; 0 turns one
     # off): RINS around the incumbent and the latest node point, and
     # crossover of the pool's solutions, up to 10 s a call.
-    plunge_depth=2,
+    plunge_depth=8,
     rins_seconds=10,
     crossover_seconds=10,
-    tree_cut_rows=1e5,
+    cut_pool_size=1e5,
 )
 print(f"Status: {result['status']}")
 exact = result["exact_nodes"]
