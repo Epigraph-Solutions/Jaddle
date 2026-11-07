@@ -30,6 +30,7 @@ def has(module):
         ("lp/cvxpy_transport.py", ["cvxpy"]),
         ("mip/facility_location.py", []),
         ("mip/cvxpy_facility_location.py", ["cvxpy"]),
+        ("mip/cvxpy_drone_swarm.py", ["cvxpy", "matplotlib"]),
         ("cp/isotonic_regression.py", ["matplotlib"]),
         ("cp/linear_regression.py", ["matplotlib", "sklearn"]),
         ("cp/cvxpy_lasso.py", ["cvxpy"]),

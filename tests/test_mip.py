@@ -6028,16 +6028,211 @@ def test_highs_rins_and_crossover_in_the_search(make):
     "make", [facility_location, generalised_assignment, lambda: coverage_chains(1)]
 )
 def test_exact_lane_solves_to_the_optimum(make):
-    # Without cuts and probing they branch, so the lane gets nodes.
+    # Without cuts and probing they branch, so the lane gets nodes. (The
+    # root's exact strong branching would solve facility_location's whole
+    # tree at the root, leaving the lane nothing to solve.)
     mip = make()
     ref = reference(mip)
-    options = dict(batch_size=4, cuts=False, probing=False)
+    options = dict(batch_size=4, cuts=False, probing=False, exact_root_candidates=0)
     for band in (0.005, 0.5, 0.0):  # the band kept for the lane; 0: none
         result = solve(mip, exact_nodes=2, exact_band=band, **options)
         assert_solved(result, mip, ref)
         stats = result["exact_nodes"]
         assert stats["solved"] > 0 and stats["bound_gain"] >= 0.0
     assert solve(mip, **options)["exact_nodes"]["solved"] == 0
+
+
+@pytest.mark.parametrize("make", [facility_location, generalised_assignment])
+def test_exact_strong_on_named_candidates(make):
+    # Named candidates, no pivot limit: both sides of each, solved to
+    # optimal (or empty), with bounds that hold; a past deadline splits none.
+    mip = make()
+    n = mip.num_variables
+    highs = jm._highs_rows(mip)
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    status, x, _, _ = jm._exact_node_lp(highs, mip, lower, upper, 10.0)
+    assert status == "optimal"
+    ints = np.flatnonzero(mip.integrality)
+    frac = ints[np.abs(x[ints] - np.round(x[ints])) > 1e-6]
+    assert frac.size > 0
+    named = np.concatenate([frac[::-1], ints[:1]])  # an integral one too
+    request = (mip.integrality, 1e-6, np.zeros((2, n)), np.zeros((2, n)), n, None, 1)
+    children = jm._exact_strong(
+        highs, mip, lower, upper, x, request, candidates=named
+    )
+    assert [c[0] for c in children[::2]] == [v for v in named if v in set(frac)]
+    for var, down, side_status, cx, y_eq, y_ineq in children:
+        lo, up = lower.copy(), upper.copy()
+        if down:
+            up[var] = np.floor(x[var])
+        else:
+            lo[var] = np.ceil(x[var])
+        optimum = lp_optimum(mip, lo, up)
+        if side_status == "infeasible":
+            assert optimum is None
+            continue
+        assert side_status == "optimal"
+        assert mip.c @ cx == pytest.approx(optimum, rel=1e-6, abs=1e-6)
+    late = jm._exact_strong(
+        highs, mip, lower, upper, x, request, candidates=named, deadline=0.0
+    )
+    assert late == []
+
+
+def test_finished_lane_nodes_count_in_the_bound_until_evaluated(monkeypatch):
+    # The lane hands back several finished nodes at once; while the first
+    # is evaluated (and logged), the global bound and the explored share
+    # still count the others. They were in no list: the logged bound rose
+    # past them (map06: -362.3, then -376.4 once they were queued).
+    search = search_for(generalised_assignment(), monkeypatch, exact_nodes=1, batch_size=4)
+    try:
+        search.tree_started = True
+        box = (search.mip.lower, search.mip.upper)
+        first = jm._Node(-10.0, 1, None, None, None)
+        second = jm._Node(-50.0, 2, None, None, None)
+        extra = dict(pivots=0, warm=False, mip=None, basis=None, sides={})
+        outcome = ("optimal", np.zeros(search.mip.num_variables), None, None)
+        finished = [
+            (node, box, search.cut_version, outcome, [], 0.0, 0.0, extra)
+            for node in (first, second)
+        ]
+        monkeypatch.setattr(search.exact_lane, "finished", lambda: finished)
+        monkeypatch.setattr(search, "exact_solution", lambda *args: object())
+        monkeypatch.setattr(search, "exact_strong_children", lambda *args: None)
+        seen = []
+
+        def evaluate_exact(node, box, solution, strong=None):
+            search.active_bound = node.bound  # as ``_evaluate`` sets it
+            seen.append((node, search.global_bound(), search.explored()))
+
+        monkeypatch.setattr(search, "evaluate_exact", evaluate_exact)
+        search.collect_exact()
+        assert [node for node, _, _ in seen] == [first, second]
+        assert seen[0][1] == -50.0  # the second, not yet evaluated
+        assert seen[0][2] == pytest.approx(1.0 - 0.25)  # its weight (depth 2) open
+        assert search.exact_unevaluated == []
+    finally:
+        search.exact_lane.shutdown()
+
+
+def test_root_exact_strong_branching_in_the_search():
+    mip = generalised_assignment()
+    ref = reference(mip)
+    options = dict(batch_size=4, cuts=False, probing=False, exact_nodes=2)
+    on = solve(mip, **options)
+    assert_solved(on, mip, ref)
+    stats = on["root_exact_strong"]
+    assert stats["candidates"] > 0 and stats["lps"] == 2 * stats["candidates"]
+    # The exact root LP's bound is the LP optimum, below the MIP's.
+    assert stats["bound"] == pytest.approx(
+        lp_optimum(mip, mip.lower, mip.upper) + mip.offset, rel=1e-6
+    )
+    off = solve(mip, exact_root_candidates=0, **options)
+    assert_solved(off, mip, ref)
+    assert off["root_exact_strong"]["candidates"] == 0
+    # Without the lane there is nothing to run it on.
+    assert solve(mip, batch_size=4, cuts=False, probing=False)[
+        "root_exact_strong"
+    ]["candidates"] == 0
+
+
+def test_root_exact_strong_seeds_the_pseudocosts(monkeypatch):
+    mip = generalised_assignment()
+    real = jm._BranchAndBound.root_exact_strong
+    seen = {}
+
+    def spy(self, root, lower, upper, result):
+        out = real(self, root, lower, upper, result)
+        seen["exact"] = self.exact_pc_count.sum()
+        seen["device"] = self.pc_count.sum()
+        seen["out"] = out
+        return out
+
+    monkeypatch.setattr(jm._BranchAndBound, "root_exact_strong", spy)
+    solve(mip, batch_size=4, cuts=False, probing=False, exact_nodes=2, max_nodes=5)
+    assert seen["out"] is not None and seen["out"]["stop_reason"] == "exact"
+    assert seen["exact"] > 0 and seen["device"] >= seen["exact"]
+
+
+@pytest.mark.parametrize("make", [facility_location, generalised_assignment])
+def test_exact_node_lp_from_the_parents_basis(make):
+    # A child's LP from its parent's optimal basis has the same optimum as
+    # one solved cold, in fewer pivots than from the slack basis.
+    mip = make()
+    highs = jm._highs_rows(mip)
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    status, x, _, _ = jm._exact_node_lp(highs, mip, lower, upper, 10.0)
+    assert status == "optimal"
+    parent = highs.getBasis()
+    ints = np.flatnonzero(mip.integrality)
+    frac = ints[np.abs(x[ints] - np.round(x[ints])) > 1e-6]
+    assert frac.size > 0
+    var = frac[0]
+    for down in (True, False):
+        lo, up = lower.copy(), upper.copy()
+        if down:
+            up[var] = np.floor(x[var])
+        else:
+            lo[var] = np.ceil(x[var])
+        cold = jm._highs_rows(mip)
+        cold_out = jm._exact_node_lp(cold, mip, lo, up, 10.0)
+        cold_pivots = cold.getInfo().simplex_iteration_count
+        warm = jm._highs_rows(mip)
+        warm_out = jm._exact_node_lp(warm, mip, lo, up, 10.0, basis=parent)
+        warm_pivots = warm.getInfo().simplex_iteration_count
+        assert warm_out[0] == cold_out[0]
+        if cold_out[0] == "optimal":
+            assert mip.c @ warm_out[1] == pytest.approx(mip.c @ cold_out[1], abs=1e-6)
+        assert warm_pivots <= cold_pivots
+
+
+@pytest.mark.parametrize("tree_cuts", [True, False])
+def test_exact_lane_children_start_from_their_parents_basis(tree_cuts):
+    # The lane's nodes branch here, so their children reach the lane with
+    # the basis kept for them, across tree cut refreshes too.
+    mip = generalised_assignment()
+    ref = reference(mip)
+    options = dict(
+        batch_size=4, cuts=False, probing=False, exact_nodes=2, exact_band=0.5,
+        tree_cuts=tree_cuts,
+    )
+    on = solve(mip, **options)
+    assert_solved(on, mip, ref)
+    assert on["exact_nodes"]["pivots"] > 0
+    assert on["exact_nodes"]["warm_bases"] > 0
+    off = solve(mip, exact_basis_memory=0, **options)
+    assert_solved(off, mip, ref)
+    assert off["exact_nodes"]["warm_bases"] == 0
+
+
+def test_basis_store_drops_bases_no_node_holds(monkeypatch):
+    search = search_for(facility_location(), monkeypatch, exact_nodes=1, batch_size=4)
+    try:
+        highs = jm._highs_rows(search.mip)
+        jm._exact_node_lp(highs, search.mip, search.mip.lower, search.mip.upper, 10.0)
+        basis = highs.getBasis()
+        key = search.store_basis(basis, search.mip)
+        node = jm._Node(0.0, 1, None, None, None)
+        node.exact_basis = key
+        children = [jm._Node(0.0, 2, None, None, None) for _ in range(2)]
+        for child in children:
+            child.exact_basis = key
+            search.hold_basis(key)
+        search.release_bases(node)  # the parent lets go once it has branched
+        assert search.basis_store[key][2] == 2
+        assert search.take_basis(children[0].exact_basis) is basis
+        assert key in search.basis_store
+        assert search.take_basis(children[1].exact_basis) is basis
+        assert key not in search.basis_store
+        # A basis of another shape (a restart) is not handed out.
+        other = search.store_basis(basis, facility_location(n_fac=5))
+        assert search.take_basis(other) is None
+        # No room: nothing kept.
+        search.exact_basis_memory = 0
+        assert search.store_basis(basis, search.mip) is None
+    finally:
+        if search.exact_lane is not None:
+            search.exact_lane.shutdown()
 
 
 def lp_optimum(mip, lower, upper):
@@ -6103,7 +6298,12 @@ def test_exact_strong_children_have_valid_bounds(make, iterations):
 
 def test_exact_strong_branching_in_the_search():
     totals = dict(strong_lps=0, children_reused=0)
-    options = dict(batch_size=4, cuts=False, probing=False, exact_nodes=2)
+    # The lane's own strong branching (the root's, ``exact_root_candidates``,
+    # also reuses children).
+    options = dict(
+        batch_size=4, cuts=False, probing=False, exact_nodes=2,
+        exact_root_candidates=0,
+    )
     for make in (facility_location, generalised_assignment, lambda: coverage_chains(1)):
         mip = make()
         ref = reference(mip)

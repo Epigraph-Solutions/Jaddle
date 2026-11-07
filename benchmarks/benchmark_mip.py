@@ -92,10 +92,14 @@ result = jm.solve(
     # HiGHS sub-MIPs on a CPU thread (the defaults, spelt out; 0 turns one
     # off): RINS around the incumbent and the latest node point, and
     # crossover of the pool's solutions, up to 10 s a call.
-    plunge_depth=8,
     rins_seconds=10,
     crossover_seconds=10,
-    cut_pool_size=1e5,
+    jump_threads=1,
+    exact_nodes=16,
+    exact_strong_candidates=8,
+    exact_band=0.25,
+    exact_overflow_share=0.5,
+    exact_strong_iterations=5000,
 )
 print(f"Status: {result['status']}")
 exact = result["exact_nodes"]
@@ -104,7 +108,15 @@ print(
     f"{exact['failed']} unfinished, {exact['seconds']:.1f}s in the threads, "
     f"bound gained {exact['bound_gain']:.3g} in all; strong branching "
     f"{exact['strong_lps']} LPs in {exact['strong_seconds']:.1f}s, "
-    f"{exact['children_reused']} children reused"
+    f"{exact['children_reused']} children reused; "
+    f"{exact['pivots'] / max(1, exact['solved']):.0f} pivots a node, "
+    f"{exact['warm_bases']} from the parent's basis"
+)
+root = result["root_exact_strong"]
+print(
+    f"Root exact strong branching: {root['candidates']} candidates, "
+    f"{root['lps']} LPs ({root['fixed']} sides empty) in {root['seconds']:.1f}s, "
+    f"exact root bound {root['bound']}"
 )
 print(
     f"Sub-MIPs (HiGHS): RINS {result['rins_finds']} finds in {result['rins_calls']} "

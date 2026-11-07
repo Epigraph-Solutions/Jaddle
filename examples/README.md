@@ -90,6 +90,29 @@ near the optimum). It takes about 50 seconds on a CPU.
 |---|---|---|
 | [`facility_location.py`](mip/facility_location.py) | Capacitated facility location: binary site openings and continuous shipments, built as a `jm.MIP` from NumPy/SciPy arrays and solved with `jm.solve`. Prints the progress log, the sites opened and their loads, and checks the cost against HiGHS through `jm.to_highs`. | — |
 | [`cvxpy_facility_location.py`](mip/cvxpy_facility_location.py) | The same facility-location model written in CVXPY, with `boolean=True` openings, solved with `jcv.JaddleSolver` (which hands mixed-integer LPs to `jm.solve`) and checked against CVXPY's HiGHS interface. | `cvxpy` |
+| [`cvxpy_drone_swarm.py`](mip/cvxpy_drone_swarm.py) | Mixed-integer trajectory planning (Richards & How, 2002), written in CVXPY: four drones swap sides of a room through a doorway in a wall, with thrust and speed limits, minimising fuel. Avoiding the wall and each other are "or" constraints, modelled with big-M `boolean=True` variables, and the search decides who goes through the door when and on which side. Each pair of drones is solved alone first, and its bound becomes a fuel floor that lifts the swarm's weak big-M bound. Solved with `jcv.JaddleSolver` under a time limit (`max_seconds`, passed on to `jm.solve`). Checks the continuous flight against the real geometry and writes `drone_swarm.gif`. | `cvxpy`, `matplotlib` |
+
+### `cvxpy_drone_swarm.py`
+
+Each drone is a double integrator on a time grid of 8 steps of 1.5 s. To keep
+the model small, every position gets bounds from how far the drone can get
+from its start and goal in the time available. Binaries are only created
+where those bounds leave a choice open, and each big-M comes from them. A
+drone that is clear of a wall at both ends of a step, on the same side, is
+clear along the straight line between them. The real path bends away from
+that line by at most `u_max dt² / 8`, so the walls are grown by that margin
+as well as the drone's radius. The script samples the flight finely
+afterwards and asserts it never touches a wall or another drone.
+
+Big-M relaxations are weak: with fractional binaries a drone can fly
+straight through another, so the swarm's LP bound ignores the cost of
+avoiding each other. To recover that cost, the script first solves each
+pair of drones on its own (6 small MIPs of about 70 binaries). Each pair's
+proven bound becomes a row `fuel_i + fuel_j >= floor_ij` of the swarm's
+model. On this scene, in 60 s, the floors cut HiGHS's gap from about 30% to
+2.5%, and Jaddle's from 37% to 15%. The script then flies the best plan
+found within the time limit and prints the remaining gap: no plan uses less
+fuel than the bound.
 
 Branch and bound on a MIPLIB instance, compared with HiGHS's branch and cut,
 is a benchmark now:

@@ -5717,6 +5717,8 @@ class _Node:
         "exact_tried",
         "exact_known",
         "converge",
+        "exact_basis",
+        "exact_sides",
     )
 
     def __init__(
@@ -5750,6 +5752,12 @@ class _Node:
         # Whether its LP runs to convergence on the device, over batches,
         # instead of being truncated (``exact_overflow_share``).
         self.converge = False
+        # A key in ``_BranchAndBound.basis_store``: the HiGHS basis its exact
+        # LP starts from (its parent's; ``None``: none), and once the lane
+        # has solved it, its own optimal one, for its children; with its
+        # strong sides' keys by ``(var, down)``.
+        self.exact_basis = None
+        self.exact_sides = None
 
 
 _LP_RESERVED = (
@@ -5794,13 +5802,14 @@ def _pseudocost_estimates(pc_sum, pc_count, x, candidates):
     return f * pc[0], (1.0 - f) * pc[1]
 
 
-def _exact_node_lp(highs, mip, lower, upper, seconds):
+def _exact_node_lp(highs, mip, lower, upper, seconds, basis=None):
     """The LP of ``mip``'s rows over ``[lower, upper]`` solved by HiGHS's
     dual simplex in ``highs`` (which holds ``mip``'s rows and keeps its
-    basis from the last call, so a node near the last one re-solves in a
-    few pivots). Returns ``(status, x, y_eq, y_ineq)``: ``status`` is
-    ``"optimal"``, ``"infeasible"`` or ``"failed"`` (time limit or another
-    status), and the duals are in Jaddle's convention (``L = cᵀx +
+    basis from the last call), from ``basis`` (a ``highspy.HighsBasis``
+    for those rows, such as the parent node's optimal one) when given,
+    else from the last call's. Returns ``(status, x, y_eq, y_ineq)``:
+    ``status`` is ``"optimal"``, ``"infeasible"`` or ``"failed"`` (time
+    limit or another status), and the duals are in Jaddle's convention (``L = cᵀx +
     yᵀ(Ax − b)``, inequality duals ``>= 0``)."""
     import highspy
 
@@ -5811,6 +5820,8 @@ def _exact_node_lp(highs, mip, lower, upper, seconds):
         np.asarray(lower, np.float64),
         np.asarray(upper, np.float64),
     )
+    if basis is not None:
+        highs.setBasis(basis)
     # ``time_limit`` counts the instance's whole run time.
     highs.setOptionValue("time_limit", highs.getRunTime() + float(seconds))
     highs.run()
@@ -5831,58 +5842,85 @@ def _jaddle_duals(highs, mip):
     return -row_dual[: mip.n_eq], np.maximum(-row_dual[mip.n_eq :], 0.0)
 
 
-def _exact_strong(highs, mip, lower, upper, x, request):
+def _exact_strong(
+    highs, mip, lower, upper, x, request, bases=None, candidates=None, deadline=None
+):
     """
     Strong branching on a node HiGHS has just solved in ``highs`` (box
-    ``[lower, upper]``, vertex ``x``), for ``_ExactLane``. ``request`` is
-    ``(is_int, tol, pc_sum, pc_count, k, iterations, reliable)``: of the
-    fractional integers whose exact pseudocosts (``pc_sum``/``pc_count``)
-    have fewer than ``reliable`` observations a side, the ``k`` with the
-    largest pseudocost product are split, and each side is re-solved from
-    the node's basis for at most ``iterations`` dual simplex pivots. Dual
-    simplex keeps its duals feasible, so a side stopped early still has
-    duals whose Lagrangian bound holds (lower than the side's LP value).
+    ``[lower, upper]``, vertex ``x``, its basis loaded), for
+    ``_ExactLane``. ``request`` is ``(is_int, tol, pc_sum, pc_count, k,
+    iterations, reliable)``: of the fractional integers whose exact
+    pseudocosts (``pc_sum``/``pc_count``) have fewer than ``reliable``
+    observations a side, the ``k`` with the largest pseudocost product are
+    split, and each side is re-solved from the node's basis for at most
+    ``iterations`` dual simplex pivots (``None``: no limit). Dual simplex
+    keeps its duals feasible, so a side stopped early (by the pivot or the
+    time limit) still has duals whose Lagrangian bound holds (lower than
+    the side's LP value). ``candidates`` (variable indices) names the
+    ones to split instead, in that order (those fractional at ``x`` with
+    room in the box; the pseudocosts are not used). With ``deadline`` (a
+    ``time.time()`` value) no side runs past it, and the candidates left
+    once it has passed are not split.
 
     Returns ``[(var, down, status, x, y_eq, y_ineq), ...]``, ``status``
     ``"optimal"``, ``"partial"`` (stopped early), ``"infeasible"`` or
-    ``"failed"``; ``highs`` is left with the node's bounds and basis.
+    ``"failed"``; ``highs`` is left with the node's bounds and basis. With
+    a dict ``bases``, each optimal or partial side's final basis goes in
+    it as ``bases[(var, down)]``, to warm-start that child's own LP.
     """
     import highspy
 
     is_int, tol, pc_sum, pc_count, k, iterations, reliable = request
     frac = x - np.floor(x)
-    candidates = np.flatnonzero(
-        is_int & (frac > tol) & (frac < 1.0 - tol) & (lower < upper)
-    )
-    if k <= 0 or candidates.size == 0:
-        return []
-    unreliable = candidates[pc_count[:, candidates].min(axis=0) < reliable]
-    if unreliable.size == 0:
-        return []
-    down, up = _pseudocost_estimates(pc_sum, pc_count, x, unreliable)
-    score = np.maximum(down, 1e-6) * np.maximum(up, 1e-6)
-    chosen = unreliable[np.argsort(-score, kind="stable")[:k]]
+    branchable = is_int & (frac > tol) & (frac < 1.0 - tol) & (lower < upper)
+    if candidates is not None:
+        chosen = np.asarray(candidates, np.int64)
+        chosen = chosen[branchable[chosen]][: max(int(k), 0)]
+        if chosen.size == 0:
+            return []
+    else:
+        found = np.flatnonzero(branchable)
+        if k <= 0 or found.size == 0:
+            return []
+        unreliable = found[pc_count[:, found].min(axis=0) < reliable]
+        if unreliable.size == 0:
+            return []
+        down, up = _pseudocost_estimates(pc_sum, pc_count, x, unreliable)
+        score = np.maximum(down, 1e-6) * np.maximum(up, 1e-6)
+        chosen = unreliable[np.argsort(-score, kind="stable")[:k]]
     MS = highspy.HighsModelStatus
     basis = highs.getBasis()
     _, limit = highs.getOptionValue("simplex_iteration_limit")
-    highs.setOptionValue("simplex_iteration_limit", int(iterations))
+    _, time_limit = highs.getOptionValue("time_limit")
+    if iterations is not None:
+        highs.setOptionValue("simplex_iteration_limit", int(iterations))
     out = []
     try:
         for var in chosen.tolist():
+            if deadline is not None and time.time() >= deadline:
+                break
             lo, up = float(lower[var]), float(upper[var])
             for is_down in (True, False):
                 side = (lo, math.floor(x[var])) if is_down else (math.ceil(x[var]), up)
                 highs.changeColBounds(var, *side)
                 highs.setBasis(basis)
+                if deadline is not None:
+                    # ``time_limit`` counts the instance's whole run time.
+                    highs.setOptionValue(
+                        "time_limit",
+                        highs.getRunTime() + max(deadline - time.time(), 0.0),
+                    )
                 highs.run()
                 status = highs.getModelStatus()
                 if status == MS.kInfeasible:
                     out.append((var, is_down, "infeasible", None, None, None))
                 elif (
-                    status in (MS.kOptimal, MS.kIterationLimit)
+                    status in (MS.kOptimal, MS.kIterationLimit, MS.kTimeLimit)
                     and highs.getSolution().dual_valid
                 ):
                     y_eq, y_ineq = _jaddle_duals(highs, mip)
+                    if bases is not None:
+                        bases[(var, is_down)] = highs.getBasis()
                     out.append(
                         (
                             var,
@@ -5898,6 +5936,7 @@ def _exact_strong(highs, mip, lower, upper, x, request):
                 highs.changeColBounds(var, lo, up)
     finally:
         highs.setOptionValue("simplex_iteration_limit", limit)
+        highs.setOptionValue("time_limit", time_limit)
         highs.setBasis(basis)
     return out
 
@@ -6057,8 +6096,11 @@ class _ExactLane:
     branch on.
 
     Each thread keeps one HiGHS instance for the rows it last solved (a tree
-    cut refresh changes them) and re-solves from its last basis: on map06 a
-    node took 1.1–1.6 s (about 5,500 pivots), where the root LP takes 3.6 s.
+    cut refresh changes them). A node re-solves from the basis it is given
+    (its parent's optimal one, ``exact_basis_memory``), else from the
+    thread's last basis, usually an unrelated node's: on presolved map06 a
+    child took 0.5–1.6 s from its parent's basis (870–3,100 pivots) against
+    1.8–2.9 s (3,400–5,200) from another node's; the root LP takes 3 s.
     HiGHS releases the GIL while it solves. Jobs are functions of NumPy and
     SciPy arrays only (JAX's settings are per thread).
     """
@@ -6081,44 +6123,133 @@ class _ExactLane:
     def nodes(self):
         return [job[1] for job in self.jobs]
 
-    def submit(self, node, box, lp_box, mip, version, strong=None):
+    def submit(
+        self, node, box, lp_box, mip, version, strong=None, basis=None, keep=False
+    ):
         """Queue ``node``'s LP over ``lp_box`` (the LP's bounds over its box
-        ``box``) for ``mip``'s rows as of cut block ``version``, then, with
-        a ``strong`` request, strong branching on it (``_exact_strong``)."""
+        ``box``) for ``mip``'s rows as of cut block ``version``, from
+        ``basis`` (a ``highspy.HighsBasis`` for ``mip``'s rows) when given,
+        then, with a ``strong`` request, strong branching on it
+        (``_exact_strong``). With ``keep``, the job also returns the node's
+        optimal basis and its strong sides' bases, for the children."""
         lower, upper = (np.array(b, np.float64) for b in lp_box)
 
         def job():
             started = time.time()
-            held = getattr(self.local, "held", None)
-            if held is None or held[0] is not mip:
-                held = self.local.held = (mip, _highs_rows(mip))
-            out = _exact_node_lp(held[1], mip, lower, upper, self.seconds)
+            highs = self._held(mip)
+            out = _exact_node_lp(highs, mip, lower, upper, self.seconds, basis)
+            extra = dict(
+                pivots=int(highs.getInfo().simplex_iteration_count),
+                warm=basis is not None,
+                mip=mip,
+                basis=None,
+                sides={},
+            )
+            if keep and out[0] == "optimal":
+                extra["basis"] = highs.getBasis()
             children, strong_seconds = [], 0.0
             if strong is not None and out[0] == "optimal":
                 strong_started = time.time()
-                children = _exact_strong(held[1], mip, lower, upper, out[1], strong)
+                children = _exact_strong(
+                    highs,
+                    mip,
+                    lower,
+                    upper,
+                    out[1],
+                    strong,
+                    extra["sides"] if keep else None,
+                )
                 strong_seconds = time.time() - strong_started
-            return out, children, strong_seconds, time.time() - started
+            return out, children, strong_seconds, time.time() - started, extra
 
         self.jobs.append((self.pool.submit(job), node, box, version))
 
+    def _held(self, mip):
+        """This thread's HiGHS instance for ``mip``'s rows (built when the
+        rows changed since its last job)."""
+        held = getattr(self.local, "held", None)
+        if held is None or held[0] is not mip:
+            held = self.local.held = (mip, _highs_rows(mip))
+        return held[1]
+
+    def root_lp(self, mip, lp_box, seconds):
+        """The root LP over ``lp_box`` on one of the threads, waited for
+        (the lane is idle at the root): ``((status, x, y_eq, y_ineq),
+        basis, pivots)``, ``basis`` the optimal one (else ``None``)."""
+        lower, upper = (np.array(b, np.float64) for b in lp_box)
+
+        def job():
+            highs = self._held(mip)
+            out = _exact_node_lp(highs, mip, lower, upper, seconds)
+            pivots = int(highs.getInfo().simplex_iteration_count)
+            return out, highs.getBasis() if out[0] == "optimal" else None, pivots
+
+        try:
+            return self.pool.submit(job).result()
+        except Exception:
+            return ("failed", None, None, None), None, 0
+
+    def split(self, mip, lp_box, x, basis, chunks, request, deadline):
+        """Strong branching on the root (vertex ``x``, optimal ``basis``,
+        box ``lp_box``) over all the threads at once: one job a chunk of
+        candidates (``_exact_strong(candidates=chunk)``), each from
+        ``basis`` on its thread's HiGHS, until ``deadline``, waited for.
+        Returns ``(children, bases, seconds)``: ``_exact_strong``'s lists
+        joined, the sides' bases by ``(var, down)`` and the threads' time."""
+        lower, upper = (np.array(b, np.float64) for b in lp_box)
+        n = lower.size
+
+        def job(chunk):
+            started = time.time()
+            highs = self._held(mip)
+            highs.changeColsBounds(n, np.arange(n, dtype=np.int32), lower, upper)
+            highs.setBasis(basis)
+            bases = {}
+            children = _exact_strong(
+                highs, mip, lower, upper, x, request, bases,
+                candidates=chunk, deadline=deadline,
+            )
+            return children, bases, time.time() - started
+
+        futures = [self.pool.submit(job, chunk) for chunk in chunks if len(chunk)]
+        children, bases, seconds = [], {}, 0.0
+        for future in futures:
+            try:
+                part, part_bases, part_seconds = future.result()
+            except Exception:
+                continue
+            children += part
+            bases.update(part_bases)
+            seconds += part_seconds
+        return children, bases, seconds
+
     def finished(self):
         """The jobs done since the last call, as ``(node, box, version,
-        (status, x, y_eq, y_ineq), children, strong_seconds, seconds)``
-        (``children`` from ``_exact_strong``). A job that raised comes back
-        ``"failed"``."""
+        (status, x, y_eq, y_ineq), children, strong_seconds, seconds,
+        extra)`` (``children`` from ``_exact_strong``; ``extra``: the node
+        LP's ``pivots``, whether it started from a given basis (``warm``),
+        the ``mip`` whose rows it solved and, kept with
+        ``submit(keep=True)``, its optimal ``basis`` and its strong sides'
+        bases (``sides``, by ``(var, down)``)). A job that
+        raised comes back ``"failed"``."""
         out, waiting = [], []
         for future, node, box, version in self.jobs:
             if not future.done():
                 waiting.append((future, node, box, version))
                 continue
             try:
-                result, children, strong_seconds, seconds = future.result()
+                result, children, strong_seconds, seconds, extra = future.result()
             except Exception:
-                result, children, strong_seconds, seconds = (
-                    ("failed", None, None, None), [], 0.0, 0.0
+                result, children, strong_seconds, seconds, extra = (
+                    ("failed", None, None, None),
+                    [],
+                    0.0,
+                    0.0,
+                    dict(pivots=0, warm=False, mip=None, basis=None, sides={}),
                 )
-            out.append((node, box, version, result, children, strong_seconds, seconds))
+            out.append(
+                (node, box, version, result, children, strong_seconds, seconds, extra)
+            )
         self.jobs = waiting
         return out
 
@@ -6526,6 +6657,10 @@ class _BranchAndBound:
         exact_strong_iterations=1000,
         exact_overflow_share=0.5,
         exact_overflow_epochs=None,
+        exact_basis_memory=2e9,
+        exact_root_candidates=128,
+        exact_root_seconds=60.0,
+        exact_root_iterations=None,
         one_opt=True,
         objective_propagation=False,
         plunge_gap=0.25,
@@ -6911,6 +7046,15 @@ class _BranchAndBound:
         self.exact_failed = 0
         self.exact_seconds = 0.0
         self.exact_gain = 0.0  # bound gained over the nodes' own, summed
+        # HiGHS bases of the lane's solved nodes and strong sides, for their
+        # children's LPs (``exact_basis_memory`` bytes at most, about one
+        # byte a column and row each): key -> [shape, basis, holders],
+        # oldest first; the oldest go when it is full.
+        self.exact_basis_memory = float(exact_basis_memory or 0)
+        self.basis_store = collections.OrderedDict()
+        self.basis_keys = itertools.count()
+        self.exact_pivots = 0
+        self.exact_warm_bases = 0
         # The band of the queue kept for the lane (``exact_band``): nodes
         # within this share of the gap above the global bound wait in
         # ``exact_reserved`` (a heap like ``open``) for an exact LP, and the
@@ -6918,6 +7062,9 @@ class _BranchAndBound:
         # whenever it has room, and the device the rest.
         self.exact_band = float(exact_band)
         self.exact_reserved = []
+        # Nodes the lane has finished that ``collect_exact`` has not yet
+        # evaluated: in no other list, so the global bound counts them here.
+        self.exact_unevaluated = []
         # Strong branching in the lane (``exact_strong_candidates``,
         # ``exact_strong_iterations``).
         self.exact_strong_candidates = int(exact_strong_candidates)
@@ -6925,6 +7072,19 @@ class _BranchAndBound:
         self.exact_strong_lps = 0
         self.exact_strong_seconds = 0.0
         self.exact_reused = 0
+        # Exact strong branching at the root over the lane's threads
+        # (``exact_root_candidates``: ``None`` every fractional integer, 0
+        # off; ``exact_root_seconds``; ``exact_root_iterations``).
+        self.exact_root_candidates = (
+            None if exact_root_candidates is None else int(exact_root_candidates)
+        )
+        self.exact_root_seconds = float(exact_root_seconds)
+        self.exact_root_iterations = (
+            None if exact_root_iterations is None else int(exact_root_iterations)
+        )
+        self.root_exact_stats = dict(
+            candidates=0, lps=0, fixed=0, pivots=0, seconds=0.0, bound=None
+        )
         # The band's overflow (``exact_overflow_share``): past
         # ``_EXACT_OVERFLOW_KEEP`` nodes a lane thread, the top of the band
         # goes to the device, solved to convergence within
@@ -7630,10 +7790,12 @@ class _BranchAndBound:
         nodes = [entry[2] for entry in self.open]
         if self.plunge_node is not None:
             nodes.append(self.plunge_node)
-        # The exact lane's (``exact_nodes``): reserved, and queued or running.
+        # The exact lane's (``exact_nodes``): reserved, queued or running,
+        # and finished but not yet evaluated.
         if self.exact_lane is not None:
             nodes += [entry[2] for entry in self.exact_reserved]
             nodes += self.exact_lane.nodes()
+            nodes += self.exact_unevaluated
         return iter(nodes)
 
     def plunging(self):
@@ -9051,7 +9213,14 @@ class _BranchAndBound:
             )
             # The exact lane's strong child solved its LP already.
             child.exact_known = strong is not None and strong[down].exact
+            # Its exact LP starts from its strong side's basis, else from
+            # this node's (``basis_store``).
+            child.exact_basis = (node.exact_sides or {}).get(
+                (var, down), node.exact_basis
+            )
+            self.hold_basis(child.exact_basis)
             children.append(child)
+        self.release_bases(node)  # the children hold what they start from
         # The child to plunge into (``children.pop()``) or, in a dive, to pop
         # next (pushed last) sorts last: the higher ``(1 + inferences) /
         # (1 + cost / unit)`` (``_child_score``), the bounds its propagation
@@ -9175,6 +9344,8 @@ class _BranchAndBound:
             if node.converge:
                 # Out of the lane's band for good, so it keeps its progress.
                 again.converge = again.exact_tried = True
+            # The same box: it keeps its hold on the basis it would start from.
+            again.exact_basis, node.exact_basis = node.exact_basis, None
             self.push(again)
             return
         # An LP that did not converge keeps its Lagrangian bound (valid at
@@ -9379,7 +9550,11 @@ class _BranchAndBound:
         else:
             candidates = fractional
         root_children = {}
-        if root and self.root_strong_candidates:
+        if (
+            root
+            and self.root_strong_candidates
+            and result.get("exact_strong") is None
+        ):
             swept = self.root_sweep(
                 x, candidates, lower, upper, warm, terms, bound, raw
             )
@@ -9792,6 +9967,7 @@ class _BranchAndBound:
             "strong_fixings": self.strong_fixings,
             "root_strong_lps": self.root_strong_lps,
             "root_strong_seconds": self.root_strong_seconds,
+            "root_exact_strong": dict(self.root_exact_stats),
             "root_crossover": self.root_crossover_used,
             "round_repair_calls": self.round_repair_calls,
             "round_repair_finds": self.round_repair_finds,
@@ -9818,6 +9994,8 @@ class _BranchAndBound:
                 "strong_lps": self.exact_strong_lps,
                 "strong_seconds": self.exact_strong_seconds,
                 "children_reused": self.exact_reused,
+                "pivots": self.exact_pivots,
+                "warm_bases": self.exact_warm_bases,
                 "overflow_nodes": self.overflow_nodes,
                 "overflow_converged": self.overflow_converged,
             },
@@ -12471,6 +12649,60 @@ class _BranchAndBound:
             return -np.inf
         return bound + self.exact_band * max(cutoff - bound, 0.0)
 
+    @staticmethod
+    def basis_shape(mip):
+        """The columns and rows a HiGHS basis for ``mip``'s LP has."""
+        return mip.num_variables, mip.A.shape[0]
+
+    def store_basis(self, basis, mip):
+        """Keep ``basis`` (for ``mip``'s rows) and return its key, or
+        ``None`` when ``exact_basis_memory`` has no room for one."""
+        if basis is None or not basis.valid:
+            return None
+        shape = self.basis_shape(mip)
+        capacity = int(self.exact_basis_memory // max(1, sum(shape)))
+        if capacity < 1:
+            return None
+        key = next(self.basis_keys)
+        self.basis_store[key] = [shape, basis, 1]  # held by its node
+        while len(self.basis_store) > capacity:
+            self.basis_store.popitem(last=False)
+        return key
+
+    def hold_basis(self, key):
+        """Count one more node starting from basis ``key``."""
+        entry = self.basis_store.get(key)
+        if entry is not None:
+            entry[2] += 1
+
+    def drop_basis(self, key):
+        """One node fewer holds basis ``key``; it goes once none does.
+        Returns its entry (``None``: evicted)."""
+        entry = self.basis_store.get(key)
+        if entry is not None:
+            entry[2] -= 1
+            if entry[2] <= 0:
+                del self.basis_store[key]
+        return entry
+
+    def take_basis(self, key):
+        """The basis ``key`` for a node's exact LP, or ``None`` (evicted, or
+        of another shape: a restart). A tree cut refresh keeps the cut
+        block's shape, so a basis from before it still fits; HiGHS takes
+        any basis of the right shape as a start and solves on from it."""
+        entry = self.drop_basis(key)
+        if entry is None or entry[0] != self.basis_shape(self.mip):
+            return None
+        return entry[1]
+
+    def release_bases(self, node):
+        """``node`` lets go of its bases (its own, its strong sides', or the
+        one it would have started from), once its children hold theirs.
+        Nodes closed without branching keep theirs until the store is full."""
+        for key in [node.exact_basis, *(node.exact_sides or {}).values()]:
+            self.drop_basis(key)
+        node.exact_basis = node.exact_sides = None
+
     def feed_exact(self):
         """Hand the lane the lowest reserved nodes while it has room."""
         lane = self.exact_lane
@@ -12534,6 +12766,10 @@ class _BranchAndBound:
                 self.exact_strong_iterations,
                 self.reliability_threshold,
             )
+        basis = None
+        if node.exact_basis is not None:
+            basis = self.take_basis(node.exact_basis)
+            node.exact_basis = None
         self.exact_lane.submit(
             node,
             box,
@@ -12541,6 +12777,8 @@ class _BranchAndBound:
             self.mip,
             self.cut_version,
             strong,
+            basis=basis,
+            keep=self.exact_basis_memory > 0,
         )
 
     def collect_exact(self):
@@ -12556,33 +12794,57 @@ class _BranchAndBound:
         lane = self.exact_lane
         if lane is None:
             return
-        for node, box, version, outcome, children, strong_seconds, seconds in (
-            lane.finished()
-        ):
-            self.exact_seconds += seconds
-            self.exact_strong_seconds += strong_seconds
-            self.exact_strong_lps += len(children)
-            status, x, y_eq, y_ineq = outcome
-            if node.bound >= self.cutoff():
-                self.close(node.bound)
-                continue
-            if status == "infeasible":
-                self.exact_infeasible += 1
-                self.close(max(node.bound, self.cutoff_bound()))
-                continue
-            solution = None
-            if status == "optimal" and version <= self.cut_version:
-                solution = self.exact_solution(node, x, y_eq, y_ineq, version)
-            if solution is None:
-                # Unsolved, or for rows the search no longer has (a restart).
-                self.exact_failed += 1
-                self.push(node)
-                continue
-            self.exact_solved += 1
-            strong = self.exact_strong_children(
-                node, box, version, solution, children
-            )
-            self.evaluate_exact(node, box, solution, strong)
+        done = lane.finished()
+        # Until its turn, each finished node is in no list but this one: the
+        # global bound and ``explored`` (logged while the others are
+        # evaluated) count it here. Each node's own evaluation holds its
+        # bound (``active_bound``) until its children are queued.
+        self.exact_unevaluated = [entry[0] for entry in done]
+        try:
+            for entry in done:
+                self.exact_unevaluated.pop(0)
+                self.collect_one(*entry)
+        finally:
+            self.exact_unevaluated = []
+
+    def collect_one(
+        self, node, box, version, outcome, children, strong_seconds, seconds, extra
+    ):
+        """``collect_exact`` for one finished lane job."""
+        self.exact_seconds += seconds
+        self.exact_strong_seconds += strong_seconds
+        self.exact_strong_lps += len(children)
+        self.exact_pivots += extra["pivots"]
+        self.exact_warm_bases += bool(extra["warm"])
+        status, x, y_eq, y_ineq = outcome
+        if node.bound >= self.cutoff():
+            self.close(node.bound)
+            return
+        if status == "infeasible":
+            self.exact_infeasible += 1
+            self.close(max(node.bound, self.cutoff_bound()))
+            return
+        solution = None
+        if status == "optimal" and version <= self.cut_version:
+            solution = self.exact_solution(node, x, y_eq, y_ineq, version)
+        if solution is None:
+            # Unsolved, or for rows the search no longer has (a restart).
+            self.exact_failed += 1
+            self.push(node)
+            return
+        self.exact_solved += 1
+        if extra["mip"] is not None:
+            # The children's start (``exact_basis_memory``).
+            node.exact_basis = self.store_basis(extra["basis"], extra["mip"])
+            node.exact_sides = {
+                side: key
+                for side, basis in extra["sides"].items()
+                if (key := self.store_basis(basis, extra["mip"])) is not None
+            }
+        strong = self.exact_strong_children(
+            node, box, version, solution, children
+        )
+        self.evaluate_exact(node, box, solution, strong)
 
     def exact_solution(self, node, x, y_eq, y_ineq, version):
         """A HiGHS solution (Jaddle's dual convention) as a ``SaddleState``
@@ -12653,6 +12915,102 @@ class _BranchAndBound:
                 out[var] = (both[True], both[False])
                 solved.add(var)
         return (out, solved) if out else None
+
+    def root_exact_strong(self, root, lower, upper, result):
+        """
+        Exact strong branching at the root (``exact_root_candidates``),
+        over all the lane's threads at once: HiGHS solves the root LP over
+        ``[lower, upper]`` exactly, the fractional integers at its vertex
+        with the largest ``impact · f(1 − f)`` (as ``root_sweep`` ranks
+        them) are dealt out to the threads, and each side is re-solved from
+        the root's basis (``_ExactLane.split``), within
+        ``exact_root_seconds`` in all (and a tenth of the time left). The
+        root then branches as a lane node does: its vertex and exact duals
+        in place of the PDHG point, its children by ``apply_strong`` (empty
+        sides fix their variable, the bound rises to the best lesser
+        child, solved sides are their children's LPs), the sides' gains
+        seeding the exact pseudocosts, and the bases kept for the children.
+        Returns the result for ``evaluate``, or ``None`` (no lane, off, no
+        time, or no optimal root vertex) to branch on the PDHG point.
+        """
+        lane = self.exact_lane
+        k = self.exact_root_candidates
+        if lane is None or k == 0 or self.out_of_time():
+            return None
+        started = time.time()
+        budget = self.exact_root_seconds
+        left = self.seconds_left()
+        if left is not None:
+            budget = min(budget, 0.1 * left)
+        if budget <= 0:
+            return None
+        deadline = started + budget
+        mip = self.mip
+        lp_box = (self.lp_lower(lower), self.lp_upper(upper))
+        (status, x, y_eq, y_ineq), basis, pivots = lane.root_lp(mip, lp_box, budget)
+        stats = self.root_exact_stats
+        stats["pivots"] += pivots
+        if status != "optimal" or basis is None:
+            stats["seconds"] += time.time() - started
+            return None
+        root.warm = (result["solution"], result["opt_state"])
+        solution = self.exact_solution(root, x, y_eq, y_ineq, self.cut_version)
+        if solution is None:
+            stats["seconds"] += time.time() - started
+            return None
+        frac = x - np.floor(x)
+        cand = np.flatnonzero(
+            self.is_int
+            & (frac > self.int_tol)
+            & (frac < 1.0 - self.int_tol)
+            & (lower < upper)
+        )
+        f = frac[cand]
+        cand = cand[np.argsort(-(self.impact[cand] * f * (1.0 - f)), kind="stable")]
+        if k is not None:
+            cand = cand[:k]
+        children, sides = [], {}
+        if cand.size:
+            chunks = [cand[i :: lane.threads] for i in range(lane.threads)]
+            zeros = np.zeros((2, mip.num_variables))
+            request = (
+                self.is_int, self.int_tol, zeros, zeros, int(cand.size),
+                self.exact_root_iterations, 1,
+            )
+            children, sides, _ = lane.split(
+                mip, lp_box, x, basis, chunks, request, deadline
+            )
+        seen_sum, seen_count = self.exact_pc_sum.copy(), self.exact_pc_count.copy()
+        strong = self.exact_strong_children(
+            root, (lower, upper), self.cut_version, solution, children
+        )
+        # The root sweep's job too: seed the device's pseudocosts, which
+        # its nodes branch by, with the sides' exact gains.
+        self.pc_sum += self.exact_pc_sum - seen_sum
+        self.pc_count += self.exact_pc_count - seen_count
+        root.exact_basis = self.store_basis(basis, mip)
+        root.exact_sides = {
+            side: key
+            for side, side_basis in sides.items()
+            if (key := self.store_basis(side_basis, mip)) is not None
+        }
+        root.exact_tried = True
+        exact_bound, _ = self.exact_bound(solution, lower, upper)
+        stats["candidates"] += int(cand.size)
+        stats["lps"] += len(children)
+        stats["fixed"] += sum(child[2] == "infeasible" for child in children)
+        stats["seconds"] += time.time() - started
+        stats["bound"] = (
+            self.model_value(exact_bound) if np.isfinite(exact_bound) else None
+        )
+        return dict(
+            solution=solution,
+            converged=True,
+            stop_reason="exact",
+            epochs=0,
+            opt_state=result["opt_state"],
+            exact_strong=strong,
+        )
 
     def evaluate_exact(self, node, box, solution, strong=None):
         """Evaluate ``node`` with an exact LP ``solution`` (and the lane's
@@ -13286,6 +13644,8 @@ class _BranchAndBound:
         if self.root_lower is not lower:
             lower, upper = self.root_lower, self.root_upper
             lp = None  # rebuilt over the fixed box if ``evaluate`` needs it
+        # The root branched as an exact lane node (``exact_root_candidates``).
+        result = self.root_exact_strong(root, lower, upper, result) or result
         self.evaluate(root, lower, upper, lp, result)
         self.tree_started = True
         self.log(" ", None, force=True)  # the root's line
@@ -13526,6 +13886,10 @@ def solve(
     exact_strong_iterations=1000,
     exact_overflow_share=0.5,
     exact_overflow_epochs=None,
+    exact_basis_memory=2e9,
+    exact_root_candidates=128,
+    exact_root_seconds=60.0,
+    exact_root_iterations=None,
     one_opt=False,
     objective_propagation=True,
     plunge_gap=0.25,
@@ -14223,9 +14587,9 @@ def solve(
       which feeds the heuristics and prunes near the cutoff. With
       ``exact_band=0`` a thread instead takes the heap's top whenever it has
       room, and the device the rest. A node goes to the lane at most once.
-      HiGHS re-solves from its last basis, within ``exact_node_seconds``
-      (10) a node; the node is then evaluated as a batch member, with the
-      exact solution in place of the PDHG one: its bound is the exact
+      HiGHS re-solves from the parent's optimal basis (below), else from
+      the thread's last basis, within ``exact_node_seconds`` (10) a node;
+      the node is then evaluated as a batch member, with the exact solution in place of the PDHG one: its bound is the exact
       duals' Lagrangian bound (rigorous at any duals), it branches on the
       vertex, and its children's bounds come from those duals over their
       boxes. A node HiGHS proves infeasible closes; one it does not finish
@@ -14233,6 +14597,35 @@ def solve(
       lift a node's bound above its parent's, so without exact LPs the
       global bound can stall while the tree grows (map06: 7,800 nodes
       moved it 3 units); a map06 node took HiGHS 1.1–1.6 s.
+      Each lane node's optimal basis (and each strong side's) is kept for
+      its children (``exact_basis_memory``, default 2e9: the bytes the
+      kept bases may take, about one a column and row each, oldest dropped
+      first; ``0``: off), and a child's LP starts from it instead of from
+      whatever node its thread solved last, as branch and bound warm-starts
+      dual simplex. On presolved map06 a child took 870–3,100 pivots
+      (0.5–1.6 s) from its parent's basis against 3,400–5,200 (1.8–2.9 s)
+      from another node's. A device node's children keep the basis it
+      would have started from.
+      The root is not a lane node, so it gets exact strong branching of its
+      own (``exact_root_candidates``, default 128; ``None``: every
+      fractional integer; ``0``: off, and the PDHG root sweep,
+      ``root_strong_candidates``, runs instead). Just before the root
+      branches, a lane thread solves the root LP exactly, and the
+      fractional integers at its vertex with the largest
+      ``impact · f(1 − f)`` are dealt out to all the threads, each side
+      re-solved from the root's basis for up to ``exact_root_iterations``
+      pivots (``None``, the default: no limit), all within
+      ``exact_root_seconds`` (60, and at most a tenth of the time left).
+      The root then branches as a lane node does, on its vertex: empty
+      sides fix their variable, the bound rises to the best lesser child,
+      solved sides become their children's LPs and bases, and the gains
+      seed both the lane's exact pseudocosts and the device's. On map06 a
+      side takes about 0.5–1.6 s, so its 69 fractional integers take about
+      10 s on 16 threads. A strong-branching side stopped by HiGHS's time
+      limit keeps its duals' bound, as one stopped by the pivot limit
+      does. ``result["root_exact_strong"]`` gives the candidates, side
+      LPs, empty sides (``fixed``), the root LP's pivots, the time and the
+      exact root bound.
       Each lane node also chooses its branching variable by strong
       branching in the same job (``exact_strong_candidates``, default 4;
       ``0``: off): of the fractional integers whose exact pseudocosts have
@@ -14259,9 +14652,10 @@ def solve(
       ``result["exact_nodes"]`` holds the nodes solved, proved infeasible
       and not finished, the threads' seconds, the bound they gained over
       the nodes' own bounds, the strong-branching LPs and their seconds,
-      the children evaluated from their strong-branching vertex, and the
-      band's nodes sent to the device (``overflow_nodes``) and those whose
-      LP converged there (``overflow_converged``).
+      the children evaluated from their strong-branching vertex, the node
+      LPs' dual simplex ``pivots`` and those started from a kept basis
+      (``warm_bases``), and the band's nodes sent to the device
+      (``overflow_nodes``) and those whose LP converged there (``overflow_converged``).
     * **Node crossover** (``node_crossover``, off by default). Every
       ``node_crossover_every`` (1) nodes that the LP bound does not close,
       HiGHS crosses the node LP's PDHG point over to an optimal vertex
@@ -14508,6 +14902,10 @@ def solve(
         exact_strong_iterations=exact_strong_iterations,
         exact_overflow_share=exact_overflow_share,
         exact_overflow_epochs=exact_overflow_epochs,
+        exact_basis_memory=exact_basis_memory,
+        exact_root_candidates=exact_root_candidates,
+        exact_root_seconds=exact_root_seconds,
+        exact_root_iterations=exact_root_iterations,
         one_opt=one_opt,
         objective_propagation=objective_propagation,
         plunge_gap=plunge_gap,
@@ -14620,6 +15018,8 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
                 "strong_lps": 0,
                 "strong_seconds": 0.0,
                 "children_reused": 0,
+                "pivots": 0,
+                "warm_bases": 0,
                 "overflow_nodes": 0,
                 "overflow_converged": 0,
             },
