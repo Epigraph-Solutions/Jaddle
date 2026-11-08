@@ -35,6 +35,7 @@ import heapq
 import itertools
 import math
 import os
+import signal
 import threading
 import time
 
@@ -5522,6 +5523,477 @@ def _propagation_search(propagator, hint, lower, upper, ints, free, budget, dead
     return None
 
 
+def trivial_points(mip, lower=None, upper=None):
+    """
+    The trivial heuristic's points (as SCIP's ``trivial``), each one matvec
+    to check: every variable at zero, at its lower bound, at its upper
+    bound, and at the bound its locks allow (the lock point). The lock
+    point puts a variable at its lower bound when at most as many rows lock
+    it from going down as from going up (an equality locks both ways), and
+    at its upper bound otherwise. An infinite bound is replaced by zero,
+    clipped to the box. Integers are rounded. Cheap insurance on covering
+    (all ones), packing and knapsack (all zeros) and many big-M models.
+    """
+    lower = mip.lower if lower is None else np.asarray(lower, np.float64)
+    upper = mip.upper if upper is None else np.asarray(upper, np.float64)
+    zero = np.clip(np.zeros(lower.shape), lower, upper)
+    at_lower = np.where(np.isfinite(lower), lower, zero)
+    at_upper = np.where(np.isfinite(upper), upper, zero)
+    A = mip.A
+    rows = np.repeat(np.arange(A.shape[0]), np.diff(A.indptr))
+    eq = rows < mip.n_eq
+    n = lower.size
+    # In a ``<=`` row, a positive entry locks its variable from going up and
+    # a negative one from going down.
+    up_locks = np.bincount(A.indices[eq | (A.data > 0)], minlength=n)
+    down_locks = np.bincount(A.indices[eq | (A.data < 0)], minlength=n)
+    locks = np.where(down_locks <= up_locks, at_lower, at_upper)
+    points = []
+    for point in (zero, at_lower, at_upper, locks):
+        point = point.copy()
+        point[mip.integrality] = np.round(point[mip.integrality])
+        if not any(np.array_equal(point, seen) for seen in points):
+            points.append(point)
+    return points
+
+
+# %%
+# Block decomposition (``block_decomposition``)
+class LinkingBlocks(
+    collections.namedtuple("LinkingBlocks", "linking blocks block_rows")
+):
+    """A MIP's block structure (``linking_blocks``): ``linking``, the
+    indices of the linking rows (``<=`` rows); ``blocks``, one array of
+    column indices per block, largest first; ``block_rows``, the rows of
+    each block (every other row lies inside one block)."""
+
+    __slots__ = ()
+
+
+def linking_blocks(
+    mip,
+    min_length=20,
+    quantile=99.0,
+    max_linking_share=0.2,
+    max_block_share=0.5,
+):
+    """
+    Blocks that only a few long ``<=`` rows join, or ``None``.
+
+    The candidate linking rows are the inequality rows with at least
+    ``max(min_length, quantile-th percentile)`` entries. Without them the
+    columns fall into connected components (of the bipartite row-column
+    graph); a candidate whose columns all lie in one component goes back
+    into it. The structure is accepted when there are at least two blocks
+    of two or more columns, the linking rows are at most
+    ``max_linking_share`` of the rows, and no block has more than
+    ``max_block_share`` of the columns. Columns in components of their own
+    form one block together (it separates, so HiGHS solves it at once).
+
+    On stp3d (Steiner tree packing, 204,880 binaries) the 2,171 node
+    capacity rows join 24 blocks, one a net; after HiGHS's presolve, 1,936
+    of them join 21.
+    """
+    from scipy.sparse import csgraph
+
+    A = mip.A
+    m, n = A.shape
+    if m < 2 or n < 2:
+        return None
+    lengths = np.diff(A.indptr)
+    threshold = max(float(min_length), float(np.percentile(lengths, quantile)))
+    linking = (np.arange(m) >= mip.n_eq) & (lengths >= threshold)
+    if not linking.any() or linking.sum() > max_linking_share * m:
+        return None
+    inner = np.flatnonzero(~linking & (lengths > 0))
+    K = A[inner]
+    pattern = sp.csr_matrix(
+        (np.ones(K.nnz, np.int8), K.indices, K.indptr), shape=(inner.size, n)
+    )
+    graph = sp.bmat([[None, pattern], [pattern.T, None]], format="csr")
+    _, label = csgraph.connected_components(graph, directed=False)
+    label = label[inner.size :]  # each column's component
+    # Candidates inside one component are rows of it, not links.
+    rows = np.flatnonzero(linking)
+    L = A[rows]
+    spans = np.array(
+        [
+            np.unique(label[L.indices[L.indptr[i] : L.indptr[i + 1]]]).size
+            for i in range(rows.size)
+        ]
+    )
+    linking[rows[spans < 2]] = False
+    rows = rows[spans >= 2]
+    if rows.size == 0:
+        return None
+    sizes = np.bincount(label)
+    real = sizes >= 2
+    if real.sum() < 2 or sizes.max() > max_block_share * n:
+        return None
+    # Singleton columns share one block, labelled past the real ones.
+    loose = ~real[label]
+    _, block_of = np.unique(np.where(loose, -1, label), return_inverse=True)
+    block_of = block_of.reshape(-1)
+    n_blocks = int(block_of.max()) + 1
+    columns = [np.flatnonzero(block_of == b) for b in range(n_blocks)]
+    inner = np.flatnonzero(~linking & (lengths > 0))
+    row_block = block_of[A.indices[A.indptr[inner]]]
+    row_lists = [inner[row_block == b] for b in range(n_blocks)]
+    order = sorted(range(n_blocks), key=lambda b: -columns[b].size)
+    return LinkingBlocks(
+        rows, [columns[b] for b in order], [row_lists[b] for b in order]
+    )
+
+
+class _HighsHolder:
+    """The HiGHS instance a background job is running, so another thread
+    can stop it (``cancel``): a block's solve runs to its own time limit
+    otherwise."""
+
+    def __init__(self):
+        self.current = None
+        self.cancelled = False
+        self.lock = threading.Lock()
+        # Progress, for the search's result (``negotiate_blocks`` fills it).
+        self.stats = {}
+
+    def run(self, highs):
+        with self.lock:
+            if self.cancelled:
+                return False
+            self.current = highs
+        try:
+            highs.run()
+        finally:
+            with self.lock:
+                self.current = None
+        return not self.cancelled
+
+    def cancel(self):
+        with self.lock:
+            self.cancelled = True
+            if self.current is not None:
+                try:
+                    self.current.cancelSolve()
+                except Exception:
+                    pass
+
+
+def _block_highs(mip, cols, rows, lower, upper, gap, relax=False):
+    """A silent one-thread ``highspy.Highs`` holding the block of ``mip``
+    on the columns ``cols`` and rows ``rows`` (``linking_blocks``), with
+    HiGHS's presolve and MIP solver, or (``relax``) its LP relaxation for
+    the simplex method without presolve, so each run starts from the last
+    basis; ``cancelSolve`` stops a run."""
+    import highspy
+
+    A = mip.A[rows][:, cols].tocsc()
+    A.sort_indices()
+    lp = highspy.HighsLp()
+    lp.num_col_, lp.num_row_ = cols.size, rows.size
+    lp.col_cost_ = np.asarray(mip.c[cols], np.float64)
+    lp.col_lower_ = np.asarray(lower[cols], np.float64)
+    lp.col_upper_ = np.asarray(upper[cols], np.float64)
+    lp.row_lower_ = np.asarray(mip.row_lower[rows], np.float64)
+    lp.row_upper_ = np.asarray(mip.row_upper[rows], np.float64)
+    lp.a_matrix_.format_ = highspy.MatrixFormat.kColwise
+    lp.a_matrix_.start_ = A.indptr
+    lp.a_matrix_.index_ = A.indices
+    lp.a_matrix_.value_ = A.data
+    highs = highspy.Highs()
+    # No ``threads`` option: HiGHS's scheduler is global, and once another
+    # instance (presolve) has started it, setting it fails every run.
+    options = [("output_flag", False), ("parallel", "off")]
+    if relax:
+        options += [("presolve", "off"), ("solver", "simplex")]
+    else:
+        options += [("mip_rel_gap", float(gap))]
+    for option, value in options:
+        highs.setOptionValue(option, value)
+    highs.passModel(lp)
+    ints = np.flatnonzero(mip.integrality[cols]).astype(np.int32)
+    if ints.size and not relax:
+        highs.changeColsIntegrality(
+            ints.size, ints, np.full(ints.size, highspy.HighsVarType.kInteger)
+        )
+    highs.HandleUserInterrupt = True
+    return highs
+
+
+def negotiate_blocks(
+    mip,
+    blocks=None,
+    lower=None,
+    upper=None,
+    deadline=None,
+    stop=None,
+    tol=1e-6,
+    block_seconds=10.0,
+    gap=0.02,
+    present_start=0.5,
+    present_growth=1.6,
+    present_max=1e4,
+    history_weight=0.1,
+    stall_sweeps=3,
+    joint_seconds=0.0,
+    max_window_share=0.1,
+    lp_first=True,
+    noise=0.05,
+    shake=0.0,
+    seed=0,
+    holder=None,
+    log=None,
+):
+    """
+    A feasible point by negotiated congestion (PathFinder, McMurchie and
+    Ebeling, 1995, the rip-up-and-reroute of VLSI routers) over the blocks
+    of ``linking_blocks``, or ``None``. It solves no LP of the whole MIP.
+
+    Each block is solved alone by HiGHS, one after another, with its own
+    rows and its objective plus prices on the linking rows, so a block pays
+    to use capacity the others already hold. A linking row ``a·x <= b``
+    with usage ``u`` by the other blocks has the price
+    ``(1 + h)·p·max(0, u - b + s)/s + w·h``, in units of the objective's
+    typical cost per unit ``s`` of the row's typical entry: ``h`` the row's
+    history (its overuse summed over the sweeps), ``p`` the present factor
+    (``present_start``, times ``present_growth`` each sweep, at most
+    ``present_max``: larger costs only blunt HiGHS's relative gap), and
+    ``w`` ``history_weight``. Each sweep solves every block again (a block
+    that keeps its route still holds capacity others need).
+
+    With ``joint_seconds`` (default 0: off; on stp3d no window ever found
+    a point, and their time slowed the negotiation), when the overuse has
+    not fallen for ``stall_sweeps`` sweeps, a window
+    around the conflicts is searched as one sub-MIP of the whole model
+    (as a router rips up a region): the linking rows within ``r`` steps of
+    the overused ones (``_linking_adjacency``; ``r`` is 1, then one more at
+    each attempt), their columns, and the columns that share a block row
+    with those (a path's flow variables beside its arcs) are freed, every
+    other column fixed, and HiGHS searches for up to ``joint_seconds``. It
+    settles the last few conflicts the prices circle around. A window
+    wider than ``max_window_share`` of the columns is skipped and the next
+    starts at ``r = 1`` again (wide ones ran far past their time limit in
+    HiGHS's presolve). If it fails, each history is scaled by a random
+    factor in ``1 ± shake`` (default 0: on presolved stp3d a shake of 0.5
+    undid the negotiation's progress) and the negotiation goes on.
+
+    On stp3d (no presolve) the overuse fell from 29 rows to 2 in seven
+    sweeps of about 3 s, and the prices alone settled the last two by 68 s
+    at 538.8 (best known 493.7).
+
+    ``holder`` (a ``_HighsHolder``) lets another thread stop a running
+    HiGHS solve; ``stop`` (an event) is checked between solves; ``log``
+    (a function of a string) gets a line a sweep. Returns
+    ``(x, feasible, "K")``, the shape of the background jobs' results.
+    """
+    import highspy
+
+    started = time.time()
+    holder = _HighsHolder() if holder is None else holder
+    say = log or (lambda line: None)
+    if blocks is None:
+        blocks = linking_blocks(mip)
+    if blocks is None:
+        return None, False, "K"
+    lower = mip.lower if lower is None else np.asarray(lower, np.float64)
+    upper = mip.upper if upper is None else np.asarray(upper, np.float64)
+    rng = np.random.default_rng(seed)
+
+    def halted():
+        return (
+            holder.cancelled
+            or (stop is not None and stop.is_set())
+            or (deadline is not None and time.time() >= deadline)
+        )
+
+    L = mip.A[blocks.linking]
+    capacity = mip.row_upper[blocks.linking]
+    size = np.ones(L.shape[0])
+    for i in range(L.shape[0]):
+        entries = np.abs(L.data[L.indptr[i] : L.indptr[i + 1]])
+        if entries.size:
+            size[i] = max(float(np.median(entries)), 1e-9)
+    L_csc = L.tocsc()
+    costs = np.abs(mip.c[mip.c != 0])
+    unit = float(np.median(costs)) if costs.size else 1.0
+    # Each block: its columns, its linking entries, its LP relaxation in
+    # HiGHS (``lp_first``; warm from the last sweep's basis, as only the
+    # costs change) and its MIP, built when the LP's point is fractional.
+    # On a network block (a path, a flow) the LP's vertex is integral: on
+    # stp3d every block's was, and a sweep of warm LPs took 1.2 s against
+    # 7.4 s for the MIPs. Alone, warm LPs kept their old routes on ties and
+    # needed more sweeps (152 s to a point, against 68-74 s with the MIPs);
+    # with ``noise`` (random costs up to 5% of a typical cost, new each
+    # sweep) they took 37-146 s (median 52 s, five runs).
+    parts = []
+    for cols, rows in zip(blocks.blocks, blocks.block_rows):
+        parts.append(
+            [
+                cols,
+                L_csc[:, cols].tocsr(),
+                (
+                    _block_highs(mip, cols, rows, lower, upper, gap, relax=True)
+                    if lp_first
+                    else None
+                ),
+                None,
+                rows,
+            ]
+        )
+    holder.stats.setdefault("mip_solves", 0)
+
+    def run_block(highs, cost):
+        """``(status, point)``: ``"ok"`` with the point, ``"none"`` (no
+        point in the time), ``"infeasible"``, ``"stopped"`` or ``"error"``."""
+        n_cols = cost.size
+        highs.changeColsCost(n_cols, np.arange(n_cols, dtype=np.int32), cost)
+        budget = block_seconds
+        if deadline is not None:
+            budget = min(budget, deadline - time.time())
+        highs.setOptionValue("time_limit", highs.getRunTime() + max(budget, 1e-3))
+        if not holder.run(highs):
+            return "stopped", None
+        status = highs.getModelStatus()
+        if status == highspy.HighsModelStatus.kNotset:
+            return "error", None
+        if status == highspy.HighsModelStatus.kInfeasible:
+            return "infeasible", None
+        if highs.getInfo().primal_solution_status != 2:  # kSolutionStatusFeasible
+            return "none", None
+        return "ok", np.array(highs.getSolution().col_value, np.float64)
+    x = np.clip(np.zeros(lower.shape), lower, upper)
+    solved = np.zeros(len(parts), bool)
+    usage = L @ x
+    history = np.zeros(L.shape[0])
+    present = float(present_start)
+    best_over, stalled, joints = np.inf, 0, 0
+    joint = None  # the whole MIP in HiGHS, built at the first stall
+    adjacent = None  # the linking rows' adjacency (``_linking_adjacency``)
+    todo = list(range(len(parts)))
+    sweep = 0
+    while not halted():
+        sweep += 1
+        for b in todo:
+            if halted():
+                break
+            cols, Lb, relaxed, exact, rows = parts[b]
+            own = Lb @ x[cols]
+            other = usage - own
+            crowd = np.maximum(other - capacity + size, 0.0) / size
+            price = unit * ((1.0 + history) * present * crowd + history_weight * history) / size
+            cost = mip.c[cols] + Lb.T @ price
+            if noise > 0:  # breaks ties afresh each sweep
+                cost = cost + unit * noise * rng.random(cols.size)
+            ints = mip.integrality[cols]
+            status, xb = ("none", None) if relaxed is None else run_block(relaxed, cost)
+            if status == "ok" and np.any(np.abs(xb[ints] - np.round(xb[ints])) > 1e-6):
+                status = "fractional"
+            if status in ("fractional", "none"):
+                if exact is None:
+                    exact = parts[b][3] = _block_highs(mip, cols, rows, lower, upper, gap)
+                if relaxed is not None:
+                    holder.stats["mip_solves"] += 1
+                status, xb = run_block(exact, cost)
+            if status == "stopped":
+                break
+            if status == "error":
+                say(f"block {b}: HiGHS did not run")
+                return None, False, "K"
+            if status == "infeasible":
+                say(f"block {b} ({cols.size} columns) is infeasible on its own")
+                return None, False, "K"
+            if status == "ok":
+                xb[ints] = np.round(xb[ints])
+                x[cols] = np.clip(xb, lower[cols], upper[cols])
+                solved[b] = True
+                usage = other + Lb @ x[cols]
+        if halted():
+            break
+        over = np.maximum(usage - capacity - tol * (1.0 + np.abs(capacity)), 0.0)
+        overused = over > 0
+        total = float((over / size).sum())
+        say(
+            f"sweep {sweep}: {int(overused.sum())} overused linking rows "
+            f"(overuse {total:.4g}), objective {float(mip.c @ x):.6g}, "
+            f"{time.time() - started:.1f}s"
+        )
+        holder.stats.update(
+            sweeps=sweep,
+            overused_rows=int(overused.sum()),
+            seconds=time.time() - started,
+        )
+        if solved.all() and not overused.any():
+            if mip.is_feasible(x, tol):
+                return x, True, "K"
+        history += over / size
+        present = min(present * present_growth, present_max)
+        if total < best_over - 1e-12:
+            best_over, stalled = total, 0
+        else:
+            stalled += 1
+        if stalled >= stall_sweeps and solved.all() and joint_seconds > 0:
+            stalled, joints = 0, joints + 1
+            if joint is None:
+                joint = _highs_submip(mip, mip.integrality)
+            if adjacent is None:
+                adjacent = _linking_adjacency(mip, blocks)
+                inner = mip.A[np.concatenate(blocks.block_rows)]
+                inner = sp.csr_matrix(
+                    (np.ones(inner.nnz, np.int32), inner.indices, inner.indptr),
+                    shape=inner.shape,
+                )
+                inner_T = inner.T.tocsr()
+                linking_T = (L != 0).T.tocsr().astype(np.int32)
+            near = overused.copy()
+            for _ in range(joints):
+                near = near | (adjacent @ near.astype(np.int32) > 0)
+            free = linking_T @ near.astype(np.int32) > 0
+            free = free | (inner_T @ (inner @ free.astype(np.int32) > 0).astype(np.int32) > 0)
+            if free.sum() > max_window_share * x.size:
+                joints = 0  # too wide to search in time: start small again
+                continue
+            box_lower = np.where(free, lower, x)
+            box_upper = np.where(free, upper, x)
+            seconds = joint_seconds
+            if deadline is not None:
+                seconds = min(seconds, deadline - time.time())
+            joint.changeColsBounds(x.size, np.arange(x.size, dtype=np.int32), box_lower, box_upper)
+            joint.setOptionValue("objective_bound", np.inf)
+            joint.setOptionValue("time_limit", joint.getRunTime() + max(seconds, 1e-3))
+            if holder.run(joint) and joint.getInfo().primal_solution_status == 2:
+                point = np.array(joint.getSolution().col_value, np.float64)
+                point[mip.integrality] = np.round(point[mip.integrality])
+                point = np.clip(point, lower, upper)
+                holder.stats["windows"] = holder.stats.get("windows", 0) + 1
+                say(f"window of {joints} steps ({int(free.sum())} columns): found a point")
+                if mip.is_feasible(point, tol):
+                    return point, True, "K"
+            else:
+                holder.stats["windows"] = holder.stats.get("windows", 0) + 1
+                say(f"window of {joints} steps ({int(free.sum())} columns): nothing")
+            if shake > 0:
+                history *= rng.uniform(1.0 - shake, 1.0 + shake, history.shape)
+    return None, False, "K"
+
+
+def _linking_adjacency(mip, blocks):
+    """The linking rows' adjacency (a boolean CSR matrix): two rows are
+    adjacent when one block row has columns of both. On a routing model
+    (stp3d) these are neighbouring nodes."""
+    def pattern(rows):
+        M = mip.A[rows]
+        return sp.csr_matrix(
+            (np.ones(M.nnz, np.int32), M.indices, M.indptr), shape=M.shape
+        )
+
+    inner = np.concatenate(blocks.block_rows) if blocks.block_rows else []
+    R = pattern(blocks.linking) @ pattern(np.asarray(inner, np.int64)).T
+    adjacent = (R @ R.T).astype(bool).tocsr()
+    adjacent.setdiag(False)
+    adjacent.eliminate_zeros()
+    return adjacent
+
+
 # ``device="auto"`` runs MIPs with at most this many nonzeros on the CPU:
 # their node LPs are latency-bound on an accelerator. Measured (ms per LP
 # epoch, CPU vs GPU): 98 nonzeros 0.7 vs 4.2, 8,937 nonzeros 4.2 vs 5.1,
@@ -5635,12 +6107,14 @@ _LOG_SOURCES = (
     ("F", "Feasibility pump"),
     ("H", "Rounding"),
     ("J", "Feasibility jump"),
+    ("K", "Block decomposition"),
     ("N", "RINS"),
     ("P", "Fix-and-propagate"),
     ("R", "Repair"),
     ("S", "User start"),
     ("T", "Evaluate node"),
     ("U", "Round and repair"),
+    ("Z", "Trivial"),
     ("C", "Crossover"),
     ("1", "1-opt"),
 )
@@ -6413,6 +6887,13 @@ _NODE_MAX_EPOCHS = 200
 # The exact lane's band (``exact_overflow_share``): reserved nodes kept for
 # each lane thread before the top of the band overflows to the device.
 _EXACT_OVERFLOW_KEEP = 4
+# The adaptive band (``exact_band="auto"``): where it starts, its limits, and
+# the factor it grows or shrinks by a batch as the lane's queue runs short of
+# or past ``_EXACT_OVERFLOW_KEEP`` nodes a thread.
+_EXACT_BAND_START = 0.01
+_EXACT_BAND_MIN = 0.001
+_EXACT_BAND_MAX = 1.0
+_EXACT_BAND_STEP = 1.5
 
 # Root cut rounds (``cut_age``): the rounds in a row a cut stays in the LP
 # while idle (slack, with a zero dual), as HiGHS's LP age limit.
@@ -6682,16 +7163,26 @@ class _BranchAndBound:
         jump_threads=4,
         jump_restarts=True,
         root_jump_seconds=60.0,
+        block_decomposition=False,
+        block_decomposition_seconds=300.0,
+        trivial_heuristic=True,
         submip_solver="highs",
         rins_tolerance=0.1,
         crossover_seconds=10.0,
         crossover_solutions=3,
         crossover_min_fixed=0.5,
+        interrupt=None,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
         self.settings = {
             key: value for key, value in locals().items() if key not in ("self", "mip")
         }
+        # Ctrl-C (``request_interrupt``): an event set at the first press,
+        # which every time check treats as the deadline passed. A sub-search
+        # shares its parent's (``interrupt``); the search that made it
+        # catches SIGINT while it runs (``run``).
+        self.owns_interrupt = interrupt is None
+        self.interrupt = threading.Event() if interrupt is None else interrupt
         self.rins_nodes = rins_nodes
         if symmetry not in ("auto", True, False):
             raise ValueError(
@@ -7059,8 +7550,13 @@ class _BranchAndBound:
         # within this share of the gap above the global bound wait in
         # ``exact_reserved`` (a heap like ``open``) for an exact LP, and the
         # device never takes them. ``0``: the lane takes the heap's top
-        # whenever it has room, and the device the rest.
-        self.exact_band = float(exact_band)
+        # whenever it has room, and the device the rest. ``"auto"``: the
+        # band follows the lane's load (``adapt_exact_band``).
+        self.exact_band_auto = isinstance(exact_band, str)
+        if self.exact_band_auto and exact_band != "auto":
+            raise ValueError(f"exact_band must be a number or 'auto', not {exact_band!r}")
+        self.exact_band = _EXACT_BAND_START if self.exact_band_auto else float(exact_band)
+        self.exact_band_range = [self.exact_band, self.exact_band]
         self.exact_reserved = []
         # Nodes the lane has finished that ``collect_exact`` has not yet
         # evaluated: in no other list, so the global bound counts them here.
@@ -7110,6 +7606,16 @@ class _BranchAndBound:
         # and the event that stops them at the first incumbent.
         self.root_jump_seconds = float(root_jump_seconds or 0.0)
         self.early_jump = None
+        # Block decomposition before the root LP (``block_decomposition``).
+        if not isinstance(block_decomposition, (bool, np.bool_)):
+            raise ValueError(
+                f"block_decomposition must be True or False, not {block_decomposition!r}"
+            )
+        self.use_block_decomposition = bool(block_decomposition)
+        self.block_decomposition_seconds = float(block_decomposition_seconds or 0.0)
+        self.block_holder = None
+        self.linking_blocks = None  # ``linking_blocks``, once found
+        self.use_trivial = bool(trivial_heuristic)
         self.jump_restarts = 0
         self.jump_restart_finds = 0
         self.recent_points = collections.deque(maxlen=64)
@@ -7690,13 +8196,34 @@ class _BranchAndBound:
     def seconds_left(self):
         """Seconds to the deadline (``None``: no deadline), at least 1ms:
         the deadline can pass between a time check and an LP solve, and
-        ``jl.solve`` needs a positive limit (it then stops at once)."""
+        ``jl.solve`` needs a positive limit (it then stops at once). An
+        interrupt (``request_interrupt``) leaves 1ms."""
+        if self.interrupt.is_set():
+            return 1e-3
         if self.deadline is None:
             return None
         return max(self.deadline - time.time(), 1e-3)
 
     def out_of_time(self):
+        """Whether the deadline has passed, or the search was interrupted:
+        an interrupt takes the time-limit path everywhere, which puts nodes
+        in flight back in the queue, so the bound reported stays valid."""
+        if self.interrupt.is_set():
+            return True
         return self.deadline is not None and time.time() >= self.deadline
+
+    def request_interrupt(self):
+        """Stop the search as a time limit would, with the best point so
+        far (the first Ctrl-C, ``run``): the interrupt event is set (the LP
+        being solved stops at its next chunk, ``jl.solve(cancel=...)``;
+        sub-searches share the event), the deadline moves to now (budgets
+        drawn from it shrink to nothing), and block decomposition's HiGHS
+        solve is cancelled. The status is then ``"interrupted"``."""
+        self.interrupt.set()
+        now = time.time()
+        self.deadline = now if self.deadline is None else min(self.deadline, now)
+        if self.block_holder is not None:
+            self.block_holder.cancel()
 
     def cutoff(self, box=True):
         """Nodes whose bound reaches this hold no solution worth finding:
@@ -7867,8 +8394,15 @@ class _BranchAndBound:
                 warm = _cast_warm(warm, _wide(lp.c.dtype))
             kwargs.update(initial_solution=warm[0], initial_opt_state=warm[1])
         result = jl.solve(
-            lp, max_epochs=max_epochs, max_seconds=self.seconds_left(), **kwargs
+            lp,
+            max_epochs=max_epochs,
+            max_seconds=self.seconds_left(),
+            cancel=self.interrupt,
+            **kwargs,
         )
+        if result["stop_reason"] == "cancelled":
+            # Stopped by ``request_interrupt``: as ``jl.solve`` reports Ctrl-C.
+            result["stop_reason"] = "interrupted"
         self.lp_epochs += result["epochs"]
         return result
 
@@ -9697,6 +10231,8 @@ class _BranchAndBound:
             "U": self.use_round_repair,
             "C": bool(self.crossover_seconds and self.submip_lane is not None),
             "1": self.use_one_opt,
+            "K": self.linking_blocks is not None,
+            "Z": self.use_trivial,
         }
         return {mark for mark, enabled in on.items() if enabled}
 
@@ -9851,6 +10387,8 @@ class _BranchAndBound:
     def result(self, status):
         # Background points that are in already (the rest are dropped).
         self.collect_heuristics(schedule=False)
+        if status == "time_limit" and self.interrupt.is_set():
+            status = "interrupted"  # it took the time-limit path
         bound = self.global_bound()
         if status == "optimal":
             # The search ended: proven unless a node closed without proof
@@ -9968,6 +10506,16 @@ class _BranchAndBound:
             "root_strong_lps": self.root_strong_lps,
             "root_strong_seconds": self.root_strong_seconds,
             "root_exact_strong": dict(self.root_exact_stats),
+            # Block decomposition's progress (``None``: it did not run).
+            "block_decomposition": (
+                None
+                if self.linking_blocks is None
+                else dict(
+                    blocks=len(self.linking_blocks.blocks),
+                    linking_rows=int(self.linking_blocks.linking.size),
+                    **self.block_holder.stats,
+                )
+            ),
             "root_crossover": self.root_crossover_used,
             "round_repair_calls": self.round_repair_calls,
             "round_repair_finds": self.round_repair_finds,
@@ -9998,6 +10546,9 @@ class _BranchAndBound:
                 "warm_bases": self.exact_warm_bases,
                 "overflow_nodes": self.overflow_nodes,
                 "overflow_converged": self.overflow_converged,
+                "band": self.exact_band,
+                "band_min": self.exact_band_range[0],
+                "band_max": self.exact_band_range[1],
             },
             "mip_start_accepted": self.mip_start_accepted,
             "one_opt_finds": self.one_opt_finds,
@@ -10404,6 +10955,59 @@ class _BranchAndBound:
             )
             started = True
         return started
+
+    def try_trivial(self, lower, upper):
+        """The trivial heuristic (``trivial_heuristic``), before the root
+        LP: ``trivial_points`` in the root box, each a matvec; a feasible
+        one goes to ``try_incumbent``, marked ``"Z"``. Points that need
+        their continuous variables re-solved are skipped (that costs an
+        LP)."""
+        if not self.use_trivial:
+            return
+        for point in trivial_points(self.original, lower, upper):
+            if self.original.is_feasible(point, self.feas_tol):
+                self.try_incumbent(point, "Z", None)
+
+    def block_decomposition(self, lower, upper):
+        """Block decomposition (``block_decomposition``) before the root
+        LP, in the foreground, with no incumbent yet: when
+        ``linking_blocks`` finds blocks (a few hundredths of a second on
+        stp3d), ``negotiate_blocks`` searches for a point for up to
+        ``block_decomposition_seconds``, with the CPU to itself (the early
+        jumps start after it, and only if it found nothing). A point it
+        finds is the incumbent, marked ``"K"``. Runs once a solve."""
+        if (
+            not self.use_block_decomposition
+            or self.block_decomposition_seconds <= 0
+            or self.block_holder is not None  # once a solve
+            or self.incumbent is not None
+            or self.out_of_time()
+        ):
+            return
+        self.block_holder = _HighsHolder()
+        blocks = linking_blocks(self.original)
+        if blocks is None:
+            return
+        self.linking_blocks = blocks
+        if self.verbose:
+            print(
+                f"Block decomposition: {len(blocks.blocks)} blocks joined by "
+                f"{blocks.linking.size} linking rows"
+            )
+        deadline = time.time() + self.block_decomposition_seconds
+        if self.deadline is not None:
+            deadline = min(deadline, self.deadline)
+        x, found, _ = negotiate_blocks(
+            self.original,
+            blocks,
+            np.array(lower, np.float64),
+            np.array(upper, np.float64),
+            deadline=deadline,
+            tol=self.feas_tol,
+            holder=self.block_holder,
+        )
+        if found:
+            self.try_incumbent(x, "K", None)
 
     def early_jumps_running(self):
         """Whether jumps started before the root LP are still at work."""
@@ -11603,6 +12207,9 @@ class _BranchAndBound:
             batch_size=1,
             verbose=False,
             parallel_heuristics=False,
+            block_decomposition=False,
+            trivial_heuristic=False,
+            interrupt=self.interrupt,
         )
         if settings["branching"] in ("auto", "reliability"):
             # Strong branching would spend the sub-MIP's short budget.
@@ -12649,6 +13256,29 @@ class _BranchAndBound:
             return -np.inf
         return bound + self.exact_band * max(cutoff - bound, 0.0)
 
+    def adapt_exact_band(self):
+        """With ``exact_band="auto"``, once a batch: widen the band while the
+        lane's queue (``exact_reserved``) holds under half its
+        ``_EXACT_OVERFLOW_KEEP`` nodes a thread, so the threads never run dry,
+        and narrow it while the queue holds over twice that, so the bound does
+        not wait on nodes the threads cannot reach. Late in a solve the lane
+        keeps up with the few nodes near the bound and the band widens."""
+        lane = self.exact_lane
+        if not self.exact_band_auto or lane is None:
+            return
+        if not np.isfinite(self.cutoff()):
+            return  # no band before an incumbent
+        target = _EXACT_OVERFLOW_KEEP * lane.threads
+        queued = len(self.exact_reserved)
+        if 2 * queued < target:
+            self.exact_band = min(_EXACT_BAND_MAX, self.exact_band * _EXACT_BAND_STEP)
+        elif queued > 2 * target:
+            self.exact_band = max(_EXACT_BAND_MIN, self.exact_band / _EXACT_BAND_STEP)
+        else:
+            return
+        low, high = self.exact_band_range
+        self.exact_band_range = [min(low, self.exact_band), max(high, self.exact_band)]
+
     @staticmethod
     def basis_shape(mip):
         """The columns and rows a HiGHS basis for ``mip``'s LP has."""
@@ -13048,6 +13678,7 @@ class _BranchAndBound:
         members, boxes = [], []
         in_flight = 0 if self.in_flight is None else len(self.in_flight["members"])
         self.feed_exact()
+        self.adapt_exact_band()
         band_top = self.exact_band_top()
         if self.exact_overflow_share > 0.0:
             # The top of a band too deep for the lane, solved to convergence
@@ -13339,13 +13970,36 @@ class _BranchAndBound:
 
     def run(self):
         """The search, on ``self.device`` when one is set. Background
-        heuristics (``parallel_heuristics``) stop when it returns."""
+        heuristics (``parallel_heuristics``) stop when it returns.
+
+        Ctrl-C, as in ``jl.solve``, ends the search with the best point so
+        far: the first press calls ``request_interrupt`` (the search winds
+        down along its time-limit path, with status ``"interrupted"``); a
+        second raises ``KeyboardInterrupt`` as usual. The handler is set
+        only on the main thread, and only by the outermost search."""
+        installed, previous = False, None
+        if self.owns_interrupt and threading.current_thread() is threading.main_thread():
+
+            def on_sigint(signum, frame):
+                if self.interrupt.is_set():  # the second press: abort
+                    signal.signal(signal.SIGINT, previous or signal.default_int_handler)
+                    raise KeyboardInterrupt
+                print("KeyboardInterrupt received. Returning current solution.")
+                self.request_interrupt()
+
+            try:
+                previous = signal.signal(signal.SIGINT, on_sigint)
+                installed = True
+            except ValueError:  # not the main interpreter
+                pass
         try:
             if self.device is None:
                 return self._run()
             with jax.default_device(self.device):
                 return self._run()
         finally:
+            if installed:
+                signal.signal(signal.SIGINT, previous or signal.default_int_handler)
             if self.workers is not None:
                 self.workers.shutdown()
             if self.exact_lane is not None:
@@ -13508,6 +14162,8 @@ class _BranchAndBound:
         warm = None
         if self.root_warm is not None:
             warm = (self.root_warm["solution"], self.root_warm["opt_state"])
+        self.try_trivial(lower, upper)
+        self.block_decomposition(lower, upper)
         self.launch_root_jumps(lower, upper)
         result = self.solve_lp(lp, warm, self.root_max_epochs)
         if (
@@ -13879,12 +14535,12 @@ def solve(
     implied_bound_cuts=True,
     implied_variable_bounds=True,
     max_aggregation=6,
-    exact_nodes=8,
+    exact_nodes=16,
     exact_node_seconds=10.0,
-    exact_band=0.005,
-    exact_strong_candidates=4,
-    exact_strong_iterations=1000,
-    exact_overflow_share=0.5,
+    exact_band=0.25,
+    exact_strong_candidates=8,
+    exact_strong_iterations=5000,
+    exact_overflow_share=0.0,
     exact_overflow_epochs=None,
     exact_basis_memory=2e9,
     exact_root_candidates=128,
@@ -13908,9 +14564,12 @@ def solve(
     gpu_dive_crossover=4,
     exact_plunges=False,
     exact_plunge_share=0.25,
-    jump_threads=4,
+    jump_threads=1,
     jump_restarts=True,
     root_jump_seconds=60.0,
+    block_decomposition=False,
+    block_decomposition_seconds=300.0,
+    trivial_heuristic=True,
     submip_solver="highs",
     rins_tolerance=0.1,
     crossover_seconds=10.0,
@@ -14528,6 +15187,25 @@ def solve(
       neos-5106984-jizera (299k columns, 391k rows after presolve) the jump
       needs 30-45 s from zero, where the root's own jumps get about 5 s
       each, and only after the root LP.
+    * **Block decomposition** (``block_decomposition``, default off;
+      ``block_decomposition_seconds``, default 300). When a few long
+      ``<=`` rows are all that join the MIP's blocks (``linking_blocks``),
+      negotiated congestion (``negotiate_blocks``, the rip-up-and-reroute
+      of VLSI routers) runs before the root LP, in the foreground: each
+      block solved alone by HiGHS (its LP relaxation, warm from the last
+      sweep, with the MIP when that is fractional), with prices on the
+      linking rows that rise where blocks overuse them. It needs no LP of
+      the whole MIP. A point it finds is the first incumbent, marked
+      ``"K"``; then the root LP and the tree go on from it. On stp3d (24
+      nets joined by 2,171 node capacity rows, no presolve), where the jump
+      and roundings find nothing, it found a point in 34 s (37-146 s in
+      runs beside others); after presolve it has not settled within three
+      minutes. ``result["block_decomposition"]`` reports its sweeps,
+      the overused rows at the last one, and its seconds.
+    * **Trivial heuristic** (``trivial_heuristic``, on). Before the root
+      LP, every variable at zero, at its lower bound, at its upper bound,
+      and at the bound its locks allow (``trivial_points``), one matvec
+      each; a feasible one is the first incumbent, marked ``"Z"``.
     * **Background heuristics** (``parallel_heuristics``, on by default).
       The numba improving jump runs on a background thread, beside the
       node LPs, instead of between them. The search hands a slice over when
@@ -14572,12 +15250,12 @@ def solve(
       once it has used the share left (but gets at least 1 s), and they skip a
       rounding of the LP point already tried at the same cutoff. A find
       also triggers RINS at the next node.
-    * **Exact nodes** (``exact_nodes``, default 8; ``0``: off). With
+    * **Exact nodes** (``exact_nodes``, default 16; ``0``: off). With
       batched search, ``exact_nodes`` CPU threads solve the LPs of the
       nodes that hold the global bound exactly with HiGHS's dual simplex,
       while the device solves the rest in batches (``_ExactLane``). Once
       the heap is in bound order (after the first incumbent), the nodes
-      within ``exact_band`` (default 0.005) of the gap above the global
+      within ``exact_band`` (default 0.25) of the gap above the global
       bound are kept for the threads, lowest first (two queued a thread),
       and the device never takes them: a truncated LP rarely lifts such a
       node's bound, and splitting it only doubles the nodes that hold the
@@ -14586,7 +15264,14 @@ def solve(
       and the bound did not move). The device takes the rest of the queue,
       which feeds the heuristics and prunes near the cutoff. With
       ``exact_band=0`` a thread instead takes the heap's top whenever it has
-      room, and the device the rest. A node goes to the lane at most once.
+      room, and the device the rest. With ``exact_band="auto"`` the band
+      follows the lane's load: it starts at 0.01 and, once a batch, grows by
+      half while the threads' queue holds under 2 nodes a thread and shrinks
+      by a third while it holds over 8, within [0.001, 1]; so it narrows
+      while the tree near the bound is wider than the threads can solve,
+      and widens late, when they keep up. The ``exact_nodes`` stats report
+      the band at the end (``band``) and its range (``band_min``,
+      ``band_max``). A node goes to the lane at most once.
       HiGHS re-solves from the parent's optimal basis (below), else from
       the thread's last basis, within ``exact_node_seconds`` (10) a node;
       the node is then evaluated as a batch member, with the exact solution in place of the PDHG one: its bound is the exact
@@ -14627,11 +15312,11 @@ def solve(
       LPs, empty sides (``fixed``), the root LP's pivots, the time and the
       exact root bound.
       Each lane node also chooses its branching variable by strong
-      branching in the same job (``exact_strong_candidates``, default 4;
+      branching in the same job (``exact_strong_candidates``, default 8;
       ``0``: off): of the fractional integers whose exact pseudocosts have
       fewer than ``reliability_threshold`` observations a side, those with
       the largest pseudocost product are split, and each side is re-solved
-      from the node's basis for at most ``exact_strong_iterations`` (1,000)
+      from the node's basis for at most ``exact_strong_iterations`` (5,000)
       dual simplex pivots. A side stopped early still has feasible duals,
       so its Lagrangian bound holds. The children then go through
       ``apply_strong`` as device strong branching's do (a side HiGHS proves
@@ -14643,7 +15328,7 @@ def solve(
       best variable against +1.5 for the median one.
       When the band holds more than ``_EXACT_OVERFLOW_KEEP`` (4) nodes a
       thread, the device takes its top (``exact_overflow_share``, default
-      0.5: up to that share of each batch; ``0``: off): those nodes leave
+      0, off; else up to that share of each batch): those nodes leave
       the band and their LPs run to convergence over as many batches as it
       takes (continuous batching, within ``exact_overflow_epochs``;
       ``None``, the default: 200), instead of the truncated ``batch_epochs``,
@@ -14707,7 +15392,11 @@ def solve(
       ``"unresolved"`` (the search ended, but nodes closed without proof
       leave the gap open; see ``"unresolved_nodes"``), ``"time_limit"``,
       ``"node_limit"`` or ``"interrupted"``; ``"converged"`` is
-      ``status == "optimal"``.
+      ``status == "optimal"``. ``"interrupted"`` is Ctrl-C: as with
+      ``jl.solve``, the first press ends the search with the best point so
+      far and a valid bound (it stops as a time limit would, the LP being
+      solved at its next chunk); a second press raises
+      ``KeyboardInterrupt``.
     * ``"bound_rigorous"``: False when a bound used a dropped reduced cost
       (see ``lagrangian_bound``).
     * ``"nodes"`` (nodes finished: with batched node LPs, a node whose LP
@@ -14927,6 +15616,9 @@ def solve(
         jump_threads=jump_threads,
         jump_restarts=jump_restarts,
         root_jump_seconds=root_jump_seconds,
+        block_decomposition=block_decomposition,
+        block_decomposition_seconds=block_decomposition_seconds,
+        trivial_heuristic=trivial_heuristic,
         submip_solver=submip_solver,
         rins_tolerance=rins_tolerance,
         crossover_seconds=crossover_seconds,
@@ -15009,6 +15701,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
                 "seconds": 0.0,
             },
             "exact_plunges": {"plunges": 0, "nodes": 0, "max depth": 0, "seconds": 0.0},
+            "block_decomposition": None,
             "exact_nodes": {
                 "solved": 0,
                 "infeasible": 0,
@@ -15022,6 +15715,9 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
                 "warm_bases": 0,
                 "overflow_nodes": 0,
                 "overflow_converged": 0,
+                "band": 0.0,
+                "band_min": 0.0,
+                "band_max": 0.0,
             },
             "inout_cuts": 0,
             "inout_rounds": 0,

@@ -251,7 +251,13 @@ pair_seconds = 30
 floors = {}
 for i, j in pairs:
     pair_problem, _, pair_binaries = build_plan([i, j])
-    pair_problem.solve(solver=JaddleSolver(), max_seconds=pair_seconds)
+    pair_problem.solve(
+        solver=JaddleSolver(),
+        max_seconds=pair_seconds,
+        presolve=True,
+        exact_band=1.0,
+        device="gpu",
+    )
     pair_stats = pair_problem.solver_stats.extra_stats
     floors[(i, j)] = pair_stats["bound"]
     print(
@@ -284,9 +290,10 @@ print(f"Swarm: {n_binaries} binaries, {len(problem.constraints)} constraints")
 # %%
 problem.solve(
     solver=JaddleSolver(),
+    max_seconds=30,
     verbose=True,
     presolve=True,
-    max_seconds=60,
+    exact_band=1.0,
     device="gpu",
 )
 stats = problem.solver_stats.extra_stats

@@ -84,6 +84,9 @@ PINNED = dict(
     exact_overflow_share=0,
     submip_solver="jaddle",
     crossover_seconds=0,
+    # The trivial heuristic would find many test models' first incumbent
+    # before the heuristics their tests check; its own tests turn it on.
+    trivial_heuristic=False,
 )
 
 
@@ -6034,12 +6037,47 @@ def test_exact_lane_solves_to_the_optimum(make):
     mip = make()
     ref = reference(mip)
     options = dict(batch_size=4, cuts=False, probing=False, exact_root_candidates=0)
-    for band in (0.005, 0.5, 0.0):  # the band kept for the lane; 0: none
+    for band in (0.005, 0.5, 0.0, "auto"):  # the band kept for the lane; 0: none
         result = solve(mip, exact_nodes=2, exact_band=band, **options)
         assert_solved(result, mip, ref)
         stats = result["exact_nodes"]
         assert stats["solved"] > 0 and stats["bound_gain"] >= 0.0
+        assert stats["band_min"] <= stats["band"] <= stats["band_max"]
     assert solve(mip, **options)["exact_nodes"]["solved"] == 0
+
+
+def test_adaptive_exact_band():
+    # The auto band widens while the lane's queue is short, narrows while it
+    # is long, holds in between, stays within its limits, and waits for a
+    # cutoff.
+    lane = types.SimpleNamespace(threads=2)  # target: 8 queued nodes
+    search = types.SimpleNamespace(
+        exact_band_auto=True,
+        exact_lane=lane,
+        exact_band=jm._EXACT_BAND_START,
+        exact_band_range=[jm._EXACT_BAND_START] * 2,
+        exact_reserved=[],
+        cutoff=lambda: 1.0,
+    )
+    adapt = lambda: jm._BranchAndBound.adapt_exact_band(search)
+    adapt()
+    assert search.exact_band == pytest.approx(jm._EXACT_BAND_START * jm._EXACT_BAND_STEP)
+    for _ in range(100):
+        adapt()
+    assert search.exact_band == jm._EXACT_BAND_MAX
+    search.exact_reserved = [None] * 8
+    adapt()
+    assert search.exact_band == jm._EXACT_BAND_MAX  # within the target: holds
+    search.exact_reserved = [None] * 17
+    for _ in range(100):
+        adapt()
+    assert search.exact_band == jm._EXACT_BAND_MIN
+    assert search.exact_band_range == [jm._EXACT_BAND_MIN, jm._EXACT_BAND_MAX]
+    search.exact_reserved, search.cutoff = [], lambda: np.inf
+    adapt()
+    assert search.exact_band == jm._EXACT_BAND_MIN  # no incumbent: no change
+    with pytest.raises(ValueError):
+        jm.solve(facility_location(), batch_size=4, exact_band="wide")
 
 
 @pytest.mark.parametrize("make", [facility_location, generalised_assignment])
@@ -6618,3 +6656,245 @@ def test_propagation_backend_is_checked():
         jm.BoundPropagator(mip.A, mip.row_lower, mip.row_upper, mip.integrality, backend="gpu")
 
 
+
+
+def disjoint_paths(size=6, nets=6, shift=2):
+    """Vertex-disjoint paths on a ``size`` x ``size`` torus grid: net ``k``
+    runs from node ``(k, 0)`` to node ``((k + shift) % size, size // 2)``
+    over binary arc variables, one flow block per net. Each node's
+    capacity row (at most one net enters it, none enters a source) has an
+    entry for every net and in-arc, so the nets are blocks joined only by
+    those rows (``linking_blocks``)."""
+    node = lambda r, c: (r % size) * size + (c % size)  # noqa: E731
+    arcs = []
+    for r in range(size):
+        for c in range(size):
+            for dr, dc in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+                arcs.append((node(r, c), node(r + dr, c + dc)))
+    n_nodes, n_arcs = size * size, len(arcs)
+    n = nets * n_arcs
+    sources = [node(k, 0) for k in range(nets)]
+    sinks = [node(k + shift, size // 2) for k in range(nets)]
+    eq_rows, eq_cols, eq_vals, b_eq = [], [], [], []
+    for k in range(nets):
+        for v in range(n_nodes):
+            row = len(b_eq)
+            for a, (tail, head) in enumerate(arcs):
+                if tail == v:
+                    eq_rows.append(row), eq_cols.append(k * n_arcs + a), eq_vals.append(1.0)
+                if head == v:
+                    eq_rows.append(row), eq_cols.append(k * n_arcs + a), eq_vals.append(-1.0)
+            b_eq.append(1.0 if v == sources[k] else -1.0 if v == sinks[k] else 0.0)
+    in_rows, in_cols = [], []
+    for k in range(nets):
+        for a, (_, head) in enumerate(arcs):
+            in_rows.append(head), in_cols.append(k * n_arcs + a)
+    capacity = np.ones(n_nodes)
+    capacity[sources] = 0.0
+    lp = jl.LP(
+        c=np.ones(n),
+        A_eq=sp.csc_matrix((eq_vals, (eq_rows, eq_cols)), shape=(len(b_eq), n)),
+        b_eq=np.array(b_eq),
+        A_ineq=sp.csc_matrix(
+            (np.ones(len(in_rows)), (in_rows, in_cols)), shape=(n_nodes, n)
+        ),
+        b_ineq=capacity,
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    return jm.MIP(lp, np.ones(n, bool))
+
+
+def test_linking_blocks_finds_the_nets():
+    mip = disjoint_paths()
+    blocks = jm.linking_blocks(mip)
+    assert blocks is not None
+    assert len(blocks.blocks) == 6
+    assert blocks.linking.size == 36  # one capacity row a node
+    assert np.all(blocks.linking >= mip.n_eq)
+    columns = np.sort(np.concatenate(blocks.blocks))
+    assert np.array_equal(columns, np.arange(mip.num_variables))
+    # Every other row lies inside one block.
+    for cols, rows in zip(blocks.blocks, blocks.block_rows):
+        inside = np.zeros(mip.num_variables, bool)
+        inside[cols] = True
+        assert np.all(inside[mip.A[rows].indices])
+    # No structure: nothing found, so the heuristic costs nothing.
+    for make in (knapsack, general_integer, facility_location):
+        assert jm.linking_blocks(make()) is None
+
+
+def test_negotiate_blocks_finds_a_feasible_point():
+    mip = disjoint_paths()
+    lines = []
+    x, feasible, mark = jm.negotiate_blocks(
+        mip, deadline=time.time() + 60, log=lines.append
+    )
+    assert feasible and mark == "K"
+    assert mip.is_feasible(x)
+    assert lines and lines[0].startswith("sweep 1:")
+    # The warm LP relaxations first: the torus's flow blocks have integral
+    # vertices, so no block needs its MIP.
+    holder = jm._HighsHolder()
+    x, feasible, _ = jm.negotiate_blocks(
+        mip, lp_first=True, holder=holder, deadline=time.time() + 60
+    )
+    assert feasible and mip.is_feasible(x)
+    assert holder.stats["mip_solves"] == 0
+
+
+def test_negotiate_blocks_window_settles_a_stall():
+    # With no prices the blocks never move off their shortest paths, so
+    # the overuse stalls; a window sub-MIP around the conflicts (every
+    # net's variables there freed together) settles it.
+    mip = disjoint_paths()
+    lines = []
+    x, feasible, _ = jm.negotiate_blocks(
+        mip,
+        present_start=0.0,
+        history_weight=0.0,
+        stall_sweeps=1,
+        joint_seconds=10.0,
+        max_window_share=1.0,  # a small model: any window is a large share
+        deadline=time.time() + 60,
+        log=lines.append,
+    )
+    assert feasible and mip.is_feasible(x)
+    assert any(line.startswith("window of") for line in lines)
+    adjacent = jm._linking_adjacency(mip, jm.linking_blocks(mip))
+    # On the torus every node has its 4 grid neighbours (and the arcs of a
+    # net's flow rows reach no further).
+    assert np.all(adjacent.sum(axis=1) >= 4)
+
+
+def test_negotiate_blocks_stops_when_cancelled():
+    holder = jm._HighsHolder()
+    holder.cancel()
+    x, feasible, _ = jm.negotiate_blocks(disjoint_paths(), holder=holder)
+    assert x is None and not feasible
+
+
+def test_block_decomposition_before_the_root(capsys):
+    # Block decomposition runs before the root LP, in the foreground (no
+    # background workers), and its point is the first incumbent; the
+    # search then goes on from it. It is off by default.
+    mip = disjoint_paths()
+    options = dict(feasibility_pump=False, bulk_rounding=False, cuts=False, max_nodes=1)
+    result = solve(mip, block_decomposition=True, **options)
+    assert result["history"][0]["source"] == "K"
+    assert mip.is_feasible(result["x"])
+    stats = result["block_decomposition"]
+    assert stats["blocks"] == 6 and stats["linking_rows"] == 36
+    assert stats["sweeps"] >= 1 and stats["overused_rows"] == 0
+    off = solve(mip, **options)
+    assert off["block_decomposition"] is None
+    assert "K" not in [entry["source"] for entry in off["history"]]
+    # One line before the progress table says it ran.
+    with_log = solve(mip, block_decomposition=True, verbose=True, **options)
+    assert with_log["history"][0]["source"] == "K"
+    out = capsys.readouterr().out
+    assert "Block decomposition: 6 blocks joined by 36 linking rows" in out
+    assert out.index("Block decomposition:") < out.index("Src  Proc. InQueue")
+    # Nothing to decompose: it does not run.
+    assert solve(knapsack(), block_decomposition=True, **options)["block_decomposition"] is None
+    with pytest.raises(ValueError):
+        solve(mip, block_decomposition="auto", **options)
+
+
+def test_trivial_points():
+    # A packing model (the knapsack) takes all zeros; a covering model
+    # (each row needs one of its columns) takes all ones, its lock point.
+    mip = knapsack()
+    points = jm.trivial_points(mip)
+    assert any(mip.is_feasible(p) and not p.any() for p in points)
+    n = 6
+    cover = np.array([[1, 1, 0, 0, 0, 0], [0, 1, 1, 0, 0, 0], [0, 0, 0, 1, 1, 1]], float)
+    A_eq, b_eq = no_rows(n)
+    lp = jl.LP(
+        c=np.arange(1.0, n + 1),
+        A_eq=A_eq,
+        b_eq=b_eq,
+        A_ineq=sp.csc_matrix(-cover),
+        b_ineq=-np.ones(3),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    covering = jm.MIP(lp, np.ones(n, bool))
+    points = jm.trivial_points(covering)
+    assert not covering.is_feasible(points[0])  # all zeros
+    assert any(covering.is_feasible(p) and p.all() for p in points)
+
+
+def test_trivial_heuristic_in_the_search():
+    mip = knapsack()
+    options = dict(feasibility_pump=False, bulk_rounding=False, max_nodes=1)
+    result = solve(mip, trivial_heuristic=True, **options)
+    assert result["history"][0]["source"] == "Z"
+    off = solve(mip, **options)
+    assert "Z" not in [entry["source"] for entry in off["history"]]
+
+
+# %% Ctrl-C
+def _sigint_at(monkeypatch, method, presses=1, call=1):
+    """Send ``presses`` SIGINTs to this process at the ``call``-th call of
+    the search's ``method``, as Ctrl-C would."""
+    import os
+    import signal
+
+    original = getattr(jm._BranchAndBound, method)
+    calls = [0]
+
+    def patched(self, *args, **kwargs):
+        calls[0] += 1
+        if calls[0] == call:
+            for _ in range(presses):
+                os.kill(os.getpid(), signal.SIGINT)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(jm._BranchAndBound, method, patched)
+    return calls
+
+
+def test_ctrl_c_in_the_tree_returns_the_best_point(monkeypatch):
+    # The first Ctrl-C winds the search down along its time-limit path:
+    # status "interrupted", the incumbent kept, the bound still valid, and
+    # the caller's SIGINT handler back afterwards.
+    import signal
+
+    mip = general_integer()
+    ref = reference(mip)
+    before = signal.getsignal(signal.SIGINT)
+    calls = _sigint_at(monkeypatch, "solve_node_lp", call=2)
+    result = solve(mip, cuts=False, probing=False, branching="pseudocost")
+    assert calls[0] >= 2
+    assert result["status"] == "interrupted" and not result["converged"]
+    assert result["bound"] <= ref + 1e-6 * (1 + abs(ref))
+    if result["x"] is not None:
+        assert mip.is_feasible(result["x"])
+        assert result["objective"] >= ref - 1e-6 * (1 + abs(ref))
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+def test_ctrl_c_before_the_root_lp(monkeypatch):
+    # Ctrl-C before the root LP (here in the trivial heuristic, which runs
+    # first) used to escape as a traceback; now the search returns.
+    import signal
+
+    mip = knapsack()
+    before = signal.getsignal(signal.SIGINT)
+    _sigint_at(monkeypatch, "try_trivial")
+    result = solve(mip)
+    assert result["status"] == "interrupted"
+    assert result["bound"] <= reference(mip) + 1e-6
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+def test_ctrl_c_twice_aborts(monkeypatch):
+    # A second press raises KeyboardInterrupt, as without the handler.
+    import signal
+
+    before = signal.getsignal(signal.SIGINT)
+    _sigint_at(monkeypatch, "try_trivial", presses=2)
+    with pytest.raises(KeyboardInterrupt):
+        solve(knapsack())
+    assert signal.getsignal(signal.SIGINT) is before

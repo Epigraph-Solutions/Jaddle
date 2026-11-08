@@ -69,14 +69,15 @@ print(
 # - float32 PDHG LPs, with node LPs 32 a batch on the device, each cut
 #   short after 4 epochs, and short plunges (4 steps), so batches stay full;
 # - no root cuts, probing or symmetry detection;
-# - the feasibility jump (at the root, then on 4 background threads), with
+# - the feasibility jump (at the root, then on a background thread), with
 #   repair of its near misses;
 # - RINS and crossover as HiGHS sub-MIPs on a CPU thread: the integers on
 #   which the incumbent and a node point (RINS) or several solutions
 #   (crossover) agree are fixed, and HiGHS searches the rest;
-# - 8 CPU threads that solve the nodes holding the global bound exactly
-#   with HiGHS's dual simplex and strong-branch them, while the device
-#   batches the rest.
+# - 16 CPU threads that solve the nodes within a quarter of the gap of the
+#   global bound exactly with HiGHS's dual simplex and strong-branch them
+#   (8 candidates, up to 5,000 pivots a side), while the device batches
+#   the rest.
 #
 # The log marks incumbents from the jump `J`, repair `R`, RINS `N` and
 # crossover `C`. The background threads make runs unrepeatable.
@@ -87,19 +88,11 @@ result = jm.solve(
     verbose=True,
     log_every_seconds=10,
     device=DEVICE,
-    batch_size=32,
+    batch_size=128,
     presolve=True,
-    # HiGHS sub-MIPs on a CPU thread (the defaults, spelt out; 0 turns one
-    # off): RINS around the incumbent and the latest node point, and
-    # crossover of the pool's solutions, up to 10 s a call.
-    rins_seconds=10,
-    crossover_seconds=10,
-    jump_threads=1,
-    exact_nodes=16,
-    exact_strong_candidates=8,
-    exact_band=0.25,
-    exact_overflow_share=0.5,
-    exact_strong_iterations=5000,
+    block_decomposition=True,
+    exact_band=1.0,
+    exact_overflow_share=0.0,
 )
 print(f"Status: {result['status']}")
 exact = result["exact_nodes"]
