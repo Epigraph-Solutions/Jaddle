@@ -256,7 +256,7 @@ for i, j in pairs:
         max_seconds=pair_seconds,
         presolve=True,
         exact_band=1.0,
-        device="gpu",
+        device=None,  # JAX's default device: the GPU when there is one
     )
     pair_stats = pair_problem.solver_stats.extra_stats
     floors[(i, j)] = pair_stats["bound"]
@@ -294,7 +294,7 @@ problem.solve(
     verbose=True,
     presolve=True,
     exact_band=1.0,
-    device="gpu",
+    device=None,
 )
 stats = problem.solver_stats.extra_stats
 if p[0].value is None:

@@ -1488,12 +1488,16 @@ def test_node_lps_stop_at_the_bound_target(monkeypatch):
         return real(self, node, lower, upper, lp, result)
 
     monkeypatch.setattr(jm._BranchAndBound, "_evaluate", evaluate)
-    result = solve(mip, batch_size=1)
+    # Tree cuts off: a cut refresh between a node's LP and its evaluation
+    # zeroes the duals of replaced rows, which can drop a stopped node's
+    # bound below the cutoff. Refreshes are paced by wall-clock time, so
+    # whether one lands there depends on the machine.
+    result = solve(mip, batch_size=1, tree_cuts=False)
     assert_solved(result, mip, reference(mip))
     # Every node LP stopped early closes its node, with a rigorous bound.
     assert stopped and all(closes and rigorous for closes, rigorous in stopped)
     assert result["bound_stops"] >= len(stopped)
-    off = solve(mip, batch_size=1, node_bound_stop=False)
+    off = solve(mip, batch_size=1, node_bound_stop=False, tree_cuts=False)
     assert_solved(off, mip, reference(mip))
     assert off["bound_stops"] == 0
 
@@ -2633,12 +2637,12 @@ def test_repair_skipped_when_propagation_proves_the_fixed_box_infeasible(monkeyp
 def test_failed_repair_is_not_repeated(monkeypatch):
     # Every facility open, no flows: worth a repair, which (faked) fails.
     mip = facility_location()
-    search = search_for(mip, monkeypatch, )
+    search = search_for(mip, monkeypatch)
     x = np.where(mip.integrality, 1.0, 0.0)
 
     def failing_solve(lp, **kwargs):
         solution = type("Solution", (), {"primal": np.zeros(mip.num_variables)})()
-        return {"solution": solution, "epochs": 1}
+        return {"solution": solution, "epochs": 1, "stop_reason": "max_epochs"}
 
     calls = count_lp_solves(monkeypatch, failing_solve)
     assert not search.try_incumbent(x, "H", None)
@@ -4695,13 +4699,14 @@ def test_batched_search_with_device_children(make):
 
 def test_batched_tree_roundings():
     mip = generalised_assignment(3)
+    # Root cuts and heuristics off: with them the root can close the model
+    # (a fast runner) or leave a few nodes (a slow one), so a tree is forced.
     result = solve(
-        mip, batch_size=4, gomory_cuts=False, children_backend="jax", heuristic_every=1,
-        batch_roundings=True,
+        mip, batch_size=4, cuts=False, feasibility_pump=False, bulk_rounding=False,
+        children_backend="jax", heuristic_every=1, batch_roundings=True,
     )
     assert_solved(result, mip, reference(mip))
-    if result["batches"]:
-        assert result["batched_roundings"] > 0
+    assert result["batches"] > 0 and result["batched_roundings"] > 0
 
 
 def test_children_backend_is_checked():
