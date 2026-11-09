@@ -50,7 +50,7 @@
 #
 # Usage:
 #     python benchmarks/scan_bigm.py
-#     python benchmarks/scan_bigm.py --data-dir data --ratio 1e3 --abs 1e4
+#     python benchmarks/scan_bigm.py --data-dir data/pdlp_set --ratio 1e3 --abs 1e4
 #     python benchmarks/scan_bigm.py --row-spread 1e3 --row-frac 0.5
 #     python benchmarks/scan_bigm.py --col-row-abs 1e3 --col-row-density 0.3
 
@@ -67,7 +67,7 @@ import highspy as hspy
 import jaddle.highs_helpers as hh
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DATA_DIR = os.path.join(REPO_ROOT, "data")
+DATA_DIR = os.path.join(REPO_ROOT, "data", "pdlp_set")
 
 # Default big-M COST thresholds: flag when the objective spans a wide dynamic
 # range (max/median over nonzero costs) AND the penalty is significant -- either
@@ -89,7 +89,7 @@ DEFAULT_MED_FLOOR = 1e-3
 # than a single outlier row -- a lone skewed row is usually benign units that
 # Ruiz scaling absorbs, whereas sp150x300d's 300 identical [1,...,1,3050] rows
 # are a systematic big-M coupling that survives equilibration. Calibrated on
-# data/: this pair flags sp150x300d (median spread 3050, 67% of rows wide) and
+# data/pdlp_set/: this pair flags sp150x300d (median spread 3050, 67% of rows wide) and
 # neos-3754480-nidda (1280, 74%) along with ~19 other known-hard instances,
 # without firing on benign mild-scaling models. Shared with benchmark.py's
 # --skip-bigm-matrix so both use one definition.
@@ -104,7 +104,7 @@ DEFAULT_WIDE_ROW = 1e2
 # spread explodes even though rows look fine; Ruiz cannot flatten it (see
 # is_bigm_column). Keying on absolute magnitude + density -- rather than the raw
 # per-column spread ratio -- avoids the tiny-min-entry false positives
-# (ran14x18-disj-8, supportcase42, where max|A| ~ O(1)). Calibrated on data/:
+# (ran14x18-disj-8, supportcase42, where max|A| ~ O(1)). Calibrated on data/pdlp_set/:
 # flags germanrr (1 dense row, max|A|=8.2e5), leo1 (9.0e7), trento1 (1.0e8)
 # without firing on glass4 (351 wide rows but none dense -- that is cost/row
 # big-M) or the small-coefficient cases. Shared with benchmark.py's

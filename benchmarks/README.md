@@ -6,8 +6,8 @@ Scripts for measuring Jaddle's solvers. They come in four kinds:
 |---|---|---|
 | **LP harnesses** | [`benchmark.py`](benchmark.py), [`benchmark_mpax.py`](benchmark_mpax.py), [`benchmark_pipeline.py`](benchmark_pipeline.py) | Solve the LP relaxations of a directory of MIPLIB instances with `jaddle_linear.solve`, then write a CSV and a README-ready markdown table. `benchmark_mpax.py` also runs [MPAX](https://github.com/MIT-Lu-Lab/MPAX) on the same presolved LPs for a head-to-head comparison. `benchmark_pipeline.py` runs the whole `jl.solve_with_presolve` pipeline with polishing and crossover. |
 | **Convex A/B suites** | [`benchmark_convex.py`](benchmark_convex.py), [`benchmark_convex_heavy.py`](benchmark_convex_heavy.py) | Compare `jaddle_convex.solve` configurations (update mode, adaptive step, restarts) on synthetic convex problems. |
-| **MIP comparison** | [`benchmark_mip.py`](benchmark_mip.py) | Load one MIPLIB instance (`python benchmarks/benchmark_mip.py <file or name in data/> [--device cpu\|gpu\|tpu\|auto]`), run `jaddle_mip.solve` on HiGHS's presolved MIP with a time limit, postsolve the incumbent, then run HiGHS's branch and cut under the same limit. |
-| **Primal heuristics** | [`benchmark_primal.py`](benchmark_primal.py) | Run only Jaddle's root heuristics (no RENS or RINS; HiGHS presolve) on the smallest `--count` MIPLIB 2017 files in `data/` with a known objective (default 30, 60 s each). It records whether a feasible point was found, how fast and by which heuristic, and the primal gap to MIPLIB's best known value (`data/miplib2017.solu`, downloaded on first use). `--set key=value` passes any `jm.solve` setting. Writes `results/primal.csv`. |
+| **MIP comparison** | [`benchmark_mip.py`](benchmark_mip.py) | For every `.mps` in `--data-dir` (default `data/pdlp_set/`; `--only` picks a subset), run `jaddle_mip.solve` on HiGHS's presolved MIP (`--max-seconds` limit, `--device cpu\|gpu\|tpu\|auto`), postsolve the incumbent, then run HiGHS's branch and cut under the same limit (`--no-highs` skips it). Writes `benchmark_mip_results.csv`. |
+| **Primal heuristics** | [`benchmark_primal.py`](benchmark_primal.py) | Run only Jaddle's root heuristics (no RENS or RINS; HiGHS presolve) on the smallest `--count` MIPLIB 2017 files in `data/pdlp_set/` with a known objective (default 30, 60 s each). It records whether a feasible point was found, how fast and by which heuristic, and the primal gap to MIPLIB's best known value (`data/miplib2017.solu`, downloaded on first use). `--set key=value` passes any `jm.solve` setting. Writes `results/primal.csv`. |
 | **AMPL-NLP convex set** | [`benchmark_ampl_nlp.py`](benchmark_ampl_nlp.py) | The convex problems from Mittelmann's [AMPL-NLP benchmark](https://plato.asu.edu/ftp/ampl-nlp.html), rebuilt in Python. Each is solved by every Jaddle route that applies and checked against Clarabel and the published IPOPT value. |
 | **Instance diagnostics** | [`scan_bigm.py`](scan_bigm.py) | Flag MPS instances whose big-M structure is known to stall saddle-point solvers. The LP harnesses use it to skip those instances. |
 
@@ -22,7 +22,7 @@ Python resolves these imports because it puts the script's own directory on
 
 The MPS files are **not** shipped with Jaddle (`data/` is gitignored). Download
 instances from the [MIPLIB website](https://miplib.zib.de/) and put the
-`.mps` files in `data/` at the repo root. The LP harnesses and `scan_bigm.py`
+`.mps` files in `data/pdlp_set/` at the repo root. The LP harnesses and `scan_bigm.py`
 run on every `*.mps` file in that directory. Use `--data-dir` to point them
 somewhere else.
 
@@ -58,7 +58,7 @@ long runs.
 ### Usage
 
 ```bash
-# Every instance in data/ (100 MB cap by default)
+# Every instance in data/pdlp_set/ (100 MB cap by default)
 python benchmarks/benchmark.py
 
 # A named subset
@@ -79,7 +79,7 @@ python benchmarks/benchmark_mpax.py --no-presolve
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--data-dir DIR` | `data/` | Directory to glob for `*.mps` files. |
+| `--data-dir DIR` | `data/pdlp_set/` | Directory to glob for `*.mps` files. |
 | `--only NAME ...` | all | Restrict the run to these instance names (without `.mps`). |
 | `--max-mb X` / `--min-mb X` | none / `0` | Skip files above or below a size in MB. By default there is no upper limit. |
 | `--tol X` | `1e-3` | Relative tolerance for primal feasibility, dual feasibility and duality gap. |

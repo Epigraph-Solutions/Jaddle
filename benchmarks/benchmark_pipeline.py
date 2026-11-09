@@ -9,7 +9,7 @@
 # HiGHS solve, timed end to end against Jaddle's whole call.
 #
 # Emits a README-ready markdown table plus a CSV. The MPS files are not shipped
-# with Jaddle: put them in ``data/`` at the repo root (see benchmarks/README.md).
+# with Jaddle: put them in ``data/pdlp_set/`` at the repo root (see benchmarks/README.md).
 #
 # Usage:
 #     python benchmarks/benchmark_pipeline.py
@@ -325,7 +325,7 @@ def main():
     if not instances:
         print(
             f"No .mps files to run in {args.data_dir}. Download MIPLIB instances "
-            "(https://miplib.zib.de/) into data/ and retry."
+            "(https://miplib.zib.de/) into data/pdlp_set/ and retry."
         )
         return
 

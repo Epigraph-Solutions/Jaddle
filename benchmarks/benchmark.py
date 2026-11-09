@@ -7,7 +7,7 @@
 #
 # The MPS files are **not** shipped with Jaddle (they are large and
 # gitignored). Download the instances you want from the MIPLIB website
-# (https://miplib.zib.de/) and drop the `.mps` files into the `data/`
+# (https://miplib.zib.de/) and drop the `.mps` files into the `data/pdlp_set/`
 # directory at the repo root. This harness globs whatever is present there.
 #
 # Usage:
@@ -46,7 +46,7 @@ import jaddle.presolve as presolve
 from scan_bigm import is_bigm_cost, is_bigm_matrix, is_bigm_column
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DATA_DIR = os.path.join(REPO_ROOT, "data")
+DATA_DIR = os.path.join(REPO_ROOT, "data", "pdlp_set")
 
 
 def add_jaddle_verbose_flag(p, default, default_text="%(default)s"):
@@ -669,7 +669,7 @@ def main():
     if not instances:
         print(
             f"No .mps files to run in {args.data_dir}. Download MIPLIB instances "
-            "(https://miplib.zib.de/) into data/ and retry."
+            "(https://miplib.zib.de/) into data/pdlp_set/ and retry."
         )
         return
 

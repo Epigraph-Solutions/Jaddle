@@ -27,7 +27,7 @@ from time import time
 # ## Path to the LP
 PROBLEM_NAME = "stp3d"  # name of MIPLIB problem (without .mps extension)
 PATH_TO_MPS = os.path.join(
-    os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
+    os.path.dirname(__file__), "..", "..", "data", "pdlp_set", f"{PROBLEM_NAME}.mps"
 )
 
 # %% [markdown]

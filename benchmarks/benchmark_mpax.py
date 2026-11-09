@@ -31,7 +31,7 @@
 #   its own, so the worker is killed when `--max-seconds` runs out; Jaddle uses
 #   its built-in `max_seconds`, with the same kill as a backstop.
 #
-# Requires `pip install mpax`. MPS files go in `data/`, as for the other
+# Requires `pip install mpax`. MPS files go in `data/pdlp_set/`, as for the other
 # harnesses.
 #
 # Usage:
@@ -650,7 +650,7 @@ def main():
     if not instances:
         print(
             f"No .mps files to run in {args.data_dir}. Download MIPLIB instances "
-            "(https://miplib.zib.de/) into data/ and retry."
+            "(https://miplib.zib.de/) into data/pdlp_set/ and retry."
         )
         return
 

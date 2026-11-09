@@ -50,7 +50,7 @@ example runs on CPU because the problem is tiny. The expected answer is
 
 The MPS files are **not** shipped with Jaddle. Download the instances you want
 from the [MIPLIB website](https://miplib.zib.de/) and put the `.mps` files in
-`data/` at the repo root. The script reads `data/<PROBLEM_NAME>.mps` (default
+`data/pdlp_set/` at the repo root. The script reads `data/pdlp_set/<PROBLEM_NAME>.mps` (default
 `stp3d`, `float64`); edit `PROBLEM_NAME` (or `PATH_TO_MPS`) at the top of the
 file to change instance.
 

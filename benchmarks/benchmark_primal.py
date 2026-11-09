@@ -6,7 +6,7 @@ Only the root runs (``max_nodes=1``), with no help from HiGHS: no RENS, no
 RINS and no HiGHS incumbent. Presolve is HiGHS's (``presolve=True``), as in
 the cuOpt primal-heuristics paper (Çördük et al., 2025), and the heuristics
 get the whole time limit. The instances are the smallest ``--count`` files
-in ``data/`` (by size) with a known objective in MIPLIB's solution list,
+in ``data/pdlp_set/`` (by size) with a known objective in MIPLIB's solution list,
 which is downloaded to ``data/miplib2017.solu`` on first use.
 
 The primal gap is the paper's: 1 without a point or when the signs differ,
@@ -41,8 +41,8 @@ jo.configure_jax("float64")
 import jaddle.jaddle_mip as jm
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-DATA_DIR = os.path.join(ROOT, "data")
-SOLU = os.path.join(DATA_DIR, "miplib2017.solu")
+DATA_DIR = os.path.join(ROOT, "data", "pdlp_set")
+SOLU = os.path.join(ROOT, "data", "miplib2017.solu")
 SOLU_URL = "https://miplib.zib.de/downloads/miplib2017-v31.solu"
 RESULTS = os.path.join(ROOT, "results", "primal.csv")
 
