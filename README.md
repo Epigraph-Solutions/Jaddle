@@ -19,12 +19,17 @@ It provides two solvers:
   user supplies the objective and constraints as ordinary JAX functions, and
   Jaddle derives everything else by automatic differentiation.
 
+Alongside the convex solver, **`jaddle.jaddle_stochastic`** handles convex
+programs whose objective and constraints are means over a large dataset. It
+runs the convex solver's algorithms on minibatch gradients, with SVRG variance
+reduction, and still tests convergence on the full problem.
+
 On top of the LP solver, **`jaddle.jaddle_mip`** is a simple branch-and-bound
 solver for mixed-integer linear programs. It is **highly experimental**: its
 interface, defaults and behaviour may change without notice, and its results
 should be checked against an established MIP solver.
 
-Both solvers run unchanged on CPU, GPU and TPU. Jaddle is not intended to
+All the solvers run unchanged on CPU, GPU and TPU. Jaddle is not intended to
 replace a commercial or production-grade solver. It aims to be a compact,
 readable and hackable platform for first-order optimisation that still holds
 up on demanding benchmarks.
@@ -37,6 +42,7 @@ up on demanding benchmarks.
 - [The linear programming solver](#the-linear-programming-solver)
 - [The mixed-integer solver](#the-mixed-integer-solver)
 - [The convex programming solver](#the-convex-programming-solver)
+- [The stochastic convex solver](#the-stochastic-convex-solver)
 - [Modelling with CVXPY](#modelling-with-cvxpy)
 - [Numerical precision](#numerical-precision)
 - [Benchmarks](#benchmarks)
@@ -88,11 +94,6 @@ be explored without code changes.
 the step size state). Warm starting, checkpointing and resuming a solve
 therefore amount to passing a value back in. The solver keeps no hidden mutable
 state.
-
-**A small, readable codebase.** Because the compiler handles fusion, memory
-layout and device placement, the full library is roughly 8,600 lines of
-Python, docstrings included. Algorithms remain close to their mathematical description, which makes
-Jaddle well suited to research and experimentation.
 
 ## Installation
 
@@ -1085,6 +1086,119 @@ time of a warm-started SCS loop on the CPU.
 a ranking SVM's whole regularisation path at once. It learns a reranker over
 keyword and dense-embedding features for retrieval on the SciFact benchmark.
 
+## The stochastic convex solver
+
+Many convex programs from statistics and machine learning are means over
+data: a loss averaged over training examples, a risk constraint averaged over
+scenarios. `jc.solve` evaluates every term on all the data at every
+iteration. `jaddle_stochastic.solve` estimates the Lagrangian's gradient from
+a small random batch instead, and goes through all the data only once or
+twice per epoch.
+
+### Problem form
+
+`jaddle_stochastic.solve` accepts a `JaddleCPStochastic`, which describes
+
+```
+minimise    f₀(x) + mean_i f(x, a_i)
+subject to  h₀(x) + mean_j h(x, b_j)  = 0
+            g₀(x) + mean_k g(x, c_k) <= 0
+            lower_bounds <= x <= upper_bounds
+```
+
+Each term is a function of the variables and **one example**, together with
+its data: any pytree of arrays whose leading axis indexes the examples. The
+`*_det` functions of `x` alone are the deterministic parts (a ridge penalty,
+a constant bound). Every part is optional, and each term can have its own
+data, of any length.
+
+```python
+import jax.numpy as jnp
+import jaddle.jaddle_stochastic as js
+
+scp = js.JaddleCPStochastic(
+    num_variables=20,
+    lower_bounds=jnp.zeros(20),                  # non-negative least squares
+    upper_bounds=jnp.full(20, jnp.inf),
+    objective=lambda w, ex: (ex["X"] @ w - ex["y"]) ** 2,  # one example
+    objective_data={"X": X, "y": y},             # X is (N, 20), y is (N,)
+    objective_det=lambda w: 1e-3 * jnp.sum(w**2),
+)
+
+result = js.solve(scp, batch_size=512)
+w = result["solution"].primal
+```
+
+Each iteration draws its row numbers once and takes those rows from every
+array in a term's data, so an example's features and label stay together.
+`scp.full_cp()` turns the same problem into an ordinary `JaddleCP` whose
+functions average over all the data, for `jc.solve` or for checking a
+stochastic solution.
+
+### Algorithm
+
+`js.solve` runs the algorithms of `jc.solve`: the same update schemes,
+adaptive step, primal weight, diagonal metric, gradient scaling, averaging
+and restarts. What changes is where the gradients come from.
+
+**Minibatch gradients.** Each iteration draws `batch_size` examples per term,
+uniformly with replacement, so every estimate is unbiased. All the gradient
+evaluations within one iteration share its minibatch, so the adaptive step's
+line search measures the Lipschitz constant of a single sampled operator.
+
+**Variance reduction.** With `variance_reduction="svrg"` (the default), each
+epoch evaluates the full Lagrangian map at its start point `z̃`, in one pass
+over the data, and each iteration uses `F_s(z) − F_s(z̃) + F(z̃)`. This is
+unbiased, and its variance vanishes as the iterates approach `z̃`, so the
+solver converges to the tolerances at a fixed step. It costs one extra
+minibatch gradient per iteration. `variance_reduction=None` uses the plain
+minibatch gradient, whose noise only a decaying step overcomes: `step_decay`
+then shrinks each update by `1 / sqrt(1 + i / step_decay)` while leaving its
+exploration step alone.
+
+**Update scheme.** The default `update_mode` is `"extragradient"`, which is
+contractive, so minibatch noise does not build up. `"alternating"` and
+`"pdhg"` are not, and can diverge when the constraints are sampled
+(constraints given only by `*_det` parts are fine).
+
+**Full-problem checks.** The convergence test (the same three residuals as
+`jc.solve`), the restart merits, the initial primal weight, the gradient
+scales and the log are all computed on the full problem. A `"certificate"`
+stop therefore certifies the full problem, exactly as for `jc.solve`. For
+data too large to evaluate in one pass, `eval_chunk_size` makes those passes
+in chunks. The data is passed to the compiled programs as an argument rather
+than embedded in them, so a dataset of several gigabytes does not bloat the
+compile, and terms given the same array share one device copy of it.
+
+### Principal options
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `batch_size` | `256` | Examples drawn per term and iteration. A term with fewer examples draws that many. |
+| `variance_reduction` | `"svrg"` | `"svrg"` or `None` (plain minibatch gradients). |
+| `step_decay` | `"auto"` | Update shrinkage for noisy gradients. `"auto"` is off with SVRG and `iterations_per_epoch` without; `None` disables it. |
+| `update_mode` | `"extragradient"` | As for `jc.solve`, but see above. |
+| `iterations_per_epoch` | `None` | About one pass over the largest term's data in batches, and at least 100. |
+| `eval_chunk_size` | `None` | Examples per chunk in the full-problem passes (`None`: all at once). |
+| `seed` | `0` | Minibatch sampling seed. A solve is reproducible for a given seed. |
+| `max_epochs`, `max_seconds` | `None` | Iteration and wall-clock budgets. |
+| `device`, `precision` | `None`, `None` | As for `jl.solve`. |
+
+The other arguments, and the result (`solution`, `converged`,
+`stop_reason`, `opt_state`, `solve_seconds` and `epochs`), are as for
+`jc.solve`.
+
+The stochastic solver pays off when there are many examples and each is cheap
+to evaluate. On fairness-constrained logistic regression with 200,000
+applicants and 1,000 features
+([`examples/stochastic/fair_logistic_regression.py`](examples/stochastic/fair_logistic_regression.py)),
+each stochastic solve takes 2–7 s on a laptop GPU, compilation included,
+against about 22 s for `jc.solve`. On risk-constrained Kelly betting over
+2,000,000 scenarios
+([`examples/stochastic/risk_constrained_kelly.py`](examples/stochastic/risk_constrained_kelly.py)),
+the stochastic solves take 2.5 s and 6.5 s on a CPU, against about 40 s.
+It is not meant for linear programs, which `jaddle_linear` solves far better.
+
 ## Modelling with CVXPY
 
 [CVXPY](https://www.cvxpy.org/) can serve as the modelling language
@@ -1214,7 +1328,7 @@ arrays:
 The profile can also be set through the `JADDLE_JAX_PROFILE` environment
 variable.
 
-`jl.solve`, `jc.solve`, `jc.quadratic_program` and `jm.solve` also take
+`jl.solve`, `jc.solve`, `jc.quadratic_program`, `js.solve` and `jm.solve` also take
 `precision=` for a single call, along with `device=` to choose where it runs:
 
 ```python
@@ -1272,13 +1386,14 @@ these results are described in [`benchmarks/README.md`](https://github.com/Brend
 | [`jaddle/jaddle_linear.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_linear.py) | LP solver, scaling, certification and polishing |
 | [`jaddle/jaddle_mip.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_mip.py) | Branch-and-bound MIP solver and MIP readers |
 | [`jaddle/jaddle_convex.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_convex.py) | Convex solver |
+| [`jaddle/jaddle_stochastic.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_stochastic.py) | Stochastic (minibatch) solver for convex finite-sum problems |
 | [`jaddle/cones.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/cones.py) | Second-order and PSD cones for the LP solver |
 | [`jaddle/jaddle_cvxpy.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_cvxpy.py) | CVXPY front end |
 | [`jaddle/jaddle_basic_types.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_basic_types.py) | `SaddleState`, `JaddleCP`, `LP` and `JaddleLP` |
 | [`jaddle/jaddle_optimisers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_optimisers.py) | Precision profiles and Optax saddle-point optimisers |
 | [`jaddle/presolve.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/presolve.py) | Defined-variable elimination and postsolve |
 | [`jaddle/highs_helpers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/highs_helpers.py) | HiGHS converters and presolve interface |
-| [`examples/`](https://github.com/BrendanVR/Jaddle/blob/main/examples/README.md) | Worked LP, MIP, conic and convex examples |
+| [`examples/`](https://github.com/BrendanVR/Jaddle/blob/main/examples/README.md) | Worked LP, MIP, conic, convex and stochastic examples |
 | [`benchmarks/`](https://github.com/BrendanVR/Jaddle/blob/main/benchmarks/README.md) | MIPLIB and convex benchmark harnesses |
 | [`tests/`](https://github.com/BrendanVR/Jaddle/tree/main/tests) | Test suite (`pytest`) |
 | [`CHANGELOG.md`](https://github.com/BrendanVR/Jaddle/blob/main/CHANGELOG.md) | Changes in each release |
