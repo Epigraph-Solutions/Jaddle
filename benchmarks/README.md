@@ -329,6 +329,8 @@ python benchmarks/benchmark_ampl_nlp.py --small                  # smoke run: be
 python benchmarks/benchmark_ampl_nlp.py bearing_400 svanberg --tol 1e-4 --max-seconds 600
 python benchmarks/benchmark_ampl_nlp.py svanberg --routes native # one route
 python benchmarks/benchmark_ampl_nlp.py --no-reference           # skip Clarabel; IPOPT values used where they exist
+python benchmarks/benchmark_ampl_nlp.py bearing_400 --set update_mode=pdhg  # any Jaddle setting, on every route
+python benchmarks/benchmark_ampl_nlp.py bearing_400 --device cpu # Jaddle on the CPU (default: JAX's default device)
 ```
 
 The output has one line per problem and route, plus a progress line (`# ...`)
