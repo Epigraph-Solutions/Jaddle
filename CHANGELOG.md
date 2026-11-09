@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `jaddle.presolve.defined_integers`: general integers that an equality
+  row defines (`z = Σ a_j x_j` over integers, `|a_z| = 1`, zero cost,
+  integer coefficients and right-hand side) substituted out of a MIP's
+  rows, with their bounds as rows over a given box.
+- `jm.feasibility_jump(..., substitute=True)` (numba backend): the jump
+  moves in those substituted rows and recomputes `z` from the point it
+  finds. On 30n20b8 (57 start times `S_j = Σ_t t·x_jt`) the jump used to
+  stall with a few defining rows violated; it now finds points on every
+  seed in 1–3 s, and the search's first incumbent comes at 15 s.
+- An adaptive RINS fixing rate on the sub-MIP lane
+  (`_BranchAndBound.adapt_rins_fixing`, `result["rins_fixing_rate"]`):
+  after a job that finds nothing and ends early, only a random share of
+  the agreeing integers is fixed (down to 40%); after one that runs out
+  of time, more. On 30n20b8, RINS fixed 96% of the integers and every box
+  was empty; with the rate it went 453 → 353 → 302 (optimal) in 148 s.
+
+### Changed
+
+- `jm.solve(batch_size="auto")` is the default (was 32), and on a GPU or
+  TPU it now sizes the batch from the device's memory
+  (`jm.auto_batch_size`): the largest power of two up to 128 whose node
+  LPs (`16·(n + m) + 4·nnz` words a member, tree cut block included) and,
+  when they would run, device children kernels (64 bytes a padded nonzero
+  a member) fit in 75% of the free memory. The envelope is fitted to peak
+  memory measured on 30n20b8, ns1830653, map06, bab5,
+  academictimetablesmall and neos-5114902-kasavu (12 GB GPU); it gives
+  128 on most of them and 32 on neos-5114902-kasavu. A CPU still gets 32,
+  and a device that reports no memory 128. The verbose log names the
+  size.
+- Tree cut separation runs on a worker thread (`jm.solve(tree_cut_async=True)`,
+  the default; `result["tree_cut_async_jobs"]`): a full refresh hands its
+  points to the worker, and the next refresh takes the cuts, judged at the
+  points they were separated at, while the main thread is blocked on the
+  device (which releases the GIL). Results from before a restart are
+  dropped.
+- The exact lane bounds its own node and strong sides on its threads
+  (`jm.exact_lane_bounds`, `result["exact_bounds_reused"]`), with the
+  function the search's `exact_bound` now uses (`_exact_side_bound`), so
+  the main thread only reuses them when the job solved the current rows.
+  In short GPU runs this did not make collecting the lane's results
+  noticeably cheaper (the bounds are not where that time goes).
+- `result["batch_timing"]`: the main thread's seconds blocked on the device
+  (`wait_seconds`), evaluating batch members (`evaluate_seconds`), in
+  Lagrangian bounds (`bound_seconds`), tree cut refreshes, exact-lane
+  results, device-built branching and heuristics.
+- Cover cut lifting skips covers no lifting can make violated, and finds
+  the items outside a cover without a sort: the same cuts, 1.25× faster.
+- Clique cut separation (`ConflictGraph.cuts`) grows each clique by
+  intersecting its members' neighbour sets instead of checking each
+  candidate against each member: the same cuts, about 4× faster on
+  30n20b8's node points (2.3–4.5 s a call to 0.6–1.1 s).
+
 ## 0.3.1
 
 ### Added

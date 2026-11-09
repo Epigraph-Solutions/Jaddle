@@ -47,6 +47,7 @@ import scipy.sparse as sp
 from jaddle import highs_helpers as hh
 from jaddle import jaddle_linear as jl
 from jaddle import jaddle_optimisers as jo
+from jaddle import presolve as jaddle_presolve
 from jaddle.jaddle_basic_types import LP, JaddleLP, _wide
 
 # Slack when rounding bounds of integer variables, so 2.9999999 becomes 3.
@@ -1658,6 +1659,36 @@ def lagrangian_bound(
     return box_bound(constant, r, lower, upper, reduced_cost_tolerance)
 
 
+def _exact_side_bound(mip, A_T, y_eq, y_ineq, lower, upper, is_int, reduced_cost_tol):
+    """``_BranchAndBound.exact_bound`` from arrays, so the exact lane's
+    threads can bound their own solutions: the Lagrangian bound of the
+    duals ``y_eq``/``y_ineq`` (Jaddle's convention; ``y_eq`` padded with
+    zeros or cut to ``mip.n_eq``) over ``mip``'s rows and the box, with
+    round-off reduced costs at infinite bounds zeroed (``vertex_terms``)
+    and continuous variables' bounds widened a little (``bound_over``).
+    Returns ``(bound, rigorous)``, or ``None`` when ``y_ineq`` is shorter
+    than ``mip``'s inequality rows."""
+    n_eq = mip.n_eq
+    m_ineq = mip.A.shape[0] - n_eq
+    y_eq = np.asarray(y_eq, np.float64)
+    y_ineq = np.asarray(y_ineq, np.float64)
+    if y_ineq.size < m_ineq:
+        return None
+    y = np.zeros(n_eq + m_ineq)
+    k = min(n_eq, y_eq.size)
+    y[:k] = y_eq[:k]
+    y[n_eq:] = y_ineq[:m_ineq]
+    constant, r = lagrangian_terms(mip.c, mip.A, mip.b, n_eq, y, A_T=A_T)
+    roundoff = (
+        ((r > 0) & ~np.isfinite(lower)) | ((r < 0) & ~np.isfinite(upper))
+    ) & (np.abs(r) <= _EXACT_DUAL_ROUNDOFF * (1.0 + np.abs(mip.c).max(initial=0.0)))
+    r = np.where(roundoff, 0.0, r)
+    cont = ~is_int
+    lower = np.where(cont, lower - 1e-7 * (1.0 + np.abs(lower)), lower)
+    upper = np.where(cont, upper + 1e-7 * (1.0 + np.abs(upper)), upper)
+    return box_bound(constant, r, lower, upper, reduced_cost_tolerance=reduced_cost_tol)
+
+
 def lagrangian_terms(c, A, b, n_eq, y, A_T=None):
     """The parts of ``lagrangian_bound`` that do not depend on the box:
     ``(−bᵀy, r)`` with ``r = c + Aᵀy`` (inequality duals clipped to
@@ -1879,7 +1910,9 @@ def _lift_cover(cover, w, z, capacity):
         update = least[:-1] + w[item]
         least[1:] = np.minimum(least[1:], update)
     slack = 1e-9 * (1.0 + abs(capacity))
-    rest = np.setdiff1d(np.arange(w.size), cover)
+    outside = np.ones(w.size, dtype=bool)
+    outside[cover] = False
+    rest = np.flatnonzero(outside)  # sorted, as np.setdiff1d gave, without its sort
     for item in rest[np.lexsort((-w[rest], -z[rest]))]:
         room = capacity - w[item] + slack
         if room < 0:
@@ -1944,8 +1977,16 @@ def cover_cuts(idx, a, b, x, lower, upper, is_binary, max_covers=_COVER_ORDERS):
         if key in seen:
             continue
         seen.add(key)
-        pi = _lift_cover(cover, w, z, capacity)
         rhs_z = cover.size - 1.0
+        # Lifting gives each item outside the cover at most |C| − 1, so a
+        # cover that no lifting can make violated is dropped before the
+        # lifting's dynamic program (most covers at a node point).
+        in_cover = z[cover].sum()
+        positive = np.maximum(z, 0.0)
+        outside = positive.sum() - positive[cover].sum()
+        if in_cover - rhs_z + rhs_z * outside <= 1e-6:
+            continue
+        pi = _lift_cover(cover, w, z, capacity)
         violation = pi @ z - rhs_z
         if violation <= 1e-6:
             continue
@@ -3424,15 +3465,29 @@ class ConflictGraph:
         starts = starts[np.argsort(-value[starts], kind="stable")][:_CLIQUE_MAX_STARTS]
         seen, cuts = set(), []
         round_checks = _CLIQUE_ROUND_CHECKS
+        cache = {}
+
+        def neighbours_of(u):
+            if u not in cache:
+                cache[u] = self.neighbours(u)
+            return cache[u]
+
         for s in starts.tolist():
-            neighbours = self.neighbours(s)
+            neighbours = neighbours_of(s)
             positive = sorted(
                 (l for l in neighbours if value[l] > 1e-9), key=lambda l: (-value[l], l)
             )
             clique = [s]
+            # The literals in conflict with every member so far: a literal
+            # joins when it is one of them. Checking each candidate against
+            # each member instead took 11–21 million checks a call on
+            # 30n20b8, whose short PDHG node solves leave 1,400–2,600
+            # binaries just off zero.
+            common = set(neighbours)
             for l in positive:
-                if all(self.adjacent(l, c) for c in clique):
+                if l in common:
                     clique.append(l)
+                    common &= neighbours_of(l)
             if value[clique].sum() <= 1.0 + min_violation:
                 continue
             key = frozenset(clique)
@@ -3446,8 +3501,9 @@ class ConflictGraph:
                 if value[l] > 1e-9:
                     continue
                 checks -= len(clique)
-                if all(self.adjacent(l, c) for c in clique):
+                if l in common:
                     clique.append(l)
+                    common &= neighbours_of(l)
             round_checks -= min(_CLIQUE_LIFT_CHECKS, round_checks) - max(checks, 0)
             literals = np.array(sorted(clique), np.int64)
             idx = literals // 2
@@ -5130,6 +5186,37 @@ def _feasibility_jump_host(
     return best, False, steps
 
 
+def _jump_substitution(mip):
+    """``mip``'s rows with its defined integers substituted out
+    (``jaddle.presolve.defined_integers``), or ``None``; built once per MIP
+    (a race between threads only builds it twice)."""
+    defined = getattr(mip, "_defined_integers", False)
+    if defined is False:
+        defined = jaddle_presolve.defined_integers(
+            mip.A, mip.b, mip.n_eq, mip.c, mip.integrality, mip.lower, mip.upper
+        )
+        mip._defined_integers = defined
+    return defined
+
+
+class _JumpRows:
+    """The rows feasibility jump searches in place of ``mip``'s, with its
+    defined integers substituted out (``defined``, a
+    ``jaddle.presolve.DefinedIntegers``) and their bound rows set from the
+    box ``lower``/``upper``: what ``_jump_rows``, ``_violated_rows`` and
+    ``_feasibility_jump_host`` read of a MIP, over the kept columns."""
+
+    def __init__(self, mip, defined, lower, upper):
+        keep = defined.keep
+        self.A = defined.A
+        self.b = defined.b
+        self.row_lower, self.row_upper = defined.rows(lower, upper)
+        self.c = mip.c[keep]
+        self.integrality = mip.integrality[keep]
+        self.implied = mip.implied[keep]
+        self.num_variables = keep.size
+
+
 def feasibility_jump(
     mip,
     x0,
@@ -5146,10 +5233,20 @@ def feasibility_jump(
     improve=False,
     improve_step=None,
     stop=None,
+    substitute=True,
 ):
     """
     Feasibility Jump (Luteberget & Sartor, 2023): an LP-free local search
     for a point that meets ``mip``'s rows, from ``x0``.
+
+    ``substitute`` (numba only): integers that an equality row defines
+    (``jaddle.presolve.defined_integers``: ``z = Σ a_j x_j`` over integers,
+    ``|a_z| = 1``, zero cost) are substituted out of the rows the search
+    moves in, and recomputed from the point it finds. One move cannot change
+    such a row's ``x`` without breaking it; on 30n20b8 (57 start times
+    ``S_j = Σ_t t·x_jt``) the plain jump stalled with a few of those rows
+    violated, and with them substituted it found points on every seed in
+    1–3 s. ``z``'s bounds become rows over the box searched.
 
     ``backend``: ``"numba"`` runs the incremental jump on the host
     (``jaddle._jump_numba``; needs numba, ``pip install jaddle[fast]``). It
@@ -5208,11 +5305,28 @@ def feasibility_jump(
     ints = mip.integrality
     x[ints] = np.clip(np.round(x[ints]), lower[ints], upper[ints])
     if backend == "numba":
-        return _feasibility_jump_host(
-            mip,
-            x,
-            lower,
-            upper,
+        defined = _jump_substitution(mip) if substitute else None
+        if defined is None:
+            return _feasibility_jump_host(
+                mip,
+                x,
+                lower,
+                upper,
+                tol,
+                max_iterations,
+                deadline,
+                seed,
+                cutoff,
+                improve,
+                improve_step,
+                stop,
+            )
+        keep = defined.keep
+        point, feasible, steps = _feasibility_jump_host(
+            _JumpRows(mip, defined, lower, upper),
+            x[keep],
+            lower[keep],
+            upper[keep],
             tol,
             max_iterations,
             deadline,
@@ -5222,6 +5336,14 @@ def feasibility_jump(
             improve_step,
             stop,
         )
+        point = defined.primal(point)
+        if feasible:
+            # The substituted rows are the MIP's, exactly at integer points;
+            # check the point in the MIP's own rows and box all the same.
+            feasible = _violated_rows(mip, point, tol).size == 0 and bool(
+                np.all(point >= lower - tol) and np.all(point <= upper + tol)
+            )
+        return point, feasible, steps
     if improve:
         raise ValueError("improve needs the numba jump backend")
     if data is None:
@@ -6491,6 +6613,13 @@ def _submip_job(highs, mip, lower, upper, cutoff, seconds):
 # The solutions crossover draws from (``_BranchAndBound.solution_pool``).
 _SOLUTION_POOL_SIZE = 10
 
+# RINS's fixing rate on the sub-MIP lane (``adapt_rins_fixing``): the factor
+# it moves by, its floor, and the share of a job's seconds under which a job
+# that found nothing counts as having ended early.
+_RINS_FIXING_STEP = 0.8
+_RINS_MIN_FIXING = 0.4
+_RINS_EARLY_SHARE = 0.5
+
 
 class _SubMipLane:
     """
@@ -6558,6 +6687,34 @@ class _SubMipLane:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
 
+def exact_lane_bounds(mip, terms, box, out, children):
+    """The bounds the search's ``exact_bound`` gives a lane job's node and
+    its strong sides, computed on the lane's thread: ``{"node": (bound,
+    rigorous), (var, down): (bound, rigorous)}`` over ``mip``'s rows
+    (``terms``: their ``A_T``, the integrality and the reduced-cost
+    tolerance), the node's ``box`` and each side's box (``box`` with
+    ``var`` rounded down or up from the node's vertex, as
+    ``exact_strong_children`` builds it). Only sides HiGHS solved
+    (``"optimal"``, ``"partial"``) are bounded."""
+    A_T, is_int, tol = terms
+    lower, upper = box
+    _, x, y_eq, y_ineq = out
+    x = np.asarray(x, np.float64)
+    bounds = {"node": _exact_side_bound(mip, A_T, y_eq, y_ineq, lower, upper, is_int, tol)}
+    for var, down, status, _, cy_eq, cy_ineq in children:
+        if status not in ("optimal", "partial"):
+            continue
+        lo, up = lower.copy(), upper.copy()
+        if down:
+            up[var] = min(up[var], math.floor(x[var]))
+        else:
+            lo[var] = max(lo[var], math.ceil(x[var]))
+        if lo[var] > up[var]:
+            continue
+        bounds[(var, down)] = _exact_side_bound(mip, A_T, cy_eq, cy_ineq, lo, up, is_int, tol)
+    return bounds
+
+
 class _ExactLane:
     """
     Exact node LPs on CPU threads (``exact_nodes``): HiGHS's dual simplex
@@ -6598,15 +6755,19 @@ class _ExactLane:
         return [job[1] for job in self.jobs]
 
     def submit(
-        self, node, box, lp_box, mip, version, strong=None, basis=None, keep=False
+        self, node, box, lp_box, mip, version, strong=None, basis=None, keep=False,
+        bound_terms=None,
     ):
         """Queue ``node``'s LP over ``lp_box`` (the LP's bounds over its box
         ``box``) for ``mip``'s rows as of cut block ``version``, from
         ``basis`` (a ``highspy.HighsBasis`` for ``mip``'s rows) when given,
         then, with a ``strong`` request, strong branching on it
         (``_exact_strong``). With ``keep``, the job also returns the node's
-        optimal basis and its strong sides' bases, for the children."""
+        optimal basis and its strong sides' bases, for the children. With
+        ``bound_terms`` (``exact_lane_bounds``'s ``terms``), it also bounds
+        the node and its sides on the thread (``extra["bounds"]``)."""
         lower, upper = (np.array(b, np.float64) for b in lp_box)
+        node_box = (np.array(box[0], np.float64), np.array(box[1], np.float64))
 
         def job():
             started = time.time()
@@ -6634,6 +6795,10 @@ class _ExactLane:
                     extra["sides"] if keep else None,
                 )
                 strong_seconds = time.time() - strong_started
+            if bound_terms is not None and out[0] == "optimal":
+                extra["bounds"] = exact_lane_bounds(
+                    mip, bound_terms, node_box, out, children
+                )
             return out, children, strong_seconds, time.time() - started, extra
 
         self.jobs.append((self.pool.submit(job), node, box, version))
@@ -6877,9 +7042,60 @@ def _early_jump_job(skip, done, *args, stop=None, **kwargs):
 # their incumbents are marked with.
 _JOB_SOURCES = {"jump": "J", "jumprestart": "J", "fixprop": "P"}
 
-# ``batch_size="auto"``: nodes a batch on a GPU or TPU, and on a CPU.
-_AUTO_BATCH_ACCELERATOR = 128
+# ``batch_size="auto"`` (``auto_batch_size``): nodes a batch on a CPU; at
+# most this many on a GPU or TPU (and this many when the device reports no
+# memory); the share of the device's free memory the batches may take; and
+# the per-member memory envelope: node LP words (of the node precision) per
+# variable or row and per nonzero, and children-kernel bytes per padded
+# nonzero.
 _AUTO_BATCH_CPU = 32
+_AUTO_BATCH_ACCELERATOR = 128
+_AUTO_BATCH_MEMORY_SHARE = 0.75
+_AUTO_BATCH_LP_WORDS = (16, 4)
+_AUTO_BATCH_CHILD_BYTES = 64
+
+
+def auto_batch_size(
+    n,
+    m,
+    nnz,
+    free_bytes,
+    itemsize=4,
+    kernel_nnz=None,
+    children=lambda batch: False,
+    largest=_AUTO_BATCH_ACCELERATOR,
+):
+    """
+    The largest power of two, at most ``largest``, whose batch of node
+    LPs fits in ``_AUTO_BATCH_MEMORY_SHARE`` of ``free_bytes`` of device
+    memory (at least 1): ``solve(batch_size="auto")`` on a GPU or TPU.
+
+    A member costs ``16·(n + m) + 4·nnz`` words of ``itemsize`` bytes (the
+    rows and nonzeros of the node LP, tree cut block included), and, when
+    ``children(batch)`` says the batch would build its children on the
+    device (``_ChildKernels``, in float64), ``64·kernel_nnz`` bytes more.
+    These are envelopes over peak memory measured on a 12 GB GPU across
+    batch sizes (pipelined batches included): a member's node LPs took
+    0.19 MB on 30n20b8, 2.7 MB on academictimetablesmall, 3.0 MB on bab5
+    and 117 MB on neos-5114902-kasavu (1.3–2.5 times under the envelope),
+    and its children 1.2–4 float64 words per padded nonzero a box (bab5:
+    2 GB at 128 a batch). The share leaves room for the rest of the
+    search (heuristics, strong branching, the root's own peak).
+
+    ``largest`` caps the batch: a short batch is padded to full size, so a
+    batch larger than the open nodes costs device time for nothing.
+    """
+    budget = _AUTO_BATCH_MEMORY_SHARE * max(float(free_bytes), 0.0)
+    per_lp, per_nnz = _AUTO_BATCH_LP_WORDS
+    member = itemsize * (per_lp * (n + m) + per_nnz * nnz)
+    kernel = _AUTO_BATCH_CHILD_BYTES * (nnz if kernel_nnz is None else kernel_nnz)
+    batch = 1 << max(0, int(largest).bit_length() - 1)
+    while batch > 1:
+        need = batch * (member + (kernel if children(batch) else 0))
+        if need <= budget:
+            break
+        batch //= 2
+    return batch
 
 # The epoch budget of a node LP outside batched search (the serial
 # search, dives, the pump) when ``node_max_epochs`` is ``None``.
@@ -7007,6 +7223,21 @@ def _cut_key(cut):
 
 
 class _BranchAndBound:
+    # Where batched search spends the main thread (``result["batch_timing"]``):
+    # blocked on the device for a batch's LPs or its children, evaluating
+    # the members on the host, and the host's Lagrangian bounds within that
+    # (``dual_terms`` and ``bound_over``, all callers).
+    batch_wait_seconds = 0.0
+    batch_evaluate_seconds = 0.0
+    bound_seconds = 0.0
+    # Within or beside that: tree cut refreshes (in the evaluation), the
+    # exact lane's results, and branching from device-built children.
+    cut_refresh_seconds = 0.0
+    exact_collect_seconds = 0.0
+    branch_seconds = 0.0
+    _cut_worker = None  # the tree cut worker (``tree_cut_async``), if made
+    exact_bounds_reused = 0  # lane jobs whose own bounds were used
+
     def __init__(
         self,
         mip,
@@ -7073,6 +7304,7 @@ class _BranchAndBound:
         gomory_candidates=None,
         inout_separation=None,
         tree_cut_points=4,
+        tree_cut_async=True,
         tree_cut_rounds=1,
         tree_cut_share=0.25,
         tree_cut_max_nnz=None,
@@ -7413,6 +7645,13 @@ class _BranchAndBound:
                     f"{name} must be an integer of at least {least}, not {value!r}"
                 )
         self.tree_cut_points = int(tree_cut_points)
+        # Tree cut separation on a worker thread (``tree_cut_async``): a
+        # full refresh hands its points to the worker and the next refresh
+        # takes the cuts (``submit_cut_job``, ``collect_cut_job``).
+        self.tree_cut_async = bool(tree_cut_async)
+        self._cut_worker = None  # its ThreadPoolExecutor, made on first use
+        self._cut_job = None  # (future, base) of the separation in flight
+        self.tree_cut_async_jobs = 0
         self.tree_cut_rounds = int(tree_cut_rounds)
         if not 0.0 <= tree_cut_share <= 1.0:
             raise ValueError(
@@ -7670,7 +7909,12 @@ class _BranchAndBound:
             else None
         )
         self.submip_last = None  # the kind of the lane's last job
+        self.submip_budget = 0.0  # the lane's last job's seconds
         self.submip_lane_seconds = 0.0
+        # The share of the agreeing integers RINS fixes on the lane
+        # (``adapt_rins_fixing``), and the draws that pick them.
+        self.rins_fixing_rate = 1.0
+        self.rins_rng = np.random.default_rng(0)
         self.rins_finds = 0
         self.crossover_calls = 0
         self.crossover_finds = 0
@@ -7695,11 +7939,10 @@ class _BranchAndBound:
                 raise ValueError(
                     f"batch_size must be 'auto' or a positive int, not {batch_size!r}"
                 )
-            # A GPU iteration costs about the same for 8 members as for 128:
-            # on ns1830653, 128 a batch ran 394 nodes a second against 298
-            # for 32 and 147 for 8. A CPU runs the members one after another.
-            platform = (self.device or jax.devices()[0]).platform
-            batch_size = _AUTO_BATCH_ACCELERATOR if platform != "cpu" else _AUTO_BATCH_CPU
+            batch_size = self.auto_batch_size(mip, children_backend)
+            self.batch_size_auto = True
+        else:
+            self.batch_size_auto = False
         if int(batch_size) < 1:
             raise ValueError("batch_size must be at least 1")
         self.batch_size = int(batch_size)
@@ -8416,8 +8659,18 @@ class _BranchAndBound:
     def exact_bound(self, solution, lower, upper):
         """``lp_bound`` of a HiGHS solution (the exact lane's): its reduced
         costs at infinite bounds that are round-off are zeroed first
-        (``vertex_terms``), or a −1e-17 one makes the bound −inf."""
-        return self.bound_over(self.vertex_terms(solution, lower, upper), lower, upper)
+        (``vertex_terms``), or a −1e-17 one makes the bound −inf. The same
+        function (``_exact_side_bound``) bounds the lane's solutions on its
+        threads (``exact_lane_bounds``)."""
+        started = time.perf_counter()
+        out = _exact_side_bound(
+            self.mip, self.A_T, solution.dual_eq, solution.dual_ineq,
+            lower, upper, self.is_int, self.reduced_cost_tol,
+        )
+        self.bound_seconds += time.perf_counter() - started
+        if out is None:
+            return self.bound_over(self.vertex_terms(solution, lower, upper), lower, upper)
+        return out
 
     def solve_node_lp(self, lower, upper, warm, max_epochs):
         """A node's LP over its box by PDHG at ``node_precision``, with the
@@ -8462,7 +8715,8 @@ class _BranchAndBound:
 
     def dual_terms(self, solution):
         """``lagrangian_terms`` of a node's duals over the searched rows."""
-        return lagrangian_terms(
+        started = time.perf_counter()
+        terms = lagrangian_terms(
             self.mip.c,
             self.mip.A,
             self.mip.b,
@@ -8470,6 +8724,8 @@ class _BranchAndBound:
             self.duals(solution, self.m_ineq),
             A_T=self.A_T,
         )
+        self.bound_seconds += time.perf_counter() - started
+        return terms
 
     def vertex_terms(self, vertex, lower, upper):
         """``dual_terms`` of an exact vertex (a crossover HiGHS proved
@@ -8490,12 +8746,15 @@ class _BranchAndBound:
     def bound_over(self, terms, lower, upper):
         """The Lagrangian bound of ``terms`` over a propagated box, widened a
         little on continuous variables against rounding error."""
+        started = time.perf_counter()
         cont = ~self.is_int
         lower = np.where(cont, lower - 1e-7 * (1.0 + np.abs(lower)), lower)
         upper = np.where(cont, upper + 1e-7 * (1.0 + np.abs(upper)), upper)
-        return box_bound(
+        bound = box_bound(
             *terms, lower, upper, reduced_cost_tolerance=self.reduced_cost_tol
         )
+        self.bound_seconds += time.perf_counter() - started
+        return bound
 
     def lp_bound(self, solution, lower, upper):
         """The Lagrangian bound of a node's duals over its propagated box."""
@@ -10433,6 +10692,8 @@ class _BranchAndBound:
             "inout_cuts": self.inout_cuts,
             "inout_rounds": self.inout_rounds,
             "tree_cut_refreshes": self.tree_cut_refreshes,
+            "tree_cut_async_jobs": self.tree_cut_async_jobs,
+            "exact_bounds_reused": self.exact_bounds_reused,
             "tree_pool_refreshes": self.tree_pool_refreshes,
             "tree_cut_requeued": self.tree_cut_requeued,
             "tree_cut_seconds": self.tree_cut_seconds,
@@ -10478,6 +10739,16 @@ class _BranchAndBound:
             "restart_log": list(self.restart_log),
             "rins_calls": self.rins_calls,
             "rins_finds": self.rins_finds,
+            "rins_fixing_rate": self.rins_fixing_rate,
+            "batch_timing": {
+                "wait_seconds": self.batch_wait_seconds,
+                "evaluate_seconds": self.batch_evaluate_seconds,
+                "bound_seconds": self.bound_seconds,
+                "cut_refresh_seconds": self.cut_refresh_seconds,
+                "exact_collect_seconds": self.exact_collect_seconds,
+                "branch_seconds": self.branch_seconds,
+                "heuristic_seconds": self.heuristic_seconds,
+            },
             "crossover_calls": self.crossover_calls,
             "crossover_finds": self.crossover_finds,
             "submip_lane_seconds": self.submip_lane_seconds,
@@ -11181,7 +11452,7 @@ class _BranchAndBound:
         with self._separator_lock:
             return [cut for separator in self.node_separators() for cut in separator(x)]
 
-    def zero_half(self, x, lower, upper, max_cuts):
+    def zero_half(self, x, lower, upper, max_cuts, mip=None):
         """Zero-half cuts at ``x`` (``zero_half_cuts``) from the LP's rows as
         searched, the cuts in it included,
         over the box ``lower``/``upper`` (the root's, so the cuts hold
@@ -11189,8 +11460,9 @@ class _BranchAndBound:
         the root bound (exact LPs, 20 rounds) from −108,341 to −107,410."""
         if not self.use_zero_half:
             return []
+        mip = self.mip if mip is None else mip  # a worker passes the rows it took
         return zero_half_cuts(
-            self.mip.A, self.mip.b, self.mip.n_eq, x, lower, upper, self.cut_int, max_cuts=max_cuts
+            mip.A, mip.b, mip.n_eq, x, lower, upper, self.cut_int, max_cuts=max_cuts
         )
 
     def inout_candidates(self, separators, x, lower, upper, max_cuts):
@@ -11430,11 +11702,13 @@ class _BranchAndBound:
         if not solved:
             return results, requeued
         order = sorted(solved, key=lambda i: members[i].bound)
+        refreshing = time.perf_counter()  # not ``started``: that one is time.time()
         replaced, added = self.refresh_cuts(
             [results[i]["solution"] for i in solved],
             [results[i]["solution"] for i in order],
             separate=kind == "full",
         )
+        self.cut_refresh_seconds += time.perf_counter() - refreshing
         if replaced:
             base_m = self.base.A.shape[0] - self.base.n_eq
             rows = [base_m + i for i in replaced]
@@ -11482,6 +11756,67 @@ class _BranchAndBound:
             self.tree_cut_requeued += len(requeued)
         self.tree_cut_seconds += time.time() - started
         return results, requeued
+
+    def separate_at(self, x, mip, lower, upper):
+        """Tree cut candidates at the node point ``x``: the root's
+        separators (``node_separated``) and zero-half cuts from ``mip``'s
+        rows over the root box ``lower``/``upper``, so each holds at every
+        node; cuts denser than ``tree_cut_max_nnz`` are left out. Returns
+        ``(selected, violated)``: the ``max_tree_cuts_per_round`` that
+        ``select_cuts`` picks at ``x``, and every violated one (for the
+        pool). Safe on a worker thread: it reads only its arguments and
+        the separators, under ``_separator_lock``."""
+        per_point = self.max_tree_cuts_per_round
+        candidates = self.node_separated(x)
+        candidates += self.zero_half(x, lower, upper, 2 * per_point, mip=mip)
+        candidates = [c for c in candidates if c[1].size <= self.tree_cut_max_nnz]
+        selected = select_cuts(candidates, x, mip.num_variables, max_cuts=per_point)
+        return selected, violated_cuts(candidates, x)
+
+    def submit_cut_job(self, points):
+        """Separate tree cuts at ``points`` on the worker thread
+        (``tree_cut_async``), with the rows and root box as they are now;
+        ``collect_cut_job`` takes the result at a later refresh. With a job
+        still running, these points are skipped.
+
+        On a GPU the main thread spends 20–40% of the tree blocked on the
+        device, which releases the GIL: the worker separates in that time.
+        The cuts reach the LP a refresh later."""
+        if self._cut_job is not None:
+            return
+        if self._cut_worker is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._cut_worker = ThreadPoolExecutor(1, thread_name_prefix="jaddle-cuts")
+        mip = self.mip
+        lower, upper = self.root_lower.copy(), self.root_upper.copy()
+
+        def job():
+            found = []
+            for x in points:
+                if self.out_of_time():
+                    break
+                found.append((x, *self.separate_at(x, mip, lower, upper)))
+            return found
+
+        self._cut_job = (self._cut_worker.submit(job), self.base)
+        self.tree_cut_async_jobs += 1
+
+    def collect_cut_job(self):
+        """The finished worker separation (``submit_cut_job``) as a list of
+        ``(x, selected, violated)``, or ``[]`` while it runs, without one,
+        after it failed, or when the searched MIP changed since (a restart:
+        its cuts may not fit the new rows)."""
+        job = self._cut_job
+        if job is None or not job[0].done():
+            return []
+        self._cut_job = None
+        future, base = job
+        try:
+            found = future.result()
+        except Exception:
+            return []
+        return found if base is self.base else []
 
     def refresh_cuts(self, solutions, best_first, separate=True):
         """
@@ -11567,20 +11902,26 @@ class _BranchAndBound:
                 for cut in self.cut_pool.violated(x, held):
                     consider(cut, x)
                     pooled.add(_cut_key(cut))
-        per_point = self.max_tree_cuts_per_round
         separated = []  # every violated candidate, for the pool
+        # The worker's cuts from an earlier refresh's points, judged at
+        # those points as a separation here would judge them.
+        for x, selected, violated in self.collect_cut_job():
+            separated += violated
+            for cut in selected:
+                consider(cut, x)
         points = [
             np.asarray(sol.primal, np.float64)
             for sol in best_first[: self.tree_cut_points if separate else 0]
         ]
+        if self.tree_cut_async and points:
+            self.submit_cut_job(points)
+            points = []
         for x in points:
             if self.out_of_time():
                 break
-            candidates = self.node_separated(x)
-            candidates += self.zero_half(x, self.root_lower, self.root_upper, 2 * per_point)
-            candidates = [c for c in candidates if c[1].size <= self.tree_cut_max_nnz]
-            separated += violated_cuts(candidates, x)
-            for cut in select_cuts(candidates, x, n, max_cuts=per_point):
+            selected, violated = self.separate_at(x, self.mip, self.root_lower, self.root_upper)
+            separated += violated
+            for cut in selected:
                 consider(cut, x)
         # Into the pool, as at the root: a later node may violate them.
         self.pool_cuts(separated)
@@ -11853,13 +12194,17 @@ class _BranchAndBound:
         point stops short of the vertex (a binary at 0.9997), so the lane
         passes ``rins_tolerance``. ``None`` when ``seconds`` is not positive,
         fewer than ``min_fixed`` of the integers agree, or the same
-        neighbourhood was searched at the same cutoff."""
+        neighbourhood was searched at the same cutoff. Below a fixing rate
+        of 1 (``adapt_rins_fixing``), only that share of the agreeing
+        integers, drawn at random, is fixed."""
         ints = self.is_int
         incumbent = self.incumbent[1]
         tol = self.int_tol if tolerance is None else tolerance
         agree = ints & (np.abs(np.asarray(x, np.float64) - incumbent) <= tol)
         if seconds <= 0 or agree.sum() < min_fixed * ints.sum():
             return None
+        if self.rins_fixing_rate < 1.0:
+            agree &= self.rins_rng.random(agree.size) < self.rins_fixing_rate
         key = (agree.tobytes(), incumbent[agree].tobytes(), self.cutoff())
         if key in self.rins_seen:
             self.rins_skipped += 1
@@ -11884,6 +12229,26 @@ class _BranchAndBound:
         self.rins_calls += 1
         return True
 
+    def adapt_rins_fixing(self, found, seconds):
+        """Move RINS's fixing rate after a lane job that took ``seconds``
+        and ``found`` a point or not, as SCIP's adaptive LNS moves its
+        fixing rates. A job that found nothing and ended early (within
+        ``_RINS_EARLY_SHARE`` of its seconds: HiGHS proved the box empty
+        below the cutoff) had too small a neighbourhood, so the rate drops
+        by ``_RINS_FIXING_STEP``, to at least ``_RINS_MIN_FIXING``; one
+        that ran out of time had too large a one, and the rate rises back
+        towards 1. On 30n20b8 the incumbent and the node points agree on
+        96% of the integers, nearly all zeros of the time-indexed binaries;
+        fixing all of them left HiGHS an empty box in 0.02 s on every call,
+        while fixing 80% of them found 453 → 353 in 0.8 s."""
+        if found:
+            return
+        if seconds < _RINS_EARLY_SHARE * self.submip_budget:
+            rate = self.rins_fixing_rate * _RINS_FIXING_STEP
+            self.rins_fixing_rate = max(_RINS_MIN_FIXING, rate)
+        else:
+            self.rins_fixing_rate = min(1.0, self.rins_fixing_rate / _RINS_FIXING_STEP)
+
     def submit_submip(self, kind, box, seconds):
         """Hand ``box`` of ``self.base`` to the sub-MIP lane, pruned at the
         cutoff."""
@@ -11892,6 +12257,7 @@ class _BranchAndBound:
             kind, self.base, self.is_int, lower, upper, self.cutoff(box=False), seconds
         )
         self.submip_last = kind
+        self.submip_budget = float(seconds)
         self.submip_calls += 1
 
     def remember_solution(self, value, x):
@@ -11986,6 +12352,8 @@ class _BranchAndBound:
         kind, x, seconds = done
         self.submip_lane_seconds += seconds
         if x is None:
+            if kind == "rins":
+                self.adapt_rins_fixing(False, seconds)
             return
         before = None if self.incumbent is None else self.incumbent[0]
         self.try_incumbent(x, "N" if kind == "rins" else "C", None)
@@ -11993,6 +12361,7 @@ class _BranchAndBound:
             before is None or self.incumbent[0] < before
         )
         if kind == "rins":
+            self.adapt_rins_fixing(improved, seconds)
             self.rins_finds += improved
         else:
             self.crossover_finds += improved
@@ -13062,10 +13431,12 @@ class _BranchAndBound:
         per box (padding dropped), whose ``opt_state`` is the member's
         final ``(k, eta)``. Waits for the device."""
         count, launched = handle
+        started = time.perf_counter()
         if hasattr(launched, "result"):  # dispatched on the device thread
             launched = launched.result()
         # One transfer for the whole batch, then slices on the host.
         out, steps = jax.device_get(launched)
+        self.batch_wait_seconds += time.perf_counter() - started
         converged = np.asarray(out.converged)
         stop_code = np.asarray(out.stop_code)
         epochs = np.asarray(out.epochs)
@@ -13409,6 +13780,7 @@ class _BranchAndBound:
             strong,
             basis=basis,
             keep=self.exact_basis_memory > 0,
+            bound_terms=(self.A_T, self.is_int, self.reduced_cost_tol),
         )
 
     def collect_exact(self):
@@ -13471,10 +13843,17 @@ class _BranchAndBound:
                 for side, basis in extra["sides"].items()
                 if (key := self.store_basis(basis, extra["mip"])) is not None
             }
+        # The bounds the lane's thread computed (``exact_lane_bounds``) are
+        # this thread's own when the job solved the rows searched now: the
+        # same function on the same arrays. Otherwise they are recomputed.
+        known = None
+        if extra.get("mip") is self.mip and version == self.cut_version:
+            known = extra.get("bounds")
+            self.exact_bounds_reused += known is not None
         strong = self.exact_strong_children(
-            node, box, version, solution, children
+            node, box, version, solution, children, known
         )
-        self.evaluate_exact(node, box, solution, strong)
+        self.evaluate_exact(node, box, solution, strong, known)
 
     def exact_solution(self, node, x, y_eq, y_ineq, version):
         """A HiGHS solution (Jaddle's dual convention) as a ``SaddleState``
@@ -13494,7 +13873,14 @@ class _BranchAndBound:
             solution = self.stale_free(solution, version)
         return solution
 
-    def exact_strong_children(self, node, box, version, solution, children):
+    def known_bound(self, known, key, solution, lower, upper):
+        """``exact_bound`` of ``solution`` over the box, from ``known`` (the
+        lane's ``exact_lane_bounds``) when it holds ``key``."""
+        if known is not None and known.get(key) is not None:
+            return known[key]
+        return self.exact_bound(solution, lower, upper)
+
+    def exact_strong_children(self, node, box, version, solution, children, known=None):
         """The lane's strong-branching ``children`` (``_exact_strong``'s
         list) as ``choose_branch``'s ``exact_strong``: ``({var: (down,
         up)}, solved)`` of ``_StrongChild``, bounded by each side's duals
@@ -13505,7 +13891,7 @@ class _BranchAndBound:
             return None
         lower, upper = box
         x = np.asarray(solution.primal, np.float64)
-        node_raw, _ = self.exact_bound(solution, lower, upper)
+        node_raw, _ = self.known_bound(known, "node", solution, lower, upper)
         sides = {}
         for var, down, status, cx, cy_eq, cy_ineq in children:
             lo, up = lower.copy(), upper.copy()
@@ -13522,7 +13908,7 @@ class _BranchAndBound:
             if child is None:  # failed: no information
                 sides.setdefault(var, {})[down] = None
                 continue
-            raw, rigorous = self.exact_bound(child, lo, up)
+            raw, rigorous = self.known_bound(known, (var, down), child, lo, up)
             if not (rigorous and np.isfinite(raw)):
                 raw = node.bound
             bound = max(self.round_bound(raw), node.bound)
@@ -13642,11 +14028,12 @@ class _BranchAndBound:
             exact_strong=strong,
         )
 
-    def evaluate_exact(self, node, box, solution, strong=None):
+    def evaluate_exact(self, node, box, solution, strong=None, known=None):
         """Evaluate ``node`` with an exact LP ``solution`` (and the lane's
-        strong children, ``strong``) as a batch member is evaluated."""
+        strong children, ``strong``) as a batch member is evaluated;
+        ``known``: the lane's bounds (``exact_lane_bounds``), if usable."""
         lower, upper = box
-        raw, _ = self.exact_bound(solution, lower, upper)
+        raw, _ = self.known_bound(known, "node", solution, lower, upper)
         if np.isfinite(raw):
             self.exact_gain += max(raw - node.bound, 0.0)
         self.nodes += 1
@@ -13776,6 +14163,7 @@ class _BranchAndBound:
                 dict(result, solution=self.stale_free(result["solution"], batch["version"]))
                 for result in results
             ]
+        evaluating = time.perf_counter()
         results, requeued = self.after_node_solves(members, boxes, results)
         self.deferring = self.batch_on_device()
         try:
@@ -13803,7 +14191,58 @@ class _BranchAndBound:
         finally:
             self.deferring = False
             self.batch_waiting = []
+            self.batch_evaluate_seconds += time.perf_counter() - evaluating
         self.flush_roundings()
+
+    def auto_batch_size(self, mip, children_backend):
+        """``batch_size="auto"``: on a CPU, ``_AUTO_BATCH_CPU`` (it runs the
+        members one after another); on a GPU or TPU, as many nodes as fit
+        in its free memory, at most ``_AUTO_BATCH_ACCELERATOR``
+        (``auto_batch_size``), or that many when the device reports no
+        memory. The node LP counted is ``mip``'s with the tree cut block
+        ``reserve_tree_cuts`` will give it (before root cuts), at the node
+        LPs' precision; the children kernels count when ``batch_on_device``
+        would run them."""
+        device = self.device or jax.devices()[0]
+        if device.platform == "cpu":
+            return _AUTO_BATCH_CPU
+        try:
+            stats = device.memory_stats() or {}
+        except Exception:
+            stats = {}
+        if "bytes_limit" not in stats:
+            return _AUTO_BATCH_ACCELERATOR
+        free = stats["bytes_limit"] - stats.get("bytes_in_use", 0)
+        n, m, nnz = mip.num_variables, mip.A.shape[0], mip.A.nnz
+        cut_rows = cut_nnz = 0
+        if self.use_tree_cuts:
+            if self.tree_cut_rows is None:
+                cut_rows = max(_TREE_CUT_MIN_ROWS, 2 * self.max_tree_cuts_per_round)
+            else:
+                cut_rows = self.tree_cut_rows
+            cut_nnz = _next_power_of_two(
+                self.tree_cut_nnz or max(256, cut_rows * min(n, 16))
+            )
+        kernel_nnz = 1 << max(8, math.ceil(math.log2(max(nnz + cut_nnz, 1))))
+        if self.node_precision is None:
+            itemsize = np.dtype(mip.lp.c.dtype).itemsize
+        else:
+            with self.node_settings():
+                itemsize = np.dtype(_wide(jo.jaddle_dtype())).itemsize
+        width = max(n, nnz)
+
+        def children(batch):
+            # ``batch_on_device``'s rule, at the MIP's own nonzeros (the
+            # cuts' come later, and more only turn the kernels off).
+            if children_backend == "numpy" or batch < 2:
+                return False
+            if children_backend == "jax":
+                return True
+            return nnz > _SMALL_MIP_NNZ and 2 * batch * width <= 2**25
+
+        return auto_batch_size(
+            n, m + cut_rows, nnz + cut_nnz, free, itemsize, kernel_nnz, children
+        )
 
     def batch_on_device(self):
         """Whether batched search splits and rounds its members on the
@@ -13911,14 +14350,18 @@ class _BranchAndBound:
         """Read back a ``launch_branches`` and ``branch`` each node on the
         host (conflict pool, pruning, the queue)."""
         out = pending["out"]
+        started = time.perf_counter()
         if hasattr(out, "result"):  # dispatched on the device thread
             out = out.result()
         with jax.enable_x64(True):
             out = jax.device_get(out)
+        self.batch_wait_seconds += time.perf_counter() - started
         self.batched_children += 1
+        started = time.perf_counter()
         for i, item in enumerate(pending["items"]):
             row = {key: value[i] for key, value in out.items()}
             self.branch(**item, precomputed=row)
+        self.branch_seconds += time.perf_counter() - started
 
     def break_symmetry(self, mip, lower, upper):
         """
@@ -14006,6 +14449,8 @@ class _BranchAndBound:
                 self.exact_lane.shutdown()
             if self.submip_lane is not None:
                 self.submip_lane.shutdown()
+            if self._cut_worker is not None:
+                self._cut_worker.shutdown(wait=False, cancel_futures=True)
             if self._device_thread is not None:
                 self._device_thread.shutdown(wait=True)
                 self._device_thread = None
@@ -14118,7 +14563,9 @@ class _BranchAndBound:
             print(
                 f"MIP: {mip.num_variables} variables ({mip.num_integers} integer), "
                 f"{mip.A.shape[0]} rows, {mip.A.nnz} nonzeros, on "
-                f"{(self.device or jax.devices()[0]).platform}"
+                f"{(self.device or jax.devices()[0]).platform}, "
+                f"{self.batch_size} nodes a batch"
+                + (" (auto)" if self.batch_size_auto else "")
             )
             if self.coefficients_tightened:
                 print(
@@ -14325,7 +14772,9 @@ class _BranchAndBound:
                 )
             ):
                 self.collect_heuristics()
+                collecting = time.perf_counter()
                 self.collect_exact()
+                self.exact_collect_seconds += time.perf_counter() - collecting
                 self.feed_exact()
                 self.collect_submip()
                 self.feed_submip()
@@ -14472,6 +14921,7 @@ def solve(
     tree_cut_rows=1000,
     tree_cut_nnz=None,
     tree_cut_points=4,
+    tree_cut_async=True,
     tree_cut_rounds=1,
     tree_cut_share=0.25,
     tree_cut_max_nnz=None,
@@ -14488,7 +14938,7 @@ def solve(
     dive_every=0,
     dive_depth=20,
     plunge_depth=4,
-    batch_size=32,
+    batch_size="auto",
     feasibility_pump=False,
     pump_iterations=30,
     pump_tolerance=1e-4,
@@ -14950,8 +15400,12 @@ def solve(
       in all. On ns1830653 (GPU, batches of 8) the truncated LPs took the
       tree from 16 to 147 nodes a second, with a higher bound at 60 s.
       Worth it on a GPU; on a CPU the members run one after another. The
-      default is 32; ``"auto"`` gives 128 on a GPU or TPU and 32 on a CPU
-      (``1``: the serial search). With ``pipeline_batches`` (default ``True``) the
+      default, ``"auto"`` (``auto_batch_size``), gives 32 on a CPU and, on
+      a GPU or TPU, the largest power of two up to 128 whose batch fits in
+      three quarters of the device's free memory, from the node LP's size
+      (variables, rows and nonzeros, with the tree cut block) and whether
+      the children kernels would run; 128 when the device reports no
+      memory. ``1``: the serial search. With ``pipeline_batches`` (default ``True``) the
       batches overlap: while the device solves one batch's LPs, the host
       evaluates the batch before (bounds, tree cuts, heuristics, branching),
       and its children are built on the device after the batch in flight,
@@ -15494,6 +15948,7 @@ def solve(
         tree_cut_rows=tree_cut_rows,
         tree_cut_nnz=tree_cut_nnz,
         tree_cut_points=tree_cut_points,
+        tree_cut_async=tree_cut_async,
         tree_cut_rounds=tree_cut_rounds,
         tree_cut_share=tree_cut_share,
         tree_cut_max_nnz=tree_cut_max_nnz,
@@ -15722,6 +16177,8 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "inout_cuts": 0,
             "inout_rounds": 0,
             "tree_cut_refreshes": 0,
+            "tree_cut_async_jobs": 0,
+            "exact_bounds_reused": 0,
             "tree_pool_refreshes": 0,
             "tree_cut_requeued": 0,
             "tree_cut_seconds": 0.0,
@@ -15760,6 +16217,12 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "restart_log": [],
             "rins_calls": 0,
             "rins_finds": 0,
+            "rins_fixing_rate": 1.0,
+            "batch_timing": {
+                "wait_seconds": 0.0, "evaluate_seconds": 0.0, "bound_seconds": 0.0,
+                "cut_refresh_seconds": 0.0, "exact_collect_seconds": 0.0,
+                "branch_seconds": 0.0, "heuristic_seconds": 0.0,
+            },
             "crossover_calls": 0,
             "crossover_finds": 0,
             "submip_lane_seconds": 0.0,

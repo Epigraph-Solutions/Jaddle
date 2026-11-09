@@ -44,6 +44,9 @@ PINNED = dict(
     rins_every=50,
     heuristic_effort=0.1,
     parallel_heuristics=False,
+    # Tree cuts separated on a worker land a refresh later, at a time that
+    # depends on the thread; the async tests turn it on.
+    tree_cut_async=False,
     dive_every=0,
     tree_heuristics=False,
     tree_heuristic_every=20,
@@ -1638,6 +1641,135 @@ NEEDS_NUMBA = pytest.mark.skipif(jm._numba_jump() is None, reason="needs numba")
 JUMP_BACKENDS = ["jax", pytest.param("numba", marks=NEEDS_NUMBA)]
 
 
+def time_indexed(seed=0, jobs=6, horizon=12):
+    """A time-indexed schedule shaped like 30n20b8: each job ``j`` picks
+    one start ``x_jt``, its start time is defined by ``S_j = Σ_t t·x_jt``
+    (a general integer), a chain of precedences ``S_j + d_j <= S_{j+1}``
+    over every other job, and the usage in each period is at most ``R``,
+    the one costed variable. Columns: the ``x`` (job by job), the ``S``,
+    then ``R``. Returns ``(mip, columns of S)``."""
+    rng = np.random.default_rng(seed)
+    d = rng.integers(1, 4, jobs)
+    use = rng.integers(1, 3, jobs).astype(float)
+    starts = [np.arange(horizon - d[j] + 1) for j in range(jobs)]
+    first = np.cumsum([0] + [s.size for s in starts])
+    nx = int(first[-1])
+    S = nx + np.arange(jobs)
+    R = nx + jobs
+    n = R + 1
+    eq = []
+    for j in range(jobs):
+        cols = first[j] + np.arange(starts[j].size)
+        assign = np.zeros(n)
+        assign[cols] = 1.0
+        define = np.zeros(n)
+        define[cols] = -starts[j]
+        define[S[j]] = 1.0
+        eq += [assign, define]
+    A_eq = np.array(eq)
+    b_eq = np.tile([1.0, 0.0], jobs)
+    ineq, b_ineq = [], []
+    for j in range(0, jobs - 1, 2):
+        row = np.zeros(n)
+        row[S[j]], row[S[j + 1]] = 1.0, -1.0
+        ineq.append(row)
+        b_ineq.append(-float(d[j]))
+    for tau in range(horizon):
+        row = np.zeros(n)
+        for j in range(jobs):
+            on = (starts[j] <= tau) & (tau < starts[j] + d[j])
+            row[first[j] + np.flatnonzero(on)] = use[j]
+        row[R] = -1.0
+        ineq.append(row)
+        b_ineq.append(0.0)
+    lower, upper = np.zeros(n), np.ones(n)
+    upper[S] = horizon
+    upper[R] = use.sum()
+    c = np.zeros(n)
+    c[R] = 1.0
+    lp = jl.LP(
+        c=c,
+        A_eq=sp.csc_matrix(A_eq),
+        b_eq=b_eq,
+        A_ineq=sp.csc_matrix(np.array(ineq)),
+        b_ineq=np.array(b_ineq),
+        lower_bounds=lower,
+        upper_bounds=upper,
+    )
+    return jm.MIP(lp, np.ones(n, bool)), S
+
+
+def test_defined_integers_are_the_start_times():
+    from jaddle.presolve import defined_integers
+
+    mip, S = time_indexed()
+    defined = defined_integers(
+        mip.A, mip.b, mip.n_eq, mip.c, mip.integrality, mip.lower, mip.upper
+    )
+    # The start times go; the binaries of ``Σ_t x_jt = 1`` and the costed
+    # ``R`` stay.
+    np.testing.assert_array_equal(np.sort(defined.elim), S)
+    # Each defining row gives way to its start time's bound row.
+    assert defined.A.shape == (mip.A.shape[0], mip.num_variables - S.size)
+    # At integer points (in the box), the substituted rows hold exactly
+    # when the MIP's rows and the start times' bounds do.
+    rng = np.random.default_rng(0)
+    A = mip.A.tocsr()
+    assign = A[0 : mip.n_eq : 2]  # the rows Σ_t x_jt = 1
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    upper[S] = 8.0  # a box that some starts leave
+    row_lower, row_upper = defined.rows(lower, upper)
+    seen = set()
+    for _ in range(300):
+        full = np.zeros(mip.num_variables)
+        if rng.random() < 0.8:
+            for r in range(assign.shape[0]):
+                full[rng.choice(assign[r].indices)] = 1.0
+        else:
+            full[: S[0]] = rng.integers(0, 2, S[0])
+        full[-1] = rng.integers(0, upper[-1] + 1)  # R
+        x = full[defined.keep]
+        act = defined.A @ x
+        holds = bool(np.all(act >= row_lower - 1e-9) and np.all(act <= row_upper + 1e-9))
+        point = defined.primal(x)
+        original = mip.is_feasible(point) and bool(
+            np.all(point >= lower) and np.all(point <= upper)
+        )
+        assert holds == original
+        seen.add(holds)
+    assert seen == {True, False}
+    # Nothing to substitute: ``None``.
+    assert defined_integers(
+        mip.A[mip.n_eq :], mip.b[mip.n_eq :], 0, mip.c, mip.integrality,
+        mip.lower, mip.upper,
+    ) is None
+
+
+@NEEDS_NUMBA
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_feasibility_jump_substitutes_defined_integers(seed):
+    mip, S = time_indexed(seed)
+    assert len(jm._jump_substitution(mip)) == S.size
+    x, feasible, _ = jm.feasibility_jump(mip, np.zeros(mip.num_variables), seed=seed)
+    assert feasible and mip.is_feasible(x)
+    np.testing.assert_array_equal(x, np.round(x))
+    # A box with tighter start times holds for the recomputed ones too.
+    lower, upper = mip.lower.copy(), mip.upper.copy()
+    lower[S[0]] = 3.0
+    upper[S[1]] = 9.0
+    x, feasible, _ = jm.feasibility_jump(
+        mip, np.zeros(mip.num_variables), lower, upper, seed=seed
+    )
+    assert feasible and mip.is_feasible(x)
+    assert x[S[0]] >= 3.0 and x[S[1]] <= 9.0
+    # The improving search ends below the first point it finds.
+    x, feasible, _ = jm.feasibility_jump(
+        mip, np.zeros(mip.num_variables), seed=seed, improve=True,
+        max_iterations=200_000,
+    )
+    assert feasible and mip.is_feasible(x)
+
+
 @pytest.mark.parametrize("backend", JUMP_BACKENDS)
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
 def test_feasibility_jump_assignment(seed, backend):
@@ -2199,6 +2331,44 @@ def test_rins_node_limit_adapts(monkeypatch):
 def test_plunging_keeps_the_optimum(plunge_depth):
     mip = generalised_assignment(2)
     assert_solved(solve(mip, plunge_depth=plunge_depth), mip, reference(mip))
+
+
+def test_rins_fixing_rate_adapts(monkeypatch):
+    mip = generalised_assignment()
+    search = search_for(mip, monkeypatch, submip_solver="highs", rins_seconds=5)
+    assert search.rins_fixing_rate == 1.0
+    search.submip_budget = 5.0
+    # Nothing found at once: the box was too small, so fewer fixings.
+    search.adapt_rins_fixing(False, 0.02)
+    assert search.rins_fixing_rate == pytest.approx(jm._RINS_FIXING_STEP)
+    for _ in range(20):
+        search.adapt_rins_fixing(False, 0.02)
+    assert search.rins_fixing_rate == jm._RINS_MIN_FIXING
+    # A find keeps the rate; a job that runs out of time raises it.
+    search.adapt_rins_fixing(True, 0.02)
+    assert search.rins_fixing_rate == jm._RINS_MIN_FIXING
+    for _ in range(20):
+        search.adapt_rins_fixing(False, 5.0)
+    assert search.rins_fixing_rate == 1.0
+
+
+def test_rins_box_fixes_a_share_of_the_agreeing_integers(monkeypatch):
+    mip = generalised_assignment()
+    search = search_for(mip, monkeypatch, submip_solver="highs", rins_seconds=5)
+    ints = search.is_int
+    incumbent = np.zeros(mip.num_variables)
+    search.incumbent = (float(mip.c @ incumbent), incumbent)
+    x = incumbent.copy()  # agrees everywhere
+    lower, upper = search.rins_box(x, 5.0)
+    assert np.array_equal((lower == upper) & ints, ints)
+    search.rins_fixing_rate = 0.5
+    lower, upper = search.rins_box(x, 5.0)
+    fixed = (lower == upper) & ints
+    assert 0 < fixed.sum() < ints.sum()
+    assert np.array_equal(lower[fixed], incumbent[fixed])
+    free = ints & ~fixed
+    assert np.array_equal(lower[free], mip.lower[free])
+    assert np.array_equal(upper[free], mip.upper[free])
 
 
 def test_rins_in_the_search():
@@ -2913,6 +3083,53 @@ def test_tree_cuts_per_round_must_be_positive():
     for name in ("tree_cut_rows", "tree_cut_nnz"):
         with pytest.raises(ValueError, match=name):
             solve(knapsack(), tree_cuts=True, **{name: 0})
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_tree_cuts_separated_on_a_worker(batch_size):
+    mip = generalised_assignment(2)
+    result = solve(
+        mip, tree_cuts=True, tree_cut_every=1, gomory_cuts=False,
+        tree_cut_async=True, batch_size=batch_size,
+    )
+    assert_solved(result, mip, reference(mip))
+    assert result["tree_cut_async_jobs"] > 0
+    off = solve(
+        mip, tree_cuts=True, tree_cut_every=1, gomory_cuts=False,
+        tree_cut_async=False, batch_size=batch_size,
+    )
+    assert off["tree_cut_async_jobs"] == 0
+    # The refreshes' time is wall time within the run: a clock mixed up
+    # with another (time.time() less a perf_counter()) once made it ~1.7e9 s,
+    # which stopped every refresh after the first past the grace seconds.
+    for run in (result, off):
+        assert 0.0 <= run["tree_cut_seconds"] <= run["seconds"]
+        timing = run["batch_timing"]
+        assert all(0.0 <= value <= run["seconds"] for value in timing.values())
+
+
+def test_worker_cuts_are_dropped_after_a_restart(monkeypatch):
+    from concurrent.futures import Future
+
+    mip = generalised_assignment(2)
+    search = search_for(mip, monkeypatch, tree_cuts=True, tree_cut_async=True)
+    x = np.zeros(mip.num_variables)
+    found = [(x, ["cut"], ["cut"])]
+
+    def finished():
+        future = Future()
+        future.set_result(found)
+        return future
+
+    # Running: nothing yet, and the job stays.
+    search._cut_job = (Future(), search.base)
+    assert search.collect_cut_job() == [] and search._cut_job is not None
+    # Finished for the rows searched now: its cuts.
+    search._cut_job = (finished(), search.base)
+    assert search.collect_cut_job() == found and search._cut_job is None
+    # Finished for rows a restart has since replaced: dropped.
+    search._cut_job = (finished(), object())
+    assert search.collect_cut_job() == [] and search._cut_job is None
 
 
 def test_tree_cut_pool_size_follows_the_options(monkeypatch):
@@ -4859,6 +5076,64 @@ def test_auto_batch_size_follows_the_device(monkeypatch):
         solve(general_integer(), batch_size="big")
 
 
+def test_auto_batch_size_fits_the_free_memory():
+    n, m, nnz = 20_000, 5_000, 120_000
+    member = 4 * (16 * (n + m) + 4 * nnz)  # float32 words of a node LP
+    share = jm._AUTO_BATCH_MEMORY_SHARE
+    # Plenty of memory: the cap, a power of two.
+    assert jm.auto_batch_size(n, m, nnz, 1e12) == jm._AUTO_BATCH_ACCELERATOR
+    assert jm.auto_batch_size(n, m, nnz, 1e12, largest=100) == 64
+    # Exactly 16 members' worth (within the share), then just under.
+    assert jm.auto_batch_size(n, m, nnz, 16 * member / share) == 16
+    assert jm.auto_batch_size(n, m, nnz, 16 * member / share - 1) == 8
+    # Wider words take more; no memory at all still leaves one node.
+    assert jm.auto_batch_size(n, m, nnz, 16 * member / share, itemsize=8) == 8
+    assert jm.auto_batch_size(n, m, nnz, 0) == 1
+    # The children kernels count only when they would run at that size.
+    kernel = jm._AUTO_BATCH_CHILD_BYTES * 2**17
+    free = 16 * (member + kernel) / share
+    on = jm.auto_batch_size(n, m, nnz, free, kernel_nnz=2**17, children=lambda b: True)
+    assert on == 16
+    off_above_16 = jm.auto_batch_size(
+        n, m, nnz, free, kernel_nnz=2**17, children=lambda b: b <= 16
+    )
+    assert off_above_16 == 32  # 32 fits without them
+
+
+class _FakeDevice:
+    platform = "gpu"
+
+    def __init__(self, stats):
+        self.stats = stats
+
+    def memory_stats(self):
+        return self.stats
+
+
+def test_auto_batch_size_reads_the_device(monkeypatch):
+    mip = general_integer()
+    search = search_for(mip, monkeypatch, batch_size=1)
+    # A device that reports no memory: the fixed accelerator size.
+    search.device = _FakeDevice(None)
+    assert search.auto_batch_size(mip, "auto") == jm._AUTO_BATCH_ACCELERATOR
+    # One that reports its memory: what fits, counting the tree cut block.
+    free = 2e6
+    search.device = _FakeDevice({"bytes_limit": free + 5e5, "bytes_in_use": 5e5})
+    got = search.auto_batch_size(mip, "numpy")
+    rows = max(jm._TREE_CUT_MIN_ROWS, 2 * search.max_tree_cuts_per_round)
+    if search.tree_cut_rows is not None:
+        rows = search.tree_cut_rows
+    n = mip.num_variables
+    cut_nnz = jm._next_power_of_two(
+        search.tree_cut_nnz or max(256, rows * min(n, 16))
+    )
+    itemsize = np.dtype(mip.lp.c.dtype).itemsize
+    expected = jm.auto_batch_size(
+        n, mip.A.shape[0] + rows, mip.A.nnz + cut_nnz, free, itemsize
+    )
+    assert got == expected and 1 <= got < jm._AUTO_BATCH_ACCELERATOR
+
+
 def test_truncated_defaults_do_not_requeue(monkeypatch):
     search = search_for(general_integer(), monkeypatch, batch_size=4)
     assert search.batch_epochs == 2 and search.batch_node_epochs == 2
@@ -6030,6 +6305,43 @@ def test_highs_rins_and_crossover_in_the_search(make):
     assert result["crossover_finds"] <= result["crossover_calls"]
     off = jm.solve(mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0)
     assert off["rins_calls"] == off["crossover_calls"] == off["submip_lane_seconds"] == 0
+
+
+@pytest.mark.parametrize("make", [facility_location, generalised_assignment])
+def test_exact_side_bound_is_exact_bound(monkeypatch, make):
+    # The lane's threads bound with ``_exact_side_bound``; the search's own
+    # ``vertex_terms`` + ``bound_over`` must give the very same numbers.
+    mip = make()
+    search = search_for(mip, monkeypatch, batch_size=1)
+    rng = np.random.default_rng(0)
+    m_eq, m_ineq = search.mip.n_eq, search.m_ineq
+    for trial in range(20):
+        dual = types.SimpleNamespace(
+            dual_eq=rng.normal(size=m_eq),
+            dual_ineq=np.abs(rng.normal(size=m_ineq)) * (rng.random(m_ineq) < 0.5),
+        )
+        lower, upper = search.mip.lower.copy(), search.mip.upper.copy()
+        if trial % 2:
+            upper[~search.is_int] = np.inf  # infinite bounds: round-off zeroing
+        old = search.bound_over(search.vertex_terms(dual, lower, upper), lower, upper)
+        new = jm._exact_side_bound(
+            search.mip, search.A_T, dual.dual_eq, dual.dual_ineq,
+            lower, upper, search.is_int, search.reduced_cost_tol,
+        )
+        assert new == old
+        assert search.exact_bound(dual, lower, upper) == old
+
+
+@pytest.mark.parametrize("make", [generalised_assignment, lambda: coverage_chains(1)])
+def test_exact_lane_bounds_on_its_threads(make):
+    mip = make()
+    result = solve(
+        mip, exact_nodes=2, exact_band=0.5, batch_size=4, cuts=False,
+        probing=False, exact_root_candidates=0,
+    )
+    assert_solved(result, mip, reference(mip))
+    assert result["exact_nodes"]["solved"] > 0
+    assert result["exact_bounds_reused"] > 0
 
 
 @pytest.mark.parametrize(

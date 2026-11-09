@@ -66,14 +66,18 @@ print(
 # %% [markdown]
 # ## Branch and bound
 # `jm.solve`'s defaults are the setup tuned on map06:
-# - float32 PDHG LPs, with node LPs 32 a batch on the device, each cut
+# - float32 PDHG LPs, with node LPs batched on the device (`batch_size="auto"`:
+#   as many as fit in a GPU's free memory, up to 128; 32 on a CPU), each cut
 #   short after 4 epochs, and short plunges (4 steps), so batches stay full;
 # - no root cuts, probing or symmetry detection;
 # - the feasibility jump (at the root, then on a background thread), with
-#   repair of its near misses;
+#   repair of its near misses; integers an equality row defines (such as
+#   start times `S_j = Σ_t t·x_jt`) are substituted out of its rows;
 # - RINS and crossover as HiGHS sub-MIPs on a CPU thread: the integers on
 #   which the incumbent and a node point (RINS) or several solutions
-#   (crossover) agree are fixed, and HiGHS searches the rest;
+#   (crossover) agree are fixed, and HiGHS searches the rest; when RINS's
+#   boxes come back empty at once, it fixes only a share of them (its
+#   fixing rate, down to 40%);
 # - 16 CPU threads that solve the nodes within a quarter of the gap of the
 #   global bound exactly with HiGHS's dual simplex and strong-branch them
 #   (8 candidates, up to 5,000 pivots a side), while the device batches
@@ -88,11 +92,7 @@ result = jm.solve(
     verbose=True,
     log_every_seconds=10,
     device=DEVICE,
-    batch_size=128,
     presolve=True,
-    block_decomposition=True,
-    exact_band=1.0,
-    exact_overflow_share=0.0,
 )
 print(f"Status: {result['status']}")
 exact = result["exact_nodes"]
@@ -113,7 +113,8 @@ print(
 )
 print(
     f"Sub-MIPs (HiGHS): RINS {result['rins_finds']} finds in {result['rins_calls']} "
-    f"calls, crossover {result['crossover_finds']} finds in "
+    f"calls (fixing rate {result['rins_fixing_rate']:.2f}), crossover "
+    f"{result['crossover_finds']} finds in "
     f"{result['crossover_calls']} calls, {result['submip_lane_seconds']:.1f}s"
 )
 print(f"Bound: {result['bound']:.6g}")

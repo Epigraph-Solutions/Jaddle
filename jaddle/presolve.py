@@ -297,3 +297,131 @@ def _eliminate_pass(
         ub_rows=np.flatnonzero(need_ub),
     )
     return reduced, offset, postsolve, fill
+
+
+class DefinedIntegers:
+    """A MIP's rows with the integers its equality rows define substituted
+    out (``defined_integers``), for a search that moves one variable at a
+    time, such as feasibility jump.
+
+    Each eliminated ``z`` is ``E_z·x + const_z`` over the kept columns. The
+    rows are, in order: the equality rows that define nothing, the
+    inequality rows (``<= b``) with each ``z`` replaced, and one row
+    ``E_z·x`` per ``z`` whose bounds come from ``z``'s (``rows``), so the
+    rows hold for whatever box the caller searches. ``A`` is over the kept
+    columns (``keep``); ``primal`` maps a point back.
+    """
+
+    def __init__(self, A, b, n_eq, rows, cols):
+        A = sp.csr_matrix(A, dtype=np.float64)
+        b = np.asarray(b, np.float64)
+        n = A.shape[1]
+        rows, cols = np.asarray(rows, np.int64), np.asarray(cols, np.int64)
+        piv = np.asarray(A[rows, cols], np.float64).ravel()
+        R = A[rows].tolil()
+        R[np.arange(rows.size), cols] = 0.0
+        # z_J = E @ x + const; E is zero on the eliminated columns, since each
+        # z sits in one equality row only.
+        E = sp.csr_matrix(-sp.diags(1.0 / piv) @ R.tocsr())
+        E.eliminate_zeros()
+        const = b[rows] / piv
+        keep_rows = np.setdiff1d(np.arange(n_eq), rows)
+        A_ineq = A[n_eq:]
+        W = sp.csr_matrix(A_ineq[:, cols])
+        A_ineq = sp.csr_matrix(A_ineq + W @ E)
+        b_ineq = b[n_eq:] - W @ const
+        self.n_full = n
+        self.elim = cols
+        self.keep = np.setdiff1d(np.arange(n), cols)
+        self.E, self.const = E, const
+        self.n_eq = keep_rows.size
+        A_out = sp.vstack([A[keep_rows], A_ineq, E], format="csc")[:, self.keep]
+        self.A = sp.csr_matrix(A_out)
+        self.A.eliminate_zeros()
+        k = rows.size
+        self.row_lower = np.concatenate(
+            [b[keep_rows], np.full(b_ineq.size, -np.inf), np.full(k, -np.inf)]
+        )
+        self.row_upper = np.concatenate([b[keep_rows], b_ineq, np.full(k, np.inf)])
+        # Each row's size, for its tolerance (``1 + |b|``); the bound rows,
+        # like bounds, get the absolute tolerance.
+        self.b = np.concatenate([b[keep_rows], b_ineq, np.zeros(k)])
+
+    def __len__(self):
+        return self.elim.size
+
+    def rows(self, lower, upper):
+        """``(row_lower, row_upper)`` with the eliminated integers' bound
+        rows set from the box ``lower``/``upper`` (over all columns)."""
+        k = self.elim.size
+        row_lower, row_upper = self.row_lower.copy(), self.row_upper.copy()
+        row_lower[-k:] = np.asarray(lower, np.float64)[self.elim] - self.const
+        row_upper[-k:] = np.asarray(upper, np.float64)[self.elim] - self.const
+        return row_lower, row_upper
+
+    def primal(self, x):
+        """The point over all columns from one over the kept columns."""
+        full = np.zeros(self.n_full)
+        full[self.keep] = np.asarray(x, np.float64)
+        full[self.elim] = self.E @ full + self.const
+        return full
+
+
+def defined_integers(A, b, n_eq, c, integrality, lower, upper, max_fill=1.0):
+    """The integers that equality rows define, substituted out
+    (``DefinedIntegers``), or ``None`` when there are none.
+
+    A row ``a_z z + r·x = b`` (one of the first ``n_eq`` rows of ``A``; the
+    rest are ``<= b``) defines ``z`` when ``z`` is an integer with zero
+    cost, ``|a_z| = 1``, ``z`` is in no other equality row, and every other
+    entry is an integer coefficient on an integer variable, with ``b`` an
+    integer. Then ``z = (b − r·x) / a_z`` is an integer at every integer
+    ``x``, so it can be dropped and recomputed. ``z`` must be a general
+    integer (``upper − lower > 1`` over the box ``lower``/``upper``): a
+    binary in a row ``Σ x = 1`` passes the other tests, but that row
+    chooses among its variables rather than defining one of them, and
+    substituting it turns the choice into packing rows. Time-indexed scheduling
+    models are full of these: on 30n20b8, 57 start times
+    ``S_j = Σ_t t·x_jt``. A search that moves one variable at a time cannot
+    change such a row's ``x`` without breaking it, and moving ``S_j`` too
+    breaks the precedence rows ``S_i <= S_j``; feasibility jump stalled
+    there with a few rows violated, and found points in seconds once the
+    start times were gone.
+
+    Of a row's candidates, the one in fewest inequality rows goes. The
+    nonzeros added (each ``z``'s row times its inequality uses plus its
+    bound row) are capped at ``max_fill`` times ``A``'s.
+    """
+    A = sp.csr_matrix(A, dtype=np.float64)
+    A.eliminate_zeros()
+    b = np.asarray(b, np.float64)
+    c = np.asarray(c, np.float64)
+    ints = np.asarray(integrality, bool)
+    general = ints & (np.asarray(upper, np.float64) - np.asarray(lower, np.float64) > 1.0)
+    n = A.shape[1]
+    split = A.indptr[n_eq]
+    eq_uses = np.bincount(A.indices[:split], minlength=n)
+    ineq_uses = np.bincount(A.indices[split:], minlength=n)
+    budget = max_fill * A.nnz
+    rows, cols, fill = [], [], 0
+    for i in range(n_eq):
+        start, end = A.indptr[i], A.indptr[i + 1]
+        if end - start < 2 or b[i] != np.round(b[i]):
+            continue
+        idx, val = A.indices[start:end], A.data[start:end]
+        if not (ints[idx].all() and np.all(val == np.round(val))):
+            continue
+        ok = (np.abs(val) == 1.0) & general[idx] & (eq_uses[idx] == 1) & (c[idx] == 0.0)
+        if not ok.any():
+            continue
+        cand = np.flatnonzero(ok)
+        j = idx[cand[np.argmin(ineq_uses[idx[cand]])]]  # first of the fewest
+        cost = (end - start - 1) * (ineq_uses[j] + 1)
+        if fill + cost > budget:
+            continue
+        fill += cost
+        rows.append(i)
+        cols.append(j)
+    if not rows:
+        return None
+    return DefinedIntegers(A, b, n_eq, rows, cols)
