@@ -3812,7 +3812,11 @@ class CutSeparator:
         integrality=None,
         implied_bounds=None,
         implied_variable_bounds=True,
+        device=None,
     ):
+        # The JAX device the batched searches run on (``None``: the default
+        # one where the call is made).
+        self.device = device
         self.flow_covers = flow_covers  # also flow cover cuts (``flow_cover_cut``)
         # Also implied-bound cuts from this ``ImpliedBounds`` (built over
         # bounds no looser than ``lower``/``upper``), and with
@@ -3873,8 +3877,15 @@ class CutSeparator:
         """Cuts violated by ``x``, as ``(family, idx, coef, rhs)``. With
         ``backend="jax"`` and at least ``_SEPARATION_MIN_BATCH`` base
         inequalities, the c-MIR and flow cover searches run batched
-        (``batched_cmir_cuts``, ``batched_flow_cover_cuts``) and give the
-        same cuts as the per-row numpy searches."""
+        (``batched_cmir_cuts``, ``batched_flow_cover_cuts``), on ``device``
+        when one is given, and give the same cuts as the per-row numpy
+        searches."""
+        if self.device is None:
+            return self._separate(x)
+        with jax.default_device(self.device):
+            return self._separate(x)
+
+    def _separate(self, x):
         x = np.asarray(x, np.float64)
         jobs = []  # per (row, sense): its covers and its aggregation path
         for r in self.tight_rows(x):
@@ -4228,6 +4239,30 @@ def _gram(D):
 
 def _next_power_of_two(k):
     return 1 << max(int(k) - 1, 0).bit_length()
+
+
+# Exact root cut rounds (``exact_cut_loop``): the most rounds a cut stays in
+# the LP slack with a zero dual (as HiGHS keeps them; ``cut_age``, tuned for
+# PDHG's inexact duals, may allow more), and the share of ``max_seconds``
+# the rounds may take.
+_EXACT_CUT_AGE = 10
+_EXACT_CUT_SHARE = 0.25
+
+
+def _cut_rows(cuts, n):
+    """The cuts (``cut_list`` dicts) as an unpadded CSR block ``A x <= b``."""
+    if not cuts:
+        return sp.csr_matrix((0, n)), np.zeros(0)
+    lengths = [cut["idx"].size for cut in cuts]
+    A = sp.csr_matrix(
+        (
+            np.concatenate([np.asarray(cut["coef"], np.float64) for cut in cuts]),
+            np.concatenate([np.asarray(cut["idx"], np.int64) for cut in cuts]),
+            np.concatenate([[0], np.cumsum(lengths)]),
+        ),
+        shape=(len(cuts), n),
+    )
+    return A, np.array([cut["rhs"] for cut in cuts], np.float64)
 
 
 def _cut_block(cuts, n, min_rows=0, min_nnz=0):
@@ -7541,6 +7576,7 @@ class _BranchAndBound:
         plunge_child="score",
         implied_integer_cuts=True,
         separation_backend="jax",
+        separation_device="cpu",
         node_bound_stop=True,
         node_lp_tolerance=None,
         heuristic_effort=0.1,
@@ -7632,6 +7668,7 @@ class _BranchAndBound:
         crossover_min_fixed=0.5,
         objective_levels=True,
         objective_level_seconds=2.0,
+        cut_round_lp="pdhg",
         interrupt=None,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
@@ -7766,6 +7803,14 @@ class _BranchAndBound:
         self.use_coefficient_tightening = coefficient_tightening
         self.coefficients_tightened = 0
         self.cuts, self.cut_rounds = cuts, cut_rounds
+        # The LP the root cut rounds re-solve (``cut_round_lp``): PDHG, or
+        # HiGHS's dual simplex warm from the last basis (``exact_cut_loop``).
+        if cut_round_lp not in ("pdhg", "exact"):
+            raise ValueError(
+                f"cut_round_lp must be 'pdhg' or 'exact', not {cut_round_lp!r}"
+            )
+        self.cut_round_lp = cut_round_lp
+        self.exact_cut_stats = None  # ``result["exact_cut_rounds"]``
         self.max_cuts_per_round, self.cut_min_progress = (
             max_cuts_per_round,
             cut_min_progress,
@@ -7954,6 +7999,16 @@ class _BranchAndBound:
                 f"separation_backend must be 'jax' or 'numpy', not {separation_backend!r}"
             )
         self.separation_backend = separation_backend
+        # Where the batched separation kernels run (``separation_device``):
+        # they run in float64, which consumer GPUs are slow at, on rows
+        # small enough that the transfers cost more than the work.
+        if separation_device not in ("cpu", "search"):
+            raise ValueError(
+                f"separation_device must be 'cpu' or 'search', not {separation_device!r}"
+            )
+        self.separation_device = (
+            jax.devices("cpu")[0] if separation_device == "cpu" else None
+        )
         # Node LPs stop once their Lagrangian bound passes the cutoff.
         self.node_bound_stop = bool(node_bound_stop)
         self.bound_stops = 0
@@ -11013,6 +11068,7 @@ class _BranchAndBound:
             "crossover_finds": self.crossover_finds,
             "submip_lane_seconds": self.submip_lane_seconds,
             "objective_levels": self.level_stats(),
+            "exact_cut_rounds": self.exact_cut_stats,
             "conflicts": (
                 dict(self.conflicts.added)
                 if self.conflicts is not None
@@ -11216,7 +11272,14 @@ class _BranchAndBound:
         bound gains less than ``cut_min_progress`` over the last three:
         relative to the gap to the incumbent when there is one, else to the
         bound. Also stops when a re-solve's bound reaches the cutoff
-        (``root_resolve``). Returns the last root LP result."""
+        (``root_resolve``). Returns the last root LP result.
+
+        With ``cut_round_lp="exact"`` the rounds run on HiGHS's dual simplex
+        instead (``exact_cut_loop``), unless it cannot solve the root LP."""
+        if self.cut_round_lp == "exact":
+            out = self.exact_cut_loop(lower, upper, result)
+            if out is not None:
+                return out
         base = self.base
         n = base.num_variables
         base_m = base.A.shape[0] - base.n_eq
@@ -11335,6 +11398,11 @@ class _BranchAndBound:
             new_bound, _ = self.lp_bound(result["solution"], lower, upper)
             bound = max(bound, new_bound)
             history.append(bound)
+            # The root's bound (the global one until it is evaluated), and
+            # the progress line at its usual pace.
+            if np.isfinite(bound):
+                self.active_bound = max(self.active_bound, self.round_bound(bound))
+            self.log(" ", None)
             # Progress comes in bursts (and a short re-solve's bound can dip),
             # so judge it over three rounds, once three have run. With an
             # incumbent it is judged against the gap left: on rmine13 the
@@ -11355,6 +11423,229 @@ class _BranchAndBound:
             and not self.out_of_time()
         ):
             # The rounds stopped early; the tree starts from a converged root.
+            result = self.root_resolve(
+                lower,
+                upper,
+                (result["solution"], result["opt_state"]),
+                self.root_max_epochs,
+            )
+        return result
+
+    def exact_cut_loop(self, lower, upper, result):
+        """
+        ``cut_loop``'s rounds on exact LPs (``cut_round_lp="exact"``): one
+        HiGHS dual simplex holds the searched rows and the cuts, added and
+        dropped as rows, so each re-solve starts from the last basis. Each
+        round separates at the exact vertex (Gomory cuts from its basis)
+        with ``cut_loop``'s separators, selection, pool, ageing
+        (``cut_age``, at most ``_EXACT_CUT_AGE``), row cap (``max_cut_rows``)
+        and stopping rule, for up to ``cut_rounds`` rounds and
+        ``_EXACT_CUT_SHARE`` of ``max_seconds``. The kept cuts then go into the PDHG root
+        LP, re-solved warm from HiGHS's solution, so the tree starts as
+        after ``cut_loop``.
+
+        Each round cuts off only its own point, so the bound builds over
+        many rounds, and PDHG re-solves of ``cut_round_epochs`` give
+        inexact points to separate from. On beasleyC3, Jaddle's separators
+        at exact points reach 718 in 40 rounds (HiGHS's root: 733); ten
+        PDHG rounds took 46 s to reach 661. Returns the root LP result, or
+        ``None`` when HiGHS cannot solve the root LP (``cut_loop`` then
+        runs on PDHG).
+        """
+        import highspy
+
+        started = time.time()
+        base = self.base
+        n = base.num_variables
+        base_rows = base.A.shape[0]
+        base_m = base_rows - base.n_eq
+        lower = np.asarray(lower, np.float64)
+        upper = np.asarray(upper, np.float64)
+        highs = _highs_rows(base)
+        highs.changeColsBounds(n, np.arange(n, dtype=np.int32), lower, upper)
+        optimal = highspy.HighsModelStatus.kOptimal
+        seconds = {"lp": 0.0, "gomory": 0.0, "separation": 0.0}
+
+        def solve():
+            """The LP's vertex, duals (Jaddle's convention) and value, or
+            ``None`` (not optimal: infeasible, out of time or failed)."""
+            limit = 60.0 if self.deadline is None else self.deadline - time.time()
+            if limit <= 0:
+                return None
+            highs.setOptionValue("time_limit", highs.getRunTime() + limit)
+            solve_started = time.time()
+            highs.run()
+            seconds["lp"] += time.time() - solve_started
+            if highs.getModelStatus() != optimal:
+                return None
+            x = np.asarray(highs.getSolution().col_value, np.float64)
+            y_eq, y_ineq = _jaddle_duals(highs, base)
+            return x, y_eq, y_ineq, float(highs.getInfo().objective_function_value)
+
+        def rows_and_bound(solved):
+            """The LP's rows (the searched ones, then the cuts) and the
+            Lagrangian bound of the solve's duals over the box: valid at any
+            duals, so it holds however exact HiGHS's are."""
+            cuts_A, cuts_b = _cut_rows(self.cut_list, n)
+            A_rows = sp.vstack([sp.csr_matrix(base.A), cuts_A]).tocsr()
+            b_rows = np.concatenate([np.asarray(base.b, np.float64), cuts_b])
+            _, y_eq, y_ineq, _ = solved
+            terms = lagrangian_terms(
+                np.asarray(base.c, np.float64),
+                A_rows,
+                b_rows,
+                base.n_eq,
+                np.concatenate([y_eq, y_ineq]),
+            )
+            return A_rows, b_rows, box_bound(*terms, lower, upper)[0]
+
+        def raise_root_bound(value):
+            """The root's bound (the global one until it is evaluated) up to
+            ``value``, and the progress line (at its usual pace)."""
+            if np.isfinite(value):
+                self.active_bound = max(self.active_bound, self.round_bound(value))
+            self.log(" ", None)
+
+        solved = solve()
+        if solved is None:
+            return None
+        A_rows, b_rows, value = rows_and_bound(solved)
+        raise_root_bound(value)
+        separators = [self.separator(base, lower, upper)]
+        if self.original is not base:
+            separators.append(self.separator(self.original, lower, upper))
+        bound, _ = self.lp_bound(result["solution"], lower, upper)
+        self.root_bound_before_cuts = bound
+        history = [solved[3]]
+        warm = (result["solution"], result["opt_state"])  # for the heuristics
+        self.cut_list = []
+        rounds = 0
+        # Exact duals show a cut idle for good sooner than PDHG's.
+        age_limit = min(self.cut_age, _EXACT_CUT_AGE)
+        stop_at = None
+        if self.deadline is not None:
+            stop_at = started + _EXACT_CUT_SHARE * (self.deadline - self.start)
+        for round_number in range(1, self.cut_rounds + 1):
+            if self.out_of_time() or (stop_at is not None and time.time() > stop_at):
+                break
+            self.collect_heuristics()
+            round_started = time.time()
+            x = solved[0]
+            candidates = []
+            if self.gomory:
+                gomory_started = time.time()
+                candidates += gomory_cuts(
+                    A_rows,
+                    b_rows,
+                    base.n_eq,
+                    lower,
+                    upper,
+                    self.cut_int,
+                    highs.getBasis(),
+                    x,
+                    max_cuts=self.gomory_candidates or 2 * self.max_cuts_per_round,
+                    max_nnz=None,
+                )
+                seconds["gomory"] += time.time() - gomory_started
+            if round_number > 1:
+                self.round_heuristics(
+                    x, lower, upper, warm, 0.1 * (time.time() - round_started)
+                )
+            separation_started = time.time()
+            for separator in separators:
+                candidates += separator(x)
+            candidates += self.zero_half(x, lower, upper, 2 * self.max_cuts_per_round)
+            inout = self.inout_candidates(
+                separators, x, lower, upper, 2 * self.max_cuts_per_round
+            )
+            candidates += inout or []
+            found = select_cuts(candidates, x, n, max_cuts=self.max_cuts_per_round)
+            self.inout_result(found, inout)
+            self.archive_cuts(found)
+            self.pool_cuts(violated_cuts(candidates, x))
+            self.pool_cuts(found)
+            seconds["separation"] += time.time() - separation_started
+            if not found:
+                break
+            binding = [cut["age"] < age_limit for cut in self.cut_list]
+            if self.max_cut_rows is not None:
+                found = self.cap_cut_rows(binding, found)
+                if not found:
+                    break  # the binding cuts fill the room
+            drop = [base_rows + i for i, keep in enumerate(binding) if not keep]
+            if drop:
+                highs.deleteRows(len(drop), np.array(drop, np.int32))
+            new = [
+                dict(family=family, idx=idx, coef=coef, rhs=rhs, age=0)
+                for family, idx, coef, rhs in found
+            ]
+            self.cut_list = [
+                cut for cut, keep in zip(self.cut_list, binding) if keep
+            ] + new
+            add_A, add_b = _cut_rows(new, n)
+            highs.addRows(
+                len(new),
+                np.full(len(new), -np.inf),
+                add_b,
+                add_A.nnz,
+                add_A.indptr[:-1].astype(np.int32),
+                add_A.indices.astype(np.int32),
+                add_A.data.astype(np.float64),
+            )
+            rounds += 1
+            solved = solve()
+            if solved is None:
+                # Infeasible with the cuts, or out of time: the PDHG re-solve
+                # below bounds it (an infeasible LP's bound passes the cutoff).
+                break
+            self.age_cuts_at(solved[0], solved[2][base_m:])
+            A_rows, b_rows, value = rows_and_bound(solved)
+            raise_root_bound(value)
+            history.append(max(history[-1], solved[3]))
+            if len(history) < 4:
+                continue
+            gain = history[-1] - history[-4]
+            scale = max(1.0, abs(history[-1] + self.mip.offset))
+            if self.incumbent is not None:
+                scale = min(scale, max(1e-9 * scale, self.incumbent[0] - history[-1]))
+            if not np.isfinite(gain) or gain <= self.cut_min_progress * scale:
+                break
+        self.exact_cut_stats = {
+            "rounds": rounds,
+            "cuts": len(self.cut_list),
+            "lp_bound": None if solved is None else self.model_value(solved[3]),
+            "seconds": time.time() - started,
+            **{f"{key}_seconds": value for key, value in seconds.items()},
+        }
+        if not self.cut_list:
+            return result
+        # Into the PDHG root LP, warm from HiGHS's vertex and duals (the
+        # last solve's; cuts added after a failed one start at zero).
+        A_cuts, b_cuts = _cut_block(self.cut_list, n)
+        self.set_mip(base.with_rows(A_cuts, b_cuts))
+        template = result["solution"]
+        dual_ineq = np.zeros(base_m + A_cuts.shape[0])
+        dual_eq = np.zeros(np.shape(template.dual_eq)[0])
+        x = np.asarray(template.primal, np.float64)
+        if solved is not None:
+            x, y_eq, y_ineq, _ = solved
+            dual_ineq[: y_ineq.size] = y_ineq
+            dual_eq[: y_eq.size] = y_eq
+            self.root_vertex_x = x
+        warm_state = template._replace(
+            primal=x, dual_eq=dual_eq, dual_ineq=jnp.asarray(dual_ineq)
+        )
+        result = self.root_resolve(
+            lower, upper, (warm_state, result["opt_state"]), self.root_max_epochs
+        )
+        if result["stop_reason"] in ("interrupted", "time_limit", "bound_target"):
+            return result
+        result = self.compact_cuts(lower, upper, result)
+        if (
+            not result["converged"]
+            and result["stop_reason"] != "bound_target"
+            and not self.out_of_time()
+        ):
             result = self.root_resolve(
                 lower,
                 upper,
@@ -11632,8 +11923,14 @@ class _BranchAndBound:
         with a dual of at most ``1e-9`` of the largest. Any other re-solve
         resets it to 0."""
         base_m = self.base.A.shape[0] - self.base.n_eq
-        y = np.asarray(solution.dual_ineq, np.float64)[base_m:]
-        x = np.asarray(solution.primal, np.float64)
+        self.age_cuts_at(
+            np.asarray(solution.primal, np.float64),
+            np.asarray(solution.dual_ineq, np.float64)[base_m:],
+        )
+
+    def age_cuts_at(self, x, y):
+        """``age_cuts`` at the point ``x`` with ``y`` the cut rows' duals
+        (in ``cut_list`` order)."""
         y_scale = 1e-9 * (1.0 + np.abs(y).max(initial=0.0))
         for i, cut in enumerate(self.cut_list):
             slack = cut["rhs"] - cut["coef"] @ x[cut["idx"]]
@@ -11814,6 +12111,7 @@ class _BranchAndBound:
             max_aggregation=self.max_aggregation,
             flow_covers=self.use_flow_covers,
             backend=self.separation_backend,
+            device=self.separation_device,
             conflict_graph=graph,
             integrality=self.cut_int,
             implied_bounds=implied,
@@ -15341,6 +15639,7 @@ def solve(
     plunge_child="rounding",
     implied_integer_cuts=True,
     separation_backend="jax",
+    separation_device="cpu",
     node_bound_stop=True,
     node_lp_tolerance=1e-3,
     heuristic_effort=0.3,
@@ -15470,6 +15769,7 @@ def solve(
     crossover_min_fixed=0.5,
     objective_levels=True,
     objective_level_seconds=2.0,
+    cut_round_lp="pdhg",
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -15673,6 +15973,20 @@ def solve(
       Lagrangian bound holds at any duals; the root is solved to convergence
       once the rounds end. On lseu that cuts the root from 17s to 7s (bound
       1,091 → 1,095).
+      With ``cut_round_lp="exact"`` (default ``"pdhg"``) the rounds re-solve
+      with HiGHS's dual simplex instead, warm from the last basis, with the
+      cuts added and dropped as rows (``exact_cut_loop``): each round
+      separates at an exact vertex, Gomory cuts come from its basis without
+      a crossover, and a cut leaves once idle for ``min(cut_age, 10)``
+      rounds. The rounds stop as above, or after 25% of ``max_seconds``;
+      the kept cuts then go into the PDHG root LP, re-solved warm from
+      HiGHS's solution. Each round cuts off only its own point, so the
+      bound builds over many rounds: on beasleyC3 (with ``cut_rounds=60``)
+      21 exact rounds took the root from 238 to 717–728 in 47 s, where ten
+      PDHG rounds took 46 s to reach 661 (HiGHS's root: 733). Results:
+      ``exact_cut_rounds`` (``None`` unless they ran: ``rounds``, ``cuts``,
+      the last ``lp_bound``, ``seconds``, and the ``lp_seconds``,
+      ``gomory_seconds`` and ``separation_seconds`` within them).
       Cover and MIR cuts follow from a row and the bounds alone, so they
       are valid whatever the LP point's accuracy; Gomory cuts rest on the
       crossover's basis, which HiGHS proves optimal, and skip tableau rows
@@ -15686,7 +16000,13 @@ def solve(
       ``batched_flow_cover_cuts``), with the same cuts as the per-row numpy
       searches (``"numpy"``) up to rounding in near-ties. Per round that is
       2.4× faster on fixnet6 and 4× on vpm2; the first calls compile a few
-      shapes (one or two seconds, then cached on disk).
+      shapes (one or two seconds, then cached on disk). They run on the
+      CPU (``separation_device="cpu"``, the default; ``"search"``: on the
+      search's device): float64 is slow on consumer GPUs, and the
+      transfers cost more than the work on rows this small. On beasleyC3
+      (GPU search) a round's separation went from 1.6 s to 1.0 s, and the
+      exact cut rounds fit 22 rounds (root 728.5) where they had fit 19
+      (718).
       Clique cuts (``clique_cuts``, on by default; family ``"clique"``)
       come from a conflict graph on the binaries (``ConflictGraph``), built
       once from the rows over the root box: two literals (``x_j`` or
@@ -16495,6 +16815,7 @@ def solve(
         plunge_child=plunge_child,
         implied_integer_cuts=implied_integer_cuts,
         separation_backend=separation_backend,
+        separation_device=separation_device,
         node_bound_stop=node_bound_stop,
         node_lp_tolerance=node_lp_tolerance,
         heuristic_effort=heuristic_effort,
@@ -16558,6 +16879,7 @@ def solve(
         crossover_min_fixed=crossover_min_fixed,
         objective_levels=objective_levels,
         objective_level_seconds=objective_level_seconds,
+        cut_round_lp=cut_round_lp,
     )
     return _solve_model(
         model, presolve, precision, highs_options, feasibility_tolerance, settings
@@ -16708,6 +17030,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "crossover_finds": 0,
             "submip_lane_seconds": 0.0,
             "objective_levels": None,
+            "exact_cut_rounds": None,
             "mip_start_accepted": None if mip_start is None else start_x is not None,
             "one_opt_finds": 0,
             "plunges_stopped": 0,

@@ -7533,3 +7533,106 @@ def test_sub_searches_leave_the_levels_to_their_parent(monkeypatch):
     finally:
         search.level_lane.shutdown()
     assert made == [True, False]
+
+
+# %% Exact root cut rounds (cut_round_lp="exact")
+@pytest.mark.parametrize(
+    "make", [facility_location, generalised_assignment, lambda: fixed_charge()[0]]
+)
+def test_exact_cut_rounds_solve(make, monkeypatch):
+    mip = make()
+    ref = reference(mip)
+    held = []  # the rounds' HiGHS instance, and its rows when the loop ends
+    real_rows = jm._highs_rows
+    real_loop = jm._BranchAndBound.exact_cut_loop
+
+    def highs_rows(m):
+        highs = real_rows(m)
+        held.append(highs)
+        return highs
+
+    def exact_cut_loop(self, lower, upper, result):
+        held.clear()
+        self.exact_rows_at_end = []  # stays empty when no cut is kept
+        out = real_loop(self, lower, upper, result)
+        # Rows in step with the cut list: the searched rows, then one per cut.
+        rows = self.base.A.shape[0] + len(self.exact_rows_at_end)
+        assert held[0].getNumRow() == rows
+        return out
+
+    real_compact = jm._BranchAndBound.compact_cuts
+
+    def compact_cuts(self, lower, upper, result):
+        self.exact_rows_at_end = list(self.cut_list)
+        return real_compact(self, lower, upper, result)
+
+    monkeypatch.setattr(jm, "_highs_rows", highs_rows)
+    monkeypatch.setattr(jm._BranchAndBound, "exact_cut_loop", exact_cut_loop)
+    monkeypatch.setattr(jm._BranchAndBound, "compact_cuts", compact_cuts)
+    result = solve(mip, cut_round_lp="exact")
+    assert_solved(result, mip, ref)
+    stats = result["exact_cut_rounds"]
+    if stats["rounds"]:
+        assert stats["cuts"] > 0 and stats["lp_bound"] is not None
+        # The LP with the cuts is still a relaxation.
+        assert mip.sign * (stats["lp_bound"] - ref) <= 1e-6 * (1 + abs(ref))
+
+
+def test_exact_cut_rounds_strengthen_the_root(monkeypatch):
+    mip = facility_location()
+    after_cuts = []
+    real_loop = jm._BranchAndBound.cut_loop
+
+    def cut_loop(self, lower, upper, result):
+        result = real_loop(self, lower, upper, result)
+        after_cuts.append(self.model_value(self.lp_bound(result["solution"], lower, upper)[0]))
+        return result
+
+    monkeypatch.setattr(jm._BranchAndBound, "cut_loop", cut_loop)
+    result = solve(mip, cut_round_lp="exact")
+    root = result["root_bound_before_cuts"]
+    ref = reference(mip)
+    assert result["exact_cut_rounds"]["rounds"] >= 1
+    assert after_cuts[0] > root + 1e-3 * abs(ref - root)
+
+
+def test_exact_cut_rounds_fall_back_to_pdhg(monkeypatch):
+    # When HiGHS cannot solve the root LP, the PDHG rounds run instead.
+    monkeypatch.setattr(jm._BranchAndBound, "exact_cut_loop", lambda self, *a: None)
+    mip = facility_location()
+    result = solve(mip, cut_round_lp="exact")
+    assert_solved(result, mip, reference(mip))
+    assert result["exact_cut_rounds"] is None
+    assert result["cuts"]["mir"] + result["cuts"]["flowcover"] > 0
+
+
+def test_cut_round_lp_must_be_known():
+    with pytest.raises(ValueError, match="cut_round_lp"):
+        solve(facility_location(), cut_round_lp="simplex")
+
+
+# %% Separation device (separation_device)
+def test_separation_on_a_given_device_finds_the_same_cuts():
+    import jax
+
+    mip = facility_location()
+    x = np.asarray(jl.solve(mip.lp)["solution"].primal, np.float64)
+    lower, upper = np.asarray(mip.lower), np.asarray(mip.upper)
+    default = jm.CutSeparator(mip, lower, upper, min_batch=1)(x)
+    on_cpu = jm.CutSeparator(mip, lower, upper, min_batch=1, device=jax.devices("cpu")[0])(x)
+    assert len(default) == len(on_cpu) > 0
+    for (fa, ia, ca, ra), (fb, ib, cb, rb) in zip(default, on_cpu):
+        assert fa == fb and np.array_equal(ia, ib)
+        assert np.allclose(ca, cb) and ra == pytest.approx(rb)
+
+
+def test_separation_device_reaches_the_separators(monkeypatch):
+    import jax
+
+    mip = facility_location()
+    search = search_for(mip, monkeypatch)
+    assert search.separator(search.base, mip.lower, mip.upper).device == jax.devices("cpu")[0]
+    search = search_for(mip, monkeypatch, separation_device="search")
+    assert search.separator(search.base, mip.lower, mip.upper).device is None
+    with pytest.raises(ValueError, match="separation_device"):
+        solve(mip, separation_device="gpu")

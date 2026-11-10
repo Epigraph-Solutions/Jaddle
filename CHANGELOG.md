@@ -34,7 +34,29 @@
   shows each of the 13 levels below 302 empty in at most 2 s, and the
   search now proves 302 optimal in 27 s (GPU, the benchmark's settings).
 
+- Exact root cut rounds (`jm.solve(cut_round_lp="exact")`; default
+  `"pdhg"`; `_BranchAndBound.exact_cut_loop`, `result["exact_cut_rounds"]`).
+  The root's cut rounds re-solve with HiGHS's dual simplex, warm from the
+  last basis, the cuts added and dropped as rows; each round separates at
+  an exact vertex (Gomory cuts from its basis), a cut leaves once idle for
+  `min(cut_age, 10)` rounds, and the rounds take at most 25% of
+  `max_seconds`. The kept cuts then go into the PDHG root LP, warm from
+  HiGHS's solution. On beasleyC3 (benchmark settings with root cuts,
+  `cut_rounds=60`): root 238 → 717–728 in 47 s (PDHG rounds: 661 in 46 s;
+  HiGHS: 733), and 738 after 180 s with `tree_cut_rows=2000` (was 692).
+  The single-node flow-set closure there is only 433 and Jaddle's cuts on
+  its own aggregated rows converge to their exact hulls, so what the
+  rounds lacked was exact points and rounds, not cut strength.
+
 ### Changed
+
+- Cut separation's batched JAX kernels run on the CPU
+  (`jm.solve(separation_device="cpu")`, the new default; `"search"`: on
+  the search's device, as before; `CutSeparator(device=...)`). They run in
+  float64, which consumer GPUs are slow at, on rows small enough that
+  transfers outweigh the work. On beasleyC3 (GPU search, exact cut
+  rounds, 25% of 180 s) the rounds fit 21 (root 719) where they had fit
+  13 (689): separation 1.1 s a round, was 3.0 s.
 
 - `jm.solve(exact_strong_lookahead=k)` (default `None`: off): the exact
   lane's strong branching stops after `k` candidates in a row that do not

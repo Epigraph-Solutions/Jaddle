@@ -148,12 +148,14 @@ def run_jaddle(path, args):
         log_every_seconds=10,
         device=args.device,
         presolve=True,
-        exact_band=0.1,
-        batch_size=128,
+        exact_band="auto",
+        batch_size=8,
         exact_strong_lookahead=8,
         one_opt=True,
         max_seconds=args.max_seconds,
-        tree_cut_every=50,
+        tree_cut_every=100,
+        cut_pool_size=1e5,
+        tree_cut_rows=2000,
     )
     row.update(
         {

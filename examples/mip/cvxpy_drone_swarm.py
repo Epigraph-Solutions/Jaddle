@@ -172,7 +172,7 @@ def either_side(q, q_lo, q_hi, t, sides):
 
 
 # %%
-def build_plan(drones, floors=None):
+def build_plan(drones):
     """The fuel-optimal plan for `drones`, a list of drone indices. Returns
     the problem, the lists of p, v and u variables, and the binary count."""
     p = {i: cp.Variable((T + 1, 2)) for i in drones}
@@ -218,60 +218,13 @@ def build_plan(drones, floors=None):
             )
             constraints += rows
             n_binaries += k
-    for (i, j), floor in (floors or {}).items():
-        constraints.append(fuel[i] + fuel[j] >= floor)
 
     problem = cp.Problem(cp.Minimize(sum(fuel.values())), constraints)
     variables = [[x[i] for i in drones] for x in (p, v, u)]
     return problem, variables, n_binaries
 
 
-# %% [markdown]
-# ## A floor on each pair's fuel
-# Big-M constraints have weak LP relaxations. With its binaries at
-# fractions, a drone can fly straight through the wall and through the other
-# drones: half of it passing on the left, half on the right, and that
-# average costs no extra fuel. So the swarm's LP bound is just the fuel the
-# drones would need if they ignored each other, far below any real plan.
-# This is not a matter of writing each constraint better: even the tightest
-# formulation of each "or" on its own (its convex hull) allows that average.
-#
-# What the relaxation lacks is the *cost* of getting out of each other's
-# way. We can measure it pair by pair. Two drones on their own make a small
-# MIP, about 70 binaries. More drones only add constraints, so the fuel a
-# pair needs alone is a floor on the fuel the same two drones need in any
-# plan of the swarm. We solve the 6 pair MIPs first and add each one's bound
-# (valid even if its gap has not closed) as a row
-# `fuel_i + fuel_j >= floor_ij` of the swarm's model. The swarm's bound
-# then starts from what the pairs need, and the search only has to account
-# for what three or four drones crowding the doorway add.
-
-# %%
-pair_seconds = 30
-floors = {}
-for i, j in pairs:
-    pair_problem, _, pair_binaries = build_plan([i, j])
-    pair_problem.solve(
-        solver=JaddleSolver(),
-        max_seconds=pair_seconds,
-        presolve=True,
-        exact_band=1.0,
-        device=None,  # JAX's default device: the GPU when there is one
-    )
-    pair_stats = pair_problem.solver_stats.extra_stats
-    floors[(i, j)] = pair_stats["bound"]
-    print(
-        f"Drones {i} and {j} alone ({pair_binaries} binaries): fuel"
-        f" {pair_problem.value:.3f}, floor {pair_stats['bound']:.3f},"
-        f" {pair_stats['status']} after {pair_stats['seconds']:.0f} s"
-    )
-# Each drone is in 3 of the pairs, so adding up the pair rows already shows
-# the swarm needs at least Σ floor / 3.
-print(
-    f"The pair floors alone prove the swarm needs at least"
-    f" {sum(floors.values()) / (n_drones - 1):.3f}"
-)
-problem, (p, v, u), n_binaries = build_plan(list(range(n_drones)), floors)
+problem, (p, v, u), n_binaries = build_plan(list(range(n_drones)))
 print(f"Swarm: {n_binaries} binaries, {len(problem.constraints)} constraints")
 
 # %% [markdown]
@@ -290,11 +243,18 @@ print(f"Swarm: {n_binaries} binaries, {len(problem.constraints)} constraints")
 # %%
 problem.solve(
     solver=JaddleSolver(),
-    max_seconds=30,
     verbose=True,
+    max_seconds=180,
     presolve=True,
-    exact_band=1.0,
-    device=None,
+    device=None,  # JAX's default device: the GPU when there is one
+    log_every_seconds=10,
+    exact_band="auto",
+    batch_size=1,
+    exact_strong_lookahead=8,
+    tree_cut_every=100,
+    cut_pool_size=1e5,
+    tree_cut_rows=2000,
+    cuts=False,
 )
 stats = problem.solver_stats.extra_stats
 if p[0].value is None:
