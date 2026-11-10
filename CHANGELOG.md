@@ -22,6 +22,22 @@
 
 ### Changed
 
+- `jm.solve(exact_strong_lookahead=k)` (default `None`: off): the exact
+  lane's strong branching stops after `k` candidates in a row that do not
+  beat the best gain product so far. `exact_strong_cutoff=True` (default
+  `False`) stops a strong side once its dual objective passes the cutoff.
+- `jm.solve(exact_strong_iterations="auto")` is the default (was 5000):
+  a strong-branching side on the exact lane gets twice the mean pivots of
+  the lane's node LPs so far, within 10 to 500
+  (`result["exact_nodes"]["strong_iterations"]`). At 5000 most sides ran
+  to optimality and strong branching took 60–85% of the lane's time.
+- The exact lane is serviced while the main thread waits for the device
+  (`_BranchAndBound.await_device`): finished lane nodes are evaluated and
+  the threads refilled as soon as a job completes, instead of once a
+  batch (`result["batch_timing"]["exact_service_seconds"]`).
+- Tree cut refreshes pick their non-parallel cuts with `select_cuts`'s
+  greedy pass (`_spread_out`) instead of one sparse product per candidate
+  per cut taken.
 - `jm.solve(batch_size="auto")` is the default (was 32), and on a GPU or
   TPU it now sizes the batch from the device's memory
   (`jm.auto_batch_size`): the largest power of two up to 128 whose node

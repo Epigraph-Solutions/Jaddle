@@ -1,5 +1,6 @@
 """Tests for the branch-and-bound MIP solver, jaddle.jaddle_mip."""
 
+import threading
 import time
 import types
 
@@ -6456,7 +6457,7 @@ def test_finished_lane_nodes_count_in_the_bound_until_evaluated(monkeypatch):
         monkeypatch.setattr(search, "exact_strong_children", lambda *args: None)
         seen = []
 
-        def evaluate_exact(node, box, solution, strong=None):
+        def evaluate_exact(node, box, solution, strong=None, known=None):
             search.active_bound = node.bound  # as ``_evaluate`` sets it
             seen.append((node, search.global_bound(), search.explored()))
 
@@ -7215,3 +7216,182 @@ def test_ctrl_c_twice_aborts(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         solve(knapsack())
     assert signal.getsignal(signal.SIGINT) is before
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_spread_out_skips_cuts_parallel_to_held_rows(seed):
+    # ``refresh_cuts``'s near-duplicate test: the greedy pass against the
+    # cuts in the block (``held``) and the ones taken before, as one stack
+    # per candidate would give.
+    rng = np.random.default_rng(seed)
+    n = int(rng.integers(5, 40))
+
+    def unit_rows(count):
+        rows = []
+        for _ in range(count):
+            size = int(rng.integers(1, min(n, 8) + 1))
+            idx = np.sort(rng.choice(n, size, replace=False))
+            coef = rng.integers(1, 3, size).astype(float)  # near-duplicates too
+            rows.append(
+                sp.csr_matrix(
+                    (coef / np.linalg.norm(coef), idx, [0, size]), shape=(1, n)
+                )
+            )
+        return sp.vstack(rows, format="csr")
+
+    held = unit_rows(int(rng.integers(1, 30)))
+    candidates = unit_rows(int(rng.integers(1, 400)))
+    expected, taken = [], [held]
+    for i in range(candidates.shape[0]):
+        row = candidates[i]
+        if np.abs(sp.vstack(taken) @ row.T).max() > jm._CUT_MAX_PARALLELISM:
+            continue
+        expected.append(i)
+        taken.append(row)
+        if len(expected) >= 25:
+            break
+    order = np.arange(candidates.shape[0])
+    assert list(jm._spread_out(candidates, order, 25, held=held)) == expected
+    assert len(expected) < candidates.shape[0]  # some were skipped
+
+
+def test_auto_exact_strong_iterations():
+    # Twice the lane's mean node pivots, within the limits; the upper one
+    # before any node.
+    low, high = jm._EXACT_STRONG_AUTO
+    search = types.SimpleNamespace(
+        exact_strong_auto=True, exact_strong_iterations=high, exact_jobs=0,
+        exact_pivots=0,
+    )
+    cap = lambda: jm._BranchAndBound.strong_iteration_cap(search)
+    assert cap() == high
+    search.exact_jobs, search.exact_pivots = 10, 600
+    assert cap() == 120
+    search.exact_pivots = 10
+    assert cap() == low
+    search.exact_pivots = 100_000
+    assert cap() == high
+    search.exact_strong_auto, search.exact_strong_iterations = False, 7
+    assert cap() == 7
+    with pytest.raises(ValueError):
+        jm.solve(facility_location(), batch_size=4, exact_strong_iterations="few")
+    mip = generalised_assignment()
+    result = solve(
+        mip, batch_size=4, cuts=False, exact_nodes=2, exact_root_candidates=0,
+        exact_strong_iterations="auto",
+    )
+    assert_solved(result, mip, reference(mip))
+    assert low <= result["exact_nodes"]["strong_iterations"] <= high
+
+
+def test_device_waits_service_the_exact_lane():
+    # While a device call runs, the lane's finished nodes are collected
+    # and its threads refilled; a wait nested in that does not do it again.
+    from concurrent.futures import Future
+
+    done = Future()
+    calls = []
+
+    def service():
+        calls.append(len(calls))
+        if len(calls) == 3:
+            done.set_result("batch")
+
+    finished = Future()
+    finished.set_result(None)  # a lane job waiting to be collected
+    search = types.SimpleNamespace(
+        exact_lane=types.SimpleNamespace(jobs=[(finished,)]),
+        _lane_busy=False,
+        out_of_time=lambda: False,
+        service_exact=service,
+    )
+    assert jm._BranchAndBound.await_device(search, done) == "batch"
+    assert calls == [0, 1, 2]
+    search._lane_busy, late = True, Future()
+    threading.Timer(0.05, late.set_result, ["late"]).start()
+    assert jm._BranchAndBound.await_device(search, late) == "late"
+    assert calls == [0, 1, 2]
+    search.exact_lane, search._lane_busy = None, False
+    assert jm._BranchAndBound.await_device(search, late) == "late"
+
+
+def test_lane_serviced_during_batches_keeps_the_optimum():
+    mip = generalised_assignment(agents=10, jobs=40)
+    ref = reference(mip)
+    result = jm.solve(
+        mip, max_seconds=300, batch_size=4, exact_nodes=2, exact_band=0.5,
+        rins_seconds=0, crossover_seconds=0,
+    )
+    assert result["bound"] <= ref + 1e-6
+    if result["status"] == "optimal":
+        assert_solved(result, mip, ref)
+    timing = result["batch_timing"]
+    assert 0.0 <= timing["exact_service_seconds"] <= timing["exact_collect_seconds"] + 1e-9
+
+
+
+def test_exact_strong_lookahead_and_cutoff():
+    # ``_exact_strong(lookahead=...)`` splits a prefix of the candidates it
+    # would split anyway; with ``objective_bound`` a side HiGHS stops past
+    # it (on LPs this small it usually reaches the optimum first) has duals
+    # whose bound still passes it.
+    mip = generalised_assignment(agents=10, jobs=40)
+    highs = jm._highs_rows(mip)
+    status, x, _, _ = jm._exact_node_lp(highs, mip, mip.lower, mip.upper, 30.0)
+    assert status == "optimal"
+    value = highs.getInfo().objective_function_value
+    zeros = np.zeros((2, mip.num_variables))
+    request = (mip.integrality, 1e-6, zeros, zeros, 8, None, 1)
+    full = jm._exact_strong(highs, mip, mip.lower, mip.upper, x, request)
+    order = [side[0] for side in full[::2]]
+    assert len(order) >= 4
+    short = jm._exact_strong(highs, mip, mip.lower, mip.upper, x, request, lookahead=1)
+    looked = [side[0] for side in short[::2]]
+    assert 2 <= len(looked) <= len(order) and looked == order[: len(looked)]
+    # Named candidates (the root's) are all split, whatever the lookahead.
+    named = jm._exact_strong(
+        highs, mip, mip.lower, mip.upper, x, request, candidates=order, lookahead=1
+    )
+    assert [side[0] for side in named[::2]] == order
+    # A bound just above the node's value: sides that gain stop on it.
+    gains = {}
+    for var, down, side_status, _, y_eq, y_ineq in full:
+        if side_status != "optimal":
+            continue
+        lo, up = mip.lower.copy(), mip.upper.copy()
+        if down:
+            up[var] = np.floor(x[var])
+        else:
+            lo[var] = np.ceil(x[var])
+        gains[(var, down)] = lp_optimum(mip, lo, up) - value
+    target = value + 0.5 * max(gains.values())
+    assert max(gains.values()) > 1e-6
+    stopped = jm._exact_strong(
+        highs, mip, mip.lower, mip.upper, x, request, objective_bound=target
+    )
+    assert [side[:2] for side in stopped] == [side[:2] for side in full]
+    for var, down, side_status, _, y_eq, y_ineq in stopped:
+        assert side_status in ("optimal", "partial")
+        if side_status != "partial":
+            continue
+        lo, up = mip.lower.copy(), mip.upper.copy()
+        if down:
+            up[var] = np.floor(x[var])
+        else:
+            lo[var] = np.ceil(x[var])
+        bound, _ = jm.lagrangian_bound(
+            mip.c, mip.A, mip.b, mip.n_eq, lo, up, np.concatenate([y_eq, y_ineq])
+        )
+        assert target - 1e-6 <= bound <= value + gains[(var, down)] + 1e-6
+    # The option is put back for the node LPs that follow.
+    assert highs.getOptionValue("objective_bound")[1] == np.inf
+
+
+def test_exact_strong_lookahead_and_cutoff_in_the_search():
+    options = dict(
+        batch_size=4, cuts=False, probing=False, exact_nodes=2,
+        exact_strong_lookahead=2, exact_strong_cutoff=True,
+    )
+    for make in (facility_location, generalised_assignment, lambda: coverage_chains(1)):
+        mip = make()
+        assert_solved(solve(mip, **options), mip, reference(mip))

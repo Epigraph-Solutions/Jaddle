@@ -4143,32 +4143,45 @@ def select_cuts(cuts, x, n, min_efficacy=1e-4, max_cuts=100):
     order = keep[np.argsort(-efficacy[keep], kind="stable")]
     with np.errstate(divide="ignore", invalid="ignore"):
         directions = sp.csr_matrix((vals / norm[rows], (rows, cols)), shape=(k, n))
-    # The greedy pass in blocks of the most efficacious candidates: a chosen
-    # cut's cosines are taken with its block only, and a later block's with
-    # all the cuts chosen before it. Same cuts as one pass over all of them,
-    # without a product over every candidate per cut chosen (a third of a
-    # second a round on bab5, with about 1,000 candidates).
+    return [cuts[i] for i in _spread_out(directions, order, max_cuts)]
+
+
+def _spread_out(directions, order, max_cuts, held=None):
+    """The greedy pass of ``select_cuts``: the rows of ``directions`` (CSR,
+    unit rows) taken in ``order``, skipping each whose |cosine| with one
+    taken before it, or with a row of ``held`` (CSR, unit rows: cuts in the
+    LP already), is over ``_CUT_MAX_PARALLELISM``; it stops at ``max_cuts``.
+    Returns the rows taken.
+
+    It works in blocks of the candidates: a chosen cut's cosines are taken
+    with its block only, and a later block's with all the cuts chosen
+    before it. Same cuts as one pass over all of them, without a product
+    over every candidate per cut chosen (a third of a second a round on
+    bab5, with about 1,000 candidates)."""
     block_size = max(4 * max_cuts, 256)
     chosen = []
     for start in range(0, order.size, block_size):
         block = order[start : start + block_size]
         D = directions[block]
         # The largest |cosine| of each candidate with a cut chosen so far.
+        nearest = np.zeros(block.size)
         if chosen:
             nearest = np.abs((D @ directions[chosen].T).toarray()).max(axis=1)
-        else:
-            nearest = np.zeros(block.size)
+        if held is not None and held.shape[0]:
+            np.maximum(
+                nearest, np.abs((D @ held.T).toarray()).max(axis=1), out=nearest
+            )
         cosines = None  # the block's |cosines|, once a cut in it is chosen
         for j, i in enumerate(block):
             if nearest[j] > _CUT_MAX_PARALLELISM:
                 continue
             chosen.append(i)
             if len(chosen) >= max_cuts:
-                return [cuts[i] for i in chosen]
+                return chosen
             if cosines is None:
                 cosines = np.abs(_gram(D))
             np.maximum(nearest, cosines[j], out=nearest)
-    return [cuts[i] for i in chosen]
+    return chosen
 
 
 # ``_gram``: dense products do this many times the work of sparse ones in
@@ -6439,7 +6452,8 @@ def _jaddle_duals(highs, mip):
 
 
 def _exact_strong(
-    highs, mip, lower, upper, x, request, bases=None, candidates=None, deadline=None
+    highs, mip, lower, upper, x, request, bases=None, candidates=None, deadline=None,
+    lookahead=None, objective_bound=None,
 ):
     """
     Strong branching on a node HiGHS has just solved in ``highs`` (box
@@ -6457,6 +6471,15 @@ def _exact_strong(
     room in the box; the pseudocosts are not used). With ``deadline`` (a
     ``time.time()`` value) no side runs past it, and the candidates left
     once it has passed are not split.
+
+    With ``lookahead`` (and no ``candidates``), the candidates after that
+    many in a row whose gain product (from the sides' objective values, an
+    empty side counting as infinite) did not beat the best so far are not
+    split, as SCIP's strong branching looks ahead: they come in order of
+    their pseudocost product, so the later ones rarely win. With
+    ``objective_bound`` (a value of ``mip.c @ x``: the cutoff), HiGHS stops
+    a side once its dual objective passes it: the side is ``"partial"``,
+    and its duals' bound closes it.
 
     Returns ``[(var, down, status, x, y_eq, y_ineq), ...]``, ``status``
     ``"optimal"``, ``"partial"`` (stopped early), ``"infeasible"`` or
@@ -6488,14 +6511,23 @@ def _exact_strong(
     basis = highs.getBasis()
     _, limit = highs.getOptionValue("simplex_iteration_limit")
     _, time_limit = highs.getOptionValue("time_limit")
+    _, bound_option = highs.getOptionValue("objective_bound")
     if iterations is not None:
         highs.setOptionValue("simplex_iteration_limit", int(iterations))
+    if objective_bound is not None and np.isfinite(objective_bound):
+        highs.setOptionValue("objective_bound", float(objective_bound))
+    looking = bool(lookahead) and candidates is None
+    node_value = highs.getInfo().objective_function_value if looking else 0.0
+    best_score, behind = -np.inf, 0
     out = []
     try:
         for var in chosen.tolist():
             if deadline is not None and time.time() >= deadline:
                 break
+            if looking and behind >= lookahead:
+                break
             lo, up = float(lower[var]), float(upper[var])
+            gains = []
             for is_down in (True, False):
                 side = (lo, math.floor(x[var])) if is_down else (math.ceil(x[var]), up)
                 highs.changeColBounds(var, *side)
@@ -6510,10 +6542,15 @@ def _exact_strong(
                 status = highs.getModelStatus()
                 if status == MS.kInfeasible:
                     out.append((var, is_down, "infeasible", None, None, None))
+                    gains.append(np.inf)
                 elif (
-                    status in (MS.kOptimal, MS.kIterationLimit, MS.kTimeLimit)
+                    status
+                    in (MS.kOptimal, MS.kIterationLimit, MS.kTimeLimit, MS.kObjectiveBound)
                     and highs.getSolution().dual_valid
                 ):
+                    if looking:
+                        value = highs.getInfo().objective_function_value
+                        gains.append(max(value - node_value, 0.0))
                     y_eq, y_ineq = _jaddle_duals(highs, mip)
                     if bases is not None:
                         bases[(var, is_down)] = highs.getBasis()
@@ -6529,10 +6566,18 @@ def _exact_strong(
                     )
                 else:
                     out.append((var, is_down, "failed", None, None, None))
+                    gains.append(0.0)
                 highs.changeColBounds(var, lo, up)
+            if looking and len(gains) == 2:
+                score = max(gains[0], 1e-6) * max(gains[1], 1e-6)
+                if score > best_score:
+                    best_score, behind = score, 0
+                else:
+                    behind += 1
     finally:
         highs.setOptionValue("simplex_iteration_limit", limit)
         highs.setOptionValue("time_limit", time_limit)
+        highs.setOptionValue("objective_bound", bound_option)
         highs.setBasis(basis)
     return out
 
@@ -6756,13 +6801,14 @@ class _ExactLane:
 
     def submit(
         self, node, box, lp_box, mip, version, strong=None, basis=None, keep=False,
-        bound_terms=None,
+        bound_terms=None, strong_options=None,
     ):
         """Queue ``node``'s LP over ``lp_box`` (the LP's bounds over its box
         ``box``) for ``mip``'s rows as of cut block ``version``, from
         ``basis`` (a ``highspy.HighsBasis`` for ``mip``'s rows) when given,
         then, with a ``strong`` request, strong branching on it
-        (``_exact_strong``). With ``keep``, the job also returns the node's
+        (``_exact_strong``, with ``strong_options``: its ``lookahead`` and
+        ``objective_bound``). With ``keep``, the job also returns the node's
         optimal basis and its strong sides' bases, for the children. With
         ``bound_terms`` (``exact_lane_bounds``'s ``terms``), it also bounds
         the node and its sides on the thread (``extra["bounds"]``)."""
@@ -6793,6 +6839,7 @@ class _ExactLane:
                     out[1],
                     strong,
                     extra["sides"] if keep else None,
+                    **(strong_options or {}),
                 )
                 strong_seconds = time.time() - strong_started
             if bound_terms is not None and out[0] == "optimal":
@@ -7103,6 +7150,9 @@ _NODE_MAX_EPOCHS = 200
 # The exact lane's band (``exact_overflow_share``): reserved nodes kept for
 # each lane thread before the top of the band overflows to the device.
 _EXACT_OVERFLOW_KEEP = 4
+# ``exact_strong_iterations="auto"``: the least and most pivots a strong
+# side gets (SCIP's limits for its strong branching LPs).
+_EXACT_STRONG_AUTO = (10, 500)
 # The adaptive band (``exact_band="auto"``): where it starts, its limits, and
 # the factor it grows or shrinks by a batch as the lane's queue runs short of
 # or past ``_EXACT_OVERFLOW_KEEP`` nodes a thread.
@@ -7234,6 +7284,11 @@ class _BranchAndBound:
     # exact lane's results, and branching from device-built children.
     cut_refresh_seconds = 0.0
     exact_collect_seconds = 0.0
+    # Of it, the time servicing the lane during device waits
+    # (``await_device``), and whether the lane is being collected or fed
+    # (a wait nested in that does not service it again).
+    exact_service_seconds = 0.0
+    _lane_busy = False
     branch_seconds = 0.0
     _cut_worker = None  # the tree cut worker (``tree_cut_async``), if made
     exact_bounds_reused = 0  # lane jobs whose own bounds were used
@@ -7371,6 +7426,8 @@ class _BranchAndBound:
         exact_overflow_share=0.5,
         exact_overflow_epochs=None,
         exact_basis_memory=2e9,
+        exact_strong_lookahead=None,
+        exact_strong_cutoff=False,
         exact_root_candidates=128,
         exact_root_seconds=60.0,
         exact_root_iterations=None,
@@ -7803,7 +7860,22 @@ class _BranchAndBound:
         # Strong branching in the lane (``exact_strong_candidates``,
         # ``exact_strong_iterations``).
         self.exact_strong_candidates = int(exact_strong_candidates)
-        self.exact_strong_iterations = int(exact_strong_iterations)
+        self.exact_strong_auto = isinstance(exact_strong_iterations, str)
+        if self.exact_strong_auto and exact_strong_iterations != "auto":
+            raise ValueError(
+                "exact_strong_iterations must be a number or 'auto', not "
+                f"{exact_strong_iterations!r}"
+            )
+        self.exact_strong_iterations = (
+            _EXACT_STRONG_AUTO[1]
+            if self.exact_strong_auto
+            else int(exact_strong_iterations)
+        )
+        self.exact_jobs = 0  # lane jobs collected (``exact_pivots`` is theirs)
+        # ``_exact_strong``'s lookahead (``None``/0: every candidate) and
+        # whether its sides stop at the cutoff.
+        self.exact_strong_lookahead = int(exact_strong_lookahead or 0)
+        self.exact_strong_cutoff = bool(exact_strong_cutoff)
         self.exact_strong_lps = 0
         self.exact_strong_seconds = 0.0
         self.exact_reused = 0
@@ -10746,6 +10818,7 @@ class _BranchAndBound:
                 "bound_seconds": self.bound_seconds,
                 "cut_refresh_seconds": self.cut_refresh_seconds,
                 "exact_collect_seconds": self.exact_collect_seconds,
+                "exact_service_seconds": self.exact_service_seconds,
                 "branch_seconds": self.branch_seconds,
                 "heuristic_seconds": self.heuristic_seconds,
             },
@@ -10814,6 +10887,7 @@ class _BranchAndBound:
                 "strong_seconds": self.exact_strong_seconds,
                 "children_reused": self.exact_reused,
                 "pivots": self.exact_pivots,
+                "strong_iterations": self.exact_strong_iterations,
                 "warm_bases": self.exact_warm_bases,
                 "overflow_nodes": self.overflow_nodes,
                 "overflow_converged": self.overflow_converged,
@@ -11926,26 +12000,39 @@ class _BranchAndBound:
         # Into the pool, as at the root: a later node may violate them.
         self.pool_cuts(separated)
         ranked = sorted(best.items(), key=lambda item: -item[1][0])
-        found, directions = [], []
-        if self.cut_list:
-            directions.append(
-                sp.csr_matrix(R.multiply(1.0 / np.maximum(
+        found = []
+        if ranked and self.max_tree_cuts_per_round > 0:
+            # None a near-duplicate of a cut in the block or of another new
+            # one: ``select_cuts``'s greedy pass (``_spread_out``) over all
+            # the candidates at once. A product per candidate per cut taken
+            # was a quarter of the tree's time on ns1830653 (thousands of
+            # pooled candidates a refresh).
+            held_rows = None
+            if self.cut_list:
+                held_rows = sp.csr_matrix(R.multiply(1.0 / np.maximum(
                     np.sqrt(np.asarray(R.multiply(R).sum(axis=1)).ravel()), 1e-12
                 )[:, None]))
+            lengths = np.array([cut[1].size for _, (_, cut) in ranked])
+            rows = np.repeat(np.arange(len(ranked)), lengths)
+            cols = np.concatenate(
+                [np.asarray(cut[1], np.int64) for _, (_, cut) in ranked]
             )
-        for key, (_, cut) in ranked:
-            if len(found) >= self.max_tree_cuts_per_round:
-                break
-            _, idx, coef, _ = cut
-            direction = np.zeros(n)
-            direction[idx] = coef / max(np.linalg.norm(coef), 1e-12)
-            if any(
-                block.shape[0] and np.abs(block @ direction).max() > _CUT_MAX_PARALLELISM
-                for block in directions
-            ):
-                continue
-            directions.append(sp.csr_matrix(direction[None, :]))
-            found.append((key, cut))
+            vals = np.concatenate(
+                [np.asarray(cut[2], np.float64) for _, (_, cut) in ranked]
+            )
+            norm = np.maximum(
+                np.sqrt(np.bincount(rows, vals * vals, minlength=len(ranked))), 1e-12
+            )
+            directions = sp.csr_matrix(
+                (vals / norm[rows], (rows, cols)), shape=(len(ranked), n)
+            )
+            taken = _spread_out(
+                directions,
+                np.arange(len(ranked)),
+                self.max_tree_cuts_per_round,
+                held=held_rows,
+            )
+            found = [(ranked[i][0], ranked[i][1][1]) for i in taken]
         if not found:
             return [], []
         self.pool_cuts([cut for _, cut in found])
@@ -13419,24 +13506,68 @@ class _BranchAndBound:
         device = self.device
 
         def call():
+            # Waited for here: on a CPU, JAX returns before the work is
+            # done, and the future must only be done once its arrays are
+            # (``await_device`` services the exact lane until then).
             if device is None:
-                return fn(*args)
+                return jax.block_until_ready(fn(*args))
             with jax.default_device(device):
-                return fn(*args)
+                return jax.block_until_ready(fn(*args))
 
         return self._device_thread.submit(call)
 
-    def read_batch(self, handle):
+    def await_device(self, future):
+        """Wait for a device thread call (``on_device_thread``), servicing
+        the exact lane meanwhile (``service_exact``): the lane's finished
+        nodes are evaluated and its threads handed their next as soon as
+        one is done, instead of once a step. On ns1830653 (CPU) the main
+        thread spent half the tree blocked on the batches' LPs with 4-8 of
+        the 16 lane threads at work. Called only where every node is in a
+        list the global bound counts and no node is being evaluated."""
+        from concurrent.futures import FIRST_COMPLETED, wait
+
+        lane = self.exact_lane
+        while lane is not None and not self._lane_busy and not future.done():
+            wait(
+                [future, *(job[0] for job in lane.jobs)],
+                timeout=0.05,
+                return_when=FIRST_COMPLETED,
+            )
+            if future.done() or self.out_of_time():
+                break
+            self.service_exact()
+        return future.result()
+
+    def service_exact(self):
+        """Evaluate the lane's finished nodes and refill it
+        (``collect_exact``, ``feed_exact``), between the tree loop's own
+        calls (``await_device``)."""
+        started = time.perf_counter()
+        try:
+            self.collect_exact()
+            self.feed_exact()
+        finally:
+            spent = time.perf_counter() - started
+            self.exact_collect_seconds += spent
+            self.exact_service_seconds += spent
+
+    def read_batch(self, handle, service=False):
         """The results of a ``launch_batch``, one ``solve_lp``-style result
         per box (padding dropped), whose ``opt_state`` is the member's
-        final ``(k, eta)``. Waits for the device."""
+        final ``(k, eta)``. Waits for the device; with ``service``, the
+        exact lane is serviced meanwhile (``await_device``)."""
         count, launched = handle
         started = time.perf_counter()
+        serviced = self.exact_service_seconds
         if hasattr(launched, "result"):  # dispatched on the device thread
-            launched = launched.result()
+            launched = (
+                self.await_device(launched) if service else launched.result()
+            )
         # One transfer for the whole batch, then slices on the host.
         out, steps = jax.device_get(launched)
-        self.batch_wait_seconds += time.perf_counter() - started
+        self.batch_wait_seconds += (
+            time.perf_counter() - started - (self.exact_service_seconds - serviced)
+        )
         converged = np.asarray(out.converged)
         stop_code = np.asarray(out.stop_code)
         epochs = np.asarray(out.epochs)
@@ -13486,8 +13617,19 @@ class _BranchAndBound:
         branching) overlaps the device's LPs for the next, where the plain
         loop left the device idle meanwhile. A node's children reach a
         batch two steps after it."""
-        pending, self.pending_children = self.pending_children, None
+        pending = self.pending_children
         if pending is not None:
+            # Waited for while they are still ``pending_children`` (the
+            # global bound counts them there), servicing the exact lane.
+            started = time.perf_counter()
+            serviced = self.exact_service_seconds
+            if hasattr(pending["out"], "result"):
+                self.await_device(pending["out"])
+            self.batch_wait_seconds += (
+                time.perf_counter() - started
+                - (self.exact_service_seconds - serviced)
+            )
+            self.pending_children = None
             self.finish_branches(pending)
         current, self.in_flight = self.in_flight, self.launch_next()
         if current is not None:
@@ -13707,22 +13849,26 @@ class _BranchAndBound:
     def feed_exact(self):
         """Hand the lane the lowest reserved nodes while it has room."""
         lane = self.exact_lane
-        while lane is not None and self.exact_reserved and lane.room():
-            _, _, node = heapq.heappop(self.exact_reserved)
-            if node.bound >= self.cutoff():
-                self.close(node.bound)
-                continue
-            box = self.expand(node.changes)
-            if np.any(box[0] > box[1]):
-                self.close(max(node.bound, self.cutoff_bound()))
-                continue
-            box = self.prune_by_conflicts(node, *box)
-            if box is None:
-                continue
-            if node.exact_known:
-                self.evaluate_known(node, box)
-                continue
-            self.submit_exact(node, box)
+        busy, self._lane_busy = self._lane_busy, True
+        try:
+            while lane is not None and self.exact_reserved and lane.room():
+                _, _, node = heapq.heappop(self.exact_reserved)
+                if node.bound >= self.cutoff():
+                    self.close(node.bound)
+                    continue
+                box = self.expand(node.changes)
+                if np.any(box[0] > box[1]):
+                    self.close(max(node.bound, self.cutoff_bound()))
+                    continue
+                box = self.prune_by_conflicts(node, *box)
+                if box is None:
+                    continue
+                if node.exact_known:
+                    self.evaluate_known(node, box)
+                    continue
+                self.submit_exact(node, box)
+        finally:
+            self._lane_busy = busy
 
     def wants_exact(self, node):
         """Without a band (``exact_band=0``): whether the lane takes
@@ -13751,6 +13897,18 @@ class _BranchAndBound:
         self.overflow_nodes += len(nodes)
         return nodes
 
+    def strong_iteration_cap(self):
+        """The pivots a lane strong-branching side gets
+        (``exact_strong_iterations``). ``"auto"``: twice the mean pivots of
+        the lane's node LPs so far, within ``_EXACT_STRONG_AUTO`` (as SCIP
+        limits its strong branching LPs), its upper end before any. A side
+        stopped there keeps its duals' bound, lower than its LP value."""
+        if self.exact_strong_auto and self.exact_jobs:
+            low, high = _EXACT_STRONG_AUTO
+            mean = self.exact_pivots / self.exact_jobs
+            self.exact_strong_iterations = int(min(high, max(low, 2.0 * mean)))
+        return self.exact_strong_iterations
+
     def submit_exact(self, node, box):
         node.exact_tried = True
         lower, upper = box
@@ -13764,7 +13922,7 @@ class _BranchAndBound:
                 self.exact_pc_sum.copy(),
                 self.exact_pc_count.copy(),
                 self.exact_strong_candidates,
-                self.exact_strong_iterations,
+                self.strong_iteration_cap(),
                 self.reliability_threshold,
             )
         basis = None
@@ -13781,6 +13939,14 @@ class _BranchAndBound:
             basis=basis,
             keep=self.exact_basis_memory > 0,
             bound_terms=(self.A_T, self.is_int, self.reduced_cost_tol),
+            strong_options=dict(
+                lookahead=self.exact_strong_lookahead,
+                # A side whose dual objective passes the cutoff is closed:
+                # it stops there (``node_bound_target``, as node LPs do).
+                objective_bound=(
+                    self.node_bound_target() if self.exact_strong_cutoff else None
+                ),
+            ),
         )
 
     def collect_exact(self):
@@ -13796,6 +13962,13 @@ class _BranchAndBound:
         lane = self.exact_lane
         if lane is None:
             return
+        busy, self._lane_busy = self._lane_busy, True
+        try:
+            self._collect_exact(lane)
+        finally:
+            self._lane_busy = busy
+
+    def _collect_exact(self, lane):
         done = lane.finished()
         # Until its turn, each finished node is in no list but this one: the
         # global bound and ``explored`` (logged while the others are
@@ -13817,6 +13990,7 @@ class _BranchAndBound:
         self.exact_strong_seconds += strong_seconds
         self.exact_strong_lps += len(children)
         self.exact_pivots += extra["pivots"]
+        self.exact_jobs += 1
         self.exact_warm_bases += bool(extra["warm"])
         status, x, y_eq, y_ineq = outcome
         if node.bound >= self.cutoff():
@@ -14154,7 +14328,9 @@ class _BranchAndBound:
     def _process_batch(self, batch):
         members, boxes = batch["members"], batch["boxes"]
         self.batch_waiting = members
-        results = self.read_batch(batch["handle"])
+        # The members wait in ``batch_waiting`` and none is being evaluated:
+        # the exact lane is serviced while the device finishes their LPs.
+        results = self.read_batch(batch["handle"], service=True)
         if batch["version"] < self.cut_version:
             # Solved before a tree cut refresh changed slots of the cut
             # block: those slots' duals are zeroed (a zero multiplier is
@@ -14989,10 +15165,12 @@ def solve(
     exact_node_seconds=10.0,
     exact_band=0.25,
     exact_strong_candidates=8,
-    exact_strong_iterations=5000,
+    exact_strong_iterations="auto",
     exact_overflow_share=0.0,
     exact_overflow_epochs=None,
     exact_basis_memory=2e9,
+    exact_strong_lookahead=None,
+    exact_strong_cutoff=False,
     exact_root_candidates=128,
     exact_root_seconds=60.0,
     exact_root_iterations=None,
@@ -15770,8 +15948,21 @@ def solve(
       ``0``: off): of the fractional integers whose exact pseudocosts have
       fewer than ``reliability_threshold`` observations a side, those with
       the largest pseudocost product are split, and each side is re-solved
-      from the node's basis for at most ``exact_strong_iterations`` (5,000)
-      dual simplex pivots. A side stopped early still has feasible duals,
+      from the node's basis for at most ``exact_strong_iterations`` dual
+      simplex pivots (``"auto"``, the default: twice the mean pivots of the
+      lane's node LPs so far, within 10 to 500, as SCIP limits its strong
+      branching LPs; a number: that many;
+      ``result["exact_nodes"]["strong_iterations"]`` gives the limit at the
+      end). With 5,000, most sides ran to optimality and strong branching
+      took 60-85% of the lane's time; on ns1830653 and 30n20b8 (60 s, CPU)
+      ``"auto"`` gave 1.1-1.7 times the nodes. With
+      ``exact_strong_lookahead`` (default ``None``: off) the candidates
+      after that many in a row that did not beat the best gain product so
+      far are not split, as SCIP's strong branching looks ahead (with 3,
+      30n20b8 went from 14 to 10 sides a node, ns1830653 from 4.2 to 2.4).
+      With ``exact_strong_cutoff`` (default ``False``) a side stops once
+      its dual objective passes the cutoff (HiGHS's ``objective_bound``):
+      its duals' bound closes it either way. A side stopped early still has feasible duals,
       so its Lagrangian bound holds. The children then go through
       ``apply_strong`` as device strong branching's do (a side HiGHS proves
       infeasible fixes the variable, and the node's bound rises to the best
@@ -16047,6 +16238,8 @@ def solve(
         exact_overflow_share=exact_overflow_share,
         exact_overflow_epochs=exact_overflow_epochs,
         exact_basis_memory=exact_basis_memory,
+        exact_strong_lookahead=exact_strong_lookahead,
+        exact_strong_cutoff=exact_strong_cutoff,
         exact_root_candidates=exact_root_candidates,
         exact_root_seconds=exact_root_seconds,
         exact_root_iterations=exact_root_iterations,
@@ -16167,6 +16360,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
                 "strong_seconds": 0.0,
                 "children_reused": 0,
                 "pivots": 0,
+                "strong_iterations": 0,
                 "warm_bases": 0,
                 "overflow_nodes": 0,
                 "overflow_converged": 0,
@@ -16221,6 +16415,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "batch_timing": {
                 "wait_seconds": 0.0, "evaluate_seconds": 0.0, "bound_seconds": 0.0,
                 "cut_refresh_seconds": 0.0, "exact_collect_seconds": 0.0,
+                "exact_service_seconds": 0.0,
                 "branch_seconds": 0.0, "heuristic_seconds": 0.0,
             },
             "crossover_calls": 0,

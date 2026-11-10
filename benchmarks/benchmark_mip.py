@@ -125,8 +125,8 @@ def discover_instances(args):
 #   fixing rate, down to 40%);
 # - 16 CPU threads that solve the nodes within a quarter of the gap of the
 #   global bound exactly with HiGHS's dual simplex and strong-branch them
-#   (8 candidates, up to 5,000 pivots a side), while the device batches
-#   the rest.
+#   (8 candidates, each side for up to twice the mean pivots of a node LP,
+#   at most 500), while the device batches the rest.
 #
 # The log marks incumbents from the jump `J`, repair `R`, RINS `N` and
 # crossover `C`. The background threads make runs unrepeatable.
@@ -148,8 +148,10 @@ def run_jaddle(path, args):
         log_every_seconds=10,
         device=args.device,
         presolve=True,
+        exact_band=1,
+        batch_size=64,
         max_seconds=args.max_seconds,
-        batch_size=16,
+        tree_cut_every=200,
     )
     row.update(
         {
