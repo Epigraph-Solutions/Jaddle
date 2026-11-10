@@ -6606,6 +6606,7 @@ _LOG_SOURCES = (
     ("U", "Round and repair"),
     ("Z", "Trivial"),
     ("C", "Crossover"),
+    ("X", "Proximity"),
     ("1", "1-opt"),
 )
 
@@ -7010,6 +7011,73 @@ def _submip_job(highs, mip, lower, upper, cutoff, seconds):
     return x
 
 
+def _highs_proximity(mip, is_int):
+    """``_highs_submip``'s MIP with one more row, ``c·x``, for proximity
+    search (``_proximity_job``) to hold under the cutoff."""
+    highs = _highs_submip(mip, is_int)
+    c = np.asarray(mip.c, np.float64)
+    cols = np.flatnonzero(c).astype(np.int32)
+    highs.addRow(-np.inf, np.inf, cols.size, cols, c[cols])
+    return highs
+
+
+def _proximity_distance(center, lower, upper, is_int):
+    """Proximity search's cost: the L1 distance to ``center`` over the
+    integers it has at a bound of ``[lower, upper]`` (all of a binary's),
+    as the feasibility pump's. Integers strictly inside their box get no
+    cost, as they would need an extra column each."""
+    at_lower = is_int & (center <= lower + 0.5)
+    at_upper = is_int & ~at_lower & (center >= upper - 0.5)
+    return np.where(at_lower, 1.0, np.where(at_upper, -1.0, 0.0))
+
+
+def _proximity_job(highs, mip, is_int, center, lower, upper, cutoff, seconds):
+    """
+    Proximity search (Fischetti & Monaci, 2014) in ``highs``
+    (``_highs_proximity``): over ``[lower, upper]`` with ``c·x ≤ cutoff``,
+    minimise the distance to ``center`` (``_proximity_distance``), and
+    stop at HiGHS's first point. Then, with its integers fixed, the
+    continuous variables are re-solved for the true objective (the
+    distance leaves them anywhere feasible). Returns ``(x, empty)``: the
+    point (``None`` when none was found) and whether HiGHS showed the box
+    holds no point under the cutoff.
+    """
+    import highspy
+
+    n = lower.size
+    cols = np.arange(n, dtype=np.int32)
+    row = highs.getNumRow() - 1
+    c = np.asarray(mip.c, np.float64)
+    deadline = highs.getRunTime() + float(seconds)
+    highs.changeColsBounds(n, cols, lower, upper)
+    highs.changeColsCost(n, cols, _proximity_distance(center, lower, upper, is_int))
+    highs.changeRowBounds(row, -np.inf, float(cutoff))
+    highs.setOptionValue("objective_bound", np.inf)
+    highs.setOptionValue("mip_max_improving_sols", 1)
+    highs.setOptionValue("time_limit", deadline)
+    highs.run()
+    status = highs.getModelStatus()
+    if highs.getInfo().primal_solution_status != 2:  # kSolutionStatusFeasible
+        return None, status == highspy.HighsModelStatus.kInfeasible
+    x = np.array(highs.getSolution().col_value, np.float64)
+    # Re-solve the continuous variables with the integers fixed.
+    fixed_lower, fixed_upper = lower.copy(), upper.copy()
+    fixed_lower[is_int] = fixed_upper[is_int] = np.round(x[is_int])
+    highs.changeColsBounds(n, cols, fixed_lower, fixed_upper)
+    highs.changeColsCost(n, cols, c)
+    highs.changeRowBounds(row, -np.inf, np.inf)
+    highs.setOptionValue("mip_max_improving_sols", 2147483647)
+    highs.setOptionValue("time_limit", max(deadline, highs.getRunTime() + 1.0))
+    highs.run()
+    if highs.getInfo().primal_solution_status == 2:
+        polished = np.array(highs.getSolution().col_value, np.float64)
+        if float(c @ polished) <= float(c @ x):
+            x = polished
+    if float(c @ x) >= cutoff:
+        return None, False
+    return x, False
+
+
 # The solutions crossover draws from (``_BranchAndBound.solution_pool``).
 _SOLUTION_POOL_SIZE = 10
 
@@ -7039,6 +7107,8 @@ class _SubMipLane:
 
         self.pool = ThreadPoolExecutor(1, thread_name_prefix="jaddle-submip")
         self.held = None  # (mip, Highs), used on the lane's thread only
+        # Proximity search's own copy, with the objective row added.
+        self.held_proximity = None
         self.job = None  # (future, kind)
 
     def busy(self):
@@ -7055,35 +7125,53 @@ class _SubMipLane:
             if self.held is None or self.held[0] is not mip:
                 self.held = (mip, _highs_submip(mip, is_int))
             x = _submip_job(self.held[1], mip, lower, upper, cutoff, seconds)
-            return x, time.time() - started
+            return x, False, time.time() - started
 
         self.job = (self.pool.submit(job), kind)
 
+    def submit_proximity(self, mip, is_int, center, lower, upper, cutoff, seconds):
+        """Queue proximity search around ``center`` (``_proximity_job``)."""
+        lower, upper = np.array(lower, np.float64), np.array(upper, np.float64)
+        is_int = np.array(is_int, bool)
+        center = np.array(center, np.float64)
+
+        def job():
+            started = time.time()
+            if self.held_proximity is None or self.held_proximity[0] is not mip:
+                self.held_proximity = (mip, _highs_proximity(mip, is_int))
+            x, empty = _proximity_job(
+                self.held_proximity[1], mip, is_int, center, lower, upper, cutoff, seconds
+            )
+            return x, empty, time.time() - started
+
+        self.job = (self.pool.submit(job), "proximity")
+
     def finished(self):
-        """The finished job as ``(kind, x, seconds)`` (``x`` ``None`` when
-        it found nothing or raised), or ``None`` while it runs or with no
-        job."""
+        """The finished job as ``(kind, x, empty, seconds)`` (``x`` ``None``
+        when it found nothing or raised; ``empty``: HiGHS showed the box
+        holds nothing under the cutoff, proximity only), or ``None`` while
+        it runs or with no job."""
         if self.job is None or not self.job[0].done():
             return None
         future, kind = self.job
         self.job = None
         try:
-            x, seconds = future.result()
+            x, empty, seconds = future.result()
         except Exception:
-            x, seconds = None, 0.0
-        return kind, x, seconds
+            x, empty, seconds = None, False, 0.0
+        return kind, x, empty, seconds
 
     def shutdown(self):
         """Stop: a running HiGHS search is cancelled, a queued one dropped."""
         if self.job is not None:
             self.job[0].cancel()
             self.job = None
-        held = self.held
-        if held is not None:
-            try:
-                held[1].cancelSolve()
-            except Exception:
-                pass
+        for held in (self.held, self.held_proximity):
+            if held is not None:
+                try:
+                    held[1].cancelSolve()
+                except Exception:
+                    pass
         self.pool.shutdown(wait=False, cancel_futures=True)
 
 
@@ -7677,13 +7765,12 @@ _EXACT_OVERFLOW_KEEP = 4
 # ``exact_strong_iterations="auto"``: the least and most pivots a strong
 # side gets (SCIP's limits for its strong branching LPs).
 _EXACT_STRONG_AUTO = (10, 500)
-# The adaptive band (``exact_band="auto"``): where it starts, its limits, and
-# the factor it grows or shrinks by a batch as the lane's queue runs short of
-# or past ``_EXACT_OVERFLOW_KEEP`` nodes a thread.
-_EXACT_BAND_START = 0.01
+# The adaptive band (``exact_band="auto"``): its limits, and the scale it
+# grows by as the relative gap closes (``_EXACT_BAND_GAP_SCALE / gap``: half
+# the gap at a 50% gap, all of it from 25% down).
 _EXACT_BAND_MIN = 0.001
 _EXACT_BAND_MAX = 1.0
-_EXACT_BAND_STEP = 1.5
+_EXACT_BAND_GAP_SCALE = 0.25
 
 # Root cut rounds (``cut_age``): the rounds in a row a cut stays in the LP
 # while idle (slack, with a zero dual), as HiGHS's LP age limit.
@@ -7986,6 +8073,7 @@ class _BranchAndBound:
         crossover_seconds=10.0,
         crossover_solutions=3,
         crossover_min_fixed=0.5,
+        proximity_seconds=10.0,
         objective_levels=True,
         objective_level_seconds=2.0,
         cut_round_lp="jaddle",
@@ -8401,11 +8489,11 @@ class _BranchAndBound:
         # ``exact_reserved`` (a heap like ``open``) for an exact LP, and the
         # device never takes them. ``0``: the lane takes the heap's top
         # whenever it has room, and the device the rest. ``"auto"``: the
-        # band follows the lane's load (``adapt_exact_band``).
+        # band widens as the gap closes (``adapt_exact_band``).
         self.exact_band_auto = isinstance(exact_band, str)
         if self.exact_band_auto and exact_band != "auto":
             raise ValueError(f"exact_band must be a number or 'auto', not {exact_band!r}")
-        self.exact_band = _EXACT_BAND_START if self.exact_band_auto else float(exact_band)
+        self.exact_band = _EXACT_BAND_MIN if self.exact_band_auto else float(exact_band)
         self.exact_band_range = [self.exact_band, self.exact_band]
         self.exact_reserved = []
         # Nodes the lane has finished that ``collect_exact`` has not yet
@@ -8529,9 +8617,11 @@ class _BranchAndBound:
         self.crossover_seconds = float(crossover_seconds or 0.0)
         self.crossover_solutions = int(crossover_solutions)
         self.crossover_min_fixed = float(crossover_min_fixed)
+        self.proximity_seconds = float(proximity_seconds or 0.0)
         self.submip_lane = (
             _SubMipLane()
-            if submip_solver == "highs" and (rins_seconds or self.crossover_seconds)
+            if submip_solver == "highs"
+            and (rins_seconds or self.crossover_seconds or self.proximity_seconds)
             else None
         )
         # The objective's levels (``objective_levels``): when it rests on a
@@ -8555,6 +8645,9 @@ class _BranchAndBound:
         self.rins_finds = 0
         self.crossover_calls = 0
         self.crossover_finds = 0
+        self.proximity_calls = 0
+        self.proximity_finds = 0
+        self.proximity_empty = 0  # calls HiGHS showed had nothing to find
         # Feasible points with distinct integers, best first: (value, key, x).
         self.solution_pool = []
         self.rens_seconds, self.rens_nodes = rens_seconds, rens_nodes
@@ -11142,6 +11235,7 @@ class _BranchAndBound:
             "T": True,
             "U": self.use_round_repair,
             "C": bool(self.crossover_seconds and self.submip_lane is not None),
+            "X": bool(self.proximity_seconds and self.submip_lane is not None),
             "L": self.level_lane is not None,
             "1": self.use_one_opt,
             "K": self.linking_blocks is not None,
@@ -11406,6 +11500,9 @@ class _BranchAndBound:
             },
             "crossover_calls": self.crossover_calls,
             "crossover_finds": self.crossover_finds,
+            "proximity_calls": self.proximity_calls,
+            "proximity_finds": self.proximity_finds,
+            "proximity_empty": self.proximity_empty,
             "submip_lane_seconds": self.submip_lane_seconds,
             "objective_levels": self.level_stats(),
             "exact_cut_rounds": self.exact_cut_stats,
@@ -13308,46 +13405,83 @@ class _BranchAndBound:
         self.crossover_calls += 1
         return True
 
+    def proximity(self):
+        """Proximity search on the sub-MIP lane (``_proximity_job``,
+        Fischetti & Monaci): the whole base box under the cutoff, searched
+        for the point nearest the incumbent. The objective is only a row,
+        so HiGHS looks for a feasible point, and needs no LP point, as
+        RINS does. Once an incumbent at a cutoff. Returns whether a job
+        went in."""
+        seconds = self.submip_seconds_left(self.proximity_seconds)
+        if seconds <= 0:
+            return False
+        base, ints = self.base, self.is_int
+        center, cutoff = self.incumbent[1], self.cutoff(box=False)
+        key = ("proximity", center[ints].tobytes(), cutoff)
+        if key in self.rins_seen:
+            return False
+        self.rins_seen.add(key)
+        if not _proximity_distance(center, base.lower, base.upper, ints).any():
+            return False
+        self.submip_lane.submit_proximity(
+            base, ints, center, base.lower, base.upper, cutoff, seconds
+        )
+        self.submip_last = "proximity"
+        self.submip_budget = float(seconds)
+        self.submip_calls += 1
+        self.proximity_calls += 1
+        return True
+
     def feed_submip(self):
         """Keep the sub-MIP lane busy between node solves: a pending RINS
-        call (around the latest node point) and crossover take turns, and
-        either fills the lane when the other has nothing to search."""
+        call (around the latest node point), proximity search and crossover
+        take turns, and each fills the lane when the others have nothing to
+        search."""
         lane = self.submip_lane
         if lane is None or lane.busy() or self.incumbent is None or self.out_of_time():
             return
-        kinds = ("crossover", "rins") if self.submip_last == "rins" else ("rins", "crossover")
-        for kind in kinds:
+        order = ("rins", "proximity", "crossover")
+        start = order.index(self.submip_last) + 1 if self.submip_last in order else 0
+        for kind in order[start:] + order[:start]:
             if kind == "rins":
                 if self.rins_seconds and self.rins_pending and self.recent_points:
                     self.rins_pending = False
                     if self.submit_rins(self.recent_points[-1]):
                         return
+            elif kind == "proximity":
+                if self.proximity_seconds and self.proximity():
+                    return
             elif self.crossover_seconds and self.crossover():
                 return
 
     def collect_submip(self):
         """Check the point of the sub-MIP lane's finished job, if any, with
-        ``try_incumbent`` (RINS ``"N"``, crossover ``"C"``)."""
+        ``try_incumbent`` (RINS ``"N"``, crossover ``"C"``, proximity
+        ``"X"``)."""
         lane = self.submip_lane
         if lane is None:
             return
         done = lane.finished()
         if done is None:
             return
-        kind, x, seconds = done
+        kind, x, empty, seconds = done
         self.submip_lane_seconds += seconds
         if x is None:
             if kind == "rins":
                 self.adapt_rins_fixing(False, seconds)
+            self.proximity_empty += empty
             return
         before = None if self.incumbent is None else self.incumbent[0]
-        self.try_incumbent(x, "N" if kind == "rins" else "C", None)
+        source = {"rins": "N", "proximity": "X"}.get(kind, "C")
+        self.try_incumbent(x, source, None)
         improved = self.incumbent is not None and (
             before is None or self.incumbent[0] < before
         )
         if kind == "rins":
             self.adapt_rins_fixing(improved, seconds)
             self.rins_finds += improved
+        elif kind == "proximity":
+            self.proximity_finds += improved
         else:
             self.crossover_finds += improved
 
@@ -13619,6 +13753,7 @@ class _BranchAndBound:
             rins_seconds=0.0,
             rens_seconds=0.0,
             crossover_seconds=0.0,
+            proximity_seconds=0.0,
             submip_solver="jaddle",
             dive_every=0,
             tree_heuristics=False,
@@ -14734,25 +14869,20 @@ class _BranchAndBound:
         return bound + self.exact_band * max(cutoff - bound, 0.0)
 
     def adapt_exact_band(self):
-        """With ``exact_band="auto"``, once a batch: widen the band while the
-        lane's queue (``exact_reserved``) holds under half its
-        ``_EXACT_OVERFLOW_KEEP`` nodes a thread, so the threads never run dry,
-        and narrow it while the queue holds over twice that, so the bound does
-        not wait on nodes the threads cannot reach. Late in a solve the lane
-        keeps up with the few nodes near the bound and the band widens."""
-        lane = self.exact_lane
-        if not self.exact_band_auto or lane is None:
+        """With ``exact_band="auto"``, once a batch: the band is
+        ``_EXACT_BAND_GAP_SCALE`` over the relative gap (``gap``), within
+        [``_EXACT_BAND_MIN``, ``_EXACT_BAND_MAX``], so its share of the gap
+        grows as the gap closes and its width stays near 25% of the
+        incumbent's value: a quarter of the gap at a 100% gap, half at 50%,
+        all of it from 25% down. Nodes past what the threads keep go to the
+        device by ``exact_overflow_share``."""
+        if not self.exact_band_auto or self.exact_lane is None:
             return
-        if not np.isfinite(self.cutoff()):
+        if self.incumbent is None:
             return  # no band before an incumbent
-        target = _EXACT_OVERFLOW_KEEP * lane.threads
-        queued = len(self.exact_reserved)
-        if 2 * queued < target:
-            self.exact_band = min(_EXACT_BAND_MAX, self.exact_band * _EXACT_BAND_STEP)
-        elif queued > 2 * target:
-            self.exact_band = max(_EXACT_BAND_MIN, self.exact_band / _EXACT_BAND_STEP)
-        else:
-            return
+        gap = self.gap(self.global_bound())
+        band = _EXACT_BAND_MAX if gap <= 0.0 else _EXACT_BAND_GAP_SCALE / gap
+        self.exact_band = min(_EXACT_BAND_MAX, max(_EXACT_BAND_MIN, band))
         low, high = self.exact_band_range
         self.exact_band_range = [min(low, self.exact_band), max(high, self.exact_band)]
 
@@ -16197,6 +16327,7 @@ def solve(
     crossover_seconds=10.0,
     crossover_solutions=3,
     crossover_min_fixed=0.5,
+    proximity_seconds=10.0,
     objective_levels=True,
     objective_level_seconds=2.0,
     cut_round_lp="jaddle",
@@ -16833,6 +16964,17 @@ def solve(
       interior points cost it nothing. RINS and crossover take turns on the
       lane. Results: ``rins_calls``, ``rins_finds``, ``crossover_calls``,
       ``crossover_finds`` and ``submip_lane_seconds``.
+    * **Proximity search** (``proximity_seconds``, default 10 s a call;
+      ``0``: off; needs ``submip_solver="highs"``), as Fischetti and
+      Monaci's. HiGHS searches the whole base box with the objective as a
+      row, ``c·x`` below the cutoff, for the point nearest the incumbent
+      (the L1 distance over the integers at a bound, all of a binary's),
+      stops at its first point, and re-solves the continuous variables for
+      the true objective with the integers fixed; marked ``"X"``. It needs
+      no LP point, so it helps where PDHG's points guide RINS poorly. One
+      call per incumbent and cutoff; it takes turns on the lane with RINS
+      and crossover. Results: ``proximity_calls``, ``proximity_finds`` and
+      ``proximity_empty`` (calls HiGHS showed had no better point).
     * **Objective levels** (``objective_levels``, on by default). When
       every nonzero cost is on at most 3 integer columns with finite bounds
       and the box holds at most 10,000 assignments of them (levels), HiGHS
@@ -16959,11 +17101,14 @@ def solve(
       which feeds the heuristics and prunes near the cutoff. With
       ``exact_band=0`` a thread instead takes the heap's top whenever it has
       room, and the device the rest. With ``exact_band="auto"`` the band
-      follows the lane's load: it starts at 0.01 and, once a batch, grows by
-      half while the threads' queue holds under 2 nodes a thread and shrinks
-      by a third while it holds over 8, within [0.001, 1]; so it narrows
-      while the tree near the bound is wider than the threads can solve,
-      and widens late, when they keep up. The ``exact_nodes`` stats report
+      widens as the gap closes: once a batch it is 0.25 over the relative
+      gap, within [0.001, 1] (a quarter of the gap at a 100% gap, half at
+      50%, all of it from 25% down), so its width stays near 25% of the
+      incumbent's value.
+      An objective near 0 keeps the relative gap large and the band at its
+      floor. A queue wider than the threads can solve waits for them unless
+      ``exact_overflow_share`` hands its top to the device. The
+      ``exact_nodes`` stats report
       the band at the end (``band``) and its range (``band_min``,
       ``band_max``). A node goes to the lane at most once.
       HiGHS re-solves from the parent's optimal basis (below), else from
@@ -17339,6 +17484,7 @@ def solve(
         crossover_seconds=crossover_seconds,
         crossover_solutions=crossover_solutions,
         crossover_min_fixed=crossover_min_fixed,
+        proximity_seconds=proximity_seconds,
         objective_levels=objective_levels,
         objective_level_seconds=objective_level_seconds,
         cut_round_lp=cut_round_lp,
@@ -17504,6 +17650,9 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             },
             "crossover_calls": 0,
             "crossover_finds": 0,
+            "proximity_calls": 0,
+            "proximity_finds": 0,
+            "proximity_empty": 0,
             "submip_lane_seconds": 0.0,
             "objective_levels": None,
             "exact_cut_rounds": None,

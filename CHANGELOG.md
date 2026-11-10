@@ -4,6 +4,13 @@
 
 ### Added
 
+- Proximity search on the sub-MIP lane (`proximity_seconds`, default 10 s
+  a call, marked `"X"`; Fischetti & Monaci). HiGHS keeps the objective as
+  a row under the cutoff and searches the whole box for the feasible point
+  nearest the incumbent, then re-solves the continuous variables for the
+  true objective. Needs no LP point. It takes turns with RINS and
+  crossover. New result keys: `proximity_calls`, `proximity_finds`,
+  `proximity_empty`.
 - Cut separation compiled with numba (`jaddle._separate_numba`;
   `CutSeparator(backend="numba")`, `jm.solve(separation_backend="numba")`).
   One call per round, with the GIL released, runs every tight row's
@@ -88,6 +95,12 @@
 
 ### Changed
 
+- `exact_band="auto"` now widens as the gap closes: once a batch the band
+  is 0.25 over the relative gap, within [0.001, 1] (a quarter of the gap
+  at a 100% gap, half at 50%, all of it from 25% down), so its width stays
+  near 25% of the incumbent's value. It no longer follows the length of the lane's
+  queue; `exact_overflow_share` hands a queue the threads cannot keep up
+  with to the device.
 - Cut separation's batched JAX kernels run on the CPU
   (`jm.solve(separation_device="cpu")`, the new default; `"search"`: on
   the search's device, as before; `CutSeparator(device=...)`). They run in

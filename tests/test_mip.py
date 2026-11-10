@@ -6369,7 +6369,7 @@ def test_band_overflow_in_the_search():
     ref = reference(mip)
     options = dict(
         max_seconds=300, batch_size=4, exact_nodes=1, exact_band=0.5,
-        rins_seconds=0, crossover_seconds=0,
+        rins_seconds=0, crossover_seconds=0, proximity_seconds=0,
     )
     result = jm.solve(mip, exact_overflow_share=0.5, **options)
     assert result["bound"] <= ref + 1e-6
@@ -6424,8 +6424,10 @@ def test_submip_lanes_run_beside_the_exact_lane():
                     done.append(out)
             exact.wait(0.05)
         finished = exact.finished()
-        assert len(done) == 2 and all(x is not None for _, x, _ in done)
-        assert all(float(mip.c @ x) == pytest.approx(reference(mip)) for _, x, _ in done)
+        assert len(done) == 2 and all(x is not None for _, x, _, _ in done)
+        assert all(
+            float(mip.c @ x) == pytest.approx(reference(mip)) for _, x, _, _ in done
+        )
         assert not exact.jobs
     finally:
         for lane in lanes:
@@ -6492,8 +6494,76 @@ def test_highs_rins_and_crossover_in_the_search(make):
     assert result["rins_calls"] > 0
     assert result["rins_finds"] <= result["rins_calls"]
     assert result["crossover_finds"] <= result["crossover_calls"]
-    off = jm.solve(mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0)
+    off = jm.solve(
+        mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
+        proximity_seconds=0,
+    )
     assert off["rins_calls"] == off["crossover_calls"] == off["submip_lane_seconds"] == 0
+
+
+@pytest.mark.parametrize("make", [facility_location, generalised_assignment])
+def test_proximity_search_walks_down_to_the_optimum(make):
+    # Each call returns a feasible point under the cutoff, with its
+    # continuous variables optimal for its integers; recentred on each and
+    # cut below it, the walk ends at the optimum, where HiGHS shows the box
+    # empty.
+    mip = make()
+    ref = reference(mip) - mip.offset
+    is_int = np.asarray(mip.integrality, bool)
+    highs = jm._highs_proximity(mip, is_int)
+    plain = jm._highs_submip(mip, is_int)
+    center = np.zeros(mip.num_variables)
+    x, empty = jm._proximity_job(
+        highs, mip, is_int, center, mip.lower, mip.upper, np.inf, 30.0
+    )
+    assert x is not None and not empty
+    values = []
+    for _ in range(50):
+        assert mip.is_feasible(x)
+        value = float(mip.c @ x)
+        values.append(value)
+        fixed = np.where(is_int, np.round(x), mip.lower), np.where(
+            is_int, np.round(x), mip.upper
+        )
+        best = jm._submip_job(plain, mip, *fixed, np.inf, 30.0)
+        assert value == pytest.approx(float(mip.c @ best), abs=1e-6)
+        cutoff = value - 1e-6 * (1.0 + abs(value))
+        y, empty = jm._proximity_job(
+            highs, mip, is_int, x, mip.lower, mip.upper, cutoff, 30.0
+        )
+        if y is None:
+            break
+        assert float(mip.c @ y) < cutoff
+        x = y
+    assert empty
+    assert values[-1] == pytest.approx(ref, abs=1e-5)
+    assert all(a > b for a, b in zip(values, values[1:]))
+
+
+def test_proximity_distance_counts_the_integers_at_a_bound():
+    is_int = np.array([True, True, True, True, False])
+    lower = np.array([0.0, 0.0, 0.0, -np.inf, 0.0])
+    upper = np.array([1.0, 1.0, 5.0, np.inf, 1.0])
+    center = np.array([0.0, 1.0, 3.0, 2.0, 0.0])
+    cost = jm._proximity_distance(center, lower, upper, is_int)
+    assert cost.tolist() == [1.0, -1.0, 0.0, 0.0, 0.0]
+
+
+def test_proximity_in_the_search():
+    mip = generalised_assignment()
+    result = jm.solve(
+        mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
+        proximity_seconds=5,
+    )
+    assert_solved(result, mip, reference(mip))
+    assert result["proximity_calls"] > 0
+    assert result["proximity_finds"] <= result["proximity_calls"]
+    assert result["proximity_empty"] <= result["proximity_calls"]
+    off = jm.solve(
+        mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
+        proximity_seconds=0,
+    )
+    assert off["proximity_calls"] == off["submip_lane_seconds"] == 0
 
 
 @pytest.mark.parametrize("make", [facility_location, generalised_assignment])
@@ -6553,35 +6623,33 @@ def test_exact_lane_solves_to_the_optimum(make):
 
 
 def test_adaptive_exact_band():
-    # The auto band widens while the lane's queue is short, narrows while it
-    # is long, holds in between, stays within its limits, and waits for a
-    # cutoff.
-    lane = types.SimpleNamespace(threads=2)  # target: 8 queued nodes
+    # The auto band is the gap scale over the relative gap, so it widens as
+    # the gap closes, stays within its limits, and waits for an incumbent.
     search = types.SimpleNamespace(
         exact_band_auto=True,
-        exact_lane=lane,
-        exact_band=jm._EXACT_BAND_START,
-        exact_band_range=[jm._EXACT_BAND_START] * 2,
-        exact_reserved=[],
-        cutoff=lambda: 1.0,
+        exact_lane=types.SimpleNamespace(threads=2),
+        exact_band=jm._EXACT_BAND_MIN,
+        exact_band_range=[jm._EXACT_BAND_MIN] * 2,
+        incumbent=None,
+        bound=90.0,
     )
+    search.global_bound = lambda: search.bound
+    search.gap = lambda bound: jm._relative_gap(search.incumbent[0], bound)
     adapt = lambda: jm._BranchAndBound.adapt_exact_band(search)
     adapt()
-    assert search.exact_band == pytest.approx(jm._EXACT_BAND_START * jm._EXACT_BAND_STEP)
-    for _ in range(100):
-        adapt()
-    assert search.exact_band == jm._EXACT_BAND_MAX
-    search.exact_reserved = [None] * 8
-    adapt()
-    assert search.exact_band == jm._EXACT_BAND_MAX  # within the target: holds
-    search.exact_reserved = [None] * 17
-    for _ in range(100):
-        adapt()
-    assert search.exact_band == jm._EXACT_BAND_MIN
-    assert search.exact_band_range == [jm._EXACT_BAND_MIN, jm._EXACT_BAND_MAX]
-    search.exact_reserved, search.cutoff = [], lambda: np.inf
-    adapt()
     assert search.exact_band == jm._EXACT_BAND_MIN  # no incumbent: no change
+    search.incumbent = (100.0, None)
+    bands = []
+    for bound in (-1e5, 0.0, 50.0, 75.0, 90.0, 100.0):
+        search.bound = bound
+        adapt()
+        bands.append(search.exact_band)
+    assert bands[0] == jm._EXACT_BAND_MIN  # a 100,100% gap: at the floor
+    assert bands[1] == pytest.approx(0.25)  # a 100% gap
+    assert bands[2] == pytest.approx(0.5)  # a 50% gap
+    assert bands[3] == bands[4] == bands[5] == jm._EXACT_BAND_MAX  # 25% and less
+    assert all(a <= b for a, b in zip(bands, bands[1:]))
+    assert search.exact_band_range == [jm._EXACT_BAND_MIN, jm._EXACT_BAND_MAX]
     with pytest.raises(ValueError):
         jm.solve(facility_location(), batch_size=4, exact_band="wide")
 
@@ -7508,7 +7576,7 @@ def test_lane_serviced_during_batches_keeps_the_optimum():
     ref = reference(mip)
     result = jm.solve(
         mip, max_seconds=300, batch_size=4, exact_nodes=2, exact_band=0.5,
-        rins_seconds=0, crossover_seconds=0,
+        rins_seconds=0, crossover_seconds=0, proximity_seconds=0,
     )
     assert result["bound"] <= ref + 1e-6
     if result["status"] == "optimal":
