@@ -115,7 +115,7 @@ can be combined, for example `pip install "jaddle[cuda12,examples]"`:
 | `rag_examples` | `fastembed`, `snowballstemmer`, and `examples` | The retrieval (RAG) examples |
 | `benchmarks` | `mpax` | The benchmarks |
 | `cvxpy` | `cvxpy` | [Modelling with CVXPY](#modelling-with-cvxpy) |
-| `fast` | `numba` | The incremental feasibility jump in the MIP solver, much faster than the device one for finding first incumbents, and compiled bound propagation (the same bounds as the numpy version, about 7× faster a call) |
+| `fast` | `numba` | The incremental feasibility jump in the MIP solver, much faster than the device one for finding first incumbents, compiled bound propagation (the same bounds as the numpy version, about 7× faster a call), compiled cut separation (7–20× faster a round than numpy) and compiled Lagrangian bounds |
 | `test` | `pytest`, `cvxpy`, `numba` | Running the test suite |
 | `dev` | `examples`, `test`, `build`, `twine` | Development and packaging |
 
@@ -812,7 +812,7 @@ reports `bound_rigorous=False`.
 | `cut_round_epochs` | `10` | Epoch budget of each cut round's root re-solve (`None`: to convergence); the root is converged once the rounds end. |
 | `gomory_cuts` | `True` | Gomory mixed-integer cuts from a crossover basis at each root round (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
 | `root_crossover` | `False` | Cross the root LP over to an exact vertex for rigorous reduced-cost tightening duals (`"auto"`: only when that tightening runs; `True`: always). |
-| `separation_backend` | `"jax"` | Run the c-MIR and flow cover searches batched in JAX (float64), or `"numpy"` for the per-row reference searches. |
+| `separation_backend` | `"auto"` | `"numba"` (the default with numba installed) runs each cut round's cover, c-MIR and flow cover searches in one compiled call; `"jax"` (the default without numba) runs the c-MIR and flow cover searches batched in JAX (float64); `"numpy"` runs the per-row reference searches. |
 | `flow_covers` | `True` | Flow cover cuts from rows with continuous variables, over their variable bounds (`y <= u·z`). |
 | `clique_cuts` | `True` | Clique cuts from a conflict graph on the binaries, built once from the rows over the root box (`jm.ConflictGraph`). |
 | `zero_half_cuts` | `True` | Zero-half ({0, ½}-Chvátal–Gomory) cuts from the rows and cuts with integer coefficients, found by elimination over GF(2) (`jm.zero_half_cuts`). |

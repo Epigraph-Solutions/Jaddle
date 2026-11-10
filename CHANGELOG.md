@@ -4,6 +4,20 @@
 
 ### Added
 
+- Cut separation compiled with numba (`jaddle._separate_numba`;
+  `CutSeparator(backend="numba")`, `jm.solve(separation_backend="numba")`).
+  One call per round, with the GIL released, runs every tight row's
+  lifted covers, aggregation path, c-MIR (with variable-bound
+  substitution) and flow cover searches, and gives the numpy searches'
+  cuts up to rounding in near-ties. At the LP point a round took 19 ms on
+  beasleyC3 (JAX 127 ms, numpy 390 ms), 91 ms on air05 (both 1.5 s) and
+  112 ms on dano3_3 (JAX 0.84 s, numpy 3.9 s). The default
+  `separation_backend` is now `"auto"`: numba when it is installed,
+  else `"jax"` as before.
+- Lagrangian bounds compiled with numba (`jaddle._bound_numba`):
+  `box_bound`, `lagrangian_terms` (with a CSR `A_T`), `_exact_side_bound`
+  and the search's `bound_over` each run in one pass without
+  temporaries, with the GIL released, when numba is installed.
 - `jaddle.presolve.defined_integers`: general integers that an equality
   row defines (`z = Σ a_j x_j` over integers, `|a_z| = 1`, zero cost,
   integer coefficients and right-hand side) substituted out of a MIP's

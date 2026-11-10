@@ -51,8 +51,9 @@ rag_examples = ["jaddle[examples]", "fastembed>=0.9", "snowballstemmer>=2.2"]
 benchmarks = ["mpax>=0.1"]
 cvxpy = ["cvxpy>=1.6"]
 # The incremental feasibility jump (jaddle._jump_numba), much faster than the
-# device one on the root heuristics, and compiled bound propagation
-# (jaddle._propagate_numba).
+# device one on the root heuristics, compiled bound propagation
+# (jaddle._propagate_numba), cut separation (jaddle._separate_numba) and
+# Lagrangian bounds (jaddle._bound_numba).
 fast = ["numba>=0.61"]
 # Symmetry detection in jm.solve (symmetry_generators): igraph bundles bliss.
 symmetry = ["igraph>=0.11"]

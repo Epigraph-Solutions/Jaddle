@@ -149,13 +149,12 @@ def run_jaddle(path, args):
         device=args.device,
         presolve=True,
         exact_band="auto",
-        batch_size=8,
-        exact_strong_lookahead=8,
-        one_opt=True,
+        batch_size=64,
         max_seconds=args.max_seconds,
-        tree_cut_every=100,
+        tree_cut_every=200,
         cut_pool_size=1e5,
         tree_cut_rows=2000,
+        cuts=True,
     )
     row.update(
         {

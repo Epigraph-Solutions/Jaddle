@@ -3761,6 +3761,107 @@ def test_batched_separation_matches_numpy(make):
                 )
 
 
+@NEEDS_NUMBA
+@pytest.mark.parametrize(
+    "make",
+    [knapsack, general_integer, facility_location, generalised_assignment,
+     lambda: fixed_charge()[0]],
+)
+def test_numba_separation_matches_numpy(make):
+    mip = make()
+    x, _ = vertex_and_basis(mip)
+    rng = np.random.default_rng(0)
+    points = [x, np.clip(x + rng.uniform(-0.3, 0.3, x.size), mip.lower, np.minimum(mip.upper, 1e3))]
+    for point in points:
+        for aggregate in (False, True):
+            kwargs = dict(aggregate_integers=aggregate, max_aggregation=4 if aggregate else 2)
+            ref = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numpy", **kwargs)(point)
+            got = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numba", **kwargs)(point)
+            assert [cut[0] for cut in got] == [cut[0] for cut in ref]
+            for (_, *mine), (_, *theirs) in zip(got, ref):
+                assert np.array_equal(mine[0], theirs[0])
+                assert np.allclose(mine[1], theirs[1], rtol=1e-9, atol=1e-12)
+                assert mine[2] == pytest.approx(theirs[2], rel=1e-9, abs=1e-12)
+
+
+@NEEDS_NUMBA
+def test_numba_separation_keeps_clique_and_implied_cuts_first():
+    mip = facility_location()
+    x, _ = vertex_and_basis(mip)
+    graph = jm.ConflictGraph([mip], mip.lower, mip.upper)
+    ref = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numpy", conflict_graph=graph)(x)
+    got = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numba", conflict_graph=graph)(x)
+    assert [cut[0] for cut in got] == [cut[0] for cut in ref]
+
+
+def test_auto_separation_backend_is_numba_when_installed():
+    mip = knapsack()
+    separator = jm.CutSeparator(mip, mip.lower, mip.upper)
+    assert separator.backend == ("jax" if jm._numba_separate() is None else "numba")
+    with pytest.raises(ValueError, match="backend"):
+        jm.CutSeparator(mip, mip.lower, mip.upper, backend="cuda")
+
+
+def _random_bound_inputs(seed, n=300, m=120):
+    rng = np.random.default_rng(seed)
+    A = sp.random(m, n, density=0.05, random_state=seed, format="csr")
+    c = rng.standard_normal(n)
+    b = rng.standard_normal(m)
+    lower = rng.uniform(-5, 0, n)
+    upper = lower + rng.uniform(0, 5, n)
+    lower[rng.random(n) < 0.1] = -np.inf
+    upper[rng.random(n) < 0.1] = np.inf
+    y = rng.standard_normal(m)
+    return A, c, b, lower, upper, y, rng.random(n) < 0.5
+
+
+@NEEDS_NUMBA
+@pytest.mark.parametrize("seed", range(4))
+def test_numba_bounds_match_numpy(seed):
+    from jaddle import _bound_numba
+
+    A, c, b, lower, upper, y, is_int = _random_bound_inputs(seed)
+    n_eq = 30
+    A_T = A.T.tocsr()
+    # Reduced costs: the same as scipy's product, bit for bit.
+    constant, r = jm.lagrangian_terms(c, A, b, n_eq, y, A_T=A_T)
+    y_clip = y.copy()
+    y_clip[n_eq:] = np.maximum(y_clip[n_eq:], 0.0)
+    assert np.array_equal(r, c + A_T @ y_clip)
+    assert constant == pytest.approx(-(b @ y_clip), rel=1e-12)
+    # The box bound, with and without infinite terms dropped.
+    for tol, rr in ((0.0, r), (1e300, r), (0.0, np.where(np.isfinite(lower) & np.isfinite(upper), r, 0.0))):
+        want = jm._box_bound_numpy(constant, rr, lower, upper, tol)
+        got = _bound_numba.box_bound(constant, rr, lower, upper, tol)
+        assert got[1] == want[1]
+        assert got[0] == pytest.approx(want[0], rel=1e-12) or got[0] == want[0] == -np.inf
+    # Widened continuous bounds (``bound_over``).
+    cont = ~is_int
+    wlo = np.where(cont, lower - 1e-7 * (1.0 + np.abs(lower)), lower)
+    wup = np.where(cont, upper + 1e-7 * (1.0 + np.abs(upper)), upper)
+    want = jm._box_bound_numpy(constant, r, wlo, wup, 1e300)
+    got = _bound_numba.widened_box_bound(constant, r, lower, upper, is_int, 1e300)
+    assert got[1] == want[1] and got[0] == pytest.approx(want[0], rel=1e-12)
+
+
+@NEEDS_NUMBA
+@pytest.mark.parametrize("seed", range(4))
+def test_numba_exact_side_bound_matches_numpy(seed):
+    A, c, b, lower, upper, y, is_int = _random_bound_inputs(seed)
+    mip = types.SimpleNamespace(A=A, b=b, c=c, n_eq=30)
+    # Round-off reduced costs at infinite bounds: zeroed, not -inf.
+    A_T = A.T.tocsr()
+    _, r = jm.lagrangian_terms(c, A, b, mip.n_eq, y, A_T=A_T)
+    c = c - np.where(~np.isfinite(lower) | ~np.isfinite(upper), r - 1e-13, 0.0)
+    mip.c = c
+    for y_eq, y_ineq in ((y[:30], y[30:]), (y[:10], np.concatenate([y[30:], [1.0, 2.0]]))):
+        want = jm._exact_side_bound(mip, None, y_eq, y_ineq, lower, upper, is_int, 0.0)
+        got = jm._exact_side_bound(mip, A_T, y_eq, y_ineq, lower, upper, is_int, 0.0)
+        assert got[1] == want[1]
+        assert got[0] == pytest.approx(want[0], rel=1e-12) or got[0] == want[0] == -np.inf
+    assert jm._exact_side_bound(mip, A_T, y[:30], y[30:40], lower, upper, is_int, 0.0) is None
+
+
 def _select_cuts_reference(cuts, x, n, min_efficacy=1e-4, max_cuts=100):
     """``select_cuts`` before it was vectorised: one stack per candidate."""
     scored = []
