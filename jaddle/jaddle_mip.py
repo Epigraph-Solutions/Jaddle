@@ -48,7 +48,7 @@ from jaddle import highs_helpers as hh
 from jaddle import jaddle_linear as jl
 from jaddle import jaddle_optimisers as jo
 from jaddle import presolve as jaddle_presolve
-from jaddle.jaddle_basic_types import LP, JaddleLP, _wide
+from jaddle.jaddle_basic_types import LP, JaddleLP, SaddleState, _wide
 
 # Slack when rounding bounds of integer variables, so 2.9999999 becomes 3.
 _ROUND_SLACK = 1e-6
@@ -801,6 +801,9 @@ def _probe_split(lower, upper):
 # implied-bound cuts (exact LPs, with Gomory cuts) reached −401.8 at 5 passes
 # and 64 implications against −395.8 at a fixed point with all of them.
 _PROBE_MAX_PASSES = 100
+# Variables per call of the numba probing kernel: the deadline is checked
+# between calls.
+_PROBE_NUMBA_CHUNK = 64
 # ``None``: every implication; the outputs are no larger than the propagated
 # boxes the chunk holds anyway.
 _PROBE_MAX_IMPLICATIONS = None
@@ -834,11 +837,17 @@ def probe(
     ``max_variables`` of them, until ``deadline`` (a ``time.time()`` value),
     and probing stops once ``max_useless`` variables in a row (``None``: no
     limit) have fixed or tightened nothing, as SCIP's probing does: on
-    fiball all 32,399 variables took 11 s for one tightened bound.
-    ``backend`` is ``"numpy"`` (one ``BoundPropagator`` call per side, each
-    from the box tightened so far), ``"jax"`` (chunks of variables at once,
-    both sides of each propagated by ``_propagate_jax`` in one vmapped call
-    of fixed shape) or ``"auto"`` (numpy up to 10,000 nonzeros).
+    fiball all 32,399 variables took 11 s for one tightened bound. Under
+    numba a probe that implies a bound on another variable also counts as
+    useful (its implications go to the cache).
+    ``backend`` is ``"numba"`` (``jaddle._probe_numba``: each side
+    propagated incrementally from the probed variable, visiting only the
+    rows whose variables changed, and undone after), ``"numpy"`` (one
+    ``BoundPropagator`` call per side, each a full
+    sweep from the box tightened so far), ``"jax"`` (chunks of variables at
+    once, both sides of each propagated by ``_propagate_jax`` in one
+    vmapped call of fixed shape) or ``"auto"`` (numba when it is installed,
+    else numpy up to 10,000 nonzeros and JAX above).
     Propagation runs at most ``max_passes`` passes (it stops sooner at a
     fixed point), and the device backend keeps at most ``max_implications``
     implications per side in the cache (``None``: all; the box tightenings
@@ -871,15 +880,71 @@ def probe(
     order = _probe_order(A, row_lower, row_upper, integrality, lower, upper, tol)
     if max_variables is not None:
         order = order[: int(max_variables)]
+    if backend not in ("auto", "numba", "numpy", "jax"):
+        raise ValueError(
+            f"backend must be 'auto', 'numba', 'numpy' or 'jax', not {backend!r}"
+        )
     if backend == "auto":
-        backend = "numpy" if A.nnz <= _SMALL_MIP_NNZ else "jax"
-    if backend not in ("numpy", "jax"):
-        raise ValueError(f"backend must be 'auto', 'numpy' or 'jax', not {backend!r}")
+        if _numba_probe() is not None:
+            backend = "numba"
+        else:
+            backend = "numpy" if A.nnz <= _SMALL_MIP_NNZ else "jax"
+    if backend == "numba" and _numba_probe() is None:
+        raise ValueError("the numba probing backend needs numba: pip install jaddle[fast]")
     probed = 0
     useless = 0  # variables probed in a row that changed no bound
 
     def progress(old_lower, old_upper):
         return bool(np.any(lower != old_lower) or np.any(upper != old_upper))
+
+    if backend == "numba":
+        kernel = _numba_probe()
+        csc = sp.csc_matrix(A, dtype=np.float64)
+        csc.eliminate_zeros()
+        csr = csc.tocsr()
+        arrays = (
+            csr.indptr.astype(np.int64),
+            csr.indices.astype(np.int64),
+            csr.data,
+            csc.indptr.astype(np.int64),
+            csc.indices.astype(np.int64),
+            np.asarray(row_lower, np.float64),
+            np.asarray(row_upper, np.float64),
+            integrality,
+        )
+        limit = -1 if max_useless is None else int(max_useless)
+        position = 0
+        while position < order.size:
+            if deadline is not None and time.time() >= deadline:
+                break
+            if limit >= 0 and useless >= limit:
+                break
+            (
+                infeasible, consumed, count, useless, var, split, empty, ptr, idx, lo, up
+            ) = kernel.probe_chunk(
+                order[position : position + _PROBE_NUMBA_CHUNK].astype(np.int64),
+                *arrays, lower, upper, int(max_passes), float(tol), _ROUND_SLACK,
+                int(useless), limit,
+            )
+            position += consumed
+            probed += count
+            for p in range(count):
+                sides = [
+                    None
+                    if empty[p, side]
+                    else (
+                        idx[ptr[2 * p + side] : ptr[2 * p + side + 1]].copy(),
+                        lo[ptr[2 * p + side] : ptr[2 * p + side + 1]].copy(),
+                        up[ptr[2 * p + side] : ptr[2 * p + side + 1]].copy(),
+                    )
+                    for side in range(2)
+                ]
+                cache.add(var[p], split[p], sides[0], sides[1])
+            if infeasible:
+                return result(True, probed)
+            if consumed == 0:
+                break
+        return result(False, probed)
 
     if backend == "numpy":
         for var in order:
@@ -3353,6 +3418,9 @@ def gomory_cuts(
 # it stores, literals that start a clique search per round, and adjacency
 # checks spent lifting one clique.
 _CLIQUE_MAX_EXTRA_EDGES = 10_000
+# Conflicts from probing (``ConflictGraph.add_implications``) kept at most:
+# on presolved mzzv11 probing implies about a million pairs of binaries.
+_CLIQUE_MAX_PROBING_EDGES = 2_000_000
 _CLIQUE_MAX_STARTS = 2000
 _CLIQUE_LIFT_CHECKS = 20_000
 _CLIQUE_ROUND_CHECKS = 1_000_000  # and in one round, over all its cliques
@@ -3403,6 +3471,77 @@ class ConflictGraph:
 
     def __len__(self):
         return len(self.cliques)
+
+    def add_implications(self, cache, lower, upper, integrality, max_edges=None):
+        """
+        Conflicts from probing (``ProbingCache``): when fixing binary ``z``
+        to ``d`` forces binary ``y`` to ``w``, literal ``z = d`` conflicts
+        with literal ``y = 1 − w``. These need not show in any single row:
+        propagation finds them through chains of rows, so clique cuts can
+        grow across rows (HiGHS and SCIP fill their clique tables this way).
+        ``lower``/``upper`` are the graph's box and ``integrality`` its
+        integers; probing's implications hold over a box at least as wide.
+        Conflicts the rows' cliques already hold are skipped, and at most
+        ``max_edges`` new ones are kept (``None``:
+        ``_CLIQUE_MAX_PROBING_EDGES``), in probing order. Returns the number
+        added.
+        """
+        lower = np.asarray(lower, np.float64)
+        upper = np.asarray(upper, np.float64)
+        is_binary = np.asarray(integrality, bool) & (lower == 0.0) & (upper == 1.0)
+        max_edges = _CLIQUE_MAX_PROBING_EDGES if max_edges is None else int(max_edges)
+        first, second = [], []
+        for z, sides in cache.sides.items():
+            if cache.split[z] != 0.0 or not is_binary[z]:
+                continue
+            for d, side in enumerate(sides):
+                if side is None:
+                    continue
+                idx, lo, up = side
+                binary = is_binary[idx] & (idx != z)
+                to_zero = binary & (up <= 0.0)
+                to_one = binary & (lo >= 1.0)
+                if not (to_zero.any() or to_one.any()):
+                    continue
+                own = 2 * z + (0 if d == 1 else 1)  # literal z = d
+                # y forced to 0 conflicts with y = 1 (literal 2y); forced to
+                # 1, with 1 − y (literal 2y + 1).
+                other = np.concatenate([2 * idx[to_zero], 2 * idx[to_one] + 1])
+                first.append(np.full(other.size, own, np.int64))
+                second.append(other.astype(np.int64))
+        if not first:
+            return 0
+        u, v = np.concatenate(first), np.concatenate(second)
+        u, v = np.minimum(u, v), np.maximum(u, v)
+        key = u * (2 * self.n) + v
+        _, keep = np.unique(key, return_index=True)
+        keep.sort()  # probing order
+        u, v = u[keep], v[keep]
+        if self.cliques:
+            # Pairs a row's clique already holds.
+            members = [
+                (literal, k)
+                for literal, ks in self.literal_cliques.items()
+                for k in ks
+            ]
+            lit, clq = np.array(members, np.int64).T
+            M = sp.csr_matrix(
+                (np.ones(lit.size), (lit, clq)), shape=(2 * self.n, len(self.cliques))
+            )
+            covered = np.asarray(M[u].multiply(M[v]).sum(axis=1)).ravel() > 0
+            u, v = u[~covered], v[~covered]
+        added = 0
+        for a, b in zip(u.tolist(), v.tolist()):
+            if added >= max_edges:
+                break
+            neighbours = self.extra.setdefault(a, set())
+            if b in neighbours:
+                continue
+            neighbours.add(b)
+            self.extra.setdefault(b, set()).add(a)
+            added += 1
+        self.num_edges += added
+        return added
 
     @staticmethod
     def _add_rows(mip, lower, upper, tol, cliques, extra, integrality=None):
@@ -5225,6 +5364,16 @@ def _numba_bound():
 
 
 @functools.cache
+def _numba_probe():
+    """``jaddle._probe_numba``, or ``None`` without numba."""
+    try:
+        from jaddle import _probe_numba
+    except ImportError:
+        return None
+    return _probe_numba
+
+
+@functools.cache
 def _numba_separate():
     """``jaddle._separate_numba``, or ``None`` without numba."""
     try:
@@ -5248,6 +5397,15 @@ def _csr_transpose(A_T, c, m):
         and A_T.format == "csr"
         and A_T.shape == (np.shape(c)[0], m)
     )
+
+
+def _lp_solver(name, option):
+    """The LP solver an option names: ``"jaddle"`` (PDHG) or ``"highs"``;
+    ``"pdhg"`` and ``"exact"`` are the earlier names of the two."""
+    name = {"pdhg": "jaddle", "exact": "highs"}.get(name, name)
+    if name not in ("jaddle", "highs"):
+        raise ValueError(f"{option} must be 'jaddle' or 'highs', not {name!r}")
+    return name
 
 
 def _separation_backend(backend):
@@ -7783,6 +7941,7 @@ class _BranchAndBound:
         restarts=5,
         mip_start=None,
         implied_bound_cuts=True,
+        probing_cliques=True,
         implied_variable_bounds=True,
         max_aggregation=None,
         exact_nodes=0,
@@ -7829,7 +7988,8 @@ class _BranchAndBound:
         crossover_min_fixed=0.5,
         objective_levels=True,
         objective_level_seconds=2.0,
-        cut_round_lp="pdhg",
+        cut_round_lp="jaddle",
+        root_lp="jaddle",
         interrupt=None,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
@@ -7964,13 +8124,14 @@ class _BranchAndBound:
         self.use_coefficient_tightening = coefficient_tightening
         self.coefficients_tightened = 0
         self.cuts, self.cut_rounds = cuts, cut_rounds
-        # The LP the root cut rounds re-solve (``cut_round_lp``): PDHG, or
+        # The LP the root cut rounds re-solve (``cut_round_lp``): Jaddle's
+        # PDHG (``"jaddle"``), or
         # HiGHS's dual simplex warm from the last basis (``exact_cut_loop``).
-        if cut_round_lp not in ("pdhg", "exact"):
-            raise ValueError(
-                f"cut_round_lp must be 'pdhg' or 'exact', not {cut_round_lp!r}"
-            )
-        self.cut_round_lp = cut_round_lp
+        self.cut_round_lp = _lp_solver(cut_round_lp, "cut_round_lp")
+        # The solver of the first root LP (``root_lp``): Jaddle's PDHG, or HiGHS with
+        # PDHG warm from its vertex (``highs_root_lp``); and its time.
+        self.root_lp = _lp_solver(root_lp, "root_lp")
+        self.root_lp_stats = {"solver": self.root_lp, "seconds": 0.0, "highs_seconds": 0.0}
         self.exact_cut_stats = None  # ``result["exact_cut_rounds"]``
         self.max_cuts_per_round, self.cut_min_progress = (
             max_cuts_per_round,
@@ -8018,6 +8179,10 @@ class _BranchAndBound:
         self.use_zero_half = bool(zero_half_cuts)
         # Implied-bound cuts (``implied_bound_cuts``) from what probing learnt.
         self.use_implied_bound_cuts = bool(implied_bound_cuts)
+        # Conflicts from probing in the conflict graph (``probing_cliques``):
+        # the cache whose implications it holds.
+        self.use_probing_cliques = bool(probing_cliques)
+        self._graph_probe_cache = None
         # Probing's bounds on continuous columns as variable bounds for c-MIR
         # and flow cover cuts (``implied_variable_bounds``).
         self.use_implied_variable_bounds = bool(implied_variable_bounds)
@@ -8530,7 +8695,9 @@ class _BranchAndBound:
         self.use_bulk_rounding = bool(bulk_rounding)
         self.bulk_starts = max(1, int(bulk_starts))
         self._bulk_data = None  # (mip, device rows) for the jax backend
-        self.probing_stats = {"probed": 0, "fixed": 0, "tightened": 0, "seconds": 0.0}
+        self.probing_stats = {
+            "probed": 0, "fixed": 0, "tightened": 0, "seconds": 0.0, "conflicts": 0,
+        }
         self.heuristic_budget = heuristic_seconds
         self.heuristic_seconds = 0.0
         self.root_heuristic_used = 0.0  # by ``root_heuristics``' calls
@@ -11278,6 +11445,7 @@ class _BranchAndBound:
                 )
             ),
             "root_crossover": self.root_crossover_used,
+            "root_lp": dict(self.root_lp_stats),
             "round_repair_calls": self.round_repair_calls,
             "round_repair_finds": self.round_repair_finds,
             "round_repair_seconds": self.round_repair_seconds,
@@ -11353,6 +11521,64 @@ class _BranchAndBound:
 
         self.node_crossover_integral += int(integral(vertex) and not integral(x))
         return crossed["solution"]
+
+    def highs_root_lp(self, lp, lower, upper):
+        """
+        The first root LP solved by HiGHS (``root_lp="highs"``), for timing
+        against PDHG: HiGHS's LP solver with its presolve, over the searched
+        rows and the box, then PDHG on ``lp`` warm from HiGHS's vertex and
+        duals, so the search goes on from a PDHG result as usual (from an
+        optimal point it stops at its first convergence check). The vertex
+        is kept as the root's crossover (``root_vertex_state``), so the
+        root's exact duals need no crossover. Returns the PDHG result,
+        ``"infeasible"`` when HiGHS proves the LP infeasible, or ``None``
+        when HiGHS does not solve it (PDHG then solves it cold).
+        """
+        import highspy
+
+        mip = self.mip
+        n = mip.num_variables
+        highs = _highs_rows(mip)
+        highs.changeColsBounds(
+            n,
+            np.arange(n, dtype=np.int32),
+            np.asarray(lower, np.float64),
+            np.asarray(upper, np.float64),
+        )
+        for option, value in (
+            ("presolve", "on"),
+            ("solver", "choose"),
+            ("parallel", "choose"),
+            ("time_limit", float(self.seconds_left() or np.inf)),
+        ):
+            highs.setOptionValue(option, value)
+        started = time.time()
+        highs.run()
+        self.root_lp_stats["highs_seconds"] += time.time() - started
+        status = highs.getModelStatus()
+        if status == highspy.HighsModelStatus.kInfeasible:
+            return "infeasible"
+        if status != highspy.HighsModelStatus.kOptimal:
+            return None
+        x = np.asarray(highs.getSolution().col_value, np.float64)
+        y_eq, y_ineq = _jaddle_duals(highs, mip)
+        self.root_vertex_state = (
+            mip, SaddleState(primal=x, dual_ineq=y_ineq, dual_eq=y_eq)
+        )
+        # The LP's dual blocks (``jl.solve`` pads an empty one to a row).
+        dual_eq = np.zeros(lp.A_eq.shape[0])
+        dual_ineq = np.zeros(lp.A_ineq.shape[0])
+        dual_eq[: y_eq.size] = y_eq
+        dual_ineq[: y_ineq.size] = y_ineq
+        warm = (
+            SaddleState(
+                primal=jnp.asarray(x),
+                dual_ineq=jnp.asarray(dual_ineq),
+                dual_eq=jnp.asarray(dual_eq),
+            ),
+            None,
+        )
+        return self.solve_lp(lp, warm, self.root_max_epochs)
 
     def root_vertex(self, lower, upper, solution):
         """Cross the root LP's point over to an optimal vertex with HiGHS
@@ -11447,9 +11673,9 @@ class _BranchAndBound:
         bound. Also stops when a re-solve's bound reaches the cutoff
         (``root_resolve``). Returns the last root LP result.
 
-        With ``cut_round_lp="exact"`` the rounds run on HiGHS's dual simplex
+        With ``cut_round_lp="highs"`` the rounds run on HiGHS's dual simplex
         instead (``exact_cut_loop``), unless it cannot solve the root LP."""
-        if self.cut_round_lp == "exact":
+        if self.cut_round_lp == "highs":
             out = self.exact_cut_loop(lower, upper, result)
             if out is not None:
                 return out
@@ -11606,7 +11832,7 @@ class _BranchAndBound:
 
     def exact_cut_loop(self, lower, upper, result):
         """
-        ``cut_loop``'s rounds on exact LPs (``cut_round_lp="exact"``): one
+        ``cut_loop``'s rounds on exact LPs (``cut_round_lp="highs"``): one
         HiGHS dual simplex holds the searched rows and the cuts, added and
         dropped as rows, so each re-solve starts from the last basis. Each
         round separates at the exact vertex (Gomory cuts from its basis)
@@ -12261,7 +12487,20 @@ class _BranchAndBound:
                 self.conflict_graph = ConflictGraph(
                     mips, lower, upper, integrality=self.cut_int
                 )
-            graph = self.conflict_graph if len(self.conflict_graph) else None
+            if (
+                self.use_probing_cliques
+                and self.probe_cache is not None
+                and self._graph_probe_cache is not self.probe_cache
+            ):
+                self.probing_stats["conflicts"] += self.conflict_graph.add_implications(
+                    self.probe_cache, lower, upper, self.cut_int
+                )
+                self._graph_probe_cache = self.probe_cache
+            graph = (
+                self.conflict_graph
+                if len(self.conflict_graph) or self.conflict_graph.extra
+                else None
+            )
         implied = None
         if (
             self.use_implied_bound_cuts
@@ -15522,7 +15761,24 @@ class _BranchAndBound:
         self.try_trivial(lower, upper)
         self.block_decomposition(lower, upper)
         self.launch_root_jumps(lower, upper)
-        result = self.solve_lp(lp, warm, self.root_max_epochs)
+        lp_started = time.time()
+        result = None
+        if self.root_lp == "highs":
+            result = self.highs_root_lp(lp, lower, upper)
+            if isinstance(result, str):  # "infeasible"
+                return self.empty_root()
+        if result is None:
+            result = self.solve_lp(lp, warm, self.root_max_epochs)
+        self.root_lp_stats["seconds"] += time.time() - lp_started
+        if self.verbose:
+            stats = self.root_lp_stats
+            highs = (
+                f" (HiGHS {stats['highs_seconds']:.2f}s)" if self.root_lp == "highs" else ""
+            )
+            print(
+                f"Root LP ({self.root_lp}): {stats['seconds']:.2f}s{highs}, "
+                f"{result['epochs']} PDHG epochs"
+            )
         if (
             not result["converged"]
             and result["stop_reason"] not in ("interrupted", "time_limit")
@@ -15896,6 +16152,7 @@ def solve(
     restarts=5,
     mip_start=None,
     implied_bound_cuts=True,
+    probing_cliques=True,
     implied_variable_bounds=True,
     max_aggregation=6,
     exact_nodes=16,
@@ -15942,7 +16199,8 @@ def solve(
     crossover_min_fixed=0.5,
     objective_levels=True,
     objective_level_seconds=2.0,
-    cut_round_lp="pdhg",
+    cut_round_lp="jaddle",
+    root_lp="jaddle",
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -16146,7 +16404,14 @@ def solve(
       Lagrangian bound holds at any duals; the root is solved to convergence
       once the rounds end. On lseu that cuts the root from 17s to 7s (bound
       1,091 → 1,095).
-      With ``cut_round_lp="exact"`` (default ``"pdhg"``) the rounds re-solve
+      With ``root_lp="highs"`` (default ``"jaddle"``; for timing the two)
+      HiGHS solves the first root LP, with its presolve and its choice of
+      solver, and PDHG then re-solves it warm from HiGHS's vertex and duals
+      (``highs_root_lp``), so the search goes on from a PDHG result; the
+      vertex serves as the root's crossover. ``result["root_lp"]`` gives
+      the ``solver``, the root LP's ``seconds`` and, of them,
+      ``highs_seconds``.
+      With ``cut_round_lp="highs"`` (default ``"jaddle"``) the rounds re-solve
       with HiGHS's dual simplex instead, warm from the last basis, with the
       cuts added and dropped as rows (``exact_cut_loop``): each round
       separates at an exact vertex, Gomory cuts come from its basis without
@@ -16476,6 +16741,18 @@ def solve(
       What each side implies is kept as a ``ProbingCache`` for bulk
       rounding and implied-bound cuts; the JAX backend keeps at most
       ``probing_max_implications`` per side (``None``, the default: all).
+      With numba installed (``probing_backend="auto"``, or ``"numba"``)
+      each side propagates incrementally from the probed variable, visiting
+      only the rows whose variables changed (``jaddle._probe_numba``),
+      where the numpy and JAX backends sweep every row each pass (on
+      presolved mzzv11 20 ms and 80 ms a variable on the CPU). Under numba
+      a probe that implies a bound on
+      another variable is not counted towards ``probing_max_useless``.
+      With ``probing_cliques`` (on by default) the pairs of binaries
+      probing shows cannot both take the values found
+      (``ConflictGraph.add_implications``) join the conflict graph of the
+      clique cuts, so cliques can grow across rows
+      (``result["probing"]["conflicts"]``).
     * **Primal heuristics.** On the first root LP, before the cut rounds
       (which then judge progress against the gap, with the background
       improving jump running beside them), and again after them, sharing
@@ -16808,7 +17085,10 @@ def solve(
     and presolves.
 
     Stops when the gap closes, the tree is empty, or at ``max_nodes``,
-    ``max_seconds`` (wall clock, from entry) or Ctrl-C.
+    ``max_seconds`` (wall clock, from entry) or Ctrl-C. With
+    ``presolve=True``, HiGHS's presolve does not count towards
+    ``max_seconds`` or ``"seconds"``, as in ``jl.solve_with_presolve``: it is
+    timed on its own (``"presolve_seconds"``).
 
     Returns a dict:
 
@@ -17014,6 +17294,7 @@ def solve(
         round_repair_seconds=round_repair_seconds,
         mip_start=mip_start,
         implied_bound_cuts=implied_bound_cuts,
+        probing_cliques=probing_cliques,
         implied_variable_bounds=implied_variable_bounds,
         max_aggregation=max_aggregation,
         exact_nodes=exact_nodes,
@@ -17061,6 +17342,7 @@ def solve(
         objective_levels=objective_levels,
         objective_level_seconds=objective_level_seconds,
         cut_round_lp=cut_round_lp,
+        root_lp=root_lp,
     )
     return _solve_model(
         model, presolve, precision, highs_options, feasibility_tolerance, settings
@@ -17112,10 +17394,23 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
         )
         if settings["verbose"] and start_x is None:
             print("mip_start: not feasible, ignored")
+    presolve_started = time.time()
     status = _presolve(highs)
     PS = highspy.HighsPresolveStatus
+    # As in ``jl.solve_with_presolve``: presolve is timed on its own
+    # (``result["presolve_seconds"]``) and not counted in ``max_seconds`` or
+    # ``result["seconds"]``, so the clock and the deadline move by it.
+    presolve_seconds = time.time() - presolve_started
+    start += presolve_seconds
+    settings = dict(
+        settings,
+        start=start,
+        deadline=(
+            None if settings["deadline"] is None else settings["deadline"] + presolve_seconds
+        ),
+    )
     if settings["verbose"]:
-        print(f"HiGHS presolve: {status.name}")
+        print(f"HiGHS presolve: {status.name} ({presolve_seconds:.1f}s)")
 
     def settled(status_name):
         return {
@@ -17217,6 +17512,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "plunges_stopped": 0,
             "implied_branchings": 0,
             "presolve": status.name,
+            "presolve_seconds": presolve_seconds,
         }
 
     if status == PS.kInfeasible:
@@ -17227,6 +17523,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
         settings["mip_start"] = mip_start
         result = _BranchAndBound(original, **settings).run()
         result["presolve"] = status.name
+        result["presolve_seconds"] = presolve_seconds
         return result
 
     if status == PS.kReducedToEmpty:
@@ -17252,6 +17549,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             settings["cutoff_from_start"] = True
         result = _BranchAndBound(reduced, **settings).run()
         result["presolve"] = status.name
+        result["presolve_seconds"] = presolve_seconds
         result["mip_start_accepted"] = (
             None if mip_start is None else start_x is not None
         )

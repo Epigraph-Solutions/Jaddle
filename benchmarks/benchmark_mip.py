@@ -149,12 +149,16 @@ def run_jaddle(path, args):
         device=args.device,
         presolve=True,
         exact_band="auto",
-        batch_size=64,
+        batch_size=8,
+        cuts=True,
         max_seconds=args.max_seconds,
         tree_cut_every=200,
-        cut_pool_size=1e5,
-        tree_cut_rows=2000,
-        cuts=True,
+        cut_pool_size=1e3,
+        tree_cut_rows=20,
+        root_lp="jaddle",
+        cut_round_lp="highs",
+        probing=True,
+        restarts=0,
     )
     row.update(
         {
@@ -163,7 +167,13 @@ def run_jaddle(path, args):
             "jaddle_bound": result["bound"],
             "jaddle_gap": result["gap"],
             "jaddle_nodes": result.get("nodes"),
-            "jaddle_seconds": time.time() - started,
+            # As in benchmark.py: the solve's own time, HiGHS's presolve
+            # apart, and the whole call (file read and postsolve included).
+            "jaddle_seconds": result["seconds"],
+            "jaddle_presolve_seconds": result.get("presolve_seconds", 0.0),
+            "jaddle_wall_seconds": time.time() - started,
+            "jaddle_root_lp": result.get("root_lp", {}).get("solver"),
+            "jaddle_root_lp_seconds": result.get("root_lp", {}).get("seconds"),
             "jaddle_postsolve_feasible": result.get("postsolve_feasible"),
         }
     )
@@ -220,7 +230,10 @@ def print_details(result):
 # %% [markdown]
 # ## HiGHS for comparison
 # HiGHS's branch and cut with the same time limit (36000 s without
-# `--max-seconds`); `--no-highs` skips it.
+# `--max-seconds`); `--no-highs` skips it. As in benchmark.py, HiGHS's time
+# is its `run()`, its presolve included, while `jaddle_seconds` leaves
+# Jaddle's (HiGHS) presolve out: it is `jaddle_presolve_seconds`, and
+# `jaddle_wall_seconds` is the whole call.
 
 
 # %%
@@ -267,6 +280,10 @@ CSV_FIELDS = [
     "jaddle_gap",
     "jaddle_nodes",
     "jaddle_seconds",
+    "jaddle_presolve_seconds",
+    "jaddle_wall_seconds",
+    "jaddle_root_lp",
+    "jaddle_root_lp_seconds",
     "jaddle_postsolve_feasible",
     "highs_status",
     "highs_objective",

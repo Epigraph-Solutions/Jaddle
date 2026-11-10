@@ -4826,7 +4826,10 @@ def restricted_optimum(mip, lower, upper):
     return result.fun if result.success else None
 
 
-@pytest.mark.parametrize("backend", ["numpy", "jax"])
+PROBE_BACKENDS = ["numpy", "jax", pytest.param("numba", marks=NEEDS_NUMBA)]
+
+
+@pytest.mark.parametrize("backend", PROBE_BACKENDS)
 @pytest.mark.parametrize(
     "make", [knapsack, general_integer, facility_location, generalised_assignment]
 )
@@ -4845,7 +4848,7 @@ def test_probing_keeps_the_optimum(make, backend):
     assert probed.probed == len(probed.cache) > 0
 
 
-@pytest.mark.parametrize("backend", ["numpy", "jax"])
+@pytest.mark.parametrize("backend", PROBE_BACKENDS)
 def test_probing_backends_agree(backend):
     mip = facility_location()
     numpy = jm.probe(
@@ -4888,7 +4891,7 @@ def test_probing_proves_an_empty_box():
         ),
         np.ones(n, bool),
     )
-    for backend in ("numpy", "jax"):
+    for backend in ("numpy", "jax") + (("numba",) if jm._numba_probe() else ()):
         probed = jm.probe(
             mip.A, mip.row_lower, mip.row_upper, mip.integrality, mip.lower, mip.upper,
             backend=backend,
@@ -6147,7 +6150,7 @@ def highs_vertex(mip):
     return np.array(highs.getSolution().col_value)
 
 
-@pytest.mark.parametrize("backend", ["numpy", "jax"])
+@pytest.mark.parametrize("backend", PROBE_BACKENDS)
 def test_probing_follows_chains_past_five_passes(backend):
     # z_0 = 0 empties the chain under it only after ``depth`` passes.
     depth = 8
@@ -6166,6 +6169,87 @@ def test_probing_follows_chains_past_five_passes(backend):
     capped = jm.probe(*args, backend=backend, max_implications=2)
     kept = max(len(side[0]) for sides in capped.cache.sides.values() for side in sides if side)
     assert kept <= 2 if backend == "jax" else kept > 2
+
+
+@NEEDS_NUMBA
+@pytest.mark.parametrize(
+    "make",
+    [knapsack, general_integer, facility_location, generalised_assignment,
+     lambda: coverage_chains(depth=8)],
+)
+def test_numba_probing_matches_numpy(make):
+    mip = make()
+    args = (mip.A, mip.row_lower, mip.row_upper, mip.integrality, mip.lower, mip.upper)
+    ref = jm.probe(*args, backend="numpy")
+    got = jm.probe(*args, backend="numba")
+    assert got.infeasible == ref.infeasible and got.probed == ref.probed
+    assert np.array_equal(got.lower, ref.lower) and np.array_equal(got.upper, ref.upper)
+    for var, (ref_down, ref_up) in ref.cache.sides.items():
+        assert got.cache.split[var] == ref.cache.split[var]
+        for mine, theirs in zip(got.cache.sides[var], (ref_down, ref_up)):
+            assert (mine is None) == (theirs is None)
+            if mine is None:
+                continue
+            # The numpy cache also lists bounds probing tightened before
+            # this variable; each side's own implications agree.
+            implied = {int(j): (lo, up) for j, lo, up in zip(*theirs)}
+            for j, lo, up in zip(*mine):
+                assert implied[int(j)] == (lo, up)
+
+
+def two_binaries_through_a_link():
+    """``x0 <= x2`` and ``x2 + x1 <= 1`` over binaries: ``x0 = 1`` forces
+    ``x1 = 0`` through ``x2``, a conflict no single row shows."""
+    A = sp.csc_matrix(np.array([[1.0, 0.0, -1.0], [0.0, 1.0, 1.0]]))
+    lp = jl.LP(
+        c=-np.ones(3),
+        A_eq=sp.csc_matrix((0, 3)),
+        b_eq=np.zeros(0),
+        A_ineq=A,
+        b_ineq=np.array([0.0, 1.0]),
+        lower_bounds=np.zeros(3),
+        upper_bounds=np.ones(3),
+    )
+    return jm.MIP(lp, np.ones(3, bool))
+
+
+def test_probing_conflicts_join_the_conflict_graph():
+    mip = two_binaries_through_a_link()
+    probed = jm.probe(
+        mip.A, mip.row_lower, mip.row_upper, mip.integrality, mip.lower, mip.upper
+    )
+    graph = jm.ConflictGraph([mip], mip.lower, mip.upper)
+    assert not graph.adjacent(0, 2)  # literals x0 and x1
+    added = graph.add_implications(probed.cache, mip.lower, mip.upper, mip.integrality)
+    assert added >= 1 and graph.adjacent(0, 2)
+    # Conflicts a row's clique holds (x2 + x1 <= 1) are not added again.
+    assert 2 not in graph.extra.get(4, ())
+    cuts = graph.cuts(np.array([0.6, 0.6, 0.6]))
+    assert any(set(idx.tolist()) >= {0, 1} for _, idx, _, _ in cuts)
+    for _, idx, coef, rhs in cuts:
+        assert max_over_mip(mip, idx, coef) <= rhs + 1e-9
+    assert graph.add_implications(probed.cache, mip.lower, mip.upper, mip.integrality, max_edges=0) == 0
+
+
+@NEEDS_NUMBA
+def test_numba_probing_counts_implications_as_progress():
+    # Nothing is fixed or tightened, but each probe implies bounds.
+    mip = two_binaries_through_a_link()
+    args = (mip.A, mip.row_lower, mip.row_upper, mip.integrality, mip.lower, mip.upper)
+    numpy = jm.probe(*args, backend="numpy", max_useless=1)
+    numba = jm.probe(*args, backend="numba", max_useless=1)
+    assert numpy.tightened == numba.tightened == 0
+    assert numpy.probed == 1 and numba.probed == 3
+
+
+def test_solve_reports_probing_conflicts():
+    mip = facility_location()
+    result = solve(mip, probing=True, cuts=True, clique_cuts=True)
+    assert result["status"] == "optimal"
+    assert result["probing"]["conflicts"] >= 0
+    off = solve(mip, probing=True, cuts=True, probing_cliques=False)
+    assert off["probing"]["conflicts"] == 0
+    assert off["objective"] == pytest.approx(result["objective"], rel=1e-9)
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
@@ -7636,7 +7720,7 @@ def test_sub_searches_leave_the_levels_to_their_parent(monkeypatch):
     assert made == [True, False]
 
 
-# %% Exact root cut rounds (cut_round_lp="exact")
+# %% Exact root cut rounds (cut_round_lp="highs")
 @pytest.mark.parametrize(
     "make", [facility_location, generalised_assignment, lambda: fixed_charge()[0]]
 )
@@ -7670,7 +7754,7 @@ def test_exact_cut_rounds_solve(make, monkeypatch):
     monkeypatch.setattr(jm, "_highs_rows", highs_rows)
     monkeypatch.setattr(jm._BranchAndBound, "exact_cut_loop", exact_cut_loop)
     monkeypatch.setattr(jm._BranchAndBound, "compact_cuts", compact_cuts)
-    result = solve(mip, cut_round_lp="exact")
+    result = solve(mip, cut_round_lp="highs")
     assert_solved(result, mip, ref)
     stats = result["exact_cut_rounds"]
     if stats["rounds"]:
@@ -7690,7 +7774,7 @@ def test_exact_cut_rounds_strengthen_the_root(monkeypatch):
         return result
 
     monkeypatch.setattr(jm._BranchAndBound, "cut_loop", cut_loop)
-    result = solve(mip, cut_round_lp="exact")
+    result = solve(mip, cut_round_lp="highs")
     root = result["root_bound_before_cuts"]
     ref = reference(mip)
     assert result["exact_cut_rounds"]["rounds"] >= 1
@@ -7701,7 +7785,7 @@ def test_exact_cut_rounds_fall_back_to_pdhg(monkeypatch):
     # When HiGHS cannot solve the root LP, the PDHG rounds run instead.
     monkeypatch.setattr(jm._BranchAndBound, "exact_cut_loop", lambda self, *a: None)
     mip = facility_location()
-    result = solve(mip, cut_round_lp="exact")
+    result = solve(mip, cut_round_lp="highs")
     assert_solved(result, mip, reference(mip))
     assert result["exact_cut_rounds"] is None
     assert result["cuts"]["mir"] + result["cuts"]["flowcover"] > 0
@@ -7737,3 +7821,42 @@ def test_separation_device_reaches_the_separators(monkeypatch):
     assert search.separator(search.base, mip.lower, mip.upper).device is None
     with pytest.raises(ValueError, match="separation_device"):
         solve(mip, separation_device="gpu")
+
+
+@pytest.mark.parametrize("make", [knapsack, facility_location, lambda: fixed_charge()[0]])
+def test_highs_root_lp_gives_the_same_search(make):
+    mip = make()
+    pdhg = solve(mip)
+    highs = solve(mip, root_lp="highs")
+    assert highs["status"] == pdhg["status"] == "optimal"
+    assert highs["objective"] == pytest.approx(pdhg["objective"], rel=1e-6, abs=1e-6)
+    assert highs["root_lp"]["solver"] == "highs" and pdhg["root_lp"]["solver"] == "jaddle"
+    assert 0.0 < highs["root_lp"]["highs_seconds"] <= highs["root_lp"]["seconds"]
+    assert pdhg["root_lp"]["highs_seconds"] == 0.0
+
+
+def test_highs_root_lp_proves_an_infeasible_root():
+    # x0 + x1 >= 3 over binaries: the LP relaxation is already infeasible.
+    lp = jl.LP(
+        c=np.ones(2),
+        A_eq=sp.csc_matrix((0, 2)),
+        b_eq=np.zeros(0),
+        A_ineq=sp.csc_matrix(-np.ones((1, 2))),
+        b_ineq=np.array([-3.0]),
+        lower_bounds=np.zeros(2),
+        upper_bounds=np.ones(2),
+    )
+    result = solve(jm.MIP(lp, np.ones(2, bool)), root_lp="highs", propagate=False)
+    assert result["status"] == "infeasible"
+
+
+def test_rejects_a_bad_root_lp():
+    with pytest.raises(ValueError, match="root_lp"):
+        solve(knapsack(), root_lp="simplex")
+    with pytest.raises(ValueError, match="cut_round_lp"):
+        solve(knapsack(), cut_round_lp="simplex")
+
+
+def test_lp_solver_names_keep_their_earlier_aliases():
+    assert jm._lp_solver("pdhg", "root_lp") == "jaddle"
+    assert jm._lp_solver("exact", "cut_round_lp") == "highs"

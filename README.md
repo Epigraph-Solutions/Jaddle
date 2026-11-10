@@ -679,10 +679,13 @@ columns are not supported.
 - **Probing** (`probing`). Before the root LP, each integer variable is
   split in two (0/1, or at its midpoint) and both sides are propagated: an
   empty side fixes the variable to the other, and otherwise all bounds
-  tighten to the hull of the two sides. Large models probe chunks of
-  variables in one vmapped JAX call. On misc07 it fixes 21 binaries, on
-  p0201 6, and on fixnet6 it tightens 483 bounds, all in under a second.
-  What each side implies is kept for bulk rounding.
+  tighten to the hull of the two sides. With numba, each side propagates
+  incrementally, visiting only the rows whose variables changed; without
+  it, large models probe chunks of variables in one vmapped JAX call. On
+  misc07 it fixes 21 binaries, on p0201 6, and on fixnet6 it tightens 483
+  bounds, all in under a second. What each side implies is kept for bulk
+  rounding and implied-bound cuts, and the conflicts between binaries it
+  finds join the clique cuts' conflict graph (`probing_cliques`).
 - **Primal heuristics.** Rounding an LP point rarely satisfies assignment
   or partitioning rows, so two heuristics run at the root after the cuts.
   *Fix-and-propagate* fixes the integers to their rounded LP values in
@@ -799,7 +802,8 @@ reports `bound_rigorous=False`.
 | `dive_every`, `dive_depth` | `50`, `20` | LP-based dives every this many nodes and at the root (`0`: off), and their depth. |
 | `pump_iterations`, `pump_tolerance` | `30`, `1e-4` | The pump's LP solves and their tolerance. |
 | `pump_jump_iterations`, `pump_jump_share` | `3000`, `0.2` | Feasibility jump steps from each rounding the pump rejects (`0`: none), and the most of the pump's time the jumps may take. |
-| `probing`, `probing_seconds`, `probing_max_variables`, `probing_backend`, `probing_max_useless` | `True`, `None`, `None`, `"auto"`, `1000` | Root probing; its budget (`None`: 5% of `max_seconds` up to 30 s, 10 s without one); the most variables probed; `"numpy"`, `"jax"` or `"auto"` (JAX above 10,000 nonzeros); stop after this many variables in a row change nothing (`None`: never). |
+| `probing`, `probing_seconds`, `probing_max_variables`, `probing_backend`, `probing_max_useless` | `True`, `None`, `None`, `"auto"`, `1000` | Root probing; its budget (`None`: 5% of `max_seconds` up to 30 s, 10 s without one); the most variables probed; `"numba"` (incremental propagation, visiting only the rows whose variables changed), `"numpy"`, `"jax"` or `"auto"` (numba when installed, else JAX above 10,000 nonzeros); stop after this many variables in a row change nothing (`None`: never; under numba a probe that implies a bound on another variable counts as progress). |
+| `probing_cliques` | `True` | Add the conflicts between binaries that probing finds (`z = d` forces `y = w`) to the clique cuts' conflict graph, so cliques can grow across rows (`jm.ConflictGraph.add_implications`, `result["probing"]["conflicts"]`). |
 | `repair_share` | `0.2` | The most of the heuristic time left that one `repair` of a near-feasible jump may take, so later heuristics still run. |
 | `bulk_rounding`, `bulk_starts` | `True`, `4` | Bulk fix-and-propagate at the root and in the pump, and how many starts run side by side. |
 | `node_crossover`, `node_crossover_every`, `node_crossover_seconds` | `False`, `1`, `2.0` | Cross node LP points over to exact vertices with HiGHS (opt-in), every this many nodes, with this time limit per call; the vertex is used for the integrality test, branching and heuristics, and its duals for the bound. |
@@ -811,6 +815,7 @@ reports `bound_rigorous=False`.
 | `max_cuts_per_round`, `cut_min_progress` | `100`, `None` | Cuts added per round, and the bound gain over three rounds below which the rounds stop (judged once three have run; relative to the gap to the incumbent when there is one, else to the bound). |
 | `cut_round_epochs` | `10` | Epoch budget of each cut round's root re-solve (`None`: to convergence); the root is converged once the rounds end. |
 | `gomory_cuts` | `True` | Gomory mixed-integer cuts from a crossover basis at each root round (`"auto"`: on for MIPs with at most 10,000 nonzeros). |
+| `root_lp` | `"jaddle"` | Solve the first root LP with Jaddle's PDHG, or `"highs"`: with HiGHS (its presolve and solver choice), then PDHG warm from HiGHS's vertex; for timing the two (`result["root_lp"]`). |
 | `root_crossover` | `False` | Cross the root LP over to an exact vertex for rigorous reduced-cost tightening duals (`"auto"`: only when that tightening runs; `True`: always). |
 | `separation_backend` | `"auto"` | `"numba"` (the default with numba installed) runs each cut round's cover, c-MIR and flow cover searches in one compiled call; `"jax"` (the default without numba) runs the c-MIR and flow cover searches batched in JAX (float64); `"numpy"` runs the per-row reference searches. |
 | `flow_covers` | `True` | Flow cover cuts from rows with continuous variables, over their variable bounds (`y <= u·z`). |

@@ -18,6 +18,30 @@
   `box_bound`, `lagrangian_terms` (with a CSR `A_T`), `_exact_side_bound`
   and the search's `bound_over` each run in one pass without
   temporaries, with the GIL released, when numba is installed.
+- Probing compiled with numba (`jaddle._probe_numba`,
+  `jm.probe(backend="numba")`, picked by `"auto"` when numba is installed):
+  each side propagates incrementally from the probed variable, visiting
+  only the rows whose variables changed, and is undone after. The numpy
+  and JAX backends sweep every row each pass (on presolved mzzv11 20 ms
+  and 80 ms a variable on the CPU). Under numba a probe that implies a
+  bound on another variable counts as progress for `probing_max_useless`
+  (on mzzv11 no probe fixes or tightens anything, but each implies about
+  250 bounds).
+- Conflicts from probing in the clique cuts' conflict graph
+  (`jm.solve(probing_cliques=True)`, the default;
+  `ConflictGraph.add_implications`): when fixing binary `z` to `d` forces
+  binary `y` to `w`, literals `z = d` and `y = 1 − w` conflict, so
+  cliques can grow across rows. `result["probing"]["conflicts"]` counts
+  them.
+- `jm.solve(root_lp="highs")` (default `"jaddle"`): HiGHS solves the first
+  root LP, then PDHG re-solves it warm from HiGHS's vertex, for timing the
+  two; `result["root_lp"]` gives the solver and the time, and the MIP
+  benchmark writes it (`jaddle_root_lp`, `jaddle_root_lp_seconds`).
+- `jm.solve(presolve=True)` times HiGHS's presolve on its own
+  (`result["presolve_seconds"]`) and leaves it out of `max_seconds` and
+  `result["seconds"]`, as `jl.solve_with_presolve` does. The MIP
+  benchmark's `jaddle_seconds` follows, with `jaddle_presolve_seconds`
+  and `jaddle_wall_seconds` beside it.
 - `jaddle.presolve.defined_integers`: general integers that an equality
   row defines (`z = Σ a_j x_j` over integers, `|a_z| = 1`, zero cost,
   integer coefficients and right-hand side) substituted out of a MIP's
@@ -48,7 +72,7 @@
   shows each of the 13 levels below 302 empty in at most 2 s, and the
   search now proves 302 optimal in 27 s (GPU, the benchmark's settings).
 
-- Exact root cut rounds (`jm.solve(cut_round_lp="exact")`; default
+- Exact root cut rounds (`jm.solve(cut_round_lp="highs")`; default
   `"pdhg"`; `_BranchAndBound.exact_cut_loop`, `result["exact_cut_rounds"]`).
   The root's cut rounds re-solve with HiGHS's dual simplex, warm from the
   last basis, the cuts added and dropped as rows; each round separates at
