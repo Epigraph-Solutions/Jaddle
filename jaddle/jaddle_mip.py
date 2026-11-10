@@ -6243,6 +6243,7 @@ _LOG_SOURCES = (
     ("H", "Rounding"),
     ("J", "Feasibility jump"),
     ("K", "Block decomposition"),
+    ("L", "Objective levels"),
     ("N", "RINS"),
     ("P", "Fix-and-propagate"),
     ("R", "Repair"),
@@ -6730,6 +6731,175 @@ class _SubMipLane:
             except Exception:
                 pass
         self.pool.shutdown(wait=False, cancel_futures=True)
+
+
+# Objective levels (``objective_levels``): the most integer columns the
+# objective may rest on, and the most assignments of them the box may hold.
+_LEVEL_MAX_COLUMNS = 3
+_LEVEL_MAX_LEVELS = 10_000
+
+
+def objective_level_table(
+    c,
+    integrality,
+    lower,
+    upper,
+    max_columns=_LEVEL_MAX_COLUMNS,
+    max_levels=_LEVEL_MAX_LEVELS,
+):
+    """
+    The objective's levels: when every nonzero cost is on one of at most
+    ``max_columns`` integer columns with finite bounds, and the box holds
+    at most ``max_levels`` (and at least two) assignments of them, returns
+    ``(columns, values, levels)``: each assignment as a row of ``values``
+    (``(k, len(columns))``), sorted by its objective value ``levels =
+    values @ c[columns]``. ``None`` otherwise.
+
+    Every solution lies in exactly one level, and its objective value is
+    that level's. A level shown empty can be dropped from the bound, so the
+    bound is the lowest level not yet shown empty. On 30n20b8
+    (``100·R1 + 51·R2``) the LP stays at 151 deep in the tree, while HiGHS
+    shows each level below the optimum, 302, empty in at most 2 s.
+    """
+    c = np.asarray(c, np.float64)
+    columns = np.flatnonzero(c)
+    is_int = np.asarray(integrality, bool)
+    if columns.size == 0 or columns.size > max_columns or not is_int[columns].all():
+        return None
+    lo = np.asarray(lower, np.float64)[columns]
+    up = np.asarray(upper, np.float64)[columns]
+    if not (np.all(np.isfinite(lo)) and np.all(np.isfinite(up))) or np.any(lo > up):
+        return None
+    count = float(np.prod(up - lo + 1.0))
+    if count < 2 or count > max_levels:
+        return None
+    grids = np.meshgrid(*[np.arange(a, b + 1.0) for a, b in zip(lo, up)], indexing="ij")
+    values = np.stack([grid.ravel() for grid in grids], axis=1)
+    levels = values @ c[columns]
+    order = np.argsort(levels, kind="stable")
+    return columns, values[order], levels[order]
+
+
+class _LevelLane:
+    """
+    The objective's levels (``objective_levels``, ``objective_level_table``)
+    searched by HiGHS on a CPU thread of their own, lowest first (from the
+    search's bound up): the box the search gives it (``update``) with the
+    level's columns fixed, for
+    ``seconds`` at first and twice as long at each new try. A level HiGHS
+    shows infeasible is ``empty``; a point it finds waits in ``found`` for
+    the search to check. The thread works on the lowest level that may still
+    hold a solution better than the cutoff, so the bound (``floor``) rises
+    level by level, and a feasible level found that way is optimal.
+
+    The thread keeps one HiGHS instance for the rows it last searched (the
+    search's base MIP changes at restarts). HiGHS releases the GIL while it
+    solves. The search reads ``empty`` and ``found``; the thread writes
+    them.
+    """
+
+    def __init__(self, columns, values, levels, seconds):
+        self.columns, self.values, self.levels = columns, values, levels
+        self.seconds = float(seconds)
+        self.empty = np.zeros(levels.size, bool)  # shown infeasible
+        self.settled = np.zeros(levels.size, bool)  # empty, or a point found
+        self.tries = np.zeros(levels.size, np.int64)
+        self.proved = 0  # levels shown empty
+        self.jobs = 0
+        self.busy_seconds = 0.0
+        self.best_found = np.inf  # the lowest level with a point found
+        self.found = collections.deque()  # (level, x) for the search to check
+        self.box = None  # (mip, is_int, lower, upper), set by the search
+        self.cutoff = np.inf
+        self.known = -np.inf  # the search's own bound: lower levels are empty
+        self.deadline = None
+        self.stop = threading.Event()
+        self.thread = None
+        self.highs = None
+
+    def update(self, mip, is_int, lower, upper, cutoff, deadline, known=-np.inf):
+        """The search's base MIP, root box, cutoff, deadline and bound
+        (``known``: the levels below it hold no solution, so the thread
+        skips them); starts the thread on the first call."""
+        self.box = (mip, is_int, lower, upper)
+        self.cutoff, self.deadline = float(cutoff), deadline
+        self.known = float(known)
+        if self.thread is None:
+            self.thread = threading.Thread(
+                target=self._run, name="jaddle-levels", daemon=True
+            )
+            self.thread.start()
+
+    def open_levels(self, cutoff, lower, upper):
+        """The levels that may still hold a solution better than
+        ``cutoff`` in the box ``[lower, upper]``."""
+        cols = self.columns
+        inside = np.all(
+            (self.values >= lower[cols] - 1e-9) & (self.values <= upper[cols] + 1e-9),
+            axis=1,
+        )
+        return ~self.empty & (self.levels < cutoff) & inside
+
+    def floor(self, cutoff, lower, upper):
+        """A bound on every solution better than ``cutoff`` in the box: the
+        lowest open level (``inf`` when none is open)."""
+        open_ = self.open_levels(cutoff, lower, upper)
+        i = int(np.argmax(open_))
+        return float(self.levels[i]) if open_[i] else np.inf
+
+    def _run(self):
+        import highspy
+
+        infeasible = highspy.HighsModelStatus.kInfeasible
+        held = None
+        while not self.stop.is_set():
+            mip, is_int, lower, upper = self.box
+            cutoff = min(self.cutoff, self.best_found)
+            pick = self.open_levels(cutoff, lower, upper) & ~self.settled
+            pick &= self.levels >= self.known
+            seconds = 0.0
+            if pick.any():
+                i = int(np.argmax(pick))
+                seconds = self.seconds * 2.0 ** int(self.tries[i])
+                if self.deadline is not None:
+                    seconds = min(seconds, self.deadline - time.time())
+            if seconds <= 0.0:
+                self.stop.wait(0.1)  # nothing to search until the search moves
+                continue
+            if held is None or held[0] is not mip:
+                held = (mip, _highs_submip(mip, is_int))
+                self.highs = held[1]
+            lo = np.array(lower, np.float64)
+            up = np.array(upper, np.float64)
+            lo[self.columns] = up[self.columns] = self.values[i]
+            started = time.time()
+            try:
+                x = _submip_job(held[1], mip, lo, up, np.inf, seconds)
+                status = held[1].getModelStatus()
+            except Exception:
+                x, status = None, None
+            self.busy_seconds += time.time() - started
+            self.jobs += 1
+            if self.stop.is_set():
+                break
+            if x is not None:
+                self.settled[i] = True
+                self.best_found = min(self.best_found, float(self.levels[i]))
+                self.found.append((i, x))
+            elif status == infeasible:
+                self.empty[i] = self.settled[i] = True
+                self.proved += 1
+            else:
+                self.tries[i] += 1
+
+    def shutdown(self):
+        """Stop the thread; a running HiGHS search is cancelled."""
+        self.stop.set()
+        if self.highs is not None:
+            try:
+                self.highs.cancelSolve()
+            except Exception:
+                pass
 
 
 def exact_lane_bounds(mip, terms, box, out, children):
@@ -7460,6 +7630,8 @@ class _BranchAndBound:
         crossover_seconds=10.0,
         crossover_solutions=3,
         crossover_min_fixed=0.5,
+        objective_levels=True,
+        objective_level_seconds=2.0,
         interrupt=None,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
@@ -7980,6 +8152,17 @@ class _BranchAndBound:
             if submip_solver == "highs" and (rins_seconds or self.crossover_seconds)
             else None
         )
+        # The objective's levels (``objective_levels``): when it rests on a
+        # few integer columns, HiGHS shows their assignments below the
+        # cutoff empty, lowest first, on a thread of its own, and the bound
+        # rises to the lowest level left (``level_floor``).
+        self.level_lane = None
+        if objective_levels:
+            table = objective_level_table(mip.c, mip.integrality, mip.lower, mip.upper)
+            if table is not None:
+                self.level_lane = _LevelLane(*table, objective_level_seconds)
+        self.level_finds = 0
+        self.level_floor_cache = (None, -np.inf)
         self.submip_last = None  # the kind of the lane's last job
         self.submip_budget = 0.0  # the lane's last job's seconds
         self.submip_lane_seconds = 0.0
@@ -8587,6 +8770,9 @@ class _BranchAndBound:
         # The rounds before a restart bounded every solution below the
         # cutoff, and the restarted root box keeps all of them.
         bound = max(bound, self.bound_floor)
+        # Every solution is in an objective level not yet shown empty
+        # (``objective_levels``).
+        bound = max(bound, self.level_floor())
         if self.incumbent is not None:
             bound = min(bound, self.incumbent[0])
         return bound
@@ -10561,6 +10747,7 @@ class _BranchAndBound:
             "T": True,
             "U": self.use_round_repair,
             "C": bool(self.crossover_seconds and self.submip_lane is not None),
+            "L": self.level_lane is not None,
             "1": self.use_one_opt,
             "K": self.linking_blocks is not None,
             "Z": self.use_trivial,
@@ -10825,6 +11012,7 @@ class _BranchAndBound:
             "crossover_calls": self.crossover_calls,
             "crossover_finds": self.crossover_finds,
             "submip_lane_seconds": self.submip_lane_seconds,
+            "objective_levels": self.level_stats(),
             "conflicts": (
                 dict(self.conflicts.added)
                 if self.conflicts is not None
@@ -12453,6 +12641,69 @@ class _BranchAndBound:
         else:
             self.crossover_finds += improved
 
+    def level_box(self):
+        """The box the objective's levels are searched in: the root box,
+        or the base MIP's before there is one."""
+        lower = getattr(self, "root_lower", None)
+        if lower is None:
+            return self.base.lower, self.base.upper
+        return lower, self.root_upper
+
+    def service_levels(self):
+        """Check the points the level lane found (``"L"``), then hand it
+        the base MIP, root box, cutoff and deadline (``objective_levels``)."""
+        lane = self.level_lane
+        if lane is None:
+            return
+        while lane.found:
+            _, x = lane.found.popleft()
+            before = None if self.incumbent is None else self.incumbent[0]
+            self.try_incumbent(x, "L", None)
+            self.level_finds += self.incumbent is not None and (
+                before is None or self.incumbent[0] < before
+            )
+        # The tree's bound, once there is a tree: the thread starts there.
+        known = self.global_bound() if self.tree_started else -np.inf
+        lane.update(
+            self.base, self.is_int, *self.level_box(), self.cutoff(), self.deadline, known
+        )
+
+    def level_floor(self):
+        """A bound on every solution better than the cutoff: the lowest
+        objective level not shown empty (``objective_levels``; ``inf``
+        when none is left, ``-inf`` without levels)."""
+        lane = self.level_lane
+        if lane is None:
+            return -np.inf
+        lower, upper = self.level_box()
+        cols = lane.columns
+        cutoff = self.cutoff()
+        key = (cutoff, lane.proved, lower[cols].tobytes(), upper[cols].tobytes())
+        if self.level_floor_cache[0] != key:
+            self.level_floor_cache = (key, lane.floor(cutoff, lower, upper))
+        return self.level_floor_cache[1]
+
+    def level_stats(self):
+        """``result["objective_levels"]``: ``None`` without levels."""
+        lane = self.level_lane
+        if lane is None:
+            return None
+        floor = self.level_floor()
+        return {
+            "columns": [int(j) for j in lane.columns],
+            "levels": int(lane.levels.size),
+            "empty": int(lane.proved),
+            "jobs": int(lane.jobs),
+            "finds": int(self.level_finds),
+            "seconds": float(lane.busy_seconds),
+            "floor": self.model_value(floor) if np.isfinite(floor) else None,
+        }
+
+    def levels_settled(self):
+        """Whether every objective level below the cutoff is shown empty,
+        which ends the search (the incumbent, if any, is optimal)."""
+        return self.level_lane is not None and self.level_floor() >= self.cutoff()
+
     def round_repair(self, x, lower, upper, warm, snap=None):
         """
         Round and repair from the LP point ``x``: its roundings up, to
@@ -12600,7 +12851,9 @@ class _BranchAndBound:
         """Check the points of finished background jobs
         (``parallel_heuristics``) with ``try_incumbent`` (jumps marked
         ``J``, fix-and-propagate ``P``), then queue the next improving-jump
-        slice (unless ``schedule`` is false)."""
+        slice (unless ``schedule`` is false). The level lane's points too
+        (``service_levels``)."""
+        self.service_levels()
         if self.workers is None:
             return
         for kind, found, seconds, warm in self.workers.finished():
@@ -12683,6 +12936,7 @@ class _BranchAndBound:
         # A sub-MIP's cutoff is its parent's, not a solution of its own:
         # it dives for one (and needs no node cuts in its short budget).
         settings["cutoff_from_start"] = False
+        settings["objective_levels"] = False  # the parent's lane has them
         search = _BranchAndBound(sub_mip, **settings)
         if warm is not None:
             m_ineq = base.A.shape[0] - base.n_eq
@@ -14625,6 +14879,8 @@ class _BranchAndBound:
                 self.exact_lane.shutdown()
             if self.submip_lane is not None:
                 self.submip_lane.shutdown()
+            if self.level_lane is not None:
+                self.level_lane.shutdown()
             if self._cut_worker is not None:
                 self._cut_worker.shutdown(wait=False, cancel_futures=True)
             if self._device_thread is not None:
@@ -14749,6 +15005,12 @@ class _BranchAndBound:
                 )
             if self.objective_step is not None:
                 print(f"Objective values are multiples of {self.objective_step:g}")
+            if self.level_lane is not None:
+                lane = self.level_lane
+                print(
+                    f"Objective levels: {lane.columns.size} integer columns, "
+                    f"{lane.levels.size} levels, searched by HiGHS on a thread"
+                )
         return lower, upper
 
     def _root(self, lower, upper):
@@ -14756,6 +15018,7 @@ class _BranchAndBound:
         evaluation. Returns ``None`` (on to the tree), ``"restart"``, or the
         search's result when the root ends it."""
         mip = self.mip
+        self.service_levels()  # the level lane starts beside the root LP
         root = _Node(-np.inf, 0, None, None, None)
         # The root is in no list until it is evaluated: its bound holds the
         # global bound down meanwhile (for incumbents logged by the root
@@ -14954,6 +15217,8 @@ class _BranchAndBound:
                 self.feed_exact()
                 self.collect_submip()
                 self.feed_submip()
+                if self.levels_settled():
+                    break  # no objective level below the cutoff is left
                 if (
                     self.exact_lane is not None
                     and (self.exact_lane.jobs or self.exact_reserved)
@@ -15203,6 +15468,8 @@ def solve(
     crossover_seconds=10.0,
     crossover_solutions=3,
     crossover_min_fixed=0.5,
+    objective_levels=True,
+    objective_level_seconds=2.0,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -15788,6 +16055,23 @@ def solve(
       interior points cost it nothing. RINS and crossover take turns on the
       lane. Results: ``rins_calls``, ``rins_finds``, ``crossover_calls``,
       ``crossover_finds`` and ``submip_lane_seconds``.
+    * **Objective levels** (``objective_levels``, on by default). When
+      every nonzero cost is on at most 3 integer columns with finite bounds
+      and the box holds at most 10,000 assignments of them (levels), HiGHS
+      searches the levels on a CPU thread of its own, lowest objective
+      first from the tree's bound up (the levels below it are empty
+      already), each with its columns fixed in the root box: for
+      ``objective_level_seconds`` (default 2 s) at first, twice as long at
+      each new try. A level shown infeasible drops out, and the bound is
+      at least the lowest level left (``objective_level_table``); a point
+      found is checked as any heuristic's (``"L"``), and the lowest level
+      that holds one is optimal. The search ends once no level below the
+      cutoff is left. The LP cannot see such levels empty: on 30n20b8
+      (``100·R1 + 51·R2``) it stays at 151 deep in the tree, while HiGHS's
+      presolve shows each level below the optimum, 302, empty in at most
+      2 s. Results: ``objective_levels`` (``None`` when off or not
+      applicable; else the ``columns``, ``levels``, those shown ``empty``,
+      ``jobs``, ``finds``, ``seconds`` and the ``floor`` reached).
     * **Round and repair** (``round_repair``, off by default). The root LP
       point (first its exact vertex, when the root is crossed over for RENS
       or ``root_crossover``), the LP points of the root's two strong
@@ -16272,6 +16556,8 @@ def solve(
         crossover_seconds=crossover_seconds,
         crossover_solutions=crossover_solutions,
         crossover_min_fixed=crossover_min_fixed,
+        objective_levels=objective_levels,
+        objective_level_seconds=objective_level_seconds,
     )
     return _solve_model(
         model, presolve, precision, highs_options, feasibility_tolerance, settings
@@ -16421,6 +16707,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "crossover_calls": 0,
             "crossover_finds": 0,
             "submip_lane_seconds": 0.0,
+            "objective_levels": None,
             "mip_start_accepted": None if mip_start is None else start_x is not None,
             "one_opt_finds": 0,
             "plunges_stopped": 0,

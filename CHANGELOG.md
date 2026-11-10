@@ -19,6 +19,20 @@
   the agreeing integers is fixed (down to 40%); after one that runs out
   of time, more. On 30n20b8, RINS fixed 96% of the integers and every box
   was empty; with the rate it went 453 → 353 → 302 (optimal) in 148 s.
+- Objective levels (`jm.solve(objective_levels=True)`, the default;
+  `objective_level_seconds=2.0`; `jm.objective_level_table`). When every
+  nonzero cost is on at most 3 integer columns with finite bounds and at
+  most 10,000 assignments of them, HiGHS searches those assignments
+  (levels) on a CPU thread of its own, lowest objective first, with the
+  level's columns fixed in the root box. A level shown infeasible drops
+  out, the bound is at least the lowest level left, a point found is an
+  incumbent (log source `L`), and the search ends once no level below
+  the cutoff is left (`result["objective_levels"]`). On 30n20b8
+  (`100·R1 + 51·R2`) the bound used to stop at 151 with 98% of the tree
+  explored: the LP stays at 151 with `R1 = R2 = 1` at any depth, and
+  neither is fractional, so neither is branched on. HiGHS's presolve
+  shows each of the 13 levels below 302 empty in at most 2 s, and the
+  search now proves 302 optimal in 27 s (GPU, the benchmark's settings).
 
 ### Changed
 

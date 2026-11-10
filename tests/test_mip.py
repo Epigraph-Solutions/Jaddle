@@ -91,6 +91,9 @@ PINNED = dict(
     # The trivial heuristic would find many test models' first incumbent
     # before the heuristics their tests check; its own tests turn it on.
     trivial_heuristic=False,
+    # A HiGHS thread that can settle a small model before the tree does;
+    # its own tests turn it on.
+    objective_levels=False,
 )
 
 
@@ -7395,3 +7398,138 @@ def test_exact_strong_lookahead_and_cutoff_in_the_search():
     for make in (facility_location, generalised_assignment, lambda: coverage_chains(1)):
         mip = make()
         assert_solved(solve(mip, **options), mip, reference(mip))
+
+
+def resource_levels():
+    """Two resource levels ``a, b`` (integers in [0, 3]) carry the whole
+    objective ``3a + 2b``, with ``a + b >= 3`` and ``2a + b >= 4``, beside
+    four binaries ``y`` that pick two (``Σ y = 2``, ``y_k <= a + b``) and
+    cost nothing: the optimum is 7 at ``(a, b) = (1, 2)``, and every lower
+    objective level is infeasible."""
+    n = 6
+    A_ineq = np.array(
+        [
+            [-1, -1, 0, 0, 0, 0],
+            [-2, -1, 0, 0, 0, 0],
+            [-1, -1, 1, 0, 0, 0],
+            [-1, -1, 0, 1, 0, 0],
+            [-1, -1, 0, 0, 1, 0],
+            [-1, -1, 0, 0, 0, 1],
+        ],
+        float,
+    )
+    lp = jl.LP(
+        c=np.array([3.0, 2.0, 0, 0, 0, 0]),
+        A_eq=sp.csc_matrix(np.array([[0, 0, 1, 1, 1, 1]], float)),
+        b_eq=np.array([2.0]),
+        A_ineq=sp.csc_matrix(A_ineq),
+        b_ineq=np.array([-3.0, -4.0, 0, 0, 0, 0]),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.array([3.0, 3.0, 1, 1, 1, 1]),
+    )
+    return jm.MIP(lp, np.ones(n, bool))
+
+
+def test_objective_level_table_sorts_the_assignments_by_value():
+    columns, values, levels = jm.objective_level_table(
+        [3.0, 2.0, 0.0], [True, True, True], [0, 0, 0], [3, 3, 1]
+    )
+    assert list(columns) == [0, 1]
+    assert values.shape == (16, 2) and len({tuple(v) for v in values}) == 16
+    assert np.all(np.diff(levels) >= 0)
+    assert np.allclose(levels, values @ [3.0, 2.0])
+    # Not applicable: a continuous column with a cost, too many columns, an
+    # unbounded column, too many levels, a single level.
+    table = jm.objective_level_table
+    assert table([3.0, 2.0], [True, False], [0, 0], [3, 3]) is None
+    assert table([1.0] * 4, [True] * 4, [0] * 4, [1] * 4) is None
+    assert table([1.0, 1.0], [True, True], [0, 0], [3, np.inf]) is None
+    assert table([1.0, 1.0], [True, True], [0, 0], [9, 9], max_levels=50) is None
+    assert table([1.0, 0.0], [True, True], [2, 0], [2, 1]) is None
+
+
+def wait_for(condition, seconds=60.0):
+    deadline = time.time() + seconds
+    while not condition() and time.time() < deadline:
+        time.sleep(0.02)
+    return condition()
+
+
+def test_level_lane_shows_the_lower_levels_empty_and_finds_the_optimum():
+    mip = resource_levels()
+    lane = jm._LevelLane(
+        *jm.objective_level_table(mip.c, mip.integrality, mip.lower, mip.upper), 5.0
+    )
+    try:
+        lane.update(mip, mip.integrality, mip.lower, mip.upper, np.inf, None)
+        assert wait_for(lambda: len(lane.found) > 0)
+        level, x = lane.found[0]
+        assert lane.levels[level] == 7.0 and mip.is_feasible(x)
+        assert float(mip.c @ x) == pytest.approx(7.0)
+        # Lowest first: every level below the point's is empty, none above.
+        assert np.all(lane.empty == (lane.levels < 7.0))
+        assert lane.floor(np.inf, mip.lower, mip.upper) == 7.0
+        assert lane.floor(6.5, mip.lower, mip.upper) == np.inf
+        # Levels outside the box are not open.
+        upper = np.array(mip.upper, float)
+        upper[1] = 1.0  # b <= 1: (1, 2) is out, (2, 1) at 8 is the lowest
+        assert lane.floor(np.inf, mip.lower, upper) == 8.0
+    finally:
+        lane.shutdown()
+
+
+def test_level_lane_points_become_the_incumbent_and_settle_the_search(monkeypatch):
+    mip = resource_levels()
+    search = search_for(mip, monkeypatch, objective_levels=True, objective_level_seconds=5.0)
+    try:
+        assert list(search.level_lane.columns) == [0, 1]
+        assert search.level_floor() == 0.0 and not search.levels_settled()
+        search.service_levels()  # starts the lane
+        lane = search.level_lane
+        assert wait_for(lambda: len(lane.found) > 0)
+        search.service_levels()
+        assert search.incumbent[0] == pytest.approx(7.0)
+        assert search.history[-1]["source"] == "L" and search.level_finds == 1
+        # No level below the cutoff is left: the search is over.
+        assert search.levels_settled()
+        assert search.level_stats()["empty"] == int(np.sum(lane.levels < 7.0))
+    finally:
+        search.level_lane.shutdown()
+
+
+@pytest.mark.parametrize("levels", [True, False])
+def test_objective_levels_solve(levels):
+    mip = resource_levels()
+    result = solve(mip, objective_levels=levels)
+    assert result["status"] == "optimal"
+    assert result["objective"] == pytest.approx(7.0)
+    assert result["bound"] == pytest.approx(7.0)
+    stats = result["objective_levels"]
+    if levels:
+        assert stats["columns"] == [0, 1] and stats["levels"] == 16
+    else:
+        assert stats is None
+
+
+def test_sub_searches_leave_the_levels_to_their_parent(monkeypatch):
+    made = []
+    real_init = jm._BranchAndBound.__init__
+
+    class Built(Exception):
+        pass
+
+    def init(self, mip, **settings):
+        made.append(settings.get("objective_levels"))
+        if len(made) > 1:
+            raise Built  # the sub-search: its settings are all we need
+        real_init(self, mip, **settings)
+
+    monkeypatch.setattr(jm._BranchAndBound, "__init__", init)
+    mip = resource_levels()
+    search = search_for(mip, monkeypatch, objective_levels=True)
+    try:
+        with pytest.raises(Built):
+            search.sub_search(mip.lower, mip.upper, 5.0, 10)
+    finally:
+        search.level_lane.shutdown()
+    assert made == [True, False]
