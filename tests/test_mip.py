@@ -577,6 +577,96 @@ def test_lagrangian_bound():
     assert bound == -np.inf and rigorous
 
 
+def difference_rows(seed=0, n_s=6, n_arcs=12, big=50.0):
+    """Arcs ``s_b >= s_a + p - big·z`` over continuous ``0 <= s <= 1e6``
+    (a cycle, so some ``z`` must open), objective on the binaries only:
+    CMS750_4's shape in miniature."""
+    rng = np.random.default_rng(seed)
+    arcs = [(k % n_s, (k + 1) % n_s) for k in range(n_s)]
+    while len(arcs) < n_arcs:
+        a, b = rng.choice(n_s, 2, replace=False)
+        arcs.append((int(a), int(b)))
+    p = rng.uniform(5, 15, len(arcs))
+    n = len(arcs) + n_s
+    A = sp.lil_matrix((len(arcs), n))
+    for k, (a, b) in enumerate(arcs):
+        A[k, k] = -big
+        A[k, len(arcs) + a] = 1.0
+        A[k, len(arcs) + b] = -1.0
+    A_eq, b_eq = no_rows(n)
+    lp = jl.LP(
+        c=np.concatenate([rng.uniform(1, 3, len(arcs)), np.zeros(n_s)]),
+        A_eq=A_eq,
+        b_eq=b_eq,
+        A_ineq=A.tocsc(),
+        b_ineq=-p,
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.concatenate([np.ones(len(arcs)), np.full(n_s, 1e6)]),
+    )
+    return jm.MIP(lp, np.arange(n) < len(arcs))
+
+
+def test_dual_repair_recovers_bound_on_wide_continuous_columns():
+    # Optimal duals with the noise a loose PDHG solve leaves: the reduced
+    # costs' small errors at the continuous columns' 1e6 upper bounds cost
+    # thousands of bound. ``DualRepair`` scales inequality duals back so
+    # no reduced cost points at a wide side; the bound stays valid and
+    # gets back most of the loss.
+    from scipy.optimize import linprog
+
+    for seed in range(3):
+        mip = difference_rows(seed)
+        lp = mip.lp.to_scipy()
+        ref = linprog(
+            mip.c,
+            A_ub=lp.A_ineq,
+            b_ub=lp.b_ineq,
+            bounds=list(zip(mip.lower, mip.upper)),
+            method="highs",
+        )
+        y = -ref.ineqlin.marginals
+        A_T = mip.A.T.tocsr()
+        repair = jm.DualRepair(mip, mip.integrality)
+        assert repair
+        # At exact duals no reduced cost points at a wide side.
+        assert repair(mip.c, A_T, y, ref.x, mip.lower, mip.upper) is None
+        rng = np.random.default_rng(seed)
+        for _ in range(3):
+            noisy = np.maximum(y + 1e-3 * rng.standard_normal(y.size), 0.0)
+            before, _ = jm.lagrangian_bound(
+                mip.c, mip.A, mip.b, mip.n_eq, mip.lower, mip.upper, noisy
+            )
+            repaired = repair(mip.c, A_T, noisy, ref.x, mip.lower, mip.upper)
+            assert repaired is not None
+            assert np.all(repaired >= 0.0)
+            after, rigorous = jm.lagrangian_bound(
+                mip.c, mip.A, mip.b, mip.n_eq, mip.lower, mip.upper, repaired
+            )
+            assert rigorous
+            assert after <= ref.fun + 1e-9  # still a valid bound
+            assert ref.fun - before > 100.0  # the noise was costly
+            assert ref.fun - after < 0.1 * (ref.fun - before)
+
+
+def test_dual_repair_skips_pure_integer_rows():
+    # Without continuous columns in inequality rows there is nothing to
+    # repair: the search keeps no repairer.
+    mip = knapsack()
+    assert not jm.DualRepair(mip, mip.integrality)
+
+
+def test_dual_repair_option_keeps_the_optimum():
+    # The search with and without the repair finds the same optimum; the
+    # repair runs on the device's node LPs.
+    mip = difference_rows()
+    on = solve(mip, dual_repair=True)
+    off = solve(mip, dual_repair=False)
+    assert on["status"] == off["status"] == "optimal"
+    assert on["objective"] == pytest.approx(off["objective"], rel=1e-6)
+    assert set(on["dual_repairs"]) == {"tried", "improved", "seconds"}
+    assert off["dual_repairs"]["tried"] == 0
+
+
 # %% Cutting planes
 def test_mir_cut_textbook():
     # x0 + x1 <= 1.5 with x integer in [0, 5], at (0.75, 0.75): the MIR with
@@ -6061,9 +6151,13 @@ def test_symmetry_must_be_known():
 
 # %% Restarts
 def force_restarts(monkeypatch, root=0.0, tree=0.0):
-    """Restart whenever one is allowed (any share fixed counts)."""
+    """Restart whenever one is allowed (any share fixed counts). The root
+    is kept open (``root_closed``): on these small MIPs the root's
+    heuristics often find the optimum at the root's bound, which ends the
+    search before any restart."""
     monkeypatch.setattr(jm, "_RESTART_ROOT_SHARE", root)
     monkeypatch.setattr(jm, "_RESTART_TREE_SHARE", tree)
+    monkeypatch.setattr(jm._BranchAndBound, "root_closed", lambda self: False)
 
 
 @pytest.mark.parametrize(
@@ -8195,6 +8289,29 @@ def test_cut_round_lp_must_be_known():
         solve(facility_location(), cut_round_lp="simplex")
 
 
+def test_root_keeps_the_cut_rounds_best_bound(monkeypatch):
+    # The rounds' best bound holds for the root box, so the root node (and
+    # its children) start from it, not from a weaker last re-solve: on irp
+    # the bound dropped from 33,249.82 to 33,242.52 when the root branched.
+    mip = facility_location()
+    rounds = []
+    real_loop = jm._BranchAndBound.cut_loop
+
+    def cut_loop(self, lower, upper, result):
+        result = real_loop(self, lower, upper, result)
+        rounds.append(self.model_value(self.active_bound))
+        # A last re-solve far weaker than the rounds': one cold epoch.
+        return self.solve_lp(self.node_lp(lower, upper), None, 1)
+
+    monkeypatch.setattr(jm._BranchAndBound, "cut_loop", cut_loop)
+    # No incumbent, so no pruning: the bound after the root is its children's.
+    monkeypatch.setattr(jm._BranchAndBound, "try_incumbent", lambda self, *a: False)
+    result = solve(mip, max_nodes=1, root_crossover=False, branching="most_fractional")
+    assert len(rounds) == 1 and np.isfinite(rounds[0])
+    assert result["status"] == "node_limit"
+    assert result["bound"] >= rounds[0] - 1e-6 * (1 + abs(rounds[0]))
+
+
 # %% Separation device (separation_device)
 def test_separation_on_a_given_device_finds_the_same_cuts():
     import jax
@@ -8259,3 +8376,22 @@ def test_rejects_a_bad_root_lp():
 def test_lp_solver_names_keep_their_earlier_aliases():
     assert jm._lp_solver("pdhg", "root_lp") == "jaddle"
     assert jm._lp_solver("exact", "cut_round_lp") == "highs"
+
+
+def test_a_crossed_over_dive_keeps_its_warm_start_shapes():
+    # crossover() gives duals for the LP's rows only, while solve() gives an
+    # empty equality block one zero row; a GPU dive batch stacks the dives'
+    # warm starts, so a crossed-over dive's is padded back (a presolved
+    # pg5_34 with no equality rows raised in the batch).
+    mip = general_integer(m_eq=0)
+    pdhg = jl.solve(mip.lp)["solution"]
+    crossed = jl.crossover(mip.lp, pdhg)
+    assert crossed["converged"]
+    assert crossed["solution"].dual_eq.shape != pdhg.dual_eq.shape
+    shaped = jm._shaped_like(crossed["solution"], pdhg)
+    for field in pdhg._fields:
+        assert np.shape(getattr(shaped, field)) == np.shape(getattr(pdhg, field))
+    np.testing.assert_array_equal(np.asarray(shaped.dual_eq), 0.0)
+    np.testing.assert_array_equal(
+        np.asarray(shaped.dual_ineq), np.asarray(crossed["solution"].dual_ineq)
+    )

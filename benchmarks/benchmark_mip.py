@@ -35,6 +35,9 @@ import time
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+# os.environ["XLA_FLAGS"] = (
+#     "--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=4"
+# )
 
 import highspy
 import jax
@@ -144,36 +147,58 @@ def run_jaddle(path, args):
     started = time.time()
     result = jm.solve(
         path,
+        branching="auto",
+        mip_rel_gap=1e-5,
         verbose=True,
+        symmetry=True,
         log_every_seconds=10,
         device=args.device,
         presolve=True,
-        exact_nodes=16,
+        exact_nodes=8,
         exact_band="auto",
-        exact_overflow_share=0.0,
+        exact_overflow_share=0,
         exact_strong_lookahead=8,
-        batch_size=64,
-        # cuts=True,
+        exact_strong_candidates=8,
+        jump_threads=4,
+        batch_size=16,
         max_seconds=args.max_seconds,
         tree_cut_every=100,
         cut_pool_size=1e4,
-        tree_cut_rows=1e4,
-        cut_rounds=100,
+        tree_cut_rows=1e3,
+        max_cut_rows=2000,
+        cut_rounds=10,
+        conflict_pool_size=5000,
         root_lp="jaddle",
-        precision="float64",
-        lp_tolerance=1e-6,
-        root_crossover=True,
-        cut_round_lp="highs",
-        probing=True,
-        restarts=0,
+        lp_tolerance=1e-3,
+        # precision="float64",
+        # root_crossover=True,
+        cut_round_lp="jaddle",
+        node_lp_tolerance=1e-3,
+        # Sign repair of loose node duals on wide continuous columns before
+        # their Lagrangian bound is taken (jm.DualRepair).
+        dual_repair=True,
+        mir_cuts=False,
         gomory_cuts=False,
-        cuts=True,
+        cuts=False,
+        tree_cuts=False,
         proximity_seconds=10,
+        rens_seconds=10,
+        fix_and_propagate=True,
+        gpu_dive_every=10,
+        # objective_level_seconds=45,
+        restarts=1,
+        # Cutoff probing: strong branching on every free integer against
+        # the cutoff, on CPU threads, fixing the root box (on by default).
+        cutoff_probing=True,
+        cutoff_probing_threads=4,
+        cutoff_probing_seconds=60,
+        cutoff_probing_iterations=1000,
         # c-MIR separation and cut selection (the defaults; for the earlier
         # behaviour: aggregation_width=1, cmir_per_row=1,
         # cut_score_weights=None, aggregate_integers=False on large MIPs).
+        restart_presolve=True,
         aggregate_integers="auto",
-        max_aggregation=10,
+        max_aggregation=8,
         aggregation_width=5,
         cmir_per_row=5,
         cut_score_weights=(0.1, 0.1, 0.5),  # objective, integer, directed
@@ -193,6 +218,10 @@ def run_jaddle(path, args):
             "jaddle_root_lp": result.get("root_lp", {}).get("solver"),
             "jaddle_root_lp_seconds": result.get("root_lp", {}).get("seconds"),
             "jaddle_postsolve_feasible": result.get("postsolve_feasible"),
+            "jaddle_dual_repairs_improved": result.get("dual_repairs", {}).get(
+                "improved"
+            ),
+            "jaddle_reduced_cost_tightenings": result.get("reduced_cost_tightenings"),
         }
     )
     try:
@@ -213,6 +242,12 @@ def print_details(result):
         f"{exact['children_reused']} children reused; "
         f"{exact['pivots'] / max(1, exact['solved']):.0f} pivots a node, "
         f"{exact['warm_bases']} from the parent's basis"
+    )
+    repairs = result["dual_repairs"]
+    print(
+        f"Dual repair: {repairs['improved']} of {repairs['tried']} node bounds raised "
+        f"in {repairs['seconds']:.1f}s; {result['reduced_cost_tightenings']} "
+        f"reduced-cost tightenings"
     )
     root = result["root_exact_strong"]
     print(
@@ -303,6 +338,8 @@ CSV_FIELDS = [
     "jaddle_root_lp",
     "jaddle_root_lp_seconds",
     "jaddle_postsolve_feasible",
+    "jaddle_dual_repairs_improved",
+    "jaddle_reduced_cost_tightenings",
     "highs_status",
     "highs_objective",
     "highs_bound",

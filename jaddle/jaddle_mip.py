@@ -1811,6 +1811,115 @@ def _box_bound_numpy(constant, r, lower, upper, reduced_cost_tolerance=0.0):
     return float(constant + term[~bad].sum()), rigorous
 
 
+# ``DualRepair``: a continuous column's side is wide when it is more than
+# this many (1 + |xⱼ|) from the node's primal; and the scaling passes.
+_DUAL_REPAIR_WIDE = 10.0
+_DUAL_REPAIR_PASSES = 10
+# A wrong-signed reduced cost is repaired only when it costs the bound more
+# than this (|rⱼ| times the room to the side it points at): round-off at
+# exact duals is left alone.
+_DUAL_REPAIR_MIN_LOSS = 1e-9
+
+
+class DualRepair:
+    """
+    Sign repair of approximate duals before their Lagrangian bound
+    (``box_bound``) is taken, for continuous columns with a wide box.
+
+    The bound charges each reduced cost ``rⱼ`` at the bound it points at,
+    so a PDHG dual whose ``rⱼ`` is off by ε on a column boxed to 1e6 loses
+    ε·1e6 of bound. On CMS750_4 (2,734 continuous columns in difference
+    rows, ``0 <= s <= ~1e6``, objective 0 on them) the device's node duals
+    at ``node_lp_tolerance=1e-3`` had |rⱼ| <= 0.03 on those columns and
+    bounds 50 to 43,000 below HiGHS's LP over the same box, almost all of
+    it from rⱼ < 0 at the upper bound.
+
+    A side of a continuous column is *wide* when it is more than
+    ``wide·(1 + |xⱼ|)`` from the node's primal ``x``; ``rⱼ`` must not point
+    at it (rⱼ >= 0 below a wide upper side, rⱼ <= 0 above a wide lower
+    one). Lowering an inequality dual ``yᵢ >= 0`` raises ``rⱼ`` where
+    ``Aᵢⱼ < 0`` and lowers it where ``Aᵢⱼ > 0``, and ``yᵢ = 0`` is always
+    allowed, so each pass scales down, at each wrong-signed column, the
+    duals of the rows that push it the wrong way just enough to zero it
+    (a row takes the smallest factor of its columns). ``y`` only falls, so
+    the passes settle; equality duals are left alone. On CMS750_4 ten
+    passes (about 7 ms a node) recovered 98.7% of the shortfall.
+
+    Any duals give a valid bound, so the caller keeps whichever of the two
+    bounds is higher and the repair cannot cost rigour.
+    """
+
+    def __init__(self, mip, is_int, wide=_DUAL_REPAIR_WIDE, passes=_DUAL_REPAIR_PASSES):
+        A = sp.coo_matrix(mip.A)
+        cont = ~np.asarray(is_int, bool)
+        keep = (A.row >= mip.n_eq) & cont[A.col] & (A.data != 0)
+        self.rows = A.row[keep].astype(np.int64)
+        self.cols = A.col[keep].astype(np.int64)
+        self.vals = np.asarray(A.data[keep], np.float64)
+        self.negative = self.vals < 0
+        self.cont = cont
+        self.n_eq = mip.n_eq
+        self.m = A.shape[0]
+        self.n = A.shape[1]
+        self.wide = float(wide)
+        self.passes = int(passes)
+
+    def __bool__(self):
+        return self.rows.size > 0
+
+    def wide_sides(self, x, lower, upper):
+        """The continuous columns whose upper and lower sides are wide at
+        ``x`` (``(up_wide, lo_wide)``)."""
+        room = self.wide * (1.0 + np.abs(x))
+        with np.errstate(invalid="ignore"):
+            up_wide = self.cont & (upper - x > room)
+            lo_wide = self.cont & (x - lower > room)
+        return up_wide, lo_wide
+
+    def __call__(self, c, A_T, y, x, lower, upper):
+        """Repaired duals for ``y`` (Jaddle's convention, inequality duals
+        clipped to ``>= 0``), or ``None`` when no wide side is pointed at."""
+        x = np.asarray(x, np.float64)
+        if x.shape != (self.n,) or not np.all(np.isfinite(x)):
+            return None
+        up_wide, lo_wide = self.wide_sides(x, lower, upper)
+        if not (up_wide.any() or lo_wide.any()):
+            return None
+        y = np.array(y, np.float64)
+        y[self.n_eq :] = np.maximum(y[self.n_eq :], 0.0)
+        rows, cols, vals, negative = self.rows, self.cols, self.vals, self.negative
+        changed = False
+        x_up = upper - x  # the room each side would charge rⱼ for
+        x_down = x - lower
+        for _ in range(self.passes):
+            r = c + A_T @ y
+            with np.errstate(invalid="ignore"):
+                need_up = up_wide & (r < 0) & (-r * x_up > _DUAL_REPAIR_MIN_LOSS)
+                need_down = lo_wide & (r > 0) & (r * x_down > _DUAL_REPAIR_MIN_LOSS)
+            if not (need_up.any() or need_down.any()):
+                break
+            mass = vals * y[rows]
+            # What pushes each column's rⱼ down (Aᵢⱼ < 0 rows) and up.
+            down_mass = np.bincount(
+                cols, weights=np.where(negative, -mass, 0.0), minlength=self.n
+            )
+            up_mass = np.bincount(
+                cols, weights=np.where(negative, 0.0, mass), minlength=self.n
+            )
+            with np.errstate(divide="ignore", invalid="ignore"):
+                f_up = np.where(need_up, 1.0 + r / down_mass, 1.0)
+                f_down = np.where(need_down, 1.0 - r / up_mass, 1.0)
+            f_up = np.clip(np.nan_to_num(f_up, nan=0.0), 0.0, 1.0)
+            f_down = np.clip(np.nan_to_num(f_down, nan=0.0), 0.0, 1.0)
+            factor = np.ones(self.m)
+            np.minimum.at(factor, rows, np.where(negative, f_up[cols], f_down[cols]))
+            if np.all(factor >= 1.0):
+                break
+            y *= factor
+            changed = True
+        return y if changed else None
+
+
 def reduced_cost_tightening(r, bound, cutoff, lower, upper, integrality):
     """
     Integer bounds tightened by reduced costs: integer values that cannot
@@ -4017,6 +4126,7 @@ class CutSeparator:
         device=None,
         aggregation_width=1,
         cmir_per_row=1,
+        mir_cuts=True,
     ):
         # The JAX device the batched searches run on (``None``: the default
         # one where the call is made).
@@ -4028,6 +4138,9 @@ class CutSeparator:
         # its aggregates (``_path_cuts``).
         self.aggregation_width = max(1, int(aggregation_width))
         self.cmir_per_row = max(1, int(cmir_per_row))
+        # c-MIR cuts at all (``mir_cuts``): without them the aggregation
+        # paths still give their flow cover and cover cuts.
+        self.mir_cuts = bool(mir_cuts)
         self.flow_covers = flow_covers  # also flow cover cuts (``flow_cover_cut``)
         # Also implied-bound cuts from this ``ImpliedBounds`` (built over
         # bounds no looser than ``lower``/``upper``), and with
@@ -4123,8 +4236,12 @@ class CutSeparator:
                 jobs.append((covers, self._aggregation_path(r, s, x)))
         bases = [base for _, path in jobs for base in path]
         if self.backend == "jax" and len(bases) >= self.min_batch:
-            mir = batched_cmir_cuts(
-                bases, x, self.lower, self.upper, self.is_int, self.variable_bounds
+            mir = (
+                batched_cmir_cuts(
+                    bases, x, self.lower, self.upper, self.is_int, self.variable_bounds
+                )
+                if self.mir_cuts
+                else [None] * len(bases)
             )
             flows = [None] * len(bases)
             if self.flow_covers:
@@ -4145,15 +4262,19 @@ class CutSeparator:
                     flows[i] = flow
         else:
             mir = [
-                cmir_cut(
-                    idx,
-                    a,
-                    b,
-                    x,
-                    self.lower,
-                    self.upper,
-                    self.is_int,
-                    variable_bounds=self.variable_bounds,
+                (
+                    cmir_cut(
+                        idx,
+                        a,
+                        b,
+                        x,
+                        self.lower,
+                        self.upper,
+                        self.is_int,
+                        variable_bounds=self.variable_bounds,
+                    )
+                    if self.mir_cuts
+                    else None
                 )
                 for idx, a, b in bases
             ]
@@ -4217,7 +4338,8 @@ class CutSeparator:
             _f64(self.relative), self.variable_bounds is not None, *vb,
             int(self.max_aggregation), bool(self.aggregate_integers),
             bool(self.flow_covers), 64, _COVER_ORDERS, _KNAPSACK_TOL, _CUT_TINY,
-            int(self.aggregation_width), int(self.cmir_per_row),
+            # None of the c-MIR cuts kept without ``mir_cuts``.
+            int(self.aggregation_width), int(self.cmir_per_row) if self.mir_cuts else 0,
         )
         names = ("cover", "mir", "flowcover")
         for k in range(family.size):
@@ -4315,6 +4437,8 @@ class CutSeparator:
                 self.is_int,
                 variable_bounds=self.variable_bounds,
             )
+            if self.mir_cuts
+            else None
             for idx, a, b in path
         ]
         flows = [
@@ -6701,6 +6825,14 @@ def _raw_of(child):
     return child.bound if child.raw is None else child.raw
 
 
+def _narrow(values):
+    """``values`` (``float64``) as ``float32`` when every one is exactly
+    representable there (``expand`` widens them back exactly), else as
+    they are."""
+    narrow = values.astype(np.float32)
+    return narrow if np.array_equal(narrow, values) else values
+
+
 def _child_box(box, var, xv, down):
     """The box of a child of ``box`` that branches on ``var`` at ``xv``."""
     lo, up = box[0].copy(), box[1].copy()
@@ -6751,6 +6883,8 @@ _LOG_SOURCES = (
     ("Z", "Trivial"),
     ("C", "Crossover"),
     ("X", "Proximity"),
+    ("Q", "Presolved restart"),
+    ("W", "HiGHS first solution"),
     ("1", "1-opt"),
 )
 
@@ -6806,17 +6940,100 @@ def _log_value(value):
     return text if len(text) <= 15 else f"{value:.8e}"
 
 
+class _SparseLeaf:
+    """A warm start array kept as its nonzeros (``_pack_leaf``)."""
+
+    __slots__ = ("shape", "dtype", "index", "values")
+
+    def __init__(self, shape, dtype, index, values):
+        self.shape, self.dtype, self.index, self.values = shape, dtype, index, values
+
+    def dense(self):
+        out = np.zeros(self.shape, self.dtype)
+        np.put(out, self.index, self.values)
+        return out
+
+
+def _pack_leaf(leaf):
+    """A warm start leaf as an open node keeps it: a host array that is
+    mostly zeros as its nonzeros (``_SparseLeaf``: an inequality's dual is
+    zero while its row is slack; on ns1830653 18% of ``dual_ineq`` and 35%
+    of ``primal`` were nonzero), any other host array as its own copy (a
+    batch member's point is a view of the whole batch's block, and a view
+    on an open node keeps the block alive: on ns1830653 the open nodes'
+    views held 2.3 times their own bytes), anything else (a device array)
+    as it is. Lossless: -0.0 counts as a nonzero, and the dtype is kept."""
+    if not isinstance(leaf, np.ndarray) or leaf.dtype.kind != "f":
+        return leaf
+    keep = np.flatnonzero((leaf != 0) | np.signbit(leaf))
+    index = np.int32 if leaf.size <= np.iinfo(np.int32).max else np.int64
+    if keep.size * (np.dtype(index).itemsize + leaf.itemsize) < leaf.nbytes:
+        return _SparseLeaf(
+            leaf.shape, leaf.dtype, keep.astype(index), leaf.reshape(-1)[keep]
+        )
+    return leaf.copy() if leaf.base is not None else leaf
+
+
+class _PackedWarm:
+    """An open node's warm start ``(solution, opt_state)`` with the
+    solution's leaves packed (``_pack_leaf``); ``unpack`` gives it back.
+    A solution none of whose leaves packing changes (device arrays, host
+    arrays of their own) is kept as it is, and given back as itself."""
+
+    __slots__ = ("treedef", "leaves", "opt_state", "solution")
+
+    def __init__(self, warm):
+        solution, self.opt_state = warm
+        leaves, self.treedef = jax.tree.flatten(solution)
+        self.leaves = [_pack_leaf(leaf) for leaf in leaves]
+        self.solution = None
+        if all(packed is leaf for packed, leaf in zip(self.leaves, leaves)):
+            self.solution, self.leaves = solution, None
+
+    def has_solution(self):
+        return self.treedef.num_leaves > 0
+
+    def unpack(self):
+        if self.leaves is None:
+            return self.solution, self.opt_state
+        leaves = [
+            leaf.dense() if isinstance(leaf, _SparseLeaf) else leaf
+            for leaf in self.leaves
+        ]
+        return jax.tree.unflatten(self.treedef, leaves), self.opt_state
+
+
+# The last warm start packed, as ``(warm, packed)``: a node's two children
+# start from the same one (``_BranchAndBound.branch``), and share its packing.
+_last_packed = None
+
+
+def _pack_warm(warm):
+    """``warm`` as ``_Node`` keeps it (``_PackedWarm``); ``None`` as it is."""
+    global _last_packed
+    if warm is None or isinstance(warm, _PackedWarm):
+        return warm
+    last = _last_packed
+    if last is not None and last[0] is warm:
+        return last[1]
+    packed = _PackedWarm(warm)
+    _last_packed = (warm, packed)
+    return packed
+
+
 class _Node:
     """An open node: its bound, depth, bound changes against the root (as
     ``(index, lower, upper)``), the parent's warm start, the branching
     that made it (``(var, down, distance, parent_value)``) and the LP
-    epochs it has had in earlier batches (``epochs``)."""
+    epochs it has had in earlier batches (``epochs``). The warm start is
+    kept packed (``_PackedWarm``): ``warm`` reads it back as
+    ``(solution, opt_state)``."""
 
     __slots__ = (
         "bound",
         "depth",
         "changes",
-        "warm",
+        "_warm",
         "branch",
         "epochs",
         "inferences",
@@ -6871,6 +7088,22 @@ class _Node:
         # strong sides' keys by ``(var, down)``.
         self.exact_basis = None
         self.exact_sides = None
+
+    @property
+    def warm(self):
+        packed = self._warm
+        return packed.unpack() if isinstance(packed, _PackedWarm) else packed
+
+    @warm.setter
+    def warm(self, warm):
+        self._warm = _pack_warm(warm)
+
+    def has_warm_solution(self):
+        """Whether its warm start has a solution (without unpacking it)."""
+        packed = self._warm
+        if isinstance(packed, _PackedWarm):
+            return packed.has_solution()
+        return packed is not None and packed[0] is not None
 
 
 _LP_RESERVED = (
@@ -6947,6 +7180,27 @@ def _exact_node_lp(highs, mip, lower, upper, seconds, basis=None):
     y_eq, y_ineq = _jaddle_duals(highs, mip)
     x = np.asarray(highs.getSolution().col_value, np.float64)
     return "optimal", x, y_eq, y_ineq
+
+
+def _shaped_like(solution, template):
+    """``solution`` (a ``SaddleState``) with each dual vector padded with
+    zeros, or cut, to its length in ``template``: ``jaddle_linear.crossover``
+    gives duals for the LP's rows only, while ``solve()`` gives an empty row
+    block one zero row, and a batch's warm starts must share their shapes."""
+
+    def fit(values, like):
+        values = np.asarray(values, np.float64)
+        size = np.shape(like)[0]
+        if values.shape[0] == size:
+            return values
+        if values.shape[0] > size:
+            return values[:size]
+        return np.concatenate([values, np.zeros(size - values.shape[0])])
+
+    return solution._replace(
+        dual_eq=fit(solution.dual_eq, template.dual_eq),
+        dual_ineq=fit(solution.dual_ineq, template.dual_ineq),
+    )
 
 
 def _jaddle_duals(highs, mip):
@@ -7262,17 +7516,27 @@ class _SubMipLane:
     def busy(self):
         return self.job is not None
 
-    def submit(self, kind, mip, is_int, lower, upper, cutoff, seconds):
-        """Queue ``kind``'s (``"rins"`` or ``"crossover"``) search of
-        ``mip`` over ``[lower, upper]`` (``_submip_job``)."""
+    def submit(self, kind, mip, is_int, lower, upper, cutoff, seconds, options=None):
+        """Queue ``kind``'s (``"rins"``, ``"crossover"``, ``"rens"`` or
+        ``"first"``) search of ``mip`` over ``[lower, upper]``
+        (``_submip_job``), with HiGHS ``options`` for this job only."""
         lower, upper = np.array(lower, np.float64), np.array(upper, np.float64)
         is_int = np.array(is_int, bool)
+        options = dict(options or {})
 
         def job():
             started = time.time()
             if self.held is None or self.held[0] is not mip:
                 self.held = (mip, _highs_submip(mip, is_int))
-            x = _submip_job(self.held[1], mip, lower, upper, cutoff, seconds)
+            highs = self.held[1]
+            saved = {key: highs.getOptionValue(key)[1] for key in options}
+            try:
+                for key, value in options.items():
+                    highs.setOptionValue(key, value)
+                x = _submip_job(highs, mip, lower, upper, cutoff, seconds)
+            finally:
+                for key, value in saved.items():
+                    highs.setOptionValue(key, value)
             return x, False, time.time() - started
 
         self.job = (self.pool.submit(job), kind)
@@ -7721,6 +7985,245 @@ class _ExactLane:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
 
+# Cutoff probing (``cutoff_probing``): the fixes a thread finds before it
+# re-solves its LP, for a fresh vertex and basis.
+_PROBE_REFRESH_FIXES = 32
+# Another round at the same cutoff while the last fixed at least this share
+# of the integers it probed (its fixes tighten the next round's LP).
+_PROBE_AGAIN_SHARE = 0.05
+# A round at a new cutoff waits until the room it has to close sides in
+# (the cutoff less the global bound) is at most this share of the last
+# round's, unless that round fixed ``_PROBE_AGAIN_SHARE``. On eil33-2 each
+# feasibility jump point started a 28 s round that fixed 41 of 4,516
+# binaries (cutoff 1,924, bound 820), against 4,046 at the optimum's.
+_PROBE_ROOM_SHRINK = 0.75
+# A restart presolve (``restart_presolve``) goes on in the reduced MIP only
+# when it removed at least this share of the columns.
+_RESTART_PRESOLVE_MIN_SHARE = 0.1
+# RENS around a node point (``tree_rens``) needs at least this share of the
+# integers integral there (the root's needs 0.3 from a vertex, 0.5 else).
+_TREE_RENS_MIN_FIXED = 0.3
+
+
+def _cutoff_probe(highs, mip, lower, upper, cols, cutoff, terms, iterations, deadline):
+    """
+    Cutoff probing on one thread (``_ProbeLane``): the LP of ``mip``'s rows
+    (``highs``: ``_highs_rows``) over ``[lower, upper]``, then for each
+    integer of ``cols`` in turn, each side its vertex is not on (``x_j >=
+    l_j + 1`` when ``x_j < l_j + 1``, ``x_j <= u_j − 1`` when ``x_j > u_j −
+    1``; for a binary at 0 the side ``x_j = 1``), re-solved from the LP's
+    basis by dual simplex for at most ``iterations`` pivots, stopped once
+    its dual objective passes ``cutoff`` (HiGHS's ``objective_bound``). A
+    side HiGHS shows infeasible, or whose duals' Lagrangian bound over the
+    side's box (``_exact_side_bound`` with ``terms``: the rows' ``A_T``,
+    the integrality and the reduced-cost tolerance) is rigorous and above
+    ``cutoff``, holds no solution with ``c·x <= cutoff``, so the integer
+    takes the other side's value: fixed. Fixes stay in the thread's LP for
+    the rest of ``cols`` (they hold for every solution searched for), and
+    every ``_PROBE_REFRESH_FIXES`` of them the LP is re-solved for a new
+    vertex and basis. Stops at ``deadline`` (a ``time.time()`` value).
+
+    Returns ``dict(status, upper, lower, probed, lps, pivots)``:
+    ``status`` ``"done"``, ``"empty"`` (the box holds nothing at or below
+    ``cutoff``), ``"failed"`` (the LP did not solve) or ``"time"``;
+    ``upper``/``lower``: ``(columns, values)`` of the new upper bounds (up
+    side closed) and lower bounds (down side closed); ``probed``: the
+    columns of ``cols`` whose sides were all tried.
+    """
+    import highspy
+
+    MS = highspy.HighsModelStatus
+    A_T, is_int, tol = terms
+    n = lower.size
+    lower = np.array(lower, np.float64)
+    upper = np.array(upper, np.float64)
+    out = dict(status="done", upper=([], []), lower=([], []), probed=0, lps=0, pivots=0)
+    saved = {
+        option: highs.getOptionValue(option)[1]
+        for option in ("objective_bound", "simplex_iteration_limit", "time_limit")
+    }
+    _, unlimited = highs.getOptionValue("simplex_iteration_limit")
+
+    def solve(limit):
+        highs.setOptionValue("simplex_iteration_limit", limit)
+        highs.setOptionValue(
+            "time_limit", highs.getRunTime() + max(deadline - time.time(), 0.0)
+        )
+        highs.run()
+        out["pivots"] += int(highs.getInfo().simplex_iteration_count)
+        return highs.getModelStatus()
+
+    def lp():
+        """The LP over the current box: ``(x, basis)``, or ``None`` with
+        ``out["status"]`` set."""
+        highs.changeColsBounds(n, np.arange(n, dtype=np.int32), lower, upper)
+        status = solve(unlimited)
+        if status in (MS.kInfeasible, MS.kObjectiveBound):
+            out["status"] = "empty"
+            return None
+        if status != MS.kOptimal:
+            out["status"] = "time" if time.time() >= deadline else "failed"
+            return None
+        return np.asarray(highs.getSolution().col_value, np.float64), highs.getBasis()
+
+    try:
+        highs.setOptionValue("objective_bound", float(cutoff))
+        state = lp()
+        if state is None:
+            return out
+        x, basis = state
+        fresh = 0
+        side_iterations = unlimited if iterations is None else int(iterations)
+        for j in np.asarray(cols, np.int64).tolist():
+            if time.time() >= deadline:
+                out["status"] = "time"
+                break
+            lo, up = float(lower[j]), float(upper[j])
+            if lo >= up:
+                out["probed"] += 1
+                continue
+            closed = []
+            for is_up in (True, False):
+                if is_up:
+                    if not (np.isfinite(lo) and x[j] < lo + 1.0 - 1e-9):
+                        continue
+                    side = (lo + 1.0, up)
+                else:
+                    if not (np.isfinite(up) and x[j] > up - 1.0 + 1e-9):
+                        continue
+                    side = (lo, up - 1.0)
+                highs.changeColBounds(j, *side)
+                highs.setBasis(basis)
+                status = solve(side_iterations)
+                out["lps"] += 1
+                shut = status == MS.kInfeasible
+                if (
+                    not shut
+                    and status
+                    in (MS.kOptimal, MS.kIterationLimit, MS.kTimeLimit, MS.kObjectiveBound)
+                    and highs.getSolution().dual_valid
+                ):
+                    side_lower, side_upper = lower.copy(), upper.copy()
+                    side_lower[j], side_upper[j] = side
+                    y_eq, y_ineq = _jaddle_duals(highs, mip)
+                    bounded = _exact_side_bound(
+                        mip, A_T, y_eq, y_ineq, side_lower, side_upper, is_int, tol
+                    )
+                    shut = bounded is not None and bounded[1] and bounded[0] > cutoff
+                highs.changeColBounds(j, lo, up)
+                if shut:
+                    closed.append(is_up)
+            if time.time() >= deadline and not closed:
+                # The sides may have stopped on the deadline unproved.
+                out["status"] = "time"
+                break
+            out["probed"] += 1
+            if not closed:
+                continue
+            if len(closed) == 2:
+                out["status"] = "empty"
+                break
+            if closed[0]:  # x_j >= lo + 1 holds nothing: x_j = lo
+                upper[j] = lo
+                out["upper"][0].append(j)
+                out["upper"][1].append(lo)
+            else:  # x_j <= up − 1 holds nothing: x_j = up
+                lower[j] = up
+                out["lower"][0].append(j)
+                out["lower"][1].append(up)
+            highs.changeColBounds(j, lower[j], upper[j])
+            fresh += 1
+            if fresh >= _PROBE_REFRESH_FIXES:
+                fresh = 0
+                state = lp()
+                if state is None:
+                    break
+                x, basis = state
+    finally:
+        for option, value in saved.items():
+            highs.setOptionValue(option, value)
+    return out
+
+
+class _ProbeLane:
+    """
+    Cutoff probing (``cutoff_probing``) on CPU threads: once there is an
+    incumbent, every free integer of the root box is tried on the side of
+    it the root LP's vertex is not on (a binary at 0: ``x_j = 1``), by
+    HiGHS's dual simplex over the search's rows, stopped at the cutoff
+    (``_cutoff_probe``). A side with no LP point below the cutoff holds no
+    better solution, so the integer is fixed in the root box for the rest
+    of the search. It is strong branching on every integer, not only the
+    fractional ones, with the cutoff as the only question asked. Reduced-
+    cost fixing estimates each side from one set of duals; probing solves
+    it. On eil33-2 (4,516 binaries, 32 rows, optimum 934.008) the root's
+    reduced costs fix 1,005 binaries at the optimum's cutoff, probing
+    4,014 and a second round 382 more; HiGHS then shows the 120 binaries
+    left hold nothing better in 1 s, against 96 s for the whole MIP.
+
+    A round deals the candidates out to the threads, one job each, and is
+    collected once every job is done. Each thread keeps a HiGHS instance
+    for the rows it last probed. Jobs are functions of NumPy and SciPy
+    arrays only.
+    """
+
+    def __init__(self, threads):
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.threads = max(1, int(threads))
+        self.pool = ThreadPoolExecutor(self.threads, thread_name_prefix="jaddle-probe")
+        self.local = threading.local()
+        self.jobs = []
+        self.started = None
+
+    def busy(self):
+        return bool(self.jobs)
+
+    def submit(self, mip, lp_box, cols, cutoff, terms, iterations, deadline):
+        """Start a round: ``cols`` (in priority order) dealt out to the
+        threads, each probing ``mip``'s LP over ``lp_box`` against
+        ``cutoff`` until ``deadline``."""
+        lower, upper = (np.array(b, np.float64) for b in lp_box)
+        cols = np.asarray(cols, np.int64)
+
+        def job(chunk):
+            held = getattr(self.local, "held", None)
+            if held is None or held[0] is not mip:
+                held = self.local.held = (mip, _highs_rows(mip))
+            return _cutoff_probe(
+                held[1], mip, lower, upper, chunk, cutoff, terms, iterations, deadline
+            )
+
+        self.started = time.time()
+        self.jobs = [
+            self.pool.submit(job, cols[i :: self.threads])
+            for i in range(min(self.threads, cols.size))
+        ]
+
+    def finished(self):
+        """The round's job results and its wall time once every job is
+        done (a job that raised comes back ``"failed"``), else ``None``."""
+        if not self.jobs or not all(job.done() for job in self.jobs):
+            return None
+        results = []
+        for job in self.jobs:
+            try:
+                results.append(job.result())
+            except Exception:
+                results.append(
+                    dict(status="failed", upper=([], []), lower=([], []),
+                         probed=0, lps=0, pivots=0)
+                )
+        self.jobs = []
+        return results, time.time() - self.started
+
+    def shutdown(self):
+        for job in self.jobs:
+            job.cancel()
+        self.jobs = []
+        self.pool.shutdown(wait=False, cancel_futures=True)
+
+
 class _HeuristicWorkers:
     """Background threads for the CPU heuristics (``parallel_heuristics``),
     so they run while the main thread keeps the device busy with node LPs.
@@ -8124,6 +8627,7 @@ class _BranchAndBound:
         conflict_pool_size=2000,
         conflict_max_nnz=None,
         flow_covers=True,
+        mir_cuts=True,
         clique_cuts=True,
         zero_half_cuts=True,
         cut_age=_CUT_AGE,
@@ -8145,6 +8649,7 @@ class _BranchAndBound:
         separation_backend="auto",
         separation_device="cpu",
         node_bound_stop=True,
+        dual_repair=True,
         node_lp_tolerance=None,
         heuristic_effort=0.1,
         reliability_threshold=4,
@@ -8187,6 +8692,7 @@ class _BranchAndBound:
         parallel_heuristics=False,
         symmetry="auto",
         restarts=5,
+        restart_presolve=False,
         mip_start=None,
         implied_bound_cuts=True,
         probing_cliques=True,
@@ -8208,6 +8714,10 @@ class _BranchAndBound:
         exact_root_candidates=128,
         exact_root_seconds=60.0,
         exact_root_iterations=None,
+        cutoff_probing=True,
+        cutoff_probing_threads=4,
+        cutoff_probing_seconds=60.0,
+        cutoff_probing_iterations=1000,
         one_opt=True,
         objective_propagation=False,
         plunge_gap=0.25,
@@ -8238,6 +8748,7 @@ class _BranchAndBound:
         crossover_solutions=3,
         crossover_min_fixed=0.5,
         proximity_seconds=10.0,
+        first_solution_seconds=0.0,
         objective_levels=True,
         objective_level_seconds=2.0,
         cut_round_lp="jaddle",
@@ -8264,6 +8775,10 @@ class _BranchAndBound:
         if int(restarts) < 0:
             raise ValueError(f"restarts must be at least 0, not {restarts!r}")
         self.max_restarts = int(restarts)
+        # HiGHS's presolve at a restart, the search going on in the reduced
+        # MIP (``presolved_round``).
+        self.restart_presolve = bool(restart_presolve)
+        self.restart_presolve_log = []
         self.restart_log = []
         # The integers free in the root box when the current round started,
         # and the best bound of the rounds before (a floor for the bound).
@@ -8446,6 +8961,7 @@ class _BranchAndBound:
         # Global cuts in the tree need one sparsity pattern per compiled
         # solver; the batched solver captures it, so they are serial only.
         self.use_flow_covers = bool(flow_covers)
+        self.use_mir_cuts = bool(mir_cuts)
         # Clique cuts (``clique_cuts``): one conflict graph over the root
         # box, built at the first separation and kept for the tree rounds.
         self.use_clique_cuts = bool(clique_cuts)
@@ -8614,6 +9130,10 @@ class _BranchAndBound:
         # Node LPs stop once their Lagrangian bound passes the cutoff.
         self.node_bound_stop = bool(node_bound_stop)
         self.bound_stops = 0
+        # Sign repair of node duals on wide continuous columns (``DualRepair``).
+        self.use_dual_repair = bool(dual_repair)
+        self.dual_repairer = None
+        self.dual_repair_stats = collections.Counter(tried=0, improved=0, seconds=0.0)
         self.use_tree_cuts = bool(tree_cuts)
         self.tree_cut_every = tree_cut_every
         if int(tree_pool_every) < 0:
@@ -8738,6 +9258,25 @@ class _BranchAndBound:
         self.root_exact_stats = dict(
             candidates=0, lps=0, fixed=0, pivots=0, seconds=0.0, bound=None
         )
+        # Cutoff probing (``_ProbeLane``): rounds over the root box's free
+        # integers on CPU threads, once per cutoff, again while a round
+        # fixes ``_PROBE_AGAIN_SHARE`` of what it probed.
+        self.probe_lane = (
+            _ProbeLane(cutoff_probing_threads)
+            if cutoff_probing and cutoff_probing_threads
+            else None
+        )
+        self.probe_seconds = float(cutoff_probing_seconds or 0.0)
+        self.probe_iterations = (
+            None if cutoff_probing_iterations is None else int(cutoff_probing_iterations)
+        )
+        self.probe_cutoff = None  # the cutoff of the last round
+        self.probe_again = False
+        self.probe_room = None  # the last round's cutoff less the global bound
+        self.probe_checked = 0.0  # when ``feed_probing`` last took the bound
+        self.probe_stats = dict(
+            rounds=0, probed=0, lps=0, pivots=0, fixed=0, seconds=0.0, empty=False
+        )
         # The band's overflow (``exact_overflow_share``): past
         # ``_EXACT_OVERFLOW_KEEP`` nodes a lane thread, the top of the band
         # goes to the device, solved to convergence within
@@ -8825,7 +9364,12 @@ class _BranchAndBound:
         self.submip_lane = (
             _SubMipLane()
             if submip_solver == "highs"
-            and (rins_seconds or self.crossover_seconds or self.proximity_seconds)
+            and (
+                rins_seconds
+                or self.crossover_seconds
+                or self.proximity_seconds
+                or first_solution_seconds
+            )
             else None
         )
         # The objective's levels (``objective_levels``): when it rests on a
@@ -8859,6 +9403,17 @@ class _BranchAndBound:
         self.dives = 0
         self.use_objective_propagation = True
         self.rins_calls = 0
+        # RENS on the sub-MIP lane (``rens``, ``tree_rens``): the root's
+        # neighbourhood waiting for the lane, and the calls and finds.
+        self.rens_pending = None
+        self.rens_calls = 0
+        self.rens_finds = 0
+        # HiGHS on the whole root box before the first incumbent
+        # (``submit_first_solution``): the next call's time, doubling.
+        self.first_solution_seconds = float(first_solution_seconds or 0.0)
+        self.first_solution_budget = self.first_solution_seconds
+        self.first_solution_calls = 0
+        self.first_solution_finds = 0
         self.plunge_depth = plunge_depth
         self.plunge_node = None  # the child the next step plunges into
         self.plunge_left = 0
@@ -9161,6 +9716,13 @@ class _BranchAndBound:
         self.conflict_bump = 1.0
         self.last_log = -np.inf
         self.log_header_printed = False
+        # The progress table is also printed by the heartbeat thread
+        # (``log_heartbeat``): the lock keeps lines whole, ``log_closed``
+        # (the solving report has begun) and ``log_paused`` (an inner
+        # search logs instead, ``presolved_round``) silence it.
+        self.log_lock = threading.RLock()
+        self.log_closed = False
+        self.log_paused = False
         self.tree_started = False  # for ``explored``
         self.branched_nodes = 0  # nodes split (the rest of ``nodes`` are leaves)
         # The bound of the node being evaluated (it is in no list meanwhile).
@@ -9216,6 +9778,9 @@ class _BranchAndBound:
                 self.node_dtype = _wide(jo.jaddle_dtype())
                 self.node_mip_lp = jl._cast_lp(mip.lp, self.node_dtype)
         self.node_values = self.node_mip_lp.values()
+        if self.use_dual_repair:
+            repairer = DualRepair(mip, self.is_int)
+            self.dual_repairer = repairer if repairer else None
         if rows_only:
             return
         # The heuristics propagate even when the search does not.
@@ -9434,6 +9999,17 @@ class _BranchAndBound:
     def cutoff_bound(self):
         """The bound of a region shown to hold no solution below the cutoff."""
         return self.round_bound(self.cutoff())
+
+    def root_closed(self):
+        """Whether, before the tree, the global bound (the root's rounds'
+        best, ``active_bound``, raised by the objective levels shown empty
+        and the restart floor) reaches the cutoff, so the incumbent is
+        within the gaps and the search is over. The rounds' re-solves stop
+        on their own bound only (``bound_target``): on 30n20b8 the levels
+        lane had the bound at 302 with the root LP's at 129, and the rounds,
+        root heuristics and root strong branching ran 22 s past an
+        incumbent of 302."""
+        return self.incumbent is not None and self.global_bound() >= self.cutoff()
 
     def global_bound(self):
         bound = min((node.bound for node in self.open_nodes()), default=np.inf)
@@ -9710,17 +10286,58 @@ class _BranchAndBound:
         """The Lagrangian bound of a node's duals over its propagated box."""
         return self.bound_over(self.dual_terms(solution), lower, upper)
 
+    def repair_terms(self, result, terms, raw, rigorous, lower, upper):
+        """A device LP's ``(terms, raw, rigorous)`` with its duals repaired
+        (``DualRepair``, ``dual_repair``) when that bounds the box higher;
+        as given otherwise, and for an exact lane result (its duals are a
+        vertex's) or a box its bound already closes."""
+        repairer = self.dual_repairer
+        if (
+            repairer is None
+            or result.get("stop_reason") == "exact"
+            or raw >= self.cutoff()
+        ):
+            return terms, raw, rigorous
+        started = time.perf_counter()
+        solution = result["solution"]
+        y = repairer(
+            self.mip.c, self.A_T, self.duals(solution, self.m_ineq),
+            solution.primal, lower, upper,
+        )
+        stats = self.dual_repair_stats
+        stats["tried"] += 1
+        if y is not None:
+            new_terms = lagrangian_terms(
+                self.mip.c, self.mip.A, self.mip.b, self.mip.n_eq, y, A_T=self.A_T
+            )
+            new_raw, new_rigorous = self.bound_over(new_terms, lower, upper)
+            # A rigorous bound only gives way to a higher rigorous one.
+            if new_raw > raw and (new_rigorous or not rigorous):
+                stats["improved"] += 1
+                terms, raw, rigorous = new_terms, new_raw, new_rigorous
+        stats["seconds"] += time.perf_counter() - started
+        return terms, raw, rigorous
+
     def reduced_cost_fix(self, terms, lower, upper):
-        """``reduced_cost_tightening`` of a box against the cutoff, then
-        propagation. Returns ``(lower, upper, infeasible)``, where
-        ``infeasible`` means the box holds no solution below the cutoff."""
-        if not np.isfinite(self.cutoff()):
+        """``reduced_cost_tightening`` of a box against ``proof_cutoff`` (the
+        largest objective a better solution can have: with an objective
+        step, the multiple of it at or below the cutoff), then propagation.
+        Returns ``(lower, upper, infeasible)``, where ``infeasible`` means
+        the box holds no solution below the cutoff.
+
+        The step matters when reduced costs are about one step: on
+        CMS750_4 (costs ±1, incumbent 252) every nonzero root reduced cost
+        is exactly 1, so with the cutoff's room (251.5 − bound) a node
+        fixed nothing until its bound passed 250.5, and with the step's
+        (251 − bound) it fixes them all once its bound passes 250."""
+        cutoff = self.proof_cutoff()
+        if not np.isfinite(cutoff):
             return lower, upper, False
         bound, rigorous = self.bound_over(terms, lower, upper)
         if not rigorous:
             return lower, upper, False
         new_lower, new_upper, changed = reduced_cost_tightening(
-            terms[1], bound, self.cutoff(), lower, upper, self.is_int
+            terms[1], bound, cutoff, lower, upper, self.is_int
         )
         if not changed:
             return lower, upper, False
@@ -9862,6 +10479,205 @@ class _BranchAndBound:
         self.root_terms_rigorous = False
         self.root_fixed_at = None
         return self.root_lower.copy(), self.root_upper.copy()
+
+    def presolved_round(self, lower, upper):
+        """
+        The rest of the search on a presolved MIP (``restart_presolve``): at
+        a restart, HiGHS's presolve runs on the searched MIP
+        (``self.base``: the kept cuts and symmetry rows included) over the
+        restarted root box ``[lower, upper]``, whose fixed columns and the
+        rows they empty a restart alone keeps. When it removes at least
+        ``_RESTART_PRESOLVE_MIN_SHARE`` of the columns, a new search of the
+        reduced MIP runs to the deadline with this one's cutoff (HiGHS
+        cannot map the incumbent into the reduced columns, so the search
+        starts from the cutoff alone, as ``solve(presolve=True)`` does
+        from a ``mip_start``), and the restarts and nodes left. Its points
+        come back through HiGHS's postsolve (marked ``"Q"``), and its bound
+        and status are this search's. Returns the result, or ``None`` to
+        restart as usual (presolve reduced too little, or failed).
+        """
+        import highspy
+
+        started = time.time()
+        base = self.base
+        dtype = base.lp.c.dtype
+        lp = base.lp.with_values(
+            base.lp.values()._replace(
+                lower_bounds=jnp.asarray(self.lp_lower(lower), dtype),
+                upper_bounds=jnp.asarray(self.lp_upper(upper), dtype),
+            )
+        )
+        # Min form with the base's offset: HiGHS's objective is this
+        # search's value plus ``base.offset``, and so is the reduced MIP's
+        # (its own value plus its offset).
+        boxed = MIP(lp, self.is_int, base.offset, False, base.implied)
+        try:
+            model = to_highs(boxed)
+            # Named by index: the reduced MIP's names say which of these
+            # columns each of its own is (``reduced_start``).
+            model.col_names_ = [f"c{j}" for j in range(base.num_variables)]
+            highs = _highs_mip(model)
+            status = _presolve(highs)
+        except Exception:
+            return None
+        PS = highspy.HighsPresolveStatus
+        n, m = base.num_variables, base.A.shape[0]
+        entry = dict(
+            presolve=status.name,
+            columns=(n, None),
+            rows=(m, None),
+            presolve_seconds=time.time() - started,
+        )
+
+        def postsolved(reduced_x):
+            solution = highspy.HighsSolution()
+            solution.col_value = list(np.asarray(reduced_x, np.float64))
+            solution.value_valid = True
+            solution.dual_valid = False
+            highs.postsolve(solution)
+            return np.array(highs.getSolution().col_value, dtype=np.float64)
+
+        def no_better_than(value):
+            """Whether the incumbent is at least as good as ``value`` (up
+            to round-off in postsolve and in the start's completion)."""
+            return self.incumbent is not None and self.incumbent[0] <= value + 1e-6 * (
+                1.0 + abs(value)
+            )
+
+        if status == PS.kInfeasible:
+            # The restarted box holds only solutions better than the
+            # incumbent (reduced-cost fixing): none is left.
+            self.restart_presolve_log.append(entry)
+            if self.verbose:
+                print("Restart presolve: the root box is infeasible")
+            return self.empty_root()
+        if status == PS.kReducedToEmpty:
+            # Presolve solved the box: its point is the best in it.
+            x = postsolved(np.zeros(0))
+            self.try_incumbent(x, "Q", None)
+            entry["columns"], entry["rows"] = (n, 0), (m, 0)
+            self.restart_presolve_log.append(entry)
+            if no_better_than(float(base.c @ x)):
+                return self.empty_root()
+            return None
+        if status != PS.kReduced:
+            return None
+        reduced = _mip_from_highs_lp(highs.getPresolvedLp(), maximise=False)
+        entry["columns"] = (n, reduced.num_variables)
+        entry["rows"] = (m, reduced.A.shape[0])
+        if reduced.num_variables > (1.0 - _RESTART_PRESOLVE_MIN_SHARE) * n:
+            entry["used"] = False
+            self.restart_presolve_log.append(entry)
+            if self.verbose:
+                print(
+                    f"Restart presolve: {n} -> {reduced.num_variables} variables, "
+                    f"too few removed; restarting as usual"
+                )
+            return None
+        entry["used"] = True
+        if self.verbose:
+            print(
+                f"Restart presolve: {n} -> {reduced.num_variables} variables, "
+                f"{m} -> {reduced.A.shape[0]} rows ({entry['presolve_seconds']:.1f}s); "
+                "the search continues on the reduced MIP"
+            )
+        # The background lanes are this search's: the new one has its own.
+        self.stop_lanes()
+        shift = base.offset - reduced.offset  # this search's value -> reduced's
+        start = self.reduced_start(highs.getPresolvedLp(), reduced)
+        initial_cutoff = self.cutoff(box=False) + shift
+        if start is not None:
+            # Room for the start itself, at the incumbent's value: once it
+            # is in, the reduced search's cutoff is this one's again.
+            value = self.incumbent[0] + shift
+            initial_cutoff = value + 1e-6 * (1.0 + abs(value))
+        settings = dict(
+            self.settings,
+            deadline=self.deadline,
+            start=self.start,
+            max_nodes=None if self.max_nodes is None else max(self.max_nodes - self.nodes, 0),
+            initial_cutoff=initial_cutoff,
+            cutoff_from_start=self.incumbent is not None,
+            mip_start=start,
+            # ``self.base`` has the symmetry rows already.
+            symmetry=False,
+            restarts=max(self.max_restarts - len(self.restart_log), 0),
+            interrupt=self.interrupt,
+        )
+        # The inner search prints its own table meanwhile.
+        self.log_paused = True
+        try:
+            inner = _BranchAndBound(reduced, **settings).run()
+        except KeyboardInterrupt:
+            return self.result("interrupted")
+        finally:
+            self.log_paused = False
+        self.nodes += inner["nodes"]
+        # Its restarts are this search's too (``result["restarts"]``).
+        self.restart_log += inner.get("restart_log", [])
+        self.restart_presolve_log += inner.get("restart_presolve", [])
+        entry.update(
+            status=inner["status"], nodes=inner["nodes"], seconds=time.time() - started
+        )
+        self.restart_presolve_log.append(entry)
+        found = None
+        if inner["x"] is not None:
+            x = postsolved(inner["x"])
+            found = float(base.c @ x)
+            self.try_incumbent(x, "Q", None)
+        inner_bound = inner["bound"]
+        bound = (
+            -np.inf
+            if inner_bound is None or not np.isfinite(inner_bound)
+            else float(inner_bound) - base.offset
+        )
+        proved = inner["status"] in ("optimal", "infeasible")
+        if proved and (found is None or no_better_than(found)):
+            # Nothing in the box beats the incumbent (or the reduced
+            # search's point, now the incumbent).
+            return self.empty_root()
+        # The reduced search's bound holds for every solution in the box.
+        self.active_bound = np.inf
+        self.close(bound, inner.get("bound_rigorous", True))
+        status = inner["status"]
+        if proved or status == "unresolved":
+            # Proved for a point postsolve did not give back feasible.
+            self.unresolved_floor = min(self.unresolved_floor, bound)
+            status = "optimal"
+        return self.result(status)
+
+    def reduced_start(self, presolved_lp, reduced):
+        """The incumbent as a start (``mip_start``) for the reduced MIP of
+        a presolved restart (``presolved_round``), or ``None`` (no
+        incumbent, or the columns' names lost). HiGHS's presolve keeps the
+        names, which ``presolved_round`` sets to the base's column indices,
+        so each reduced column takes the incumbent's value there. Presolve
+        moves the costs and offset of the columns it keeps (substitutions,
+        dual fixings), so the continuous values need not fit the reduced
+        rows; the search's start goes through ``try_incumbent``, which keeps
+        the integers and re-solves the continuous variables. On pg5_34 the
+        reduced search had only the cutoff, 0.3% from its bound, and no
+        heuristic found a point below it in 50 s, so RINS, proximity search
+        and crossover, which had found the incumbents, never ran."""
+        if self.incumbent is None:
+            return None
+        try:
+            names = list(presolved_lp.col_names_)
+            cols = np.array([int(name[1:]) for name in names], np.int64)
+        except (ValueError, TypeError, IndexError):
+            return None
+        if cols.size != reduced.num_variables or np.any(cols >= self.base.num_variables):
+            return None
+        return np.asarray(self.incumbent[1], np.float64)[cols]
+
+    def stop_lanes(self):
+        """Shut the background lanes down for good (``run`` does the same
+        when it returns)."""
+        for name in ("workers", "exact_lane", "submip_lane", "level_lane", "probe_lane"):
+            lane = getattr(self, name)
+            if lane is not None:
+                lane.shutdown()
+                setattr(self, name, None)
 
     def close_all(self):
         """Close every open node: none holds a solution below the cutoff.
@@ -10771,6 +11587,9 @@ class _BranchAndBound:
             solution = result["solution"]
             child_terms = self.result_terms(result, lo, up)
             child_raw, rigorous = self.bound_over(child_terms, lo, up)
+            child_terms, child_raw, rigorous = self.repair_terms(
+                result, child_terms, child_raw, rigorous, lo, up
+            )
             child_raw = max(child_raw, pre_raw)
             score_raw = child_raw  # for the score and pseudocost either way
             if not (rigorous or trust):
@@ -10821,8 +11640,14 @@ class _BranchAndBound:
         return lower, upper
 
     def compress(self, lower, upper):
+        """A box's changes against the root box, as ``expand`` takes them:
+        ``int32`` indices, and bounds in ``float32`` where that is exact
+        (integer bounds and infinities: half the bytes of the open nodes'
+        changes on ns1830653)."""
         idx = np.flatnonzero((lower != self.root_lower) | (upper != self.root_upper))
-        return idx, lower[idx], upper[idx]
+        if lower.size <= np.iinfo(np.int32).max:
+            idx = idx.astype(np.int32)
+        return idx, _narrow(lower[idx]), _narrow(upper[idx])
 
     def _child_estimate(self, child, xv, var):
         """A child's estimated bound: its bound plus its pseudocost gain
@@ -11040,6 +11865,9 @@ class _BranchAndBound:
     def _evaluate(self, node, lower, upper, lp, result):
         terms = self.result_terms(result, lower, upper)
         raw, rigorous = self.bound_over(terms, lower, upper)
+        terms, raw, rigorous = self.repair_terms(
+            result, terms, raw, rigorous, lower, upper
+        )
         self.last_raw_bound = raw
         bound = max(self.round_bound(raw), node.bound)
         self.active_bound = bound
@@ -11441,6 +12269,8 @@ class _BranchAndBound:
             "U": self.use_round_repair,
             "C": bool(self.crossover_seconds and self.submip_lane is not None),
             "X": bool(self.proximity_seconds and self.submip_lane is not None),
+            "Q": self.restart_presolve and self.max_restarts > 0,
+            "W": bool(self.first_solution_seconds and self.submip_lane is not None),
             "L": self.level_lane is not None,
             "1": self.use_one_opt,
             "K": self.linking_blocks is not None,
@@ -11453,6 +12283,12 @@ class _BranchAndBound:
         The first one prints the source legend and the header."""
         if not self.verbose:
             return
+        with self.log_lock:
+            if self.log_closed:
+                return
+            self._log(source, bound, force)
+
+    def _log(self, source, bound, force):
         now = time.time()
         if not force and now - self.last_log < self.log_every:
             return
@@ -11484,11 +12320,34 @@ class _BranchAndBound:
             f"   {_log_count(self.lp_epochs):>7} {now - self.start:7.1f}s"
         )
 
+    def log_heartbeat(self, stop):
+        """The heartbeat thread (``verbose``): a progress line whenever the
+        search has printed none for ``log_every_seconds``, so the global
+        bound and incumbent keep showing through long steps that log
+        nothing themselves (a root cut round's separation, the root's
+        heuristics and exact strong branching). On irp the first exact cut
+        round separated for 70 s with no line after the first incumbent's.
+        It starts once the table has (its header printed) and stops at the
+        solving report. The bound is read while the search runs, so a line
+        can catch a node between lists; an error skips the line."""
+        interval = max(0.5, float(self.log_every))
+        while not stop.wait(interval):
+            if not self.log_header_printed or self.log_closed or self.log_paused:
+                continue
+            if time.time() - self.last_log < self.log_every:
+                continue
+            try:
+                self.log(" ", None)
+            except Exception:  # a list changed under the read: next time
+                pass
+
     def report(self, status, bound, objective):
         """The end of the log, as HiGHS's solving report: the last table
         line, then the status, bounds, gap, time and counts."""
-        if self.log_header_printed:
-            self.log(" ", bound, force=True)
+        with self.log_lock:
+            if self.log_header_printed:
+                self.log(" ", bound, force=True)
+            self.log_closed = True  # no heartbeat line inside the report
         print()
         print("Solving report")
         rows = [("Status", _STATUS_TEXT.get(status, status))]
@@ -11681,6 +12540,7 @@ class _BranchAndBound:
             "batches": self.batches,
             "objective_step": self.objective_step,
             "reduced_cost_tightenings": self.reduced_cost_tightenings,
+            "dual_repairs": dict(self.dual_repair_stats),
             "children_pruned": self.children_pruned,
             "lp_repairs": self.lp_repairs,
             "lp_repairs_skipped": self.lp_repairs_skipped,
@@ -11691,6 +12551,10 @@ class _BranchAndBound:
             "restarts": len(self.restart_log),
             "restart_log": list(self.restart_log),
             "rins_calls": self.rins_calls,
+            "rens_calls": self.rens_calls,
+            "rens_finds": self.rens_finds,
+            "first_solution_calls": self.first_solution_calls,
+            "first_solution_finds": self.first_solution_finds,
             "rins_finds": self.rins_finds,
             "rins_fixing_rate": self.rins_fixing_rate,
             "batch_timing": {
@@ -11736,6 +12600,10 @@ class _BranchAndBound:
             "root_strong_lps": self.root_strong_lps,
             "root_strong_seconds": self.root_strong_seconds,
             "root_exact_strong": dict(self.root_exact_stats),
+            "cutoff_probing": (
+                dict(self.probe_stats) if self.settings["cutoff_probing"] else None
+            ),
+            "restart_presolve": [dict(entry) for entry in self.restart_presolve_log],
             # Block decomposition's progress (``None``: it did not run).
             "block_decomposition": (
                 None
@@ -12007,6 +12875,8 @@ class _BranchAndBound:
             # Pick up background jump points and queue the next slice from
             # the incumbent, so the improving jump runs beside the rounds.
             self.collect_heuristics()
+            if self.root_closed():
+                return result  # the caller closes the root
             round_started = time.time()
             solution = result["solution"]
             x = np.asarray(solution.primal, np.float64)
@@ -12111,6 +12981,8 @@ class _BranchAndBound:
             if np.isfinite(bound):
                 self.active_bound = max(self.active_bound, self.round_bound(bound))
             self.log(" ", None)
+            if self.root_closed():
+                return result  # the caller closes the root
             # Progress comes in bursts (and a short re-solve's bound can dip),
             # so judge it over three rounds, once three have run. With an
             # incumbent it is judged against the gap left: on rmine13 the
@@ -12237,6 +13109,8 @@ class _BranchAndBound:
             if self.out_of_time() or (stop_at is not None and time.time() > stop_at):
                 break
             self.collect_heuristics()
+            if self.root_closed():
+                break
             round_started = time.time()
             x = solved[0]
             candidates = []
@@ -12309,6 +13183,8 @@ class _BranchAndBound:
             self.age_cuts_at(solved[0], solved[2][base_m:])
             A_rows, b_rows, value = rows_and_bound(solved)
             raise_root_bound(value)
+            if self.root_closed():
+                break
             history.append(max(history[-1], solved[3]))
             if len(history) < 4:
                 continue
@@ -12325,8 +13201,8 @@ class _BranchAndBound:
             "seconds": time.time() - started,
             **{f"{key}_seconds": value for key, value in seconds.items()},
         }
-        if not self.cut_list:
-            return result
+        if not self.cut_list or self.root_closed():
+            return result  # with the root closed, the caller closes it
         # Into the PDHG root LP, warm from HiGHS's vertex and duals (the
         # last solve's; cuts added after a failed one start at zero).
         A_cuts, b_cuts = _cut_block(self.cut_list, n)
@@ -12439,6 +13315,20 @@ class _BranchAndBound:
         self.background_roundings += 1
         return True
 
+    def jump_cutoff(self):
+        """The objective row (``c·x <= cutoff``) for the jumps that run
+        while there is no incumbent: the cutoff when it comes from a
+        solution outside this search (``cutoff_from_start``: a ``mip_start``
+        under presolve, or a presolved restart, ``restart_presolve``), else
+        ``None``. Without it they stop at their first feasible point, which
+        is rarely better than that solution and ``try_incumbent`` drops; so
+        the search had no incumbent, and the improving jumps (which take
+        the cutoff) never started."""
+        if not self.cutoff_from_start:
+            return None
+        cutoff = self.cutoff(box=False)
+        return float(cutoff) if np.isfinite(cutoff) else None
+
     def launch_root_jumps(self, lower, upper):
         """The feasibility jump before the root LP (``root_jump_seconds``),
         as HiGHS runs its jump before its first LP: with background workers,
@@ -12483,6 +13373,7 @@ class _BranchAndBound:
                 max_iterations=self.jump_iterations,
                 deadline=deadline,
                 seed=101 + i,
+                cutoff=self.jump_cutoff(),
                 backend="numba",
             )
             started = True
@@ -12603,6 +13494,7 @@ class _BranchAndBound:
                     max_iterations=self.jump_iterations,
                     deadline=deadline,
                     seed=seed,
+                    cutoff=self.jump_cutoff(),
                     backend="numba",
                     info=warm,
                 )
@@ -12848,6 +13740,7 @@ class _BranchAndBound:
             aggregation_width=self.aggregation_width,
             cmir_per_row=self.cmir_per_row,
             flow_covers=self.use_flow_covers,
+            mir_cuts=self.use_mir_cuts,
             backend=self.separation_backend,
             device=self.separation_device,
             conflict_graph=graph,
@@ -13662,12 +14555,23 @@ class _BranchAndBound:
         return True
 
     def feed_submip(self):
-        """Keep the sub-MIP lane busy between node solves: a pending RINS
-        call (around the latest node point), proximity search and crossover
-        take turns, and each fills the lane when the others have nothing to
-        search."""
+        """Keep the sub-MIP lane busy between node solves: the root's RENS
+        when it is waiting; while there is no incumbent, HiGHS on the whole
+        root box (``first_solution``) and RENS around the node points
+        (``tree_rens``) in turn; then a pending RINS call (around the
+        latest node point), proximity search and crossover take turns, and
+        each fills the lane when the others have nothing to search."""
         lane = self.submip_lane
-        if lane is None or lane.busy() or self.incumbent is None or self.out_of_time():
+        if lane is None or lane.busy() or self.out_of_time():
+            return
+        if self.rens_seconds:
+            # The root's RENS first, when it is waiting (``rens``).
+            box, self.rens_pending = self.rens_pending, None
+            if box is not None and self.submit_rens(box):
+                return
+        if self.incumbent is None:
+            if getattr(self, "root_lower", None) is not None:
+                self.feed_first_solution()
             return
         order = ("rins", "proximity", "crossover")
         start = order.index(self.submip_last) + 1 if self.submip_last in order else 0
@@ -13686,7 +14590,7 @@ class _BranchAndBound:
     def collect_submip(self):
         """Check the point of the sub-MIP lane's finished job, if any, with
         ``try_incumbent`` (RINS ``"N"``, crossover ``"C"``, proximity
-        ``"X"``)."""
+        ``"X"``, RENS ``"E"``)."""
         lane = self.submip_lane
         if lane is None:
             return
@@ -13701,7 +14605,7 @@ class _BranchAndBound:
             self.proximity_empty += empty
             return
         before = None if self.incumbent is None else self.incumbent[0]
-        source = {"rins": "N", "proximity": "X"}.get(kind, "C")
+        source = {"rins": "N", "proximity": "X", "rens": "E", "first": "W"}.get(kind, "C")
         self.try_incumbent(x, source, None)
         improved = self.incumbent is not None and (
             before is None or self.incumbent[0] < before
@@ -13711,8 +14615,149 @@ class _BranchAndBound:
             self.rins_finds += improved
         elif kind == "proximity":
             self.proximity_finds += improved
+        elif kind == "rens":
+            self.rens_finds += improved
+        elif kind == "first":
+            self.first_solution_finds += improved
         else:
             self.crossover_finds += improved
+
+    def service_probing(self):
+        """Collect a finished cutoff probing round and start the next
+        (``cutoff_probing``). A round that shows the root box holds nothing
+        better than the incumbent raises the bound to the cutoff
+        (``bound_floor``), which ends the search (``root_closed`` at the
+        root) with the incumbent optimal."""
+        if self.probe_lane is None or getattr(self, "root_lower", None) is None:
+            return
+        if not self.collect_probing():
+            self.bound_floor = max(self.bound_floor, self.cutoff_bound())
+            self.close_all()
+            return
+        self.feed_probing()
+
+    def feed_probing(self):
+        """Start a cutoff probing round (``_ProbeLane``) when the lane is
+        idle and there is an incumbent: once per proof cutoff, and again at
+        the same cutoff while the last round fixed enough to tighten the
+        next one's LP (``_PROBE_AGAIN_SHARE``). A new cutoff waits until
+        the room (the cutoff less the global bound) is at most
+        ``_PROBE_ROOM_SHRINK`` of the last round's, unless that round fixed
+        enough; without a finite bound there is no round. The candidates are the root
+        box's free integers, the largest root reduced costs first (the
+        sides likeliest to close); a round takes at most
+        ``cutoff_probing_seconds`` and a fifth of the time left."""
+        lane = self.probe_lane
+        if lane is None or lane.busy() or self.incumbent is None or self.out_of_time():
+            return
+        cutoff = self.proof_cutoff()
+        if not np.isfinite(cutoff):
+            return
+        if cutoff == self.probe_cutoff and not self.probe_again:
+            return
+        # ``global_bound`` walks the open nodes: once a second at most.
+        now = time.time()
+        if now - self.probe_checked < 1.0:
+            return
+        self.probe_checked = now
+        bound = self.global_bound()
+        if not np.isfinite(bound):
+            return
+        room = cutoff - bound
+        if (
+            not self.probe_again
+            and self.probe_room is not None
+            and room > _PROBE_ROOM_SHRINK * self.probe_room
+        ):
+            return
+        lower, upper = self.root_lower, self.root_upper
+        if np.any(lower > upper):
+            return
+        cols = np.flatnonzero(self.is_int & (lower < upper))
+        if cols.size == 0:
+            return
+        terms = self.root_terms
+        if terms is not None and np.size(terms[1]) == lower.size:
+            score = np.abs(np.asarray(terms[1], np.float64)[cols])
+            cols = cols[np.argsort(-score, kind="stable")]
+        budget = self.probe_seconds
+        left = self.seconds_left()
+        if left is not None:
+            budget = min(budget, 0.2 * left)
+        if budget <= 0:
+            return
+        self.probe_cutoff, self.probe_again, self.probe_room = cutoff, False, room
+        lane.submit(
+            self.mip,
+            (self.lp_lower(lower), self.lp_upper(upper)),
+            cols,
+            cutoff,
+            (self.A_T, self.is_int, self.reduced_cost_tol),
+            self.probe_iterations,
+            time.time() + budget,
+        )
+
+    def collect_probing(self):
+        """Fix the root box by a finished cutoff probing round, then
+        propagate it. Every fix holds for each solution better than the
+        cutoff the round probed at, which only falls, over the root box it
+        probed, which only shrinks, so the fixes hold for the search from
+        here on, restarts included. Returns False when the round showed the
+        root box holds nothing better than the incumbent."""
+        lane = self.probe_lane
+        if lane is None:
+            return True
+        done = lane.finished()
+        if done is None:
+            return True
+        results, seconds = done
+        stats = self.probe_stats
+        stats["rounds"] += 1
+        stats["seconds"] += seconds
+        lower, upper = self.root_lower.copy(), self.root_upper.copy()
+        empty, complete, probed = False, True, 0
+        for out in results:
+            stats["lps"] += out["lps"]
+            stats["pivots"] += out["pivots"]
+            probed += out["probed"]
+            empty |= out["status"] == "empty"
+            complete &= out["status"] == "done"
+            cols, values = out["upper"]
+            if cols:
+                cols = np.asarray(cols, np.int64)
+                upper[cols] = np.minimum(upper[cols], values)
+            cols, values = out["lower"]
+            if cols:
+                cols = np.asarray(cols, np.int64)
+                lower[cols] = np.maximum(lower[cols], values)
+        stats["probed"] += probed
+        fixed = int(
+            np.count_nonzero(
+                self.is_int
+                & (self.root_lower < self.root_upper)
+                & (lower == upper)
+            )
+        )
+        stats["fixed"] += fixed
+        if self.verbose:
+            print(
+                f"Cutoff probing: {fixed} of {probed} integers fixed "
+                f"({sum(out['lps'] for out in results)} LPs, {seconds:.1f}s"
+                + (", box empty" if empty else "")
+                + ")"
+            )
+        if empty or np.any(lower > upper):
+            stats["empty"] = True
+            return False
+        if fixed:
+            if self.propagator is not None:
+                lower, upper, infeasible = self.propagator(lower, upper)
+                if infeasible:
+                    stats["empty"] = True
+                    return False
+            self.root_lower, self.root_upper = lower, upper
+        self.probe_again = complete and fixed >= _PROBE_AGAIN_SHARE * max(probed, 1)
+        return True
 
     def level_box(self):
         """The box the objective's levels are searched in: the root box,
@@ -13925,8 +14970,16 @@ class _BranchAndBound:
         (``parallel_heuristics``) with ``try_incumbent`` (jumps marked
         ``J``, fix-and-propagate ``P``), then queue the next improving-jump
         slice (unless ``schedule`` is false). The level lane's points too
-        (``service_levels``)."""
+        (``service_levels``), cutoff probing's (``service_probing``) and
+        the sub-MIP lane's (``collect_submip``, then ``feed_submip``): the
+        lane needs no tree, so proximity search and crossover start from
+        the first incumbent, during the root's cut rounds. On eil33-2 the
+        rounds ran past 100 s with only the jump's points (1,773 against
+        an optimum of 934, which HiGHS finds within 60 s)."""
         self.service_levels()
+        self.service_probing()
+        self.collect_submip()
+        self.feed_submip()
         if self.workers is None:
             return
         for kind, found, seconds, warm in self.workers.finished():
@@ -13983,7 +15036,9 @@ class _BranchAndBound:
             rens_seconds=0.0,
             crossover_seconds=0.0,
             proximity_seconds=0.0,
+            first_solution_seconds=0.0,
             submip_solver="jaddle",
+            cutoff_probing=False,
             dive_every=0,
             tree_heuristics=False,
             node_crossover=False,
@@ -14028,22 +15083,17 @@ class _BranchAndBound:
         fewer than ``min_fixed`` of the integers are integral. A point found
         is marked ``"E"``.
         """
-        ints = self.is_int
-        x = np.asarray(x, np.float64)
-        integral = ints & (np.abs(x - np.round(x)) <= self.int_tol)
-        if integral.sum() < min_fixed * ints.sum():
+        box = self.rens_box(x, lower, upper, min_fixed, self.int_tol)
+        if box is None:
             return
+        if self.submip_lane is not None:
+            # HiGHS searches it on the lane (``submit_rens``), now or once
+            # the lane is free, while the root goes on.
+            self.rens_pending = box
+            self.feed_submip()
+            return
+        sub_lower, sub_upper = box
         started = time.time()
-        sub_lower = np.where(
-            ints, np.maximum(lower, np.floor(x + self.int_tol)), self.base.lower
-        )
-        sub_upper = np.where(
-            ints, np.minimum(upper, np.ceil(x - self.int_tol)), self.base.upper
-        )
-        sub_lower = np.where(integral, np.round(x), sub_lower)
-        sub_upper = np.where(integral, np.round(x), sub_upper)
-        if np.any(sub_lower > sub_upper):
-            return
         seconds = self.rens_seconds
         if self.deadline is not None:
             seconds = min(seconds, self.deadline - started)
@@ -14054,6 +15104,118 @@ class _BranchAndBound:
         if found is not None:
             self.try_incumbent(found, "E", warm)
         self.heuristic_seconds += time.time() - started
+
+    def rens_box(self, x, lower, upper, min_fixed, tolerance):
+        """RENS's neighbourhood of the point ``x`` within ``[lower,
+        upper]``: the integers within ``tolerance`` of a whole number (in
+        the box) fixed there, the others restricted to ``[floor, ceil]``;
+        the continuous variables keep the base MIP's bounds. ``None`` when
+        fewer than ``min_fixed`` of the integers are fixed, or the box is
+        empty."""
+        ints = self.is_int
+        x = np.asarray(x, np.float64)
+        near = np.round(x)
+        integral = (
+            ints & (np.abs(x - near) <= tolerance) & (near >= lower) & (near <= upper)
+        )
+        if integral.sum() < min_fixed * ints.sum():
+            return None
+        sub_lower = np.where(
+            ints, np.maximum(lower, np.floor(x + tolerance)), self.base.lower
+        )
+        sub_upper = np.where(
+            ints, np.minimum(upper, np.ceil(x - tolerance)), self.base.upper
+        )
+        sub_lower = np.where(integral, near, sub_lower)
+        sub_upper = np.where(integral, near, sub_upper)
+        if np.any(sub_lower > sub_upper):
+            return None
+        return sub_lower, sub_upper
+
+    def submit_rens(self, box):
+        """RENS's neighbourhood ``box`` to the sub-MIP lane for HiGHS, for
+        ``rens_seconds``, unless it was searched at this cutoff already.
+        Returns whether a job went in."""
+        seconds = self.submip_seconds_left(self.rens_seconds)
+        if seconds <= 0:
+            return False
+        # Hashed: a call per node point would keep two copies of the box
+        # each otherwise.
+        key = ("rens", hash((box[0].tobytes(), box[1].tobytes())), self.cutoff())
+        if key in self.rins_seen:
+            return False
+        self.rins_seen.add(key)
+        self.submit_submip("rens", box, seconds)
+        self.rens_calls += 1
+        return True
+
+    def tree_rens(self):
+        """RENS around the latest node LP point while there is no
+        incumbent (``rens_seconds``, with the sub-MIP lane): RINS,
+        proximity search and crossover all start from an incumbent, so
+        before the first one RENS is the lane's only work. A node point
+        comes from a deeper box than the root's, and PDHG's points stop
+        short of their vertex, so an integer within ``rins_tolerance`` of a
+        whole number counts as integral; at least
+        ``_TREE_RENS_MIN_FIXED`` of the integers must be. On piperout-08
+        the root vertex's neighbourhood is infeasible (HiGHS shows it in
+        no time) and Jaddle's search found no incumbent, while HiGHS's
+        first one, the optimum, came from a root sub-MIP after its probing
+        and cuts. Returns whether a job went in."""
+        if self.incumbent is not None or not self.recent_points:
+            return False
+        box = self.rens_box(
+            self.recent_points[-1],
+            self.root_lower,
+            self.root_upper,
+            _TREE_RENS_MIN_FIXED,
+            self.rins_tolerance,
+        )
+        return box is not None and self.submit_rens(box)
+
+    def feed_first_solution(self):
+        """The lane's work before the first incumbent: HiGHS on the whole
+        root box (``submit_first_solution``) and RENS around a node point
+        (``tree_rens``) take turns, each filling the lane when the other
+        has nothing to search."""
+        first = bool(self.first_solution_seconds)
+        if first and self.submip_last != "first" and self.submit_first_solution():
+            return
+        if self.rens_seconds and self.tree_rens():
+            return
+        if first:
+            self.submit_first_solution()
+
+    def submit_first_solution(self):
+        """HiGHS's MIP solver on the whole root box (``first_solution_seconds``),
+        stopped at its first point (``mip_max_improving_sols=1``), as
+        proximity search searches the whole box once there is an incumbent:
+        HiGHS's own probing, cuts and heuristics put to finding a first
+        point. Each call gets twice the last one's time, since HiGHS starts
+        over each time. On piperout-08 every RENS neighbourhood of the root
+        vertex and of the node points was infeasible (fixing even a random
+        tenth of the integral binaries was), and Jaddle had no incumbent
+        after 120 s; HiGHS on the whole MIP finds its first point, the
+        optimum, at 20 s. Marked ``"W"``. Returns whether a job went in."""
+        seconds = self.submip_seconds_left(self.first_solution_budget)
+        if seconds <= 0:
+            return False
+        self.submip_lane.submit(
+            "first",
+            self.base,
+            self.is_int,
+            self.lp_lower(self.root_lower),
+            self.lp_upper(self.root_upper),
+            self.cutoff(box=False),
+            seconds,
+            options={"mip_max_improving_sols": 1},
+        )
+        self.submip_last = "first"
+        self.submip_budget = float(seconds)
+        self.submip_calls += 1
+        self.first_solution_calls += 1
+        self.first_solution_budget *= 2.0
+        return True
 
     def dive_seconds(self):
         """The time a dive may take: the heuristic budget
@@ -14324,7 +15486,12 @@ class _BranchAndBound:
         if not crossed["converged"]:
             return
         dive["x"] = np.asarray(crossed["solution"].primal, np.float64)
-        dive["warm"] = (crossed["solution"], dive["warm"][1])
+        # In the shapes of the dive's PDHG warm start: the batch stacks the
+        # dives' warm starts, and ``crossover`` leaves out the zero row
+        # ``solve()`` gives an empty row block (on pg5_34, presolved at a
+        # restart down to no equality rows, ``dual_eq`` came back ``(0,)``
+        # beside the others' ``(1,)``, and the batch raised).
+        dive["warm"] = (_shaped_like(crossed["solution"], dive["warm"][0]), dive["warm"][1])
 
     def fix_dive_chunk(self, dive, ints):
         """One step of a GPU dive (``gpu_dives``) on the host: fix a chunk of
@@ -14557,6 +15724,7 @@ class _BranchAndBound:
             max_iterations=self.jump_iterations,
             deadline=None if not np.isfinite(deadline) else deadline,
             seed=seed,
+            cutoff=None if self.incumbent is not None else self.jump_cutoff(),
             backend=self.jump_backend,
         )
         if feasible:
@@ -15079,8 +16247,7 @@ class _BranchAndBound:
             self.exact_lane is not None
             and not node.exact_tried
             and node.depth > 0
-            and node.warm is not None
-            and node.warm[0] is not None
+            and node.has_warm_solution()
             and not self.diving()
             and not self.out_of_time()
         )
@@ -16061,12 +17228,25 @@ class _BranchAndBound:
                 installed = True
             except ValueError:  # not the main interpreter
                 pass
+        heartbeat = heartbeat_stop = None
+        if self.verbose:
+            heartbeat_stop = threading.Event()
+            heartbeat = threading.Thread(
+                target=self.log_heartbeat,
+                args=(heartbeat_stop,),
+                name="jaddle-log",
+                daemon=True,
+            )
+            heartbeat.start()
         try:
             if self.device is None:
                 return self._run()
             with jax.default_device(self.device):
                 return self._run()
         finally:
+            if heartbeat is not None:
+                heartbeat_stop.set()
+                heartbeat.join(timeout=5.0)
             if installed:
                 signal.signal(signal.SIGINT, previous or signal.default_int_handler)
             if self.workers is not None:
@@ -16075,6 +17255,8 @@ class _BranchAndBound:
                 self.exact_lane.shutdown()
             if self.submip_lane is not None:
                 self.submip_lane.shutdown()
+            if self.probe_lane is not None:
+                self.probe_lane.shutdown()
             if self.level_lane is not None:
                 self.level_lane.shutdown()
             if self._cut_worker is not None:
@@ -16102,6 +17284,10 @@ class _BranchAndBound:
             if out != "restart":
                 return out if isinstance(out, dict) else self.result(out)
             lower, upper = self.restart()
+            if self.restart_presolve:
+                out = self.presolved_round(lower, upper)
+                if out is not None:
+                    return out
 
     def _prepare(self, lower, upper, first):
         """The root box: propagated, with coefficient tightening over it,
@@ -16277,6 +17463,13 @@ class _BranchAndBound:
                 return self.result("unbounded_or_infeasible")
             result = detection["result"]
         self.nodes += 1
+        # The root LP's bound holds for the root box whatever its duals, so
+        # it is the global bound from now (the first incumbent's line, and
+        # the heartbeat's through the cut rounds, showed -inf before).
+        self.active_bound = max(
+            self.active_bound,
+            self.round_bound(self.lp_bound(result["solution"], lower, upper)[0]),
+        )
         # Points the early root jumps found while the LP was solved.
         self.collect_heuristics(schedule=False)
         if result["stop_reason"] == "interrupted":
@@ -16307,9 +17500,17 @@ class _BranchAndBound:
                 self.root_heuristics(lower, upper, result, improve=False)
         if cut_loop_due and not self.out_of_time():
             result = self.cut_loop(lower, upper, result)
+            if result["stop_reason"] != "interrupted" and self.root_closed():
+                return self.empty_root()
             lp =self.node_lp(lower, upper)
             if self.cut_list and self.propagator is not None:
-                lower, upper, infeasible = self.propagator(lower, upper, max_passes=20)
+                # Within the root box, which cutoff probing may have fixed
+                # during the rounds.
+                lower, upper, infeasible = self.propagator(
+                    np.maximum(lower, self.root_lower),
+                    np.minimum(upper, self.root_upper),
+                    max_passes=20,
+                )
                 if infeasible:
                     return self.empty_root()
                 self.root_lower, self.root_upper = lower, upper
@@ -16323,12 +17524,19 @@ class _BranchAndBound:
             bound, rigorous = self.lp_bound(result["solution"], lower, upper)
             self.close(bound, rigorous)
             return self.result("time_limit")
-        self.active_bound = self.round_bound(
-            self.lp_bound(result["solution"], lower, upper)[0]
+        # Every round's bound holds for the root box (the cuts are valid,
+        # and propagation only narrows the box), so keep the rounds' best:
+        # the last re-solve's can be lower.
+        self.active_bound = max(
+            self.active_bound,
+            self.round_bound(self.lp_bound(result["solution"], lower, upper)[0]),
         )
+        rounds_bound = self.active_bound
         # A point HiGHS found beside the cut rounds gives the heuristics
         # below a cutoff (and spares those that run only without one).
         self.collect_heuristics(schedule=False)
+        if self.root_closed():
+            return self.empty_root()
         if self.use_round_repair and not self.out_of_time():
             # Round and repair first, from an exact vertex when the root is
             # crossed over anyway (RENS, ``root_crossover``): the later
@@ -16354,6 +17562,8 @@ class _BranchAndBound:
             )
         if use_root_heuristics:
             self.root_heuristics(lower, upper, result)
+        if self.root_closed():
+            return self.empty_root()
         root_x = np.asarray(result["solution"].primal, np.float64)
         root_warm = (result["solution"], result["opt_state"])
         if self.rens_seconds and not self.out_of_time():
@@ -16399,6 +17609,13 @@ class _BranchAndBound:
         if self.root_lower is not lower:
             lower, upper = self.root_lower, self.root_upper
             lp = None  # rebuilt over the fixed box if ``evaluate`` needs it
+        # The root starts from the rounds' best bound, which holds for its
+        # box (only narrowed since), and its children from the root's:
+        # ``evaluate`` keeps the larger of it and the last re-solve's. On
+        # irp the root's line dropped from the rounds' 33,249.82 to the last
+        # re-solve's 33,242.52, and the tree's bound stayed there.
+        if np.isfinite(rounds_bound):
+            root.bound = max(root.bound, rounds_bound)
         # The root branched as an exact lane node (``exact_root_candidates``).
         result = self.root_exact_strong(root, lower, upper, result) or result
         self.evaluate(root, lower, upper, lp, result)
@@ -16541,6 +17758,7 @@ def solve(
     gomory_cuts=True,
     aggregate_integers="auto",
     flow_covers=True,
+    mir_cuts=True,
     clique_cuts=True,
     zero_half_cuts=True,
     cut_age=100,
@@ -16556,6 +17774,7 @@ def solve(
     separation_backend="auto",
     separation_device="cpu",
     node_bound_stop=True,
+    dual_repair=True,
     node_lp_tolerance=1e-3,
     heuristic_effort=0.3,
     reliability_threshold=4,
@@ -16636,6 +17855,7 @@ def solve(
     parallel_heuristics=True,
     symmetry=False,
     restarts=5,
+    restart_presolve=False,
     mip_start=None,
     implied_bound_cuts=True,
     probing_cliques=True,
@@ -16657,6 +17877,10 @@ def solve(
     exact_root_candidates=128,
     exact_root_seconds=60.0,
     exact_root_iterations=None,
+    cutoff_probing=True,
+    cutoff_probing_threads=4,
+    cutoff_probing_seconds=60.0,
+    cutoff_probing_iterations=1000,
     one_opt=False,
     objective_propagation=True,
     plunge_gap=0.25,
@@ -16687,6 +17911,7 @@ def solve(
     crossover_solutions=3,
     crossover_min_fixed=0.5,
     proximity_seconds=10.0,
+    first_solution_seconds=0.0,
     objective_levels=True,
     objective_level_seconds=2.0,
     cut_round_lp="jaddle",
@@ -16748,6 +17973,19 @@ def solve(
       solves it in about 530 s; Jaddle's root reduced-cost fixing there
       fixed 8 to 2,908 integers (up to 14%), depending on its root bound
       and incumbent.
+      With ``restart_presolve=True`` (off by default) a restart also runs
+      HiGHS's presolve on the searched MIP over the restarted root box, so
+      the fixed columns and the rows they empty leave the LP (a restart
+      alone keeps them, at ``l = u``). When it removes at least 10% of the
+      columns, the rest of the search is a new search of the reduced MIP:
+      its points come back through HiGHS's postsolve (marked ``"Q"``), and
+      its bound and status are the result's. HiGHS cannot map the
+      incumbent into the reduced columns, so that search starts from the
+      cutoff alone (as ``presolve=True`` does from a ``mip_start``), with
+      the pseudocosts, conflicts and cut pool left behind; it may restart,
+      and presolve, again. ``result["restart_presolve"]`` gives each
+      presolve's status, columns and rows before and after, and, when the
+      search went on in the reduced MIP, its status, nodes and seconds.
     * **More from the incumbent** (all on by default). Each holds for
       every solution better than the cutoff, which is all the search needs.
       ``root_redcost_propagation`` puts the root's reduced-cost row
@@ -16852,7 +18090,10 @@ def solve(
       20, the optimum. The row and each aggregate with a continuous
       variable also give a flow cover cut (``flow_cover_cut``, family
       ``"flowcover"``; ``flow_covers``, on by default), from its single-node
-      flow set over those variable bounds. MIR cuts come from single rows
+      flow set over those variable bounds. ``mir_cuts=False`` (on by
+      default) keeps no c-MIR cuts while the rows and aggregates still give
+      their cover and flow cover cuts (the tableau MIR cuts of
+      ``gomory_cuts`` are separate). MIR cuts come from single rows
       and from aggregates of up to three rows that cancel continuous
       variables; with ``aggregate_integers``
       (``"auto"``, the default: on for MIPs with at most 10,000 nonzeros,
@@ -17081,6 +18322,18 @@ def solve(
       in the result). No node LP or root cut round runs infeasibility
       detection: a node LP that stops unconverged keeps its bound and
       branches on its point.
+      The bound charges each reduced cost at the bound it points at, so on
+      a continuous column boxed to 1e6 a dual error of 1e-3 costs 1e3 of
+      bound. With ``dual_repair`` (on by default; ``DualRepair``) each
+      device node's and strong-branching child's duals are repaired before
+      the bound is taken: inequality duals are scaled back until no
+      reduced cost points at a continuous column's wide side (one more
+      than 10·(1 + |xⱼ|) from the node's point), and the higher of the two
+      bounds is kept. On CMS750_4 the node bounds were 50 to 43,000 below
+      HiGHS's LP over the same box; repaired, 98.7% of that came back, for
+      about 7 ms a node, and reduced-cost fixing went from 0 tightenings to
+      37,846 in 120 s (``dual_repairs`` in the result: tried, improved,
+      seconds).
     * **Conflicts** (``conflicts``, on by default; ``ConflictPool``). Each
       node or child closed by its Lagrangian bound leaves a dual proof,
       ``constant + r·x <= cutoff``, which every better solution satisfies
@@ -17349,6 +18602,37 @@ def solve(
       call per incumbent and cutoff; it takes turns on the lane with RINS
       and crossover. Results: ``proximity_calls``, ``proximity_finds`` and
       ``proximity_empty`` (calls HiGHS showed had no better point).
+    * **Before the first incumbent** (needs ``submip_solver="highs"``):
+      RINS, proximity search and crossover start from an incumbent, so
+      until there is one the lane runs, in turn, HiGHS's MIP solver on the
+      whole root box stopped at its first point (``first_solution_seconds``,
+      default 0: off; each call twice as long as the last, as HiGHS starts
+      over; marked ``"W"``) and, with ``rens_seconds``, RENS around the
+      latest node LP point (an integer within ``rins_tolerance`` of a whole
+      number fixed there, at least 30% of them; marked ``"E"``). With the
+      lane, the root's RENS goes to it too, instead of a Jaddle
+      sub-search. On piperout-08 every RENS neighbourhood is infeasible,
+      while HiGHS on the whole MIP finds its first point, the optimum, at
+      20 s. Results: ``first_solution_calls``, ``first_solution_finds``,
+      ``rens_calls`` and ``rens_finds``.
+    * **Cutoff probing** (``cutoff_probing``, on by default), on
+      ``cutoff_probing_threads`` CPU threads (default 4) of its own. Once
+      there is an incumbent, every free integer of the root box is tried
+      on the side its root LP vertex is not on (a binary at 0: ``x = 1``),
+      by HiGHS's dual simplex over the search's rows (cuts included) from
+      the LP's basis, for up to ``cutoff_probing_iterations`` pivots
+      (default 1,000), stopped once the side's dual objective passes the
+      cutoff. A side that cannot get below the cutoff holds no better
+      solution, so the integer is fixed in the root box for the rest of
+      the search: strong branching on every integer with the cutoff as the
+      question. The largest root reduced costs go first. One round per
+      cutoff, of at most ``cutoff_probing_seconds`` (default 60 s) and a
+      fifth of the time left, and another at the same cutoff while a round
+      fixes at least 5% of what it probed. A round that shows the box
+      empty proves the incumbent optimal. On eil33-2, at the optimum's
+      cutoff, reduced costs fix 1,005 of 4,516 binaries, probing 4,396 in
+      two rounds. Results: ``cutoff_probing`` (``rounds``, ``probed``,
+      ``lps``, ``pivots``, ``fixed``, ``seconds``, ``empty``).
     * **Objective levels** (``objective_levels``, on by default). When
       every nonzero cost is on at most 3 integer columns with finite bounds
       and the box holds at most 10,000 assignments of them (levels), HiGHS
@@ -17771,6 +19055,7 @@ def solve(
         parallel_heuristics=parallel_heuristics,
         symmetry=symmetry,
         restarts=restarts,
+        restart_presolve=restart_presolve,
         heuristic_seconds=heuristic_seconds,
         lp_options=lp_options,
         node_lp_options=node_lp_options,
@@ -17782,6 +19067,7 @@ def solve(
         conflict_pool_size=conflict_pool_size,
         conflict_max_nnz=conflict_max_nnz,
         flow_covers=flow_covers,
+        mir_cuts=mir_cuts,
         clique_cuts=clique_cuts,
         zero_half_cuts=zero_half_cuts,
         cut_age=cut_age,
@@ -17797,6 +19083,7 @@ def solve(
         separation_backend=separation_backend,
         separation_device=separation_device,
         node_bound_stop=node_bound_stop,
+        dual_repair=dual_repair,
         node_lp_tolerance=node_lp_tolerance,
         heuristic_effort=heuristic_effort,
         reliability_threshold=reliability_threshold,
@@ -17832,6 +19119,10 @@ def solve(
         exact_root_candidates=exact_root_candidates,
         exact_root_seconds=exact_root_seconds,
         exact_root_iterations=exact_root_iterations,
+        cutoff_probing=cutoff_probing,
+        cutoff_probing_threads=cutoff_probing_threads,
+        cutoff_probing_seconds=cutoff_probing_seconds,
+        cutoff_probing_iterations=cutoff_probing_iterations,
         one_opt=one_opt,
         objective_propagation=objective_propagation,
         plunge_gap=plunge_gap,
@@ -17862,6 +19153,7 @@ def solve(
         crossover_solutions=crossover_solutions,
         crossover_min_fixed=crossover_min_fixed,
         proximity_seconds=proximity_seconds,
+        first_solution_seconds=first_solution_seconds,
         objective_levels=objective_levels,
         objective_level_seconds=objective_level_seconds,
         cut_round_lp=cut_round_lp,
@@ -18014,6 +19306,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "batches": 0,
             "objective_step": None,
             "reduced_cost_tightenings": 0,
+            "dual_repairs": {"tried": 0, "improved": 0, "seconds": 0.0},
             "children_pruned": 0,
             "lp_repairs": 0,
             "lp_repairs_skipped": 0,
@@ -18025,6 +19318,10 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "restart_log": [],
             "rins_calls": 0,
             "rins_finds": 0,
+            "rens_calls": 0,
+            "rens_finds": 0,
+            "first_solution_calls": 0,
+            "first_solution_finds": 0,
             "rins_fixing_rate": 1.0,
             "batch_timing": {
                 "wait_seconds": 0.0, "evaluate_seconds": 0.0, "bound_seconds": 0.0,
@@ -18038,6 +19335,8 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "proximity_finds": 0,
             "proximity_empty": 0,
             "submip_lane_seconds": 0.0,
+            "cutoff_probing": None,
+            "restart_presolve": [],
             "objective_levels": None,
             "exact_cut_rounds": None,
             "mip_start_accepted": None if mip_start is None else start_x is not None,

@@ -4,6 +4,24 @@
 
 ### Added
 
+- Progress heartbeat (`verbose`): a background thread prints a table line
+  whenever the search has printed none for `log_every_seconds`, so the
+  bound and incumbent keep showing through long steps that log nothing
+  themselves. On irp the first exact cut round separated for 70 s with no
+  line after the first incumbent's. The root LP's bound is also the global
+  bound as soon as it is solved, so the first incumbent's line shows it
+  instead of `-inf`.
+- Dual repair of node bounds (`dual_repair`, on by default;
+  `jm.DualRepair`). A node's Lagrangian bound charges each reduced cost at
+  the bound it points at, so loose PDHG duals lose ε·1e6 of bound on a
+  continuous column boxed to 1e6. Before the bound of a device node or a
+  strong-branching child is taken, its inequality duals are scaled back
+  until no reduced cost points at a continuous column's wide side, and the
+  higher of the two bounds is kept (any duals give a valid bound). On
+  CMS750_4 the node bounds were 50–43,000 below HiGHS's LP over the same
+  box; the repair recovers 98.7% of that for about 7 ms a node, and
+  reduced-cost fixing went from 0 to 37,846 tightenings in 120 s. New
+  result key: `dual_repairs` (`tried`, `improved`, `seconds`).
 - Wider c-MIR aggregation (`aggregation_width`, default 3): the first
   aggregation step of each tight row tries the partner rows of its best
   three columns to cancel, not only the best, and each branch continues
@@ -109,6 +127,14 @@
 
 ### Changed
 
+- Open nodes take less host memory, with the search unchanged (every
+  number read back is bit for bit the one stored). A node's warm start is
+  kept packed: mostly-zero arrays (inequality duals, binaries at 0) as
+  their nonzeros, the rest as their own copies, where a batch member's
+  view kept the whole batch's block alive. A node's bound changes keep
+  `int32` indices and, where exact, `float32` bounds. On ns1830653 (240 s,
+  defaults) peak RSS fell from 3.58 GB to 2.48 GB, each open node from
+  about 43 KB to 14 KB.
 - `exact_band="auto"` now widens as the gap closes: once a batch the band
   is 0.25 over the relative gap, within [0.001, 1] (a quarter of the gap
   at a 100% gap, half at 50%, all of it from 25% down), so its width stays
@@ -175,6 +201,10 @@
 
 ### Fixed
 
+- The global bound could drop when the root branched. The root node started
+  from the last cut round's re-solve, which can be weaker than the rounds'
+  best, so its children did too. It now starts from the rounds' best. On
+  irp the bound fell from 33,249.82 to 33,242.52 and stayed there.
 - c-MIR's variable-bound substitution broke ties the wrong way. When a
   continuous column's variable bound and simple bound are equally close to
   the LP point, it now takes the side whose shifted term the MIR drops: a
