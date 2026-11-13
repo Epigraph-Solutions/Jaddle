@@ -243,18 +243,69 @@ print(f"Swarm: {n_binaries} binaries, {len(problem.constraints)} constraints")
 # %%
 problem.solve(
     solver=JaddleSolver(),
+    branching="auto",
+    mip_rel_gap=1e-5,
     verbose=True,
-    max_seconds=180,
-    presolve=True,
-    device=None,  # JAX's default device: the GPU when there is one
+    symmetry=True,
     log_every_seconds=10,
+    device="gpu",
+    presolve=True,
+    exact_nodes=16,
     exact_band="auto",
-    batch_size=1,
-    exact_strong_lookahead=8,
-    tree_cut_every=100,
-    cut_pool_size=1e5,
-    tree_cut_rows=2000,
-    cuts=False,
+    exact_overflow_share=0,
+    exact_strong_lookahead=2,
+    exact_strong_candidates=2,
+    jump_threads=1,
+    batch_size=8,
+    tree_cut_every=150,
+    cut_pool_size=1e4,
+    tree_cut_rows=1e3,
+    max_cut_rows=5000,
+    cut_rounds=20,
+    conflict_pool_size=5000,
+    root_lp="jaddle",
+    lp_tolerance=1e-6,
+    precision="float64",
+    root_crossover=True,
+    cut_round_lp="jaddle",
+    node_precision="float64",
+    node_lp_tolerance=1e-4,
+    # node_crossover=True,
+    # Sign repair of loose node duals on wide continuous columns before
+    # their Lagrangian bound is taken (jm.DualRepair).
+    dual_repair=True,
+    mir_cuts=False,
+    gomory_cuts=False,
+    cuts=True,
+    tree_cuts=True,
+    proximity_seconds=10,
+    rens_seconds=10,
+    one_opt=True,
+    # Dual-guided fixing on the sub-MIP lane: the root's largest
+    # reduced costs fix integers at their preferred bound, HiGHS
+    # searches the rest (jm._BranchAndBound.dual_fix_box).
+    dual_fix_seconds=10,
+    # Integer-projected PDHG at the root before the pump: PDHG with the
+    # integers' projection a rounding, 8 lanes batched on the device.
+    # projected_pdhg=True,
+    gpu_dive_every=10,
+    # objective_level_seconds=45,
+    restarts=1,
+    # Cutoff probing: strong branching on every free integer against
+    # the cutoff, on CPU threads, fixing the root box (on by default).
+    cutoff_probing=True,
+    cutoff_probing_threads=4,
+    cutoff_probing_seconds=60,
+    cutoff_probing_iterations=1000,
+    # c-MIR separation and cut selection (the defaults; for the earlier
+    # behaviour: aggregation_width=1, cmir_per_row=1,
+    # cut_score_weights=None, aggregate_integers=False on large MIPs).
+    restart_presolve=True,
+    aggregate_integers="auto",
+    max_aggregation=8,
+    aggregation_width=5,
+    cmir_per_row=5,
+    cut_score_weights=(0.1, 0.1, 0.5),  # objective, integer, directed
 )
 stats = problem.solver_stats.extra_stats
 if p[0].value is None:

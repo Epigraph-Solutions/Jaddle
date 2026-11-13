@@ -35,9 +35,9 @@ import time
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-# os.environ["XLA_FLAGS"] = (
-#     "--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=4"
-# )
+os.environ["XLA_FLAGS"] = (
+    "--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=4"
+)
 
 import highspy
 import jax
@@ -154,36 +154,45 @@ def run_jaddle(path, args):
         log_every_seconds=10,
         device=args.device,
         presolve=True,
-        exact_nodes=8,
+        exact_nodes=16,
         exact_band="auto",
         exact_overflow_share=0,
-        exact_strong_lookahead=8,
-        exact_strong_candidates=8,
-        jump_threads=4,
-        batch_size=16,
+        exact_strong_lookahead=2,
+        exact_strong_candidates=2,
+        jump_threads=1,
+        batch_size=8,
         max_seconds=args.max_seconds,
-        tree_cut_every=100,
+        tree_cut_every=150,
         cut_pool_size=1e4,
         tree_cut_rows=1e3,
-        max_cut_rows=2000,
-        cut_rounds=10,
+        max_cut_rows=5000,
+        cut_rounds=20,
         conflict_pool_size=5000,
         root_lp="jaddle",
-        lp_tolerance=1e-3,
-        # precision="float64",
-        # root_crossover=True,
+        lp_tolerance=1e-6,
+        precision="float64",
+        root_crossover=True,
         cut_round_lp="jaddle",
-        node_lp_tolerance=1e-3,
+        node_precision="float64",
+        node_lp_tolerance=1e-4,
+        # node_crossover=True,
         # Sign repair of loose node duals on wide continuous columns before
         # their Lagrangian bound is taken (jm.DualRepair).
         dual_repair=True,
-        mir_cuts=False,
-        gomory_cuts=False,
-        cuts=False,
-        tree_cuts=False,
+        mir_cuts=True,
+        gomory_cuts=True,
+        cuts=True,
+        tree_cuts=True,
         proximity_seconds=10,
         rens_seconds=10,
-        fix_and_propagate=True,
+        one_opt=True,
+        # Dual-guided fixing on the sub-MIP lane: the root's largest
+        # reduced costs fix integers at their preferred bound, HiGHS
+        # searches the rest (jm._BranchAndBound.dual_fix_box).
+        dual_fix_seconds=10,
+        # Integer-projected PDHG at the root before the pump: PDHG with the
+        # integers' projection a rounding, 8 lanes batched on the device.
+        # projected_pdhg=True,
         gpu_dive_every=10,
         # objective_level_seconds=45,
         restarts=1,
@@ -207,7 +216,12 @@ def run_jaddle(path, args):
         {
             "jaddle_status": result["status"],
             "jaddle_objective": result["objective"],
+            # The proven bound; the search pruned on ``search_bound``, which
+            # is the same unless a bound dropped wrong-sign reduced costs on
+            # infinite bounds (within reduced_cost_tol): ``bound_rigorous``.
             "jaddle_bound": result["bound"],
+            "jaddle_search_bound": result.get("search_bound"),
+            "jaddle_bound_rigorous": result.get("bound_rigorous"),
             "jaddle_gap": result["gap"],
             "jaddle_nodes": result.get("nodes"),
             # As in benchmark.py: the solve's own time, HiGHS's presolve
@@ -233,6 +247,12 @@ def run_jaddle(path, args):
 
 def print_details(result):
     print(f"Status: {result['status']}")
+    if not result.get("bound_rigorous", True):
+        print(
+            f"Bound: {result['bound']} proven; the search pruned on "
+            f"{result.get('search_bound')}, which is not rigorous (wrong-sign "
+            "reduced costs on infinite bounds dropped within reduced_cost_tol)"
+        )
     exact = result["exact_nodes"]
     print(
         f"Exact nodes: {exact['solved']} solved, {exact['infeasible']} infeasible, "
@@ -330,6 +350,8 @@ CSV_FIELDS = [
     "jaddle_status",
     "jaddle_objective",
     "jaddle_bound",
+    "jaddle_search_bound",
+    "jaddle_bound_rigorous",
     "jaddle_gap",
     "jaddle_nodes",
     "jaddle_seconds",

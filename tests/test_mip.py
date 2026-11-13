@@ -5,6 +5,7 @@ import time
 import types
 
 import highspy
+import jax
 import jax.numpy as jnp
 import re
 
@@ -195,6 +196,19 @@ def assert_solved(result, mip, ref, rel=1e-4, rigorous=True):
         assert result["bound"] <= ref + slack
     if rigorous:
         assert result["bound_rigorous"]
+    assert_proven_bound(result, mip.maximise)
+
+
+def assert_proven_bound(result, maximise=False):
+    """The reported bound is the proven part of the search's (``search_bound``):
+    never past it, and equal to it when every bound was rigorous."""
+    bound, search = result["bound"], result["search_bound"]
+    if bound is None or search is None or not np.isfinite(search):
+        return
+    sign = -1.0 if maximise else 1.0
+    assert sign * bound <= sign * search + 1e-9 * (1 + abs(search))
+    if result["bound_rigorous"]:
+        assert bound == pytest.approx(search, rel=1e-9, abs=1e-9)
 
 
 def write_mps(mip, path):
@@ -6184,6 +6198,24 @@ def test_restart_bound_is_a_floor(monkeypatch):
     assert mip.sign * (result["bound"] - entry["bound"]) >= -1e-9 * (1 + abs(entry["bound"]))
 
 
+def test_no_restart_once_the_gap_is_closed(monkeypatch):
+    # A new incumbent lowers the cutoff, root reduced-cost fixing against it
+    # fixes the share a restart needs, and the same incumbent can close the
+    # gap: the search is then over, not due a restart.
+    monkeypatch.setattr(jm, "_RESTART_TREE_SHARE", 0.0)
+    mip = generalised_assignment(1)
+    search = search_for(mip, monkeypatch, restarts=1, cuts=False)
+    search.restart_free = int(search.is_int.sum())
+    search.root_lower, search.root_upper = mip.lower.copy(), mip.upper.copy()
+    x = np.zeros(mip.num_variables)
+    search.incumbent = (100.0, x)
+    monkeypatch.setattr(jm._BranchAndBound, "global_bound", lambda self: 50.0)
+    assert search.restart_due(jm._RESTART_TREE_SHARE)
+    monkeypatch.setattr(jm._BranchAndBound, "global_bound", lambda self: 100.0)
+    assert search.root_closed()
+    assert not search.restart_due(jm._RESTART_TREE_SHARE)
+
+
 def test_restarts_off(monkeypatch):
     force_restarts(monkeypatch)
     mip = generalised_assignment(1)
@@ -8395,3 +8427,281 @@ def test_a_crossed_over_dive_keeps_its_warm_start_shapes():
     np.testing.assert_array_equal(
         np.asarray(shaped.dual_ineq), np.asarray(crossed["solution"].dual_ineq)
     )
+
+
+# %% Dual-guided fixing and integer-projected PDHG
+def test_dual_fix_box_fixes_the_largest_reduced_costs(monkeypatch):
+    mip = generalised_assignment()
+    search = search_for(
+        mip, monkeypatch, submip_solver="highs", dual_fix_seconds=5, dual_fix_rate=0.5
+    )
+    n = mip.num_variables
+    rng = np.random.default_rng(0)
+    r = rng.uniform(1.0, 2.0, n) * rng.choice([-1.0, 1.0], n)
+    r[:10] = 0.0  # no reduced cost: never fixed
+    search.root_terms = (0.0, r)
+    search.root_lower, search.root_upper = mip.lower.copy(), mip.upper.copy()
+    search.root_upper[10] = 0.0  # fixed already: neither free nor counted
+    lower, upper = search.dual_fix_box(5.0)
+    free = search.is_int & (search.root_lower < search.root_upper)
+    newly = (lower == upper) & free
+    k = int(np.ceil(0.5 * free.sum()))
+    candidates = np.flatnonzero(free & (r != 0))
+    top = candidates[np.argsort(-np.abs(r[candidates]), kind="stable")[:k]]
+    assert set(np.flatnonzero(newly)) == set(top.tolist())
+    # At the bound the reduced cost's sign prefers; the rest in the root box.
+    assert np.array_equal(lower[newly], np.where(r[newly] > 0, 0.0, 1.0))
+    assert np.array_equal(lower[~newly], search.root_lower[~newly])
+    assert np.array_equal(upper[~newly], search.root_upper[~newly])
+    assert lower[10] == upper[10] == 0.0
+    # The same box at the same cutoff is not searched twice; a new rate
+    # gives a new one.
+    assert search.dual_fix_box(5.0) is None
+    search.dual_fix_rate = 0.3
+    assert search.dual_fix_box(5.0) is not None
+    assert search.dual_fix_box(0.0) is None
+    # Too few reduced costs (5 of 99 free integers) to fix 10% of them.
+    search.dual_fix_rate = 0.9
+    search.root_terms = (0.0, np.where(np.arange(n) < 5, 1.0, 0.0))
+    assert search.dual_fix_box(5.0) is None
+    search.root_terms = None
+    assert search.dual_fix_box(5.0) is None
+
+
+def test_dual_fixing_rate_moves_as_rins(monkeypatch):
+    search = search_for(
+        generalised_assignment(), monkeypatch, submip_solver="highs",
+        dual_fix_seconds=5, dual_fix_rate=0.5,
+    )
+    search.submip_budget = 10.0
+    search.adapt_dual_fixing(True, 1.0)  # a find keeps the rate
+    assert search.dual_fix_rate == 0.5
+    search.adapt_dual_fixing(False, 1.0)  # empty early: fix fewer
+    assert search.dual_fix_rate == pytest.approx(0.4)
+    search.adapt_dual_fixing(False, 10.0)  # out of time: fix more
+    assert search.dual_fix_rate == pytest.approx(0.5)
+    search.dual_fix_rate = 0.1
+    search.adapt_dual_fixing(False, 1.0)
+    assert search.dual_fix_rate == pytest.approx(0.1)
+    search.dual_fix_rate = 0.95
+    search.adapt_dual_fixing(False, 10.0)
+    assert search.dual_fix_rate == pytest.approx(0.95)
+
+
+def test_rejects_bad_dual_fix_and_projected_pdhg_options():
+    with pytest.raises(ValueError, match="dual_fix_rate"):
+        solve(knapsack(), dual_fix_rate=0.0)
+    with pytest.raises(ValueError, match="projected_pdhg_lanes"):
+        solve(knapsack(), projected_pdhg_lanes=0)
+
+
+@pytest.mark.parametrize("make", [generalised_assignment, facility_location])
+def test_dual_fixing_in_the_search(make):
+    mip = make()
+    result = jm.solve(
+        mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
+        proximity_seconds=0, dual_fix_seconds=5,
+    )
+    assert_solved(result, mip, reference(mip))
+    assert result["dual_fix_calls"] > 0
+    assert result["dual_fix_finds"] <= result["dual_fix_calls"]
+    assert 0.1 <= result["dual_fix_rate"] <= 0.95
+    off = jm.solve(
+        mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
+        proximity_seconds=0,
+    )
+    assert off["dual_fix_calls"] == 0
+
+
+@pytest.mark.parametrize("make", [general_integer, facility_location])
+def test_projected_pdhg_without_integers_is_pdhg(make):
+    # With no integer variables the projection is the box's: plain PDHG,
+    # which goes to the LP's optimum with duals of the right sign.
+    mip = make()
+    upper = np.minimum(mip.upper, 1e3)
+    ints = np.zeros(mip.num_variables, bool)
+    with jax.enable_x64(True):
+        data = jm._projected_pdhg_data(
+            mip.A, mip.row_lower, mip.row_upper, mip.b, mip.c, mip.lower, upper,
+            ints, np.float64,
+        )
+        n, m = mip.num_variables, mip.A.shape[0]
+        state = (
+            jnp.zeros((1, n)), jnp.zeros((1, m)), jnp.zeros((1, m)),
+            jax.random.split(jax.random.PRNGKey(0), 1), jnp.zeros((1, n)),
+            jnp.full((1,), np.inf), jnp.full((1,), np.inf),
+        )
+        x, _, y, *_ = jm._projected_pdhg_chunk(
+            data, state, jnp.ones(1), jnp.zeros(1), jnp.asarray(0, jnp.int32),
+            jnp.asarray(1.0), jnp.asarray(1e-6), iterations=20000,
+        )
+    x, y = np.asarray(x[0]), np.asarray(y[0])
+    lp = milp(
+        mip.c,
+        constraints=LinearConstraint(mip.A.toarray(), mip.row_lower, mip.row_upper),
+        bounds=Bounds(mip.lower, upper),
+    )
+    assert float(mip.c @ x) == pytest.approx(lp.fun, rel=1e-5)
+    assert mip.violation(x)["rows"] <= 1e-6
+    assert np.all(y[mip.n_eq :] >= -1e-12)  # round-off in v − σ·clip(v/σ)
+
+
+def lp_solution(mip):
+    sol = jl.solve(
+        mip.lp,
+        primal_feasibility_tolerance=1e-7,
+        dual_feasibility_tolerance=1e-7,
+        dual_gap_tolerance=1e-7,
+    )["solution"]
+    y = np.concatenate(
+        [np.asarray(sol.dual_eq)[: mip.n_eq], np.asarray(sol.dual_ineq)]
+    )
+    return np.asarray(sol.primal, np.float64), y
+
+
+@pytest.mark.parametrize(
+    "make", [knapsack, general_integer, generalised_assignment, facility_location]
+)
+def test_projected_pdhg_finds_integral_feasible_points(make):
+    mip = make()
+    x0, y0 = lp_solution(mip)
+    ints = mip.integrality
+    seen = []
+    best_x, best_v = jm.projected_pdhg(
+        mip.A, mip.row_lower, mip.row_upper, mip.b, mip.c, mip.lower, mip.upper,
+        ints, x0, y0, lanes=8, iterations=1000, tol=1e-6, dtype=np.float64,
+        on_chunk=lambda bx, bv: seen.append(bv.copy()) and False,
+    )
+    assert len(seen) == 10  # one call a chunk, none stopped it
+    assert best_x.shape == (8, mip.num_variables)
+    # Every iterate is integral and in the box.
+    assert np.array_equal(best_x[:, ints], np.round(best_x[:, ints]))
+    assert np.all((best_x >= mip.lower) & (best_x <= mip.upper))
+    feasible = best_v <= 1e-6
+    assert feasible.any()
+    ref = mip.sign * reference(mip) - mip.offset
+    for x in best_x[feasible]:
+        assert mip.is_feasible(x)
+        assert float(mip.c @ x) >= ref - 1e-6
+    # A lane's best violation never rises, but within the tolerance, where a
+    # cheaper feasible point replaces a feasible one.
+    assert all(np.all((b <= a) | (b <= 1e-6)) for a, b in zip(seen, seen[1:]))
+
+
+def test_projected_pdhg_stops_when_asked():
+    mip = knapsack()
+    x0, y0 = lp_solution(mip)
+    calls = []
+    jm.projected_pdhg(
+        mip.A, mip.row_lower, mip.row_upper, mip.b, mip.c, mip.lower, mip.upper,
+        mip.integrality, x0, y0, lanes=2, iterations=1000,
+        on_chunk=lambda bx, bv: calls.append(1) or True,
+    )
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("make", [knapsack, generalised_assignment, facility_location])
+def test_projected_pdhg_in_the_search(make):
+    # With the other root heuristics off, the first incumbent is its.
+    mip = make()
+    result = solve(
+        mip,
+        max_nodes=1,
+        cuts=False,
+        fix_and_propagate=False,
+        bulk_rounding=False,
+        feasibility_jump=False,
+        feasibility_pump=False,
+        round_repair=False,
+        rens_seconds=0,
+        rins_seconds=0,
+        projected_pdhg=True,
+    )
+    assert result["projected_pdhg_calls"] == 1
+    assert result["projected_pdhg_finds"] == 1
+    assert result["history"][0]["source"] == "I"
+    assert mip.is_feasible(result["x"])
+
+
+def test_new_heuristics_in_the_legend(capsys):
+    solve(
+        knapsack(), verbose=True, submip_solver="highs", dual_fix_seconds=1,
+        projected_pdhg=True,
+    )
+    out = capsys.readouterr().out
+    assert "G => Dual-guided fixing" in out
+    assert "I => Integer-projected PDHG" in out
+
+
+# %% Proven bounds (``proven_bound``)
+def test_closed_regions_keep_their_proven_bound(monkeypatch):
+    search = search_for(generalised_assignment(), monkeypatch)
+    search.active_proven = np.inf  # no node being evaluated
+    search.incumbent = (500.0, np.zeros(search.mip.num_variables))
+    a = jm._Node(450.0, 1, None, None, None, proven=440.0)
+    b = jm._Node(460.0, 1, None, None, None, proven=455.0)
+    search.push(a)
+    search.push(b)
+    assert search.global_bound() == 450.0
+    assert search.proven_bound() == 440.0
+    # A node pruned on its stored bound keeps its proven bound.
+    search.open = [entry for entry in search.open if entry[2] is not a]
+    search.close(a.bound, proven=a.proven)
+    assert search.proven_bound() == 440.0
+    # A region closed on a bound that is not rigorous, with nothing proven.
+    search.close(470.0, rigorous=False)
+    assert search.proven_bound() == -np.inf
+    assert search.global_bound() == 450.0
+    # The kept bound never passes the closing one.
+    search.proven_closed = np.inf
+    search.close(452.0, proven=480.0)
+    assert search.proven_bound() == 452.0
+
+
+def test_reported_bound_is_proven_when_the_search_bound_is_not(monkeypatch):
+    # Every Lagrangian bound inflated and not rigorous (as dropped reduced
+    # costs make it): the search prunes on them, but nothing it reports
+    # rests on them.
+    real = jm._BranchAndBound.bound_over
+
+    def inflated(self, terms, lower, upper):
+        raw, _ = real(self, terms, lower, upper)
+        return (raw + 3.0 if np.isfinite(raw) else raw), False
+
+    monkeypatch.setattr(jm._BranchAndBound, "bound_over", inflated)
+    for mip in (generalised_assignment(), facility_location()):
+        ref = reference(mip)
+        result = solve(mip, max_seconds=60)
+        assert not result["bound_rigorous"]
+        assert result["bound"] <= ref + 1e-9 * (1 + abs(ref))
+        assert result["bound"] <= result["search_bound"]
+
+
+@pytest.mark.parametrize("seed", [0, 5])
+def test_proven_bound_is_the_search_bound_when_rigorous(seed):
+    # Loose node LPs and strong branching that closes the root's children:
+    # with rigorous bounds throughout, every closed region keeps its bound.
+    mip = facility_location(seed)
+    result = solve(mip, lp_tolerance=1e-2, node_lp_tolerance=1e-2, max_seconds=60)
+    assert_solved(result, mip, reference(mip), rel=1e-3)
+    assert result["bound"] == result["search_bound"]
+
+
+def test_nodes_in_transit_hold_the_bounds(monkeypatch):
+    # A node taken from the queue (a batch being built, a serial node while
+    # its LP is solved) is in no list: a progress line printed meanwhile
+    # showed buildingenergy's bound past its optimum.
+    search = search_for(generalised_assignment(), monkeypatch)
+    search.active_bound = search.active_proven = np.inf
+    search.incumbent = (500.0, np.zeros(search.mip.num_variables))
+    low = jm._Node(440.0, 1, None, None, None, proven=430.0)
+    high = jm._Node(470.0, 1, None, None, None, proven=465.0)
+    search.push(low)
+    search.push(high)
+    node = search.next_node()
+    assert node is low
+    assert search.global_bound() == 440.0
+    assert search.proven_bound() == 430.0
+    search.in_transit = []  # landed (the tree loop's next iteration)
+    assert search.global_bound() == 470.0
+    assert search.proven_bound() == 465.0

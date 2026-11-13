@@ -4,6 +4,26 @@
 
 ### Added
 
+- Dual-guided fixing (`dual_fix_seconds`, default 0: off; needs
+  `submip_solver="highs"`). The root LP's reduced costs rank the free
+  integers of the root box. The share `dual_fix_rate` (default 0.7) with
+  the largest `|r_j|` is fixed at the bound each one's sign prefers, and
+  HiGHS searches the rest on the sub-MIP lane below the cutoff (marked
+  `G`). This is reduced-cost fixing without the proof. It needs no
+  incumbent and no LP point, so it takes turns with HiGHS's first solution
+  and RENS before the first incumbent, and with RINS, proximity search and
+  crossover after it. The rate adapts as RINS's does. New result keys:
+  `dual_fix_calls`, `dual_fix_finds`, `dual_fix_rate`.
+- Integer-projected PDHG (`projected_pdhg`, off by default;
+  `jm.projected_pdhg`). At the root, before the pump, PDHG runs on the LP
+  from the root point and duals, with the integers' box projection
+  replaced by a rounding (as the nonconvex-ADMM heuristic of Takapoui et
+  al.). It uses Pock–Chambolle diagonal steps. `projected_pdhg_lanes`
+  (default 8) lanes run as one batched device loop for up to
+  `projected_pdhg_iterations` (default 2,000) steps, with objective
+  weights 1 to 0.03 (duals scaled to match) and plain or noisy rounding.
+  Points are marked `I`, and the least violated one seeds a jump. New
+  result keys: `projected_pdhg_calls`, `projected_pdhg_finds`.
 - Progress heartbeat (`verbose`): a background thread prints a table line
   whenever the search has printed none for `log_every_seconds`, so the
   bound and incumbent keep showing through long steps that log nothing
@@ -201,6 +221,34 @@
 
 ### Fixed
 
+- The reported bound could pass the optimum. A Lagrangian bound that drops
+  wrong-sign reduced costs at infinite bounds (within `reduced_cost_tol =
+  lp_tolerance·(1+‖c‖₂)`) is not a bound, but node bounds took it and the
+  result reported it. On buildingenergy (every column unbounded above)
+  `lp_tolerance=1e-3` made that tolerance 7.43. The root duals dropped
+  17,701 reduced costs, worth about −22 at the LP point, and the bound
+  reached 33,287.8 against an optimum of 33,283.85. The search still prunes
+  on these bounds, but `result["bound"]` (and the log's BestBound, the
+  history and the gap) is now the proven part (`_BranchAndBound.proven_bound`).
+  Each node carries the rigorous bound it holds: the root's when its LP
+  bound is rigorous (an exact crossover's), raised by its own LP's and its
+  strong children's rigorous bounds. A region closed on a bound that is not
+  rigorous keeps only that. The pruning bound is `result["search_bound"]`.
+  `bound_rigorous` was True in some such cases, when the root closed on its
+  (not rigorous) LP or cut-round bound. It is now False whenever
+  `search_bound` passes `bound`.
+- Progress lines could show a bound past the optimum for a moment. A node
+  taken from the queue (a batch being built, a serial or plunge node while
+  its LP is solved) was in no list the bounds read. A line printed
+  meanwhile, by an exact node evaluated during batch building or by the
+  heartbeat, skipped it: buildingenergy showed 33,340 between lines of
+  33,246. Both bounds now count nodes in transit.
+- A search could restart after its gap had closed. A new incumbent lowers
+  the cutoff, root reduced-cost fixing against it fixed the share a restart
+  needs, and the restart check came before the tree's convergence check,
+  which ran only every 20 nodes. One run spent 14 s on restart presolve and
+  a new root after reaching 0%. Restarts now need an open gap, and the tree
+  checks convergence as soon as the incumbent changes.
 - The global bound could drop when the root branched. The root node started
   from the last cut round's re-solve, which can be weaker than the rounds'
   best, so its children did too. It now starts from the rounds' best. On

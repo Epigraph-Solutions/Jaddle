@@ -6007,6 +6007,203 @@ def feasibility_jump(
     return best, False, steps
 
 
+# Integer-projected PDHG (``projected_pdhg``): iterations per device call,
+# the largest rounding noise (decaying to 0 over the run), and the objective
+# weights the lanes cycle through.
+_PROJECTED_PDHG_CHUNK = 100
+_PROJECTED_PDHG_NOISE = 0.3
+_PROJECTED_PDHG_WEIGHTS = (1.0, 0.3, 0.1, 0.03)
+
+
+def _projected_pdhg_data(A, row_lower, row_upper, b, c, lower, upper, is_int, dtype):
+    """The device arrays of ``projected_pdhg``: the rows as COO entries, the
+    box (the integers' rounded inwards), and Pock and Chambolle's diagonal
+    step sizes ``τⱼ = 1/Σᵢ|aᵢⱼ|`` and ``σᵢ = 1/Σⱼ|aᵢⱼ|``, with which PDHG
+    converges on the LP without a norm estimate (1 for an empty row or
+    column). ``scale`` turns a row's violation into the relative one
+    ``MIP.violation`` measures, over ``1 + |bᵢ|``."""
+    A = sp.coo_matrix(A, dtype=np.float64)
+    absA = abs(A).tocsr()
+    row_sum = np.asarray(absA.sum(axis=1)).ravel()
+    col_sum = np.asarray(absA.sum(axis=0)).ravel()
+    with np.errstate(divide="ignore"):
+        tau = np.where(col_sum > 0, 1.0 / col_sum, 1.0)
+        sigma = np.where(row_sum > 0, 1.0 / row_sum, 1.0)
+    is_int = np.asarray(is_int, bool)
+    lower = np.asarray(lower, np.float64)
+    upper = np.asarray(upper, np.float64)
+    int_lower = np.where(is_int, np.ceil(lower - 1e-9), lower)
+    int_upper = np.where(is_int, np.floor(upper + 1e-9), upper)
+
+    def dev(values):
+        return jnp.asarray(np.asarray(values, np.float64).astype(dtype))
+
+    return {
+        "rows": jnp.asarray(A.row.astype(np.int32)),
+        "cols": jnp.asarray(A.col.astype(np.int32)),
+        "a": dev(A.data),
+        "c": dev(c),
+        "lower": dev(lower),
+        "upper": dev(upper),
+        "int_lower": dev(int_lower),
+        "int_upper": dev(int_upper),
+        "is_int": jnp.asarray(is_int),
+        "tau": dev(tau),
+        "sigma": dev(sigma),
+        "row_lower": dev(row_lower),
+        "row_upper": dev(row_upper),
+        "scale": dev(1.0 / (1.0 + np.abs(np.asarray(b, np.float64)))),
+    }
+
+
+def _projected_pdhg_step(data, x, ax, y, key, weight, noise):
+    """One step of PDHG on ``min weight·cᵀx`` over the rows and the box,
+    for one lane, with the primal step's projection onto the box replaced,
+    for the integers, by a projection onto the whole numbers in it (a
+    rounding, after uniform noise in ``±noise``). ``ax`` is ``A x``, kept
+    so a step takes one product with ``A`` and one with ``Aᵀ``. The duals
+    are as ``lagrangian_terms``': ``r = c + Aᵀy``, ``y >= 0`` on the
+    ``<=`` rows. Returns ``(x, A x, y, key, violation)``, the violation the
+    largest relative one of the new ``x``."""
+    rows, cols, a = data["rows"], data["cols"], data["a"]
+    m, n = data["row_lower"].shape[0], x.shape[0]
+    aty = jax.ops.segment_sum(a * y[rows], cols, num_segments=n)
+    z = x - data["tau"] * (weight * data["c"] + aty)
+    key, sub = jax.random.split(key)
+    xi = noise * (2.0 * jax.random.uniform(sub, (n,), dtype=z.dtype) - 1.0)
+    rounded = jnp.clip(jnp.round(z + xi), data["int_lower"], data["int_upper"])
+    x_new = jnp.where(
+        data["is_int"], rounded, jnp.clip(z, data["lower"], data["upper"])
+    )
+    ax_new = jax.ops.segment_sum(a * x_new[cols], rows, num_segments=m)
+    sigma = data["sigma"]
+    # The dual prox by Moreau's identity: v − σ·proj_[row_lower, row_upper](v/σ).
+    v = y + sigma * (2.0 * ax_new - ax)
+    y_new = v - sigma * jnp.clip(v / sigma, data["row_lower"], data["row_upper"])
+    excess = jnp.maximum(ax_new - data["row_upper"], 0.0) + jnp.maximum(
+        data["row_lower"] - ax_new, 0.0
+    )
+    violation = jnp.max(excess * data["scale"], initial=0.0)
+    return x_new, ax_new, y_new, key, violation
+
+
+@functools.partial(jax.jit, static_argnames=("iterations",))
+def _projected_pdhg_chunk(data, state, weights, noises, k0, total, tol, iterations):
+    """``iterations`` steps of ``_projected_pdhg_step`` on every lane at
+    once. ``state`` is ``(x, A x, y, key, best_x, best_violation,
+    best_objective)``, one row a lane; each lane's best point is its
+    feasible one (violation at most ``tol``) of least objective, else its
+    least violated. Lane ``l``'s noise is ``noises[l]``, decaying linearly
+    from step ``0`` to ``0`` at step ``total`` (``k0``: this call's first)."""
+    step = jax.vmap(_projected_pdhg_step, in_axes=(None, 0, 0, 0, 0, 0, 0))
+
+    def body(i, state):
+        x, ax, y, key, best_x, best_v, best_obj = state
+        k = (k0 + i).astype(x.dtype)
+        noise = noises * jnp.maximum(1.0 - k / total, 0.0)
+        x, ax, y, key, violation = step(data, x, ax, y, key, weights, noise)
+        objective = x @ data["c"]
+        feasible = violation <= tol
+        had = best_v <= tol
+        better = jnp.where(
+            feasible, ~had | (objective < best_obj), ~had & (violation < best_v)
+        )
+        best_x = jnp.where(better[:, None], x, best_x)
+        best_v = jnp.where(better, violation, best_v)
+        best_obj = jnp.where(better, objective, best_obj)
+        return x, ax, y, key, best_x, best_v, best_obj
+
+    return jax.lax.fori_loop(0, iterations, body, state)
+
+
+def projected_pdhg(
+    A,
+    row_lower,
+    row_upper,
+    b,
+    c,
+    lower,
+    upper,
+    is_int,
+    x0,
+    y0=None,
+    lanes=8,
+    iterations=2000,
+    tol=1e-6,
+    seed=0,
+    deadline=None,
+    dtype=np.float32,
+    on_chunk=None,
+):
+    """
+    Integer-projected PDHG: a primal heuristic that runs PDHG on the LP
+    relaxation with the projection of its primal step onto the box replaced,
+    for the integer variables, by the nearest whole number in the box, as
+    the nonconvex-ADMM heuristics of Takapoui, Moehle, Boyd and Bemporad
+    (2017) project onto the integer set. The iterates are then integral
+    throughout; the duals gather each row's violation until ``Aᵀy`` moves
+    an integer by more than ½, and a fixed point is a feasible point. No LP
+    is solved, so the lanes run as one batched device loop.
+
+    The rows are ``row_lower <= A x <= row_upper`` (``b``: the right-hand
+    sides ``MIP.violation`` scales by), the box ``[lower, upper]``. Lanes
+    start from ``x0`` and from ``weight·y0`` (``None``: zero duals) for
+    their objective weight, cycling through ``_PROJECTED_PDHG_WEIGHTS``
+    (two lanes each: one rounds plainly, the other after noise of up to
+    ``_PROJECTED_PDHG_NOISE``, decaying to 0). With LP-optimal duals
+    ``y0``, ``weight·(c + Aᵀy0)`` is the reduced costs scaled, so a lighter
+    weight keeps the LP point's balance and leaves the rows more say.
+
+    Runs ``iterations`` steps (in chunks of ``_PROJECTED_PDHG_CHUNK``) or
+    until ``deadline``. After each chunk, ``on_chunk(best_x, best_violation)``
+    (host arrays, one row a lane) may return True to stop. Returns
+    ``(best_x, best_violation)`` (the last chunk's).
+    """
+    n = len(c)
+    dtype = np.dtype(dtype)
+    with jax.enable_x64(True):
+        data = _projected_pdhg_data(
+            A, row_lower, row_upper, b, c, lower, upper, is_int, dtype
+        )
+        weights = np.array(
+            [_PROJECTED_PDHG_WEIGHTS[(l // 2) % len(_PROJECTED_PDHG_WEIGHTS)]
+             for l in range(lanes)]
+        )
+        noises = np.where(np.arange(lanes) % 2 == 1, _PROJECTED_PDHG_NOISE, 0.0)
+        x0 = np.clip(np.asarray(x0, np.float64), lower, upper)
+        y0 = np.zeros(A.shape[0]) if y0 is None else np.asarray(y0, np.float64)
+        ax0 = np.asarray(sp.csr_matrix(A) @ x0, np.float64)
+        x = jnp.asarray(np.tile(x0, (lanes, 1)).astype(dtype))
+        state = (
+            x,
+            jnp.asarray(np.tile(ax0, (lanes, 1)).astype(dtype)),
+            jnp.asarray((weights[:, None] * y0[None, :]).astype(dtype)),
+            jax.random.split(jax.random.PRNGKey(seed), lanes),
+            x,
+            jnp.full((lanes,), np.inf, dtype),
+            jnp.full((lanes,), np.inf, dtype),
+        )
+        weights = jnp.asarray(weights.astype(dtype))
+        noises = jnp.asarray(noises.astype(dtype))
+        total = jnp.asarray(max(iterations, 1), dtype)
+        tol = jnp.asarray(tol, dtype)
+        best_x, best_v = np.tile(x0, (lanes, 1)), np.full(lanes, np.inf)
+        done = 0
+        while done < iterations:
+            if deadline is not None and time.time() >= deadline:
+                break
+            state = _projected_pdhg_chunk(
+                data, state, weights, noises, jnp.asarray(done, jnp.int32),
+                total, tol, iterations=_PROJECTED_PDHG_CHUNK,
+            )
+            done += _PROJECTED_PDHG_CHUNK
+            best_x = np.asarray(state[4], np.float64)
+            best_v = np.asarray(state[5], np.float64)
+            if on_chunk is not None and on_chunk(best_x, best_v):
+                break
+    return best_x.reshape(lanes, n), best_v
+
+
 def integer_roundings(x, integrality, lower, upper, snap=1e-6):
     """
     Up to three roundings of ``x``'s integers, in the order round and repair
@@ -6850,7 +7047,9 @@ def _batch_member(tree, i):
 
 class _StrongChild(
     collections.namedtuple(
-        "_StrongChild", "bound closed solution raw exact", defaults=(None, False)
+        "_StrongChild",
+        "bound closed solution raw exact proven",
+        defaults=(None, False, -np.inf),
     )
 ):
     """A strong-branching child: its bound (rounded as node bounds are),
@@ -6859,7 +7058,9 @@ class _StrongChild(
     and its unrounded bound, for scores and pseudocosts (``None``: the
     bound). Rounding to an objective step would make most gains 0 or one
     step. ``exact``: its solution is an optimal vertex of its LP (the exact
-    lane's strong branching), so its node needs no LP solve of its own."""
+    lane's strong branching), so its node needs no LP solve of its own.
+    ``proven``: its rigorous bound (``_Node.proven``; ``inf`` when shown
+    empty, ``-inf`` when none is known)."""
 
     __slots__ = ()
 
@@ -6870,7 +7071,9 @@ _LOG_SOURCES = (
     ("D", "Dive"),
     ("E", "RENS"),
     ("F", "Feasibility pump"),
+    ("G", "Dual-guided fixing"),
     ("H", "Rounding"),
+    ("I", "Integer-projected PDHG"),
     ("J", "Feasibility jump"),
     ("K", "Block decomposition"),
     ("L", "Objective levels"),
@@ -7046,6 +7249,7 @@ class _Node:
         "exact_basis",
         "exact_sides",
         "band_edge",
+        "proven",
     )
 
     def __init__(
@@ -7059,8 +7263,14 @@ class _Node:
         inferences=0,
         cut_rounds=0,
         branch_value=None,
+        proven=-np.inf,
     ):
         self.bound, self.depth, self.changes = bound, depth, changes
+        # A rigorous bound on its solutions (``proven_bound``): ``bound``
+        # prunes, and may rest on duals whose bound dropped reduced costs
+        # (not rigorous); ``proven`` only ever takes rigorous bounds, so it
+        # is what the search reports. ``-inf`` until one is known.
+        self.proven = proven
         self.warm, self.branch = warm, branch
         self.epochs = epochs
         # Bounds that propagation tightened beyond the split that made it.
@@ -7489,6 +7699,15 @@ _SOLUTION_POOL_SIZE = 10
 _RINS_FIXING_STEP = 0.8
 _RINS_MIN_FIXING = 0.4
 _RINS_EARLY_SHARE = 0.5
+
+# Dual-guided fixing (``dual_fix_box``): the least share of the free
+# integers a neighbourhood must fix, the bounds on its fixing rate (moved by
+# ``_RINS_FIXING_STEP``, ``adapt_dual_fixing``), and the reduced costs that
+# count as zero, relative to ``1 + max|c|`` (PDHG duals leave small noise).
+_DUAL_FIX_MIN_FIXED = 0.1
+_DUAL_FIX_MIN_RATE = 0.1
+_DUAL_FIX_MAX_RATE = 0.95
+_DUAL_FIX_ZERO = 1e-7
 
 
 class _SubMipLane:
@@ -8749,6 +8968,11 @@ class _BranchAndBound:
         crossover_min_fixed=0.5,
         proximity_seconds=10.0,
         first_solution_seconds=0.0,
+        dual_fix_seconds=0.0,
+        dual_fix_rate=0.7,
+        projected_pdhg=False,
+        projected_pdhg_lanes=8,
+        projected_pdhg_iterations=2000,
         objective_levels=True,
         objective_level_seconds=2.0,
         cut_round_lp="jaddle",
@@ -9361,6 +9585,26 @@ class _BranchAndBound:
         self.crossover_solutions = int(crossover_solutions)
         self.crossover_min_fixed = float(crossover_min_fixed)
         self.proximity_seconds = float(proximity_seconds or 0.0)
+        # Dual-guided fixing on the sub-MIP lane (``dual_fix_box``): its
+        # seconds a call, the share of the free integers it fixes (moved
+        # as RINS's, ``adapt_dual_fixing``), and its calls and finds.
+        self.dual_fix_seconds = float(dual_fix_seconds or 0.0)
+        if not 0.0 < float(dual_fix_rate) <= 1.0:
+            raise ValueError(f"dual_fix_rate must be in (0, 1], not {dual_fix_rate!r}")
+        self.dual_fix_rate = float(dual_fix_rate)
+        self.dual_fix_calls = 0
+        self.dual_fix_finds = 0
+        # Integer-projected PDHG at the root (``projected_pdhg``).
+        self.use_projected_pdhg = bool(projected_pdhg)
+        if int(projected_pdhg_lanes) < 1:
+            raise ValueError(
+                f"projected_pdhg_lanes must be at least 1, not {projected_pdhg_lanes!r}"
+            )
+        self.projected_pdhg_lanes = int(projected_pdhg_lanes)
+        self.projected_pdhg_iterations = int(projected_pdhg_iterations)
+        self.projected_pdhg_calls = 0
+        self.projected_pdhg_finds = 0
+        self.projected_last = None  # its last best near miss, for a jump
         self.submip_lane = (
             _SubMipLane()
             if submip_solver == "highs"
@@ -9369,6 +9613,7 @@ class _BranchAndBound:
                 or self.crossover_seconds
                 or self.proximity_seconds
                 or first_solution_seconds
+                or self.dual_fix_seconds
             )
             else None
         )
@@ -9681,6 +9926,12 @@ class _BranchAndBound:
         self.has_mip_start = self.mip_start is not None  # for the log legend
         self.mip_start_accepted = None
         self.closed_floor = np.inf  # least bound of the nodes closed so far
+        # ``proven_bound``'s parts: the least proven bound of the regions
+        # closed so far, of the node being evaluated (``-inf`` at the root
+        # until a rigorous root bound is known), and the restart floor.
+        self.proven_closed = np.inf
+        self.active_proven = -np.inf
+        self.proven_floor = -np.inf
         # Least bound of the nodes closed without proof: an LP that did not
         # converge, or an integral LP point that failed the feasibility check.
         self.unresolved_floor = np.inf
@@ -9729,6 +9980,10 @@ class _BranchAndBound:
         self.active_bound = np.inf
         # A batch's members still to be evaluated (also in no list meanwhile).
         self.batch_waiting = []
+        # Nodes taken from the queue and not yet back in a list the bounds
+        # read (``in_transit``): a batch being built, a serial or plunge
+        # node while its LP is solved. Cleared where every one has landed.
+        self.in_transit = []
         # Every objective value is a multiple of this (None: no such step).
         self.objective_step = objective_step(mip.c, mip.integrality | mip.implied)
         # The columns cut separation counts as integers: with
@@ -10034,9 +10289,50 @@ class _BranchAndBound:
             bound = min(bound, self.incumbent[0])
         return bound
 
-    def close(self, bound, rigorous=True):
+    def close(self, bound, rigorous=True, proven=None):
+        """Close a region at ``bound``. ``proven``: the rigorous bound the
+        region keeps for ``proven_bound`` (``None``: ``bound`` when
+        ``rigorous``, else ``-inf``), at most ``bound``, so the reported
+        bound never passes the search's."""
         self.closed_floor = min(self.closed_floor, bound)
         self.bound_rigorous &= rigorous
+        if proven is None:
+            proven = bound if rigorous else -np.inf
+        self.proven_closed = min(self.proven_closed, proven, bound)
+
+    def proven_bound(self):
+        """The reported bound: as ``global_bound``, from the nodes' and
+        closed regions' rigorous bounds (``_Node.proven``) only. The search
+        prunes on ``global_bound``'s, which may rest on duals whose bound
+        dropped wrong-sign reduced costs at infinite bounds (within
+        ``reduced_cost_tol``): on buildingenergy (every column unbounded
+        above) at ``lp_tolerance=1e-3`` the root duals dropped 17,701, worth
+        about −22 at the LP point, and the search's bound reached 33,287.8
+        against an optimum of 33,283.85. A region closed on such a bound
+        keeps its proven bound, so the reported one never passes a proof:
+        the exact duals of the root crossover and the exact lane, and every
+        bound of a model whose duals drop nothing."""
+        nodes = itertools.chain(
+            self.open_nodes(),
+            (d["node"] for d in self.deferred_branches),
+            self.batch_waiting,
+            self.pipeline_nodes(),
+        )
+        bound = min((node.proven for node in nodes), default=np.inf)
+        bound = min(bound, self.proven_closed, self.active_proven)
+        bound = max(bound, self.proven_floor)
+        # Objective levels are shown empty by HiGHS.
+        bound = max(bound, self.level_floor())
+        if self.incumbent is not None:
+            bound = min(bound, self.incumbent[0])
+        return bound
+
+    def raise_root_proven(self, raw, rigorous):
+        """The root's proven bound (``active_proven``, until the root node
+        is evaluated) up to the bound ``raw`` of its LP, when that is
+        rigorous."""
+        if rigorous and np.isfinite(raw):
+            self.active_proven = max(self.active_proven, self.round_bound(raw))
 
     def gap(self, bound):
         if self.incumbent is None:
@@ -10399,12 +10695,18 @@ class _BranchAndBound:
         return (self.restart_free - free) / self.restart_free
 
     def restart_due(self, share):
-        """Whether to restart: restarts left (``restarts``), time left, and
-        at least ``share`` of this round's free integers fixed since."""
+        """Whether to restart: restarts left (``restarts``), time left, at
+        least ``share`` of this round's free integers fixed since, and the
+        search not already over (``root_closed``: the global bound at the
+        cutoff). A new incumbent lowers the cutoff, and root reduced-cost
+        fixing against it is what fixes the share, so a restart came due
+        just as the incumbent closed the gap: one search ran 14 s of
+        restart presolve and a new root after its gap reached 0%."""
         return (
             len(self.restart_log) < self.max_restarts
             and not self.out_of_time()
             and self.fixed_share() >= share
+            and not self.root_closed()
         )
 
     def restart(self):
@@ -10427,6 +10729,7 @@ class _BranchAndBound:
         share = self.fixed_share()
         free = int(np.count_nonzero(self.is_int & (self.root_lower < self.root_upper)))
         self.bound_floor = max(self.bound_floor, self.global_bound())
+        self.proven_floor = max(self.proven_floor, self.proven_bound())
         kept = [cut for cut in self.cut_list if cut["age"] == 0]
         if kept:
             lengths = [cut["idx"].size for cut in kept]
@@ -10467,9 +10770,12 @@ class _BranchAndBound:
         self.deferred_branches = []
         self.deferred_roundings = []
         self.batch_waiting = []
+        self.in_transit = []
         self.closed_floor = np.inf
         self.unresolved_floor = np.inf
         self.active_bound = -np.inf
+        self.proven_closed = np.inf
+        self.active_proven = -np.inf
         # The cut pool and the root's LP state.
         self.cut_list = []
         self.set_mip(self.base)
@@ -10631,14 +10937,22 @@ class _BranchAndBound:
             if inner_bound is None or not np.isfinite(inner_bound)
             else float(inner_bound) - base.offset
         )
+        # Its bound is the proven one (``proven_bound``); its search's, which
+        # pruned, is ``search_bound``.
+        search = inner.get("search_bound", inner_bound)
+        search = (
+            -np.inf
+            if search is None or not np.isfinite(search)
+            else float(search) - base.offset
+        )
         proved = inner["status"] in ("optimal", "infeasible")
         if proved and (found is None or no_better_than(found)):
             # Nothing in the box beats the incumbent (or the reduced
             # search's point, now the incumbent).
-            return self.empty_root()
+            return self.empty_root(None if search <= bound else bound)
         # The reduced search's bound holds for every solution in the box.
-        self.active_bound = np.inf
-        self.close(bound, inner.get("bound_rigorous", True))
+        self.active_bound = self.active_proven = np.inf
+        self.close(search, inner.get("bound_rigorous", True), proven=bound)
         status = inner["status"]
         if proved or status == "unresolved":
             # Proved for a point postsolve did not give back feasible.
@@ -10679,13 +10993,15 @@ class _BranchAndBound:
                 lane.shutdown()
                 setattr(self, name, None)
 
-    def close_all(self):
+    def close_all(self, proven=None):
         """Close every open node: none holds a solution below the cutoff.
         So do the pipeline's (``pipeline_batches``): its batch on the device
         is dropped, and its children are dropped unread; so are the exact
-        lane's (``exact_nodes``)."""
-        self.close(self.cutoff_bound())
+        lane's (``exact_nodes``). ``proven``: the proven bound they keep
+        (``None``: the cutoff's, for a proof such as propagation's)."""
+        self.close(self.cutoff_bound(), proven=proven)
         self.open = []
+        self.in_transit = []
         self.plunge_node = None
         self.in_flight = None
         self.pending_children = None
@@ -10693,16 +11009,17 @@ class _BranchAndBound:
         if self.exact_lane is not None:
             self.exact_lane.drop()
 
-    def empty_root(self):
+    def empty_root(self, proven=None):
         """The result when the root box holds no solution below the cutoff
         (propagation, probing, the root LP or reduced-cost fixing shows it
         empty): every node closes, and the incumbent, if any, is optimal.
         After a restart the box only ever held the solutions better than
         the incumbent (reduced-cost fixing, and with
         ``objective_propagation`` the objective row), so an empty one there
-        is a proof of optimality, not of infeasibility."""
-        self.close_all()
-        self.active_bound = np.inf
+        is a proof of optimality, not of infeasibility. ``proven``: as ``close_all``'s,
+        for a root closed on a bound that may not be rigorous."""
+        self.close_all(proven)
+        self.active_bound = self.active_proven = np.inf
         return self.result("optimal")
 
     # -- conflicts -----------------------------------------------------------
@@ -10799,7 +11116,10 @@ class _BranchAndBound:
         lower, upper, infeasible = self.conflict_propagate(lower, upper)
         if infeasible:
             self.conflict_pruned += 1
-            self.close(max(node.bound, self.cutoff_bound()))
+            self.close(
+                max(node.bound, self.cutoff_bound()),
+                proven=max(node.proven, self.cutoff_bound()),
+            )
             return None
         return lower, upper
 
@@ -10876,7 +11196,7 @@ class _BranchAndBound:
             self.early_jump.set()  # the early root jumps stop
         if source != "N":
             self.rins_pending = True
-        bound = self.global_bound()
+        bound = self.proven_bound()  # the reported bound, for the history
         self.history.append(
             dict(
                 seconds=time.time() - self.start,
@@ -11185,6 +11505,7 @@ class _BranchAndBound:
             upper,
             bound,
             raw,
+            node,
         )
         if applied is None:
             return None
@@ -11200,6 +11521,7 @@ class _BranchAndBound:
                     self.compress(lower, upper),
                     warm,
                     None,
+                    proven=node.proven,
                 )
             )
             return None
@@ -11219,6 +11541,7 @@ class _BranchAndBound:
         upper,
         bound,
         raw,
+        node=None,
     ):
         """
         Use strong-branching ``children`` (``{var: (down, up)}`` of
@@ -11234,6 +11557,10 @@ class _BranchAndBound:
         """
         lower, upper = lower.copy(), upper.copy()
         strong_bound, fixed = bound, False
+        # The rigorous part (``_Node.proven``): the node's, raised as the
+        # bound is, by the children's proven bounds.
+        proven = -np.inf if node is None else node.proven
+        strong_proven = proven
         results = {}
         position = {var: k for k, var in enumerate(candidates.tolist())}
         for var, (down, up) in children.items():
@@ -11244,14 +11571,19 @@ class _BranchAndBound:
             self.branch_cutoffs[0, var] += down.closed
             self.branch_cutoffs[1, var] += up.closed
             if down.closed and up.closed:
-                self.close(max(min(down.bound, up.bound), bound))
+                self.close(
+                    max(min(down.bound, up.bound), bound),
+                    proven=max(proven, min(down.proven, up.proven)),
+                )
                 return None
             # Either child of a candidate holds every solution of its side,
             # so the lesser child bound bounds the node.
             strong_bound = max(strong_bound, min(down.bound, up.bound))
+            strong_proven = max(strong_proven, min(down.proven, up.proven))
             if down.closed or up.closed:
                 # The closed side leaves the search: its bound counts as closed.
-                self.close(max((down if down.closed else up).bound, bound))
+                side = down if down.closed else up
+                self.close(max(side.bound, bound), proven=max(proven, side.proven))
                 if down.closed:
                     lower[var] = max(lower[var], math.ceil(x[var]))
                 else:
@@ -11268,7 +11600,7 @@ class _BranchAndBound:
             score[k] = max(gain_down, 1e-6) * max(gain_up, 1e-6)
             results[var] = {True: down, False: up}
         if strong_bound >= self.cutoff():
-            self.close(strong_bound)
+            self.close(strong_bound, proven=strong_proven)
             return None
         if fixed:
             infeasible = False
@@ -11277,16 +11609,26 @@ class _BranchAndBound:
             if not infeasible:
                 lower, upper, infeasible = self.conflict_propagate(lower, upper)
             if infeasible:
-                self.close(max(strong_bound, self.cutoff_bound()))
+                # Propagation shows what is left of the node empty.
+                self.close(
+                    max(strong_bound, self.cutoff_bound()),
+                    proven=max(strong_proven, self.cutoff_bound()),
+                )
                 return None
             # Only candidates still inside the tightened box can be split.
             inside = (x[candidates] > lower[candidates]) & (
                 x[candidates] < upper[candidates]
             )
             score[~inside] = -np.inf
+        if node is not None:
+            node.proven = max(node.proven, strong_proven)
+            if self.active_proven < node.proven:
+                self.active_proven = node.proven
         return lower, upper, strong_bound, results
 
-    def root_sweep(self, x, candidates, lower, upper, warm, terms, bound, raw):
+    def root_sweep(
+        self, x, candidates, lower, upper, warm, terms, bound, raw, node=None
+    ):
         """
         Strong branching at the root on the ``root_strong_candidates``
         fractional integers with the largest ``impact · f(1 − f)``
@@ -11334,6 +11676,7 @@ class _BranchAndBound:
             upper,
             bound,
             raw,
+            node,
         )
         return applied
 
@@ -11467,11 +11810,15 @@ class _BranchAndBound:
             for side, down in enumerate((True, False)):
                 if small["infeasible"][i, side]:
                     self.learn_nogood(*_child_box(pending["box"], var, x[var], down))
-                    sides.append(_StrongChild(np.inf, True, None))
+                    sides.append(_StrongChild(np.inf, True, None, proven=np.inf))
                     continue
-                pre_raw = max(float(small["pre"][i, side]), raw)
+                own = float(small["pre"][i, side])
+                pre_raw = max(own, raw)
                 pre = max(self.round_bound(pre_raw), bound)
                 rigorous = bool(small["pre_rigorous"][i, side])
+                pre_proven = (
+                    self.round_bound(own) if rigorous and np.isfinite(own) else -np.inf
+                )
                 if pre >= cutoff:
                     self.bound_rigorous &= rigorous
                     if rigorous:
@@ -11479,9 +11826,13 @@ class _BranchAndBound:
                             (screened["lower"][i, side], screened["upper"][i, side])
                         )
                         self.learn(terms, lo, up)
-                    sides.append(_StrongChild(pre, True, None, pre_raw))
+                    sides.append(
+                        _StrongChild(pre, True, None, pre_raw, proven=pre_proven)
+                    )
                 else:
-                    sides.append(_StrongChild(pre, False, None, pre_raw))
+                    sides.append(
+                        _StrongChild(pre, False, None, pre_raw, proven=pre_proven)
+                    )
             children[var] = sides
 
         solved = set()
@@ -11495,8 +11846,12 @@ class _BranchAndBound:
                 self.strong_branch_lps += 1
                 self.lp_epochs += int(small["epochs"][member])
                 pre, pre_raw = children[var][side].bound, children[var][side].raw
-                child_raw = max(float(small["bound"][member]), pre_raw)
+                own = float(small["bound"][member])
+                child_raw = max(own, pre_raw)
                 rigorous = bool(small["rigorous"][member])
+                child_proven = children[var][side].proven
+                if rigorous and np.isfinite(own):
+                    child_proven = max(child_proven, self.round_bound(own))
                 child_bound = max(self.round_bound(child_raw), pre)
                 if child_bound > pre:
                     self.bound_rigorous &= rigorous
@@ -11519,7 +11874,7 @@ class _BranchAndBound:
                 if not closed:
                     solution = functools.partial(_batch_member, out.solution, member)
                 children[var][side] = _StrongChild(
-                    child_bound, closed, solution, child_raw
+                    child_bound, closed, solution, child_raw, proven=child_proven
                 )
         return {var: tuple(sides) for var, sides in children.items()}, solved
 
@@ -11557,39 +11912,51 @@ class _BranchAndBound:
                     lo[var] = max(lo[var], math.ceil(xv))
                 child = None
                 if lo[var] > up[var]:
-                    child = _StrongChild(np.inf, True, None)
+                    child = _StrongChild(np.inf, True, None, proven=np.inf)
                 elif self.propagator is not None:
                     branched = (lo, up)
                     lo, up, infeasible = self.propagator(lo, up)
                     if infeasible:
                         self.learn_nogood(*branched)
-                        child = _StrongChild(np.inf, True, None)
+                        child = _StrongChild(np.inf, True, None, proven=np.inf)
                 if child is None:
                     lo, up, infeasible = self.conflict_propagate(lo, up)
                     if infeasible:
-                        child = _StrongChild(self.cutoff_bound(), True, None)
+                        child = _StrongChild(
+                            self.cutoff_bound(), True, None, proven=self.cutoff_bound()
+                        )
                 if child is None:
-                    pre_raw, rigorous = self.bound_over(terms, lo, up)
-                    pre_raw = max(pre_raw, raw)
+                    own, rigorous = self.bound_over(terms, lo, up)
+                    pre_raw = max(own, raw)
                     pre = max(self.round_bound(pre_raw), bound)
+                    pre_proven = (
+                        self.round_bound(own)
+                        if rigorous and np.isfinite(own)
+                        else -np.inf
+                    )
                     if pre >= cutoff:
                         self.bound_rigorous &= rigorous
                         if rigorous:
                             self.learn(terms, lo, up)
-                        child = _StrongChild(pre, True, None, pre_raw)
+                        child = _StrongChild(pre, True, None, pre_raw, proven=pre_proven)
                     else:
-                        pending.append((var, down, lo, up, pre, pre_raw))
+                        pending.append((var, down, lo, up, pre, pre_raw, pre_proven))
                 children.setdefault(var, {})[down] = child
 
         results = self.solve_children([box[2:4] for box in pending], warm)
         self.strong_branch_lps += len(pending)
-        for (var, down, lo, up, pre, pre_raw), result in zip(pending, results):
+        for (var, down, lo, up, pre, pre_raw, pre_proven), result in zip(
+            pending, results
+        ):
             solution = result["solution"]
             child_terms = self.result_terms(result, lo, up)
             child_raw, rigorous = self.bound_over(child_terms, lo, up)
             child_terms, child_raw, rigorous = self.repair_terms(
                 result, child_terms, child_raw, rigorous, lo, up
             )
+            child_proven = pre_proven
+            if rigorous and np.isfinite(child_raw):
+                child_proven = max(child_proven, self.round_bound(child_raw))
             child_raw = max(child_raw, pre_raw)
             score_raw = child_raw  # for the score and pseudocost either way
             if not (rigorous or trust):
@@ -11606,7 +11973,11 @@ class _BranchAndBound:
             if closed and rigorous:
                 self.learn(child_terms, lo, up)
             children[var][down] = _StrongChild(
-                child_bound, closed, None if closed else solution, score_raw
+                child_bound,
+                closed,
+                None if closed else solution,
+                score_raw,
+                proven=child_proven,
             )
         return {var: (sides[True], sides[False]) for var, sides in children.items()}
 
@@ -11741,7 +12112,7 @@ class _BranchAndBound:
                 self.conflict_pruned += 1
                 self.branch_cutoffs[side, var] += 1
                 self.bump_conflict(lo, up)
-                self.close(max(bound, self.cutoff_bound()))
+                self.close(max(bound, self.cutoff_bound()), proven=self.cutoff_bound())
                 continue
             inferences = int(np.count_nonzero((lo != split_lo) | (up != split_up)))
             self.inference_sum[side, var] += inferences
@@ -11752,11 +12123,16 @@ class _BranchAndBound:
                 rigorous = bool(precomputed["rigorous"][side])
             else:
                 child_bound, rigorous = self.bound_over(terms, lo, up)
+            # Its own bound, when rigorous, on top of the node's proven one.
+            child_proven = node.proven
+            if rigorous and np.isfinite(child_bound):
+                child_proven = max(child_proven, self.round_bound(child_bound))
             child_bound = max(self.round_bound(child_bound), bound)
             child_warm = warm
             if strong is not None:
                 # Its box is inside the strong child's, so that bound holds.
                 child_bound = max(child_bound, strong[down].bound)
+                child_proven = max(child_proven, strong[down].proven)
                 solution = strong[down].solution
                 if solution is not None:
                     child_warm = (
@@ -11766,7 +12142,7 @@ class _BranchAndBound:
             if child_bound >= self.cutoff():
                 self.children_pruned += 1
                 self.branch_cutoffs[side, var] += 1
-                self.close(child_bound, rigorous)
+                self.close(child_bound, rigorous, child_proven)
                 if rigorous:
                     self.learn(terms, lo, up)
                 continue
@@ -11778,6 +12154,7 @@ class _BranchAndBound:
                 child_warm,
                 (var, down, distance, value),
                 inferences=inferences,
+                proven=child_proven,
             )
             # The exact lane's strong child solved its LP already.
             child.exact_known = strong is not None and strong[down].exact
@@ -11857,10 +12234,18 @@ class _BranchAndBound:
     def evaluate(self, node, lower, upper, lp, result):
         """Bound, prune, accept or branch on a solved node."""
         self.active_bound = node.bound
+        self.active_proven = node.proven
         try:
             self._evaluate(node, lower, upper, lp, result)
         finally:
             self.active_bound = np.inf
+            self.active_proven = np.inf
+
+    def prove(self, node, raw, rigorous):
+        """``node.proven`` up to its LP's bound ``raw``, when rigorous."""
+        if rigorous and np.isfinite(raw):
+            node.proven = max(node.proven, self.round_bound(raw))
+            self.active_proven = node.proven
 
     def _evaluate(self, node, lower, upper, lp, result):
         terms = self.result_terms(result, lower, upper)
@@ -11871,6 +12256,7 @@ class _BranchAndBound:
         self.last_raw_bound = raw
         bound = max(self.round_bound(raw), node.bound)
         self.active_bound = bound
+        self.prove(node, raw, rigorous)
         spent = node.epochs + result["epochs"]
         # A node with every integer fixed has nothing to branch on: its LP
         # gets the full ``node_max_epochs`` to converge, even when the
@@ -11912,6 +12298,7 @@ class _BranchAndBound:
                 spent,
                 cut_rounds=node.cut_rounds,
                 branch_value=node.branch_value,
+                proven=node.proven,
             )
             if node.converge:
                 # Out of the lane's band for good, so it keeps its progress.
@@ -11933,6 +12320,7 @@ class _BranchAndBound:
                 terms, raw, rigorous = self.root_terms, exact_raw, True
                 bound = max(self.round_bound(raw), node.bound)
                 self.active_bound = bound
+                self.prove(node, raw, rigorous)
         if root and not self.root_terms_rigorous:
             self.root_terms = terms
             self.root_terms_rigorous = rigorous and np.isfinite(raw)
@@ -11957,7 +12345,7 @@ class _BranchAndBound:
         if bound >= self.cutoff():
             self.record_cutoff(node.branch)
             self.bump_conflict(lower, upper)
-            self.close(bound, rigorous)
+            self.close(bound, rigorous, node.proven)
             if rigorous:
                 self.learn(terms, lower, upper)
             return
@@ -11980,8 +12368,9 @@ class _BranchAndBound:
                     terms, raw, rigorous = new_terms, new_raw, new_rigorous
                     bound = max(self.round_bound(raw), node.bound)
                     self.active_bound = bound
+                    self.prove(node, raw, rigorous)
                 if bound >= self.cutoff():
-                    self.close(bound, rigorous)
+                    self.close(bound, rigorous, node.proven)
                     if rigorous:
                         self.learn(terms, lower, upper)
                     return
@@ -11992,7 +12381,7 @@ class _BranchAndBound:
         if not fractional.any():
             feasible = self.try_incumbent(x, "T", warm)
             if converged and feasible:
-                self.close(bound, rigorous)
+                self.close(bound, rigorous, node.proven)
                 return
             # The LP point is integral but did not settle the node (it failed
             # the check, or the LP did not converge). Closing the node on its
@@ -12003,7 +12392,7 @@ class _BranchAndBound:
             if var is None:  # every integer fixed: nothing left to split
                 self.unresolved_nodes += 1
                 self.unresolved_floor = min(self.unresolved_floor, bound)
-                self.close(bound, rigorous)
+                self.close(bound, rigorous, node.proven)
                 return
             self.integral_splits += 1
             self.bound_rigorous &= rigorous
@@ -12063,12 +12452,12 @@ class _BranchAndBound:
                     self.try_incumbent(candidate, "P", warm)
                 self.heuristic_seconds += time.time() - started
             if bound >= self.cutoff():
-                self.close(bound, rigorous)
+                self.close(bound, rigorous, node.proven)
                 return
         if not root and self.round_repair_due():
             self.round_repair(x, lower, upper, warm)
             if bound >= self.cutoff():
-                self.close(bound, rigorous)
+                self.close(bound, rigorous, node.proven)
                 return
         if (
             self.rins_seconds
@@ -12080,12 +12469,12 @@ class _BranchAndBound:
             self.rins_pending = False
             self.rins(x, warm)
             if bound >= self.cutoff():
-                self.close(bound, rigorous)
+                self.close(bound, rigorous, node.proven)
                 return
         if self.tree_heuristics_due():
             self.tree_heuristics(x, lower, upper, warm)
             if bound >= self.cutoff():
-                self.close(bound, rigorous)
+                self.close(bound, rigorous, node.proven)
                 return
         if (
             self.dive_every
@@ -12094,12 +12483,16 @@ class _BranchAndBound:
         ):
             self.dive(x, lower, upper, warm)
             if bound >= self.cutoff():
-                self.close(bound, rigorous)
+                self.close(bound, rigorous, node.proven)
                 return
         node_lower = lower
         lower, upper, infeasible = self.reduced_cost_fix(terms, lower, upper)
         if infeasible:
-            self.close(max(bound, self.cutoff_bound()), rigorous)
+            self.close(
+                max(bound, self.cutoff_bound()),
+                rigorous,
+                max(node.proven, self.cutoff_bound()) if rigorous else node.proven,
+            )
             return
         # Branch on a variable whose LP value is inside the (fixed) box, so
         # both children are new.
@@ -12116,6 +12509,7 @@ class _BranchAndBound:
                     self.compress(lower, upper),
                     warm,
                     None,
+                    proven=node.proven,
                 )
             )
             return
@@ -12128,7 +12522,7 @@ class _BranchAndBound:
             and result.get("exact_strong") is None
         ):
             swept = self.root_sweep(
-                x, candidates, lower, upper, warm, terms, bound, raw
+                x, candidates, lower, upper, warm, terms, bound, raw, node
             )
             if swept is None:  # the sweep closed the root
                 return
@@ -12144,6 +12538,7 @@ class _BranchAndBound:
                         self.compress(lower, upper),
                         warm,
                         None,
+                        proven=node.proven,
                     )
                 )
                 return
@@ -12182,7 +12577,7 @@ class _BranchAndBound:
                     np.asarray(solution.primal, np.float64), lower, upper, warm
                 )
             if bound >= self.cutoff():
-                self.close(bound, rigorous)
+                self.close(bound, rigorous, node.proven)
                 return
         self.active_bound = bound
         # Recent node points, restarts for the background jumps.
@@ -12258,6 +12653,8 @@ class _BranchAndBound:
             or bool(self.gpu_dive_every and self.batch_size > 1),
             "E": bool(self.rens_seconds),
             "F": bool(self.use_pump),
+            "G": bool(self.dual_fix_seconds and self.submip_lane is not None),
+            "I": self.use_projected_pdhg,
             "H": bool(self.heuristic_every),
             "J": bool(self.use_jump),
             "N": bool(self.rins_seconds),
@@ -12300,7 +12697,7 @@ class _BranchAndBound:
             print(_LOG_HEADER)
             print()
         if bound is None:
-            bound = self.global_bound()
+            bound = self.proven_bound()
         best = np.inf if self.incumbent is None else self.incumbent[0]
         gap = self.gap(bound)
         if not np.isfinite(gap):
@@ -12355,6 +12752,12 @@ class _BranchAndBound:
             ("Primal bound", "inf" if objective is None else f"{objective:.10g}")
         )
         rows.append(("Dual bound", f"{self.model_value(bound):.10g}"))
+        search = self.global_bound()
+        if search > bound + 1e-9 * (1.0 + abs(bound)):
+            # Pruning used bounds that dropped reduced costs (not proofs).
+            rows.append(
+                ("", f"{self.model_value(search):.10g} (search, not rigorous)")
+            )
         gap = self.gap(bound)
         gap_text = f"{100 * gap:.4g}%" if np.isfinite(gap) else "inf"
         rows.append(("Gap", f"{gap_text} (tolerance: {100 * self.rel_gap:.4g}%)"))
@@ -12460,7 +12863,8 @@ class _BranchAndBound:
         self.collect_heuristics(schedule=False)
         if status == "time_limit" and self.interrupt.is_set():
             status = "interrupted"  # it took the time-limit path
-        bound = self.global_bound()
+        search_bound = self.global_bound()
+        bound = self.proven_bound()
         if status == "optimal":
             # The search ended: proven unless a node closed without proof
             # could still hold a better solution.
@@ -12480,9 +12884,19 @@ class _BranchAndBound:
             "objective": objective,
             "bound": self.model_value(bound),
             "gap": self.gap(bound),
+            # The bound the search pruned on (``global_bound``); ``bound`` is
+            # its proven part (``proven_bound``), the same when every bound
+            # was rigorous.
+            "search_bound": self.model_value(search_bound),
             "status": status,
             "converged": status == "optimal",
-            "bound_rigorous": self.bound_rigorous,
+            # Whether the search's bound was rigorous: then ``bound`` is it.
+            # (``bound`` itself always is.)
+            "bound_rigorous": self.bound_rigorous
+            and (
+                bound == search_bound
+                or bound >= search_bound - 1e-9 * (1.0 + abs(search_bound))
+            ),
             "nodes": self.nodes,
             "infeasible_nodes": self.infeasible_nodes,
             "unresolved_nodes": self.unresolved_nodes,
@@ -12555,6 +12969,11 @@ class _BranchAndBound:
             "rens_finds": self.rens_finds,
             "first_solution_calls": self.first_solution_calls,
             "first_solution_finds": self.first_solution_finds,
+            "dual_fix_calls": self.dual_fix_calls,
+            "dual_fix_finds": self.dual_fix_finds,
+            "dual_fix_rate": self.dual_fix_rate,
+            "projected_pdhg_calls": self.projected_pdhg_calls,
+            "projected_pdhg_finds": self.projected_pdhg_finds,
             "rins_finds": self.rins_finds,
             "rins_fixing_rate": self.rins_fixing_rate,
             "batch_timing": {
@@ -12973,7 +13392,8 @@ class _BranchAndBound:
             if result["stop_reason"] in ("interrupted", "time_limit", "bound_target"):
                 return result
             self.age_cuts(result["solution"])
-            new_bound, _ = self.lp_bound(result["solution"], lower, upper)
+            new_bound, new_rigorous = self.lp_bound(result["solution"], lower, upper)
+            self.raise_root_proven(new_bound, new_rigorous)
             bound = max(bound, new_bound)
             history.append(bound)
             # The root's bound (the global one until it is evaluated), and
@@ -13077,7 +13497,9 @@ class _BranchAndBound:
                 base.n_eq,
                 np.concatenate([y_eq, y_ineq]),
             )
-            return A_rows, b_rows, box_bound(*terms, lower, upper)[0]
+            value, rigorous = box_bound(*terms, lower, upper)
+            self.raise_root_proven(value, rigorous)
+            return A_rows, b_rows, value
 
         def raise_root_bound(value):
             """The root's bound (the global one until it is evaluated) up to
@@ -13448,8 +13870,9 @@ class _BranchAndBound:
         ``"round"`` lane (``background_rounding``) and, with the numba jump and no incumbent, the
         jumps from the LP point and from the bounds nearest zero to the
         ``"jump"`` lane (each skipped if an incumbent has come by the time
-        it starts; together within the heuristic budget). Bulk rounding and
-        the pump run on the device, so they wait for ``root_heuristics``
+        it starts; together within the heuristic budget). Bulk rounding,
+        integer-projected PDHG and the pump run on the device, so they wait
+        for ``root_heuristics``
         after the rounds, if there is still no incumbent then. Their points
         are checked as the rounds collect them (``collect_heuristics``); the
         first incumbent starts the background improving jump. Returns False
@@ -13941,6 +14364,7 @@ class _BranchAndBound:
                     node.inferences,
                     cut_rounds=node.cut_rounds + 1,
                     branch_value=value,
+                    proven=node.proven,
                 )
                 self.push(requeue)
                 requeued.add(i)
@@ -14453,6 +14877,79 @@ class _BranchAndBound:
         else:
             self.rins_fixing_rate = min(1.0, self.rins_fixing_rate / _RINS_FIXING_STEP)
 
+    def dual_fix_box(self, seconds):
+        """Dual-guided fixing's neighbourhood of the root box: the free
+        integers with the largest root reduced costs ``|rⱼ|`` fixed at the
+        bound their sign prefers (``rⱼ > 0``: the lower), the share
+        ``dual_fix_rate`` of the free integers (or as many as have a
+        reduced cost), the rest left in the root box. An integer off its
+        preferred bound costs the LP bound at least ``|rⱼ|``, so these are
+        the integers least likely to move in a good solution, as
+        reduced-cost fixing reasons without its proof: any point found is
+        feasible, only the neighbourhood may miss the optimum. It needs no
+        incumbent and no LP point, only the root duals, which need not be
+        rigorous. ``None`` when ``seconds`` is not positive, there are no
+        root duals, fewer than ``_DUAL_FIX_MIN_FIXED`` of the free integers
+        would be fixed, or the box was searched at this cutoff."""
+        if (
+            seconds <= 0
+            or self.root_terms is None
+            or getattr(self, "root_lower", None) is None
+        ):
+            return None
+        ints = self.is_int
+        lower = self.lp_lower(self.root_lower)
+        upper = self.lp_upper(self.root_upper)
+        r = np.asarray(self.root_terms[1], np.float64)
+        if r.shape != lower.shape:
+            return None
+        zero = max(
+            self.reduced_cost_tol,
+            _DUAL_FIX_ZERO * (1.0 + np.abs(self.mip.c).max(initial=0.0)),
+        )
+        free = ints & (lower < upper)
+        n_free = int(free.sum())
+        target = np.where(r > 0, lower, upper)
+        candidates = np.flatnonzero(free & (np.abs(r) > zero) & np.isfinite(target))
+        k = min(int(math.ceil(self.dual_fix_rate * n_free)), candidates.size)
+        if n_free == 0 or k == 0 or k < _DUAL_FIX_MIN_FIXED * n_free:
+            return None
+        order = np.argsort(-np.abs(r[candidates]), kind="stable")[:k]
+        fix = np.zeros(ints.shape, bool)
+        fix[candidates[order]] = True
+        key = ("dualfix", fix.tobytes(), target[fix].tobytes(), self.cutoff())
+        if key in self.rins_seen:
+            return None
+        self.rins_seen.add(key)
+        return np.where(fix, target, lower), np.where(fix, target, upper)
+
+    def dual_fix(self):
+        """Dual-guided fixing (``dual_fix_box``) on the sub-MIP lane for
+        ``dual_fix_seconds``, pruned at the cutoff; marked ``"G"``. Returns
+        whether a job went in."""
+        seconds = self.submip_seconds_left(self.dual_fix_seconds)
+        box = self.dual_fix_box(seconds)
+        if box is None:
+            return False
+        self.submit_submip("dualfix", box, seconds)
+        self.dual_fix_calls += 1
+        return True
+
+    def adapt_dual_fixing(self, found, seconds):
+        """Move dual-guided fixing's rate after a lane job, as
+        ``adapt_rins_fixing`` moves RINS's: down by ``_RINS_FIXING_STEP``
+        after one that found nothing early (the box too small), up after
+        one that ran out of time (too large), within
+        ``[_DUAL_FIX_MIN_RATE, _DUAL_FIX_MAX_RATE]``; a new box follows
+        either way, since the fixed set changes with the rate."""
+        if found:
+            return
+        if seconds < _RINS_EARLY_SHARE * self.submip_budget:
+            rate = self.dual_fix_rate * _RINS_FIXING_STEP
+        else:
+            rate = self.dual_fix_rate / _RINS_FIXING_STEP
+        self.dual_fix_rate = min(_DUAL_FIX_MAX_RATE, max(_DUAL_FIX_MIN_RATE, rate))
+
     def submit_submip(self, kind, box, seconds):
         """Hand ``box`` of ``self.base`` to the sub-MIP lane, pruned at the
         cutoff."""
@@ -14573,7 +15070,7 @@ class _BranchAndBound:
             if getattr(self, "root_lower", None) is not None:
                 self.feed_first_solution()
             return
-        order = ("rins", "proximity", "crossover")
+        order = ("rins", "proximity", "crossover", "dualfix")
         start = order.index(self.submip_last) + 1 if self.submip_last in order else 0
         for kind in order[start:] + order[:start]:
             if kind == "rins":
@@ -14584,7 +15081,10 @@ class _BranchAndBound:
             elif kind == "proximity":
                 if self.proximity_seconds and self.proximity():
                     return
-            elif self.crossover_seconds and self.crossover():
+            elif kind == "crossover":
+                if self.crossover_seconds and self.crossover():
+                    return
+            elif self.dual_fix_seconds and self.dual_fix():
                 return
 
     def collect_submip(self):
@@ -14602,10 +15102,14 @@ class _BranchAndBound:
         if x is None:
             if kind == "rins":
                 self.adapt_rins_fixing(False, seconds)
+            elif kind == "dualfix":
+                self.adapt_dual_fixing(False, seconds)
             self.proximity_empty += empty
             return
         before = None if self.incumbent is None else self.incumbent[0]
-        source = {"rins": "N", "proximity": "X", "rens": "E", "first": "W"}.get(kind, "C")
+        source = {
+            "rins": "N", "proximity": "X", "rens": "E", "first": "W", "dualfix": "G"
+        }.get(kind, "C")
         self.try_incumbent(x, source, None)
         improved = self.incumbent is not None and (
             before is None or self.incumbent[0] < before
@@ -14619,6 +15123,9 @@ class _BranchAndBound:
             self.rens_finds += improved
         elif kind == "first":
             self.first_solution_finds += improved
+        elif kind == "dualfix":
+            self.adapt_dual_fixing(improved, seconds)
+            self.dual_fix_finds += improved
         else:
             self.crossover_finds += improved
 
@@ -14632,6 +15139,7 @@ class _BranchAndBound:
             return
         if not self.collect_probing():
             self.bound_floor = max(self.bound_floor, self.cutoff_bound())
+            self.proven_floor = max(self.proven_floor, self.cutoff_bound())
             self.close_all()
             return
         self.feed_probing()
@@ -15037,6 +15545,8 @@ class _BranchAndBound:
             crossover_seconds=0.0,
             proximity_seconds=0.0,
             first_solution_seconds=0.0,
+            dual_fix_seconds=0.0,
+            projected_pdhg=False,
             submip_solver="jaddle",
             cutoff_probing=False,
             dive_every=0,
@@ -15175,16 +15685,20 @@ class _BranchAndBound:
 
     def feed_first_solution(self):
         """The lane's work before the first incumbent: HiGHS on the whole
-        root box (``submit_first_solution``) and RENS around a node point
-        (``tree_rens``) take turns, each filling the lane when the other
-        has nothing to search."""
-        first = bool(self.first_solution_seconds)
-        if first and self.submip_last != "first" and self.submit_first_solution():
-            return
-        if self.rens_seconds and self.tree_rens():
-            return
-        if first:
-            self.submit_first_solution()
+        root box (``submit_first_solution``), RENS around a node point
+        (``tree_rens``) and dual-guided fixing (``dual_fix``) take turns,
+        each filling the lane when the others have nothing to search."""
+        order = ("first", "rens", "dualfix")
+        start = order.index(self.submip_last) + 1 if self.submip_last in order else 0
+        for kind in order[start:] + order[:start]:
+            if kind == "first":
+                if self.first_solution_seconds and self.submit_first_solution():
+                    return
+            elif kind == "rens":
+                if self.rens_seconds and self.tree_rens():
+                    return
+            elif self.dual_fix_seconds and self.dual_fix():
+                return
 
     def submit_first_solution(self):
         """HiGHS's MIP solver on the whole root box (``first_solution_seconds``),
@@ -15750,6 +16264,79 @@ class _BranchAndBound:
             if repaired is not None:
                 self.try_incumbent(repaired, "R", warm)
 
+    def projected_pdhg(self, lower, upper, result, deadline):
+        """
+        Integer-projected PDHG (``projected_pdhg``, the module function)
+        over the search's rows (cuts included) and the root box, from the
+        root LP's point and duals, ``projected_pdhg_lanes`` lanes for up to
+        ``projected_pdhg_iterations`` steps, at the LP's precision. After
+        each chunk, every lane whose best point is feasible on the device is
+        tried as an incumbent (``"I"``); with continuous variables, so is
+        the least violated one, whose integers ``try_incumbent``'s LP
+        repair may complete (PDHG's continuous values are never exact). It
+        stops at the first incumbent, or at ``deadline``. The least
+        violated point is kept (``projected_last``) for a jump. Returns
+        whether it found one.
+        """
+        mip, ints = self.mip, self.is_int
+        if not ints.any():
+            return False
+        self.projected_pdhg_calls += 1
+        lp_lower = np.where(ints, lower, mip.lower)
+        lp_upper = np.where(ints, upper, mip.upper)
+        warm = (result["solution"], result["opt_state"])
+        x0 = np.asarray(result["solution"].primal, np.float64)
+        y0 = self.duals(result["solution"])
+        if y0.shape[0] != mip.A.shape[0]:
+            y0 = None
+        dtype = np.float64 if np.dtype(self.dtype) == np.float64 else np.float32
+        # Single precision's round-off in a row's activity; the host checks.
+        tol = self.feas_tol if dtype == np.float64 else max(self.feas_tol, 1e-5)
+        tried = set()
+        found = [False]
+
+        def on_chunk(best_x, best_v):
+            if self.out_of_time():
+                return True
+            picks = list(np.flatnonzero(best_v <= tol))
+            if self.has_continuous and np.isfinite(best_v).any():
+                picks.append(int(np.argmin(best_v)))
+            for lane in picks:
+                key = best_x[lane][ints].tobytes()
+                if key in tried:
+                    continue
+                tried.add(key)
+                before = None if self.incumbent is None else self.incumbent[0]
+                self.try_incumbent(best_x[lane], "I", warm)
+                if self.incumbent is not None and (
+                    before is None or self.incumbent[0] < before
+                ):
+                    found[0] = True
+            return found[0]
+
+        best_x, best_v = projected_pdhg(
+            mip.A,
+            mip.row_lower,
+            mip.row_upper,
+            mip.b,
+            mip.c,
+            lp_lower,
+            lp_upper,
+            ints,
+            x0,
+            y0,
+            lanes=self.projected_pdhg_lanes,
+            iterations=self.projected_pdhg_iterations,
+            tol=tol,
+            deadline=deadline,
+            dtype=dtype,
+            on_chunk=on_chunk,
+        )
+        if np.isfinite(best_v).any():
+            self.projected_last = best_x[int(np.argmin(best_v))]
+        self.projected_pdhg_finds += found[0]
+        return found[0]
+
     def root_heuristics(self, lower, upper, result, improve=True):
         """Fix-and-propagate from the root LP point, then the feasibility
         pump while there is no incumbent, within the heuristic budget. It
@@ -15782,7 +16369,10 @@ class _BranchAndBound:
         # jump from the LP point took the whole budget, though a jump from
         # zero finds a point in under a second.
         stages = [
-            int(self.use_bulk_rounding) + 2 * int(self.use_jump) + int(self.use_pump)
+            int(self.use_bulk_rounding)
+            + 2 * int(self.use_jump)
+            + int(self.use_projected_pdhg)
+            + int(self.use_pump)
         ]
 
         def stage_deadline():
@@ -15810,6 +16400,18 @@ class _BranchAndBound:
                 if self.incumbent is not None or time.time() >= deadline:
                     break
                 self.jump(start, lower, upper, warm, stage_deadline(), seed)
+        if self.use_projected_pdhg and self.incumbent is None:
+            own = stage_deadline()
+            self.projected_last = None
+            self.projected_pdhg(lower, upper, result, own)
+            if (
+                self.use_jump
+                and self.incumbent is None
+                and self.projected_last is not None
+                and time.time() < own
+            ):
+                # Its least violated point: integral, near feasible.
+                self.jump(self.projected_last, lower, upper, warm, own, seed=4)
         if self.use_pump and self.incumbent is None:
             self.feasibility_pump(lower, upper, result, deadline)
             if (
@@ -15846,9 +16448,11 @@ class _BranchAndBound:
         heap's top."""
         if self.plunge_node is not None and not self.exact_plunges_on():
             node, self.plunge_node = self.plunge_node, None
+            self.in_transit.append(node)
             return node
         _, _, node = heapq.heappop(self.open)
         self.plunge_left = self.plunge_depth
+        self.in_transit.append(node)
         return node
 
     def node_batch(
@@ -16128,6 +16732,7 @@ class _BranchAndBound:
             self.pending_children = None
             self.finish_branches(pending)
         current, self.in_flight = self.in_flight, self.launch_next()
+        self.in_transit = []  # the new batch is ``in_flight``
         if current is not None:
             self.process_batch(current)
             self.pending_children = self.launch_branches()
@@ -16186,12 +16791,16 @@ class _BranchAndBound:
                     self.exact_plunge_stats["plunges"] += 1
                 else:
                     break
+                self.in_transit.append(node)
                 if node.bound >= self.cutoff():
-                    self.close(node.bound)
+                    self.close(node.bound, proven=node.proven)
                     continue
                 lower, upper = self.expand(node.changes)
                 if np.any(lower > upper):
-                    self.close(max(node.bound, self.cutoff_bound()))
+                    self.close(
+                        max(node.bound, self.cutoff_bound()),
+                        proven=max(node.proven, self.cutoff_bound()),
+                    )
                     continue
                 box = self.prune_by_conflicts(node, lower, upper)
                 if box is None:
@@ -16213,13 +16822,18 @@ class _BranchAndBound:
         finally:
             self.exact_plunge_active = False
             self.exact_plunge_seconds += time.time() - started
+            if not self.deferring and self.in_flight is None:
+                self.in_transit = []
 
     def pipeline_nodes(self):
         """The nodes the pipeline holds outside the queue
         (``pipeline_batches``): those dispatched and not yet evaluated, and
         those evaluated whose children are still on the device. The global
-        bound counts them."""
-        nodes = []
+        bound counts them, and the nodes in transit (``in_transit``): a
+        progress line printed while a batch was being built (an exact node
+        evaluated meanwhile, or the heartbeat) showed buildingenergy's
+        bound at 33,340, past its optimum, until the next line."""
+        nodes = list(self.in_transit)
         if self.in_flight is not None:
             nodes += self.in_flight["members"]
         if self.pending_children is not None:
@@ -16427,11 +17041,14 @@ class _BranchAndBound:
             while lane is not None and self.exact_reserved and lane.room():
                 _, _, node = heapq.heappop(self.exact_reserved)
                 if node.bound >= self.cutoff():
-                    self.close(node.bound)
+                    self.close(node.bound, proven=node.proven)
                     continue
                 box = self.expand(node.changes)
                 if np.any(box[0] > box[1]):
-                    self.close(max(node.bound, self.cutoff_bound()))
+                    self.close(
+                        max(node.bound, self.cutoff_bound()),
+                        proven=max(node.proven, self.cutoff_bound()),
+                    )
                     continue
                 box = self.prune_by_conflicts(node, *box)
                 if box is None:
@@ -16464,6 +17081,7 @@ class _BranchAndBound:
         take = min(limit, excess)
         reserved.sort()  # a sorted list is still a heap
         nodes = [entry[2] for entry in reserved[-take:]]
+        self.in_transit.extend(nodes)
         del reserved[-take:]
         for node in nodes:
             node.exact_tried = node.converge = True
@@ -16568,13 +17186,16 @@ class _BranchAndBound:
         self.exact_warm_bases += bool(extra["warm"])
         status, x, y_eq, y_ineq = outcome
         if node.bound >= self.cutoff():
-            self.close(node.bound)
+            self.close(node.bound, proven=node.proven)
             return
         lp_seconds = seconds - strong_seconds
         if status == "infeasible":
             self.exact_infeasible += 1
             self.record_band_edge(node, "exact", self.cutoff() - node.bound, lp_seconds)
-            self.close(max(node.bound, self.cutoff_bound()))
+            self.close(
+                max(node.bound, self.cutoff_bound()),
+                proven=max(node.proven, self.cutoff_bound()),
+            )
             return
         solution = None
         if status == "optimal" and version <= self.cut_version:
@@ -16651,7 +17272,9 @@ class _BranchAndBound:
             else:
                 lo[var] = max(lo[var], math.ceil(x[var]))
             if status == "infeasible" or lo[var] > up[var]:
-                sides.setdefault(var, {})[down] = _StrongChild(np.inf, True, None)
+                sides.setdefault(var, {})[down] = _StrongChild(
+                    np.inf, True, None, proven=np.inf
+                )
                 continue
             child = None
             if status in ("optimal", "partial"):
@@ -16660,7 +17283,10 @@ class _BranchAndBound:
                 sides.setdefault(var, {})[down] = None
                 continue
             raw, rigorous = self.known_bound(known, (var, down), child, lo, up)
-            if not (rigorous and np.isfinite(raw)):
+            proven = -np.inf
+            if rigorous and np.isfinite(raw):
+                proven = self.round_bound(raw)
+            else:
                 raw = node.bound
             bound = max(self.round_bound(raw), node.bound)
             closed = rigorous and bound >= self.cutoff()
@@ -16670,6 +17296,7 @@ class _BranchAndBound:
                 None if closed else child,
                 raw,
                 status == "optimal" and not closed,
+                proven,
             )
             distance = x[var] - math.floor(x[var]) if down else math.ceil(x[var]) - x[var]
             if distance > 0 and np.isfinite(node_raw) and np.isfinite(raw):
@@ -16849,11 +17476,14 @@ class _BranchAndBound:
                 int(self.exact_overflow_share * self.batch_size)
             ):
                 if node.bound >= self.cutoff():
-                    self.close(node.bound)
+                    self.close(node.bound, proven=node.proven)
                     continue
                 box = self.expand(node.changes)
                 if np.any(box[0] > box[1]):
-                    self.close(max(node.bound, self.cutoff_bound()))
+                    self.close(
+                        max(node.bound, self.cutoff_bound()),
+                        proven=max(node.proven, self.cutoff_bound()),
+                    )
                     continue
                 box = self.prune_by_conflicts(node, *box)
                 if box is None:
@@ -16871,7 +17501,7 @@ class _BranchAndBound:
             from_heap = self.plunge_node is None or self.exact_plunges_on()
             node = self.next_node()
             if node.bound >= self.cutoff():
-                self.close(node.bound)
+                self.close(node.bound, proven=node.proven)
                 continue
             eligible = from_heap and self.exact_eligible(node)
             if eligible and node.bound <= band_top:
@@ -16888,7 +17518,10 @@ class _BranchAndBound:
             box = self.expand(node.changes)
             if np.any(box[0] > box[1]):
                 # Emptied by reduced-cost fixing of the root box.
-                self.close(max(node.bound, self.cutoff_bound()))
+                self.close(
+                    max(node.bound, self.cutoff_bound()),
+                    proven=max(node.proven, self.cutoff_bound()),
+                )
                 continue
             box = self.prune_by_conflicts(node, *box)
             if box is None:
@@ -16938,6 +17571,7 @@ class _BranchAndBound:
     def _process_batch(self, batch):
         members, boxes = batch["members"], batch["boxes"]
         self.batch_waiting = members
+        self.in_transit = []
         # The members wait in ``batch_waiting`` and none is being evaluated:
         # the exact lane is serviced while the device finishes their LPs.
         results = self.read_batch(batch["handle"], service=True)
@@ -16967,7 +17601,7 @@ class _BranchAndBound:
                 self.bound_stops += result["stop_reason"] == "bound_target"
                 # An incumbent found by an earlier member may prune this one.
                 if node.bound >= self.cutoff():
-                    self.close(node.bound)
+                    self.close(node.bound, proven=node.proven)
                     continue
                 lower, upper = boxes[i]
                 requeues = self.batch_requeues
@@ -17406,6 +18040,7 @@ class _BranchAndBound:
         # global bound down meanwhile (for incumbents logged by the root
         # heuristics), from its LP bound once that is known.
         self.active_bound = -np.inf
+        self.active_proven = -np.inf
         if self.mip_start is not None:
             # The user's starting point (``mip_start``), once, before the
             # root LP: its value prunes and fixes from the start.
@@ -17466,10 +18101,9 @@ class _BranchAndBound:
         # The root LP's bound holds for the root box whatever its duals, so
         # it is the global bound from now (the first incumbent's line, and
         # the heartbeat's through the cut rounds, showed -inf before).
-        self.active_bound = max(
-            self.active_bound,
-            self.round_bound(self.lp_bound(result["solution"], lower, upper)[0]),
-        )
+        raw, rigorous = self.lp_bound(result["solution"], lower, upper)
+        self.active_bound = max(self.active_bound, self.round_bound(raw))
+        self.raise_root_proven(raw, rigorous)
         # Points the early root jumps found while the LP was solved.
         self.collect_heuristics(schedule=False)
         if result["stop_reason"] == "interrupted":
@@ -17480,6 +18114,7 @@ class _BranchAndBound:
             or self.use_bulk_rounding
             or self.use_jump
             or self.use_pump
+            or self.use_projected_pdhg
         )
         cut_loop_due = (
             self.cuts
@@ -17501,7 +18136,7 @@ class _BranchAndBound:
         if cut_loop_due and not self.out_of_time():
             result = self.cut_loop(lower, upper, result)
             if result["stop_reason"] != "interrupted" and self.root_closed():
-                return self.empty_root()
+                return self.empty_root(self.proven_bound())
             lp =self.node_lp(lower, upper)
             if self.cut_list and self.propagator is not None:
                 # Within the root box, which cutoff probing may have fixed
@@ -17522,21 +18157,21 @@ class _BranchAndBound:
             lp = self.node_lp(lower, upper)
         if result["stop_reason"] == "time_limit" or self.out_of_time():
             bound, rigorous = self.lp_bound(result["solution"], lower, upper)
-            self.close(bound, rigorous)
+            self.raise_root_proven(bound, rigorous)
+            self.close(bound, rigorous, proven=self.active_proven)
             return self.result("time_limit")
         # Every round's bound holds for the root box (the cuts are valid,
         # and propagation only narrows the box), so keep the rounds' best:
         # the last re-solve's can be lower.
-        self.active_bound = max(
-            self.active_bound,
-            self.round_bound(self.lp_bound(result["solution"], lower, upper)[0]),
-        )
+        raw, rigorous = self.lp_bound(result["solution"], lower, upper)
+        self.active_bound = max(self.active_bound, self.round_bound(raw))
+        self.raise_root_proven(raw, rigorous)
         rounds_bound = self.active_bound
         # A point HiGHS found beside the cut rounds gives the heuristics
         # below a cutoff (and spares those that run only without one).
         self.collect_heuristics(schedule=False)
         if self.root_closed():
-            return self.empty_root()
+            return self.empty_root(self.proven_bound())
         if self.use_round_repair and not self.out_of_time():
             # Round and repair first, from an exact vertex when the root is
             # crossed over anyway (RENS, ``root_crossover``): the later
@@ -17563,7 +18198,7 @@ class _BranchAndBound:
         if use_root_heuristics:
             self.root_heuristics(lower, upper, result)
         if self.root_closed():
-            return self.empty_root()
+            return self.empty_root(self.proven_bound())
         root_x = np.asarray(result["solution"].primal, np.float64)
         root_warm = (result["solution"], result["opt_state"])
         if self.rens_seconds and not self.out_of_time():
@@ -17616,6 +18251,7 @@ class _BranchAndBound:
         # re-solve's 33,242.52, and the tree's bound stayed there.
         if np.isfinite(rounds_bound):
             root.bound = max(root.bound, rounds_bound)
+        root.proven = max(root.proven, self.active_proven)
         # The root branched as an exact lane node (``exact_root_candidates``).
         result = self.root_exact_strong(root, lower, upper, result) or result
         self.evaluate(root, lower, upper, lp, result)
@@ -17626,6 +18262,7 @@ class _BranchAndBound:
     def _tree(self):
         """The node loop. Returns the search's status, or ``"restart"``."""
         status = "optimal"
+        checked = None  # the incumbent the last convergence check saw
         # The tree's clock, for strong branching's share (``strong_branching_on``),
         # summed over the rounds between restarts.
         self.tree_clock = (time.time(), self.strong_branch_seconds)
@@ -17640,6 +18277,8 @@ class _BranchAndBound:
                     and (self.exact_lane.jobs or self.exact_reserved)
                 )
             ):
+                # Every node taken last iteration is in a list by now.
+                self.in_transit = []
                 self.collect_heuristics()
                 collecting = time.perf_counter()
                 self.collect_exact()
@@ -17669,7 +18308,14 @@ class _BranchAndBound:
                 if self.max_nodes is not None and self.nodes >= self.max_nodes:
                     status = "node_limit"
                     break
-                if self.incumbent is not None and self.nodes % 20 == 0:
+                # The global bound against the cutoff every 20 nodes, and at
+                # once when the incumbent changes: a new one can close the
+                # gap, and with batches ``nodes`` seldom lands on a multiple
+                # of 20.
+                if self.incumbent is not None and (
+                    self.nodes % 20 == 0 or self.incumbent[0] != checked
+                ):
+                    checked = self.incumbent[0]
                     if self.global_bound() >= self.cutoff():
                         break
                 if not self.tighten_root():
@@ -17683,12 +18329,15 @@ class _BranchAndBound:
                     continue
                 node = self.next_node()
                 if node.bound >= self.cutoff():
-                    self.close(node.bound)
+                    self.close(node.bound, proven=node.proven)
                     continue
                 lower, upper = self.expand(node.changes)
                 if np.any(lower > upper):
                     # Emptied by reduced-cost fixing of the root box.
-                    self.close(max(node.bound, self.cutoff_bound()))
+                    self.close(
+                        max(node.bound, self.cutoff_bound()),
+                        proven=max(node.proven, self.cutoff_bound()),
+                    )
                     continue
                 box = self.prune_by_conflicts(node, lower, upper)
                 if box is None:
@@ -17912,6 +18561,11 @@ def solve(
     crossover_min_fixed=0.5,
     proximity_seconds=10.0,
     first_solution_seconds=0.0,
+    dual_fix_seconds=0.0,
+    dual_fix_rate=0.7,
+    projected_pdhg=False,
+    projected_pdhg_lanes=8,
+    projected_pdhg_iterations=2000,
     objective_levels=True,
     objective_level_seconds=2.0,
     cut_round_lp="jaddle",
@@ -18615,6 +19269,34 @@ def solve(
       while HiGHS on the whole MIP finds its first point, the optimum, at
       20 s. Results: ``first_solution_calls``, ``first_solution_finds``,
       ``rens_calls`` and ``rens_finds``.
+    * **Dual-guided fixing** (``dual_fix_seconds``, default 0: off; a
+      call's seconds; needs ``submip_solver="highs"``). The root LP's
+      reduced costs ``r = c + Aᵀy`` rank the free integers of the root box:
+      the share ``dual_fix_rate`` (default 0.7) with the largest ``|rⱼ|``
+      are fixed at the bound their sign prefers, and HiGHS searches the
+      rest below the cutoff, marked ``"G"``. It is reduced-cost fixing
+      without the proof: an integer off that bound costs the LP bound at
+      least ``|rⱼ|``, so good solutions seldom move it, and any point found
+      is feasible. It needs no incumbent and no LP point, so it takes turns
+      with HiGHS's first solution and RENS before the first incumbent, and
+      with RINS, proximity search and crossover after it. The rate moves as
+      RINS's does (down after a box HiGHS shows empty early, up after one
+      that runs out of time, within 0.1–0.95). Results: ``dual_fix_calls``,
+      ``dual_fix_finds`` and ``dual_fix_rate``.
+    * **Integer-projected PDHG** (``projected_pdhg``, off by default): at
+      the root, before the feasibility pump while there is no incumbent,
+      PDHG on the LP from the root LP's point and duals, with the primal
+      step's projection onto the box replaced, for the integers, by a
+      rounding (as the nonconvex-ADMM heuristic of Takapoui, Moehle, Boyd
+      and Bemporad). The iterates stay integral; the duals gather the rows'
+      violations until they move integers, and a fixed point is feasible.
+      ``projected_pdhg_lanes`` (default 8) run at once on the device, with
+      objective weights 1, 0.3, 0.1 and 0.03 (duals scaled to match) and
+      plain or noisy rounding, for up to ``projected_pdhg_iterations``
+      (default 2,000) steps; no LP is solved. Points are marked ``"I"``; the
+      least violated one (with continuous variables, completed by the LP
+      repair) is tried, and a jump starts from it if nothing was found.
+      Results: ``projected_pdhg_calls`` and ``projected_pdhg_finds``.
     * **Cutoff probing** (``cutoff_probing``, on by default), on
       ``cutoff_probing_threads`` CPU threads (default 4) of its own. Once
       there is an incumbent, every free integer of the root box is tried
@@ -18899,6 +19581,16 @@ def solve(
     * ``"objective"``: its value in the model's own sense, offset included.
     * ``"bound"``: the proven bound on the optimum in the model's sense (a
       lower bound for a minimisation, an upper bound for a maximisation).
+      Only rigorous bounds count towards it. A Lagrangian bound that drops
+      wrong-sign reduced costs at infinite bounds (within the LP
+      tolerance; see ``lagrangian_bound``) still prunes, but a region it
+      closes keeps only the rigorous bound it had (from an exact root
+      crossover, the exact lane's LPs, propagation, and every bound of a
+      model whose duals drop nothing).
+    * ``"search_bound"``: the bound the search pruned on: ``"bound"`` when
+      every bound was rigorous, and possibly past the optimum otherwise
+      (on buildingenergy at ``lp_tolerance=1e-3``, 33,287.8 against an
+      optimum of 33,283.85).
     * ``"gap"``: ``|objective − bound| / |objective|``.
     * ``"status"``: ``"optimal"`` (gap within tolerance), ``"infeasible"``,
       ``"unbounded_or_infeasible"`` (the LP relaxation is unbounded),
@@ -18910,8 +19602,11 @@ def solve(
       far and a valid bound (it stops as a time limit would, the LP being
       solved at its next chunk); a second press raises
       ``KeyboardInterrupt``.
-    * ``"bound_rigorous"``: False when a bound used a dropped reduced cost
-      (see ``lagrangian_bound``).
+    * ``"bound_rigorous"``: False when the search's bound used a dropped
+      reduced cost (see ``lagrangian_bound``), so ``"search_bound"`` is no
+      proof and ``"bound"`` lies below it. The status is the search's:
+      ``"optimal"`` then means the search closed its gap on bounds that are
+      not all proofs.
     * ``"nodes"`` (nodes finished: with batched node LPs, a node whose LP
       goes back to the queue unconverged counts once, when it finishes;
       the returns are ``"batch_requeues"``), ``"infeasible_nodes"``
@@ -19154,6 +19849,11 @@ def solve(
         crossover_min_fixed=crossover_min_fixed,
         proximity_seconds=proximity_seconds,
         first_solution_seconds=first_solution_seconds,
+        dual_fix_seconds=dual_fix_seconds,
+        dual_fix_rate=dual_fix_rate,
+        projected_pdhg=projected_pdhg,
+        projected_pdhg_lanes=projected_pdhg_lanes,
+        projected_pdhg_iterations=projected_pdhg_iterations,
         objective_levels=objective_levels,
         objective_level_seconds=objective_level_seconds,
         cut_round_lp=cut_round_lp,
@@ -19232,6 +19932,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "x": None,
             "objective": None,
             "bound": None,
+            "search_bound": None,
             "gap": np.inf,
             "status": status_name,
             "converged": False,
@@ -19322,6 +20023,11 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "rens_finds": 0,
             "first_solution_calls": 0,
             "first_solution_finds": 0,
+            "dual_fix_calls": 0,
+            "dual_fix_finds": 0,
+            "dual_fix_rate": float(dual_fix_rate),
+            "projected_pdhg_calls": 0,
+            "projected_pdhg_finds": 0,
             "rins_fixing_rate": 1.0,
             "batch_timing": {
                 "wait_seconds": 0.0, "evaluate_seconds": 0.0, "bound_seconds": 0.0,
@@ -19388,16 +20094,26 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
         reduced_x = result["x"]
         if reduced_x is None and start_x is not None:
             # Nothing better than the start: it is the answer.
+
+            def min_form(key):
+                value = result.get(key)
+                return np.nan if value is None else original.sign * value
+
             if result["status"] == "infeasible":
-                # Proven: no point beats the cutoff.
+                # No point beats the cutoff: proven as far as the search's
+                # bound is (``bound``, its proven part, can be lower).
                 result["status"], result["converged"] = "optimal", True
-                bound = settings["initial_cutoff"] + reduced.offset
+                search = settings["initial_cutoff"] + reduced.offset
+                proven = min_form("bound")
+                bound = search if np.isnan(proven) else min(search, proven)
             else:
-                bound = original.sign * result["bound"]
+                bound, search = min_form("bound"), min_form("search_bound")
                 bound = start_value if np.isnan(bound) else min(bound, start_value)
+                search = start_value if np.isnan(search) else min(search, start_value)
             result["x"] = start_x
             result["objective"] = original.objective(start_x)
             result["bound"] = original.sign * bound
+            result["search_bound"] = original.sign * search
             result["gap"] = _relative_gap(start_value, bound)
             result["postsolve_feasible"] = True
             result["seconds"] = time.time() - start
@@ -19416,7 +20132,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
     result["objective"] = original.objective(x)
     result["postsolve_feasible"] = original.is_feasible(x, feasibility_tolerance)
     if status == PS.kReducedToEmpty:
-        result["bound"] = result["objective"]
+        result["bound"] = result["search_bound"] = result["objective"]
         result["gap"] = 0.0
     result["seconds"] = time.time() - start
     return result
