@@ -25,6 +25,7 @@ import numba as nb
 import numpy as np
 
 COVER, MIR, FLOW = 0, 1, 2  # cut families, as ``separate`` reports them
+vb_tie = 1e-6  # ``jaddle_mip._VB_TIE``
 
 
 # %%
@@ -412,13 +413,24 @@ def _substituted_cmir(
         if is_int[y] or vb_ptr[y] == vb_ptr[y + 1]:
             continue
         a_y, x_y = vals[pos[y]], x[y]
-        best_distance = min(x_y - lower[y], upper[y] - x_y)
+        # Ties go to the side whose shifted term the MIR drops (kind 1, a
+        # lower bound, when a_y > 0; kind 0 when a_y < 0), as in jaddle_mip.
+        prefer = 1 if a_y > 0 else 0
+        lb_distance, ub_distance = x_y - lower[y], upper[y] - x_y
+        best_distance = min(lb_distance, ub_distance)
+        held = 1 if lb_distance <= ub_distance else 0
         best = -1
         for e in range(vb_ptr[y], vb_ptr[y + 1]):
             implied = vb_d[e] + vb_c[e] * x[vb_z[e]]
             distance = implied - x_y if vb_kind[e] == 0 else x_y - implied
-            if distance <= best_distance + 1e-9:
-                best_distance, best = distance, e
+            if distance < best_distance - vb_tie:
+                better = True
+            elif distance <= best_distance + vb_tie:
+                better = vb_kind[e] == prefer or held != prefer
+            else:
+                better = False
+            if better:
+                best_distance, best, held = distance, e, vb_kind[e]
         if best < 0:
             continue
         kind, z, c, d = vb_kind[best], vb_z[best], vb_c[best], vb_d[best]
@@ -722,9 +734,91 @@ def flow_cover_cut(
 
 
 @nb.njit(cache=True)
+def _cancel_order(idx, a, x, lower, upper, is_int, aggregate_integers):
+    """``CutSeparator._cancel_order``: the positions worth cancelling, best
+    first."""
+    k = idx.size
+    score = np.empty(k)
+    best = -np.inf
+    for p in range(k):
+        j = idx[p]
+        if is_int[j]:
+            d = -1.0
+        else:
+            d = min(x[j] - lower[j], upper[j] - x[j])
+            if np.isnan(d):
+                d = 0.0
+            elif d == np.inf:
+                d = 1e30
+            elif d == -np.inf:
+                d = -np.finfo(np.float64).max
+        score[p] = d
+        best = max(best, d)
+    if best <= 1e-6:
+        if not aggregate_integers:
+            return np.empty(0, np.int64)
+        for p in range(k):
+            j = idx[p]
+            if is_int[j]:
+                frac = x[j] - math.floor(x[j])
+                score[p] = abs(a[p]) * min(frac, 1.0 - frac)
+            else:
+                score[p] = -1.0
+    order = np.argsort(-score, kind="mergesort")
+    count = 0
+    while count < k and score[order[count]] > 1e-6:
+        count += 1
+    return order[:count]
+
+
+@nb.njit(cache=True)
+def _partner(col, coef, used, C_ptr, C_row, C_val, relative, is_eq):
+    """``CutSeparator._partner``: ``(row, weight)``, row ``-1`` for none."""
+    c_start, c_end = C_ptr[col], C_ptr[col + 1]
+    rows = C_row[c_start:c_end]
+    for q in np.argsort(relative[rows], kind="mergesort"):
+        r2, a2 = rows[q], C_val[c_start + q]
+        if a2 == 0 or r2 in used:
+            continue
+        weight = -coef / a2
+        if weight < 0 and not is_eq[r2]:
+            continue  # a <= row can only be added with a weight >= 0
+        return r2, weight
+    return -1, 0.0
+
+
+@nb.njit(cache=True)
+def _add_row(idx, a, b, col, partner, lam, A_ptr, A_idx, A_val, b_rows):
+    """``CutSeparator._add_row``."""
+    s2, e2 = A_ptr[partner], A_ptr[partner + 1]
+    both = np.concatenate((idx, A_idx[s2:e2]))
+    values = np.concatenate((a, lam * A_val[s2:e2]))
+    order = np.argsort(both, kind="mergesort")
+    merged_idx = np.empty(both.size, np.int64)
+    merged = np.empty(both.size)
+    m = -1
+    for q in order:
+        if m < 0 or both[q] != merged_idx[m]:
+            m += 1
+            merged_idx[m] = both[q]
+            merged[m] = 0.0
+        merged[m] += values[q]
+    m += 1
+    merged_idx, merged = merged_idx[:m], merged[:m]
+    largest = 1.0
+    for q in range(m):
+        if merged_idx[q] == col:
+            merged[q] = 0.0
+        largest = max(largest, abs(merged[q]))
+    nonzero = np.abs(merged) > 1e-12 * largest
+    return merged_idx[nonzero], merged[nonzero], b + lam * b_rows[partner]
+
+
+@nb.njit(cache=True)
 def aggregation_path(
     r, s, x, lower, upper, is_int, A_ptr, A_idx, A_val, b_rows, is_eq,
     C_ptr, C_row, C_val, relative, max_aggregation, aggregate_integers,
+    aggregation_width,
 ):
     """``CutSeparator._aggregation_path``: lists of each level's columns,
     coefficients and right-hand side."""
@@ -732,84 +826,56 @@ def aggregation_path(
     idx = A_idx[start:end].copy()
     a = s * A_val[start:end]
     b = s * b_rows[r]
-    used = [r]
     path_idx, path_a, path_b = [idx], [a], [b]
-    for level in range(max_aggregation):
-        k = idx.size
-        best_pos, best_score = 0, -np.inf
-        for p in range(k):
-            j = idx[p]
-            if is_int[j]:
-                d = -1.0
-            else:
-                d = min(x[j] - lower[j], upper[j] - x[j])
-                if np.isnan(d):
-                    d = 0.0
-                elif d == np.inf:
-                    d = 1e30
-                elif d == -np.inf:
-                    d = -np.finfo(np.float64).max
-            if d > best_score:
-                best_pos, best_score = p, d
-        if best_score <= 1e-6:
-            if not aggregate_integers:
+    if max_aggregation <= 0 or idx.size == 0:
+        return path_idx, path_a, path_b
+    start_col = [0]
+    start_col.pop()
+    start_row = [0]
+    start_row.pop()
+    start_lam = [0.0]
+    start_lam.pop()
+    first = [r]
+    order = _cancel_order(idx, a, x, lower, upper, is_int, aggregate_integers)
+    for pos in order[:aggregation_width]:
+        r2, lam = _partner(idx[pos], a[pos], first, C_ptr, C_row, C_val, relative, is_eq)
+        if r2 < 0:
+            continue
+        seen = False
+        for q in range(len(start_row)):
+            if start_row[q] == r2 and start_lam[q] == lam:
+                seen = True
+        if not seen:
+            start_col.append(idx[pos])
+            start_row.append(r2)
+            start_lam.append(lam)
+    for branch in range(len(start_row)):
+        col, r2, lam = start_col[branch], start_row[branch], start_lam[branch]
+        used = [r]
+        level_idx, level_a, level_b = idx, a, b
+        for level in range(max_aggregation):
+            if level > 0:
+                order = _cancel_order(
+                    level_idx, level_a, x, lower, upper, is_int, aggregate_integers
+                )
+                if order.size == 0:
+                    break
+                pos = order[0]
+                col = level_idx[pos]
+                r2, lam = _partner(
+                    col, level_a[pos], used, C_ptr, C_row, C_val, relative, is_eq
+                )
+                if r2 < 0:
+                    break
+            level_idx, level_a, level_b = _add_row(
+                level_idx, level_a, level_b, col, r2, lam, A_ptr, A_idx, A_val, b_rows
+            )
+            used.append(r2)
+            if level_idx.size == 0:
                 break
-            best_pos, best_score = 0, -np.inf
-            for p in range(k):
-                j = idx[p]
-                if is_int[j]:
-                    frac = x[j] - math.floor(x[j])
-                    score = abs(a[p]) * min(frac, 1.0 - frac)
-                else:
-                    score = -1.0
-                if score > best_score:
-                    best_pos, best_score = p, score
-            if best_score <= 1e-6:
-                break
-        col, coef = idx[best_pos], a[best_pos]
-        c_start, c_end = C_ptr[col], C_ptr[col + 1]
-        rows = C_row[c_start:c_end]
-        partner, lam = -1, 0.0
-        for q in np.argsort(relative[rows], kind="mergesort"):
-            r2, a2 = rows[q], C_val[c_start + q]
-            if a2 == 0 or r2 in used:
-                continue
-            weight = -coef / a2
-            if weight < 0 and not is_eq[r2]:
-                continue  # a <= row can only be added with a weight >= 0
-            partner, lam = r2, weight
-            break
-        if partner < 0:
-            break
-        s2, e2 = A_ptr[partner], A_ptr[partner + 1]
-        both = np.concatenate((idx, A_idx[s2:e2]))
-        values = np.concatenate((a, lam * A_val[s2:e2]))
-        order = np.argsort(both, kind="mergesort")
-        merged_idx = np.empty(both.size, np.int64)
-        merged = np.empty(both.size)
-        m = -1
-        for q in order:
-            if m < 0 or both[q] != merged_idx[m]:
-                m += 1
-                merged_idx[m] = both[q]
-                merged[m] = 0.0
-            merged[m] += values[q]
-        m += 1
-        merged_idx, merged = merged_idx[:m], merged[:m]
-        largest = 1.0
-        for q in range(m):
-            if merged_idx[q] == col:
-                merged[q] = 0.0
-            largest = max(largest, abs(merged[q]))
-        nonzero = np.abs(merged) > 1e-12 * largest
-        idx, a = merged_idx[nonzero], merged[nonzero]
-        b = b + lam * b_rows[partner]
-        used.append(partner)
-        if idx.size == 0:
-            break
-        path_idx.append(idx)
-        path_a.append(a)
-        path_b.append(b)
+            path_idx.append(level_idx)
+            path_a.append(level_a)
+            path_b.append(level_b)
     return path_idx, path_a, path_b
 
 
@@ -830,7 +896,7 @@ def separate(
     A_ptr, A_idx, A_val, b_rows, is_eq, C_ptr, C_row, C_val, relative,
     has_vb, vb_ptr, vb_kind, vb_z, vb_c, vb_d,
     max_aggregation, aggregate_integers, flow_covers, max_divisors, max_covers,
-    knapsack_tol, cut_tiny,
+    knapsack_tol, cut_tiny, aggregation_width=1, cmir_per_row=1,
 ):
     """``CutSeparator._separate`` without the clique and implied-bound cuts:
     the cleaned cuts of the rows ``rows`` (already the tight ones, in
@@ -866,11 +932,19 @@ def separate(
             p_idx, p_a, p_b = aggregation_path(
                 r, s, x, lower, upper, is_int, A_ptr, A_idx, A_val, b_rows, is_eq,
                 C_ptr, C_row, C_val, relative, max_aggregation, aggregate_integers,
+                aggregation_width,
             )
-            # ``_path_cuts``: the best c-MIR cut over the levels, then each
-            # level's flow cover cut and, beyond the row, its cover cuts.
-            best, best_eff = False, 0.0
-            best_idx, best_coef, best_rhs = np.empty(0, np.int64), np.empty(0), 0.0
+            # ``_path_cuts``: the ``cmir_per_row`` best c-MIR cuts over the
+            # levels, then each level's flow cover cut and, beyond the row,
+            # its cover cuts.
+            mir_eff = [0.0]
+            mir_eff.pop()
+            mir_idx = [np.empty(0, np.int64)]
+            mir_idx.pop()
+            mir_coef = [np.empty(0)]
+            mir_coef.pop()
+            mir_rhs = [0.0]
+            mir_rhs.pop()
             extra_fam = [0]
             extra_fam.pop()
             extra_idx = [np.empty(0, np.int64)]
@@ -887,9 +961,11 @@ def separate(
                 )
                 if ok:
                     eff = _efficacy(m_idx, m_coef, m_rhs, x)
-                    if eff > best_eff:
-                        best, best_eff = True, eff
-                        best_idx, best_coef, best_rhs = m_idx, m_coef, m_rhs
+                    if eff > 0.0:
+                        mir_eff.append(eff)
+                        mir_idx.append(m_idx)
+                        mir_coef.append(m_coef)
+                        mir_rhs.append(m_rhs)
                 if flow_covers and not is_int[idx].all():
                     ok, f_idx, f_coef, f_rhs = flow_cover_cut(
                         idx, a, b, x, lower, upper, is_int,
@@ -909,9 +985,13 @@ def separate(
                         extra_idx.append(c_idx[k])
                         extra_coef.append(c_coef[k])
                         extra_rhs.append(c_rhs[k])
-            if best:
-                _add(fams, cut_idx, cut_coef, cut_rhs, MIR, best_idx, best_coef,
-                     best_rhs, lower, upper, cut_tiny)
+            if len(mir_eff):
+                effs = np.empty(len(mir_eff))
+                for k in range(len(mir_eff)):
+                    effs[k] = -mir_eff[k]
+                for k in np.argsort(effs, kind="mergesort")[:cmir_per_row]:
+                    _add(fams, cut_idx, cut_coef, cut_rhs, MIR, mir_idx[k],
+                         mir_coef[k], mir_rhs[k], lower, upper, cut_tiny)
             for k in range(len(extra_fam)):
                 _add(fams, cut_idx, cut_coef, cut_rhs, extra_fam[k], extra_idx[k],
                      extra_coef[k], extra_rhs[k], lower, upper, cut_tiny)

@@ -3584,6 +3584,51 @@ def test_variable_bound_cmir_is_stronger():
     assert plain is None or efficacy(substituted) > efficacy(plain) + 1e-6
 
 
+@pytest.mark.parametrize("backend", ["numpy", "jax", "numba"])
+def test_variable_bound_ties_give_the_cut_set_inequality(backend):
+    # A node set with net demand 1, inflows y0, y1 and outflows y2, y3, each
+    # arc y_j <= 82·z_j (beasleyC3's two-node cut sets). At the LP point
+    # only arc 1 carries flow, on its VUB; the unused arcs are at both their
+    # bounds (y = 0 = 82·z). The outflows must take their lower bound (the
+    # MIR drops them) and the inflows their VUBs, giving z0 + z1 >= 1. With
+    # the VUB taken on every tie the cut had 81·(z2 + z3) − y2 − y3 terms.
+    if backend == "numba" and jm._numba_separate() is None:
+        pytest.skip("needs numba")
+    u = 82.0
+    A = np.zeros((5, 8))
+    A[0, :4] = [-1.0, -1.0, 1.0, 1.0]  # y2 + y3 − y0 − y1 <= −1
+    for j in range(4):
+        A[1 + j, j], A[1 + j, 4 + j] = 1.0, -u
+    lp = jl.LP(
+        c=np.r_[np.zeros(4), np.ones(4)],
+        A_eq=sp.csc_matrix((0, 8)),
+        b_eq=np.zeros(0),
+        A_ineq=sp.csc_matrix(A),
+        b_ineq=np.r_[-1.0, np.zeros(4)],
+        lower_bounds=np.zeros(8),
+        upper_bounds=np.r_[np.full(4, u), np.ones(4)],
+    )
+    mip = jm.MIP(lp, np.r_[np.zeros(4, bool), np.ones(4, bool)])
+    x = np.zeros(8)
+    x[1], x[5] = 1.0, 1.0 / u
+    separator = jm.CutSeparator(
+        mip, mip.lower, mip.upper, backend=backend, min_batch=1, cmir_per_row=3
+    )
+    target = np.zeros(8)
+    target[[4, 5]] = -1.0  # −z0 − z1 <= −1
+    best = 0.0
+    for family, idx, coef, rhs in separator(x):
+        if family != "mir":
+            continue
+        dense = np.zeros(8)
+        dense[idx] = coef
+        cosine = dense @ target / (np.linalg.norm(dense) * np.linalg.norm(target))
+        if cosine > best:
+            best, scaled = cosine, rhs / np.abs(coef).max()
+    assert best == pytest.approx(1.0)
+    assert scaled == pytest.approx(-1.0)
+
+
 # %% Node LPs stop at the cutoff
 @pytest.mark.parametrize("make", [general_integer, generalised_assignment, facility_location])
 def test_node_bound_stop_keeps_the_optimum(make):
@@ -3748,13 +3793,22 @@ def test_batched_separation_matches_numpy(make):
     rng = np.random.default_rng(0)
     points = [x, np.clip(x + rng.uniform(-0.3, 0.3, x.size), mip.lower, np.minimum(mip.upper, 1e3))]
     for point in points:
-        for aggregate in (False, True):
-            kwargs = dict(aggregate_integers=aggregate, max_aggregation=4 if aggregate else 2)
+        for aggregate, width in ((False, 1), (True, 1), (False, 3), (True, 3)):
+            kwargs = dict(
+                aggregate_integers=aggregate,
+                max_aggregation=4 if aggregate else 2,
+                aggregation_width=width,
+                cmir_per_row=width,
+            )
             ref = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numpy", **kwargs)(point)
             got = jm.CutSeparator(
                 mip, mip.lower, mip.upper, backend="jax", min_batch=0, **kwargs
             )(point)
             assert [cut[0] for cut in got] == [cut[0] for cut in ref]
+            if width > 1:
+                # A row's lesser c-MIR cuts can come from near-tied scalings
+                # (δ halved down to 1/64) that rounding orders differently.
+                continue
             for (_, *mine), (_, *theirs) in zip(got, ref):
                 assert cut_efficacy(mine, point) == pytest.approx(
                     cut_efficacy(theirs, point), rel=1e-7, abs=1e-9
@@ -3773,8 +3827,13 @@ def test_numba_separation_matches_numpy(make):
     rng = np.random.default_rng(0)
     points = [x, np.clip(x + rng.uniform(-0.3, 0.3, x.size), mip.lower, np.minimum(mip.upper, 1e3))]
     for point in points:
-        for aggregate in (False, True):
-            kwargs = dict(aggregate_integers=aggregate, max_aggregation=4 if aggregate else 2)
+        for aggregate, width in ((False, 1), (True, 1), (False, 3), (True, 3)):
+            kwargs = dict(
+                aggregate_integers=aggregate,
+                max_aggregation=4 if aggregate else 2,
+                aggregation_width=width,
+                cmir_per_row=width,
+            )
             ref = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numpy", **kwargs)(point)
             got = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numba", **kwargs)(point)
             assert [cut[0] for cut in got] == [cut[0] for cut in ref]
@@ -3792,6 +3851,169 @@ def test_numba_separation_keeps_clique_and_implied_cuts_first():
     ref = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numpy", conflict_graph=graph)(x)
     got = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numba", conflict_graph=graph)(x)
     assert [cut[0] for cut in got] == [cut[0] for cut in ref]
+
+
+SEPARATION_MAKERS = [
+    knapsack, general_integer, facility_location, generalised_assignment,
+    lambda: fixed_charge()[0],
+]
+
+
+def _perturbed_points(mip):
+    x, _ = vertex_and_basis(mip)
+    rng = np.random.default_rng(1)
+    upper = np.minimum(mip.upper, 1e3)
+    return [x] + [
+        np.clip(x + rng.uniform(-0.3, 0.3, x.size), mip.lower, upper) for _ in range(3)
+    ]
+
+
+@pytest.mark.parametrize("make", SEPARATION_MAKERS)
+@pytest.mark.parametrize("aggregate", [False, True])
+def test_wider_aggregation_extends_the_greedy_path(make, aggregate):
+    """The first branch of a wider aggregation is the greedy path itself, so
+    ``aggregation_width=1``'s bases come first; the rest are new, and none
+    repeats."""
+    mip = make()
+    kwargs = dict(aggregate_integers=aggregate, max_aggregation=4)
+    narrow = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numpy", **kwargs)
+    wide = jm.CutSeparator(
+        mip, mip.lower, mip.upper, backend="numpy", aggregation_width=3, **kwargs
+    )
+    grew = False
+    for x in _perturbed_points(mip):
+        rows = narrow.tight_rows(x)
+        wide.tight_rows(x)
+        for r in rows:
+            for s in (1.0, -1.0) if narrow.is_eq[r] else (1.0,):
+                short = narrow._aggregation_path(r, s, x)
+                long = wide._aggregation_path(r, s, x)
+                assert len(long) >= len(short)
+                for (i1, a1, b1), (i2, a2, b2) in zip(short, long):
+                    assert np.array_equal(i1, i2)
+                    assert np.array_equal(a1, a2) and b1 == b2
+                grew |= len(long) > len(short)
+    # Pure-integer rows aggregate only with ``aggregate_integers``.
+    assert grew or make is knapsack or (not aggregate and mip.integrality.all())
+
+
+@pytest.mark.parametrize("make", SEPARATION_MAKERS)
+def test_wider_aggregation_cuts_are_valid(make):
+    mip = make()
+    lower, upper, _ = jm.propagate_bounds(
+        mip.A, mip.row_lower, mip.row_upper, mip.lower, mip.upper, mip.integrality
+    )
+    separator = jm.CutSeparator(
+        mip, lower, upper, aggregate_integers=True, max_aggregation=4,
+        aggregation_width=4, cmir_per_row=4,
+    )
+    for x in _perturbed_points(mip):
+        for _, idx, coef, rhs in separator(np.clip(x, lower, upper)):
+            assert max_over_mip(mip, idx, coef) <= rhs + 1e-7 * (1 + abs(rhs))
+
+
+@pytest.mark.parametrize("make", SEPARATION_MAKERS)
+def test_cmir_per_row_keeps_the_most_efficacious(make):
+    """``cmir_per_row=k`` keeps up to ``k`` c-MIR cuts a row, most
+    efficacious first, and the first of them is the one cut ``k=1`` keeps."""
+    mip = make()
+    kwargs = dict(aggregate_integers=True, max_aggregation=4, aggregation_width=3)
+    one = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numpy", **kwargs)
+    three = jm.CutSeparator(
+        mip, mip.lower, mip.upper, backend="numpy", cmir_per_row=3, **kwargs
+    )
+    for x in _perturbed_points(mip):
+        rows = one.tight_rows(x)
+        three.tight_rows(x)
+        for r in rows:
+            for s in (1.0, -1.0) if one.is_eq[r] else (1.0,):
+                best = [c for c in one.aggregated_mir(r, s, x) if c[0] == "mir"]
+                top = [c for c in three.aggregated_mir(r, s, x) if c[0] == "mir"]
+                assert len(best) <= 1 and len(top) <= 3
+                assert len(top) >= len(best)
+                if best:
+                    assert np.array_equal(top[0][1], best[0][1])
+                    assert np.array_equal(top[0][2], best[0][2])
+                efficacies = [cut_efficacy(cut[1:], x) for cut in top]
+                assert efficacies == sorted(efficacies, reverse=True)
+
+
+def test_select_cuts_scores_without_weights_rank_by_efficacy():
+    rng = np.random.default_rng(3)
+    n = 12
+    x = rng.uniform(0, 1, n)
+    cuts = []
+    for k in range(40):
+        idx = np.sort(rng.choice(n, rng.integers(1, 6), replace=False))
+        coef = rng.normal(size=idx.size)
+        cuts.append((str(k), idx, coef, float(coef @ x[idx] - rng.uniform(0, 0.5))))
+    plain = jm.select_cuts(cuts, x, n, max_cuts=15)
+    zero = jm.select_cuts(
+        cuts, x, n, max_cuts=15, weights=(0.0, 0.0, 0.0), objective=rng.normal(size=n)
+    )
+    assert [c[0] for c in zero] == [c[0] for c in plain]
+
+
+def test_select_cuts_scores_break_ties_by_objective_and_integers():
+    # Two orthogonal cuts, equally efficacious at x.
+    x = np.array([1.0, 1.0, 0.0])
+    along = ("along", np.array([0]), np.array([1.0]), 0.5)
+    across = ("across", np.array([1]), np.array([1.0]), 0.5)
+    cuts = [along, across]
+    c = np.array([0.0, 1.0, 0.0])
+    picked = jm.select_cuts(cuts, x, 3, max_cuts=1, weights=(0.1, 0.0, 0.0), objective=c)
+    assert picked[0][0] == "across"  # parallel to the objective
+    is_int = np.array([True, False, False])
+    picked = jm.select_cuts(cuts, x, 3, max_cuts=1, weights=(0.0, 0.1, 0.0), is_int=is_int)
+    assert picked[0][0] == "along"  # on an integer column
+    # Efficacy dominates small weights.
+    deeper = ("deeper", np.array([0]), np.array([1.0]), 0.2)
+    picked = jm.select_cuts(
+        [deeper, across], x, 3, max_cuts=1, weights=(0.1, 0.0, 0.0), objective=c
+    )
+    assert picked[0][0] == "deeper"
+
+
+def test_select_cuts_directed_cutoff_distance_prefers_the_incumbents_way():
+    # The first cut is a little deeper at x (0.51 against 0.5), but along
+    # the segment to the incumbent it lies 0.51 away and the second (at an
+    # angle to it) 0.5 / 0.6 ≈ 0.83.
+    x = np.array([0.0, 0.0])
+    incumbent = np.array([2.0, 0.0])
+    straight = ("straight", np.array([0]), np.array([-1.0]), -0.51)
+    slanted = ("slanted", np.array([0, 1]), np.array([-0.6, -0.8]), -0.5)
+    cuts = [straight, slanted]
+    plain = jm.select_cuts(cuts, x, 2, max_cuts=1)
+    assert plain[0][0] == "straight"
+    picked = jm.select_cuts(
+        cuts, x, 2, max_cuts=1, weights=(0.0, 0.0, 0.5), incumbent=incumbent
+    )
+    assert picked[0][0] == "slanted"
+    # An incumbent of another shape is ignored.
+    picked = jm.select_cuts(
+        cuts, x, 2, max_cuts=1, weights=(0.0, 0.0, 0.5), incumbent=np.zeros(3)
+    )
+    assert picked[0][0] == "straight"
+
+
+def test_solve_rejects_bad_cut_score_weights():
+    with pytest.raises(ValueError, match="cut_score_weights"):
+        solve(general_integer(), cuts=True, cut_score_weights=(0.1, 0.1), max_nodes=1)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        dict(aggregation_width=1, cmir_per_row=1, cut_score_weights=None),
+        dict(aggregation_width=4, cmir_per_row=4, cut_score_weights=(0.2, 0.2, 1.0)),
+    ],
+)
+def test_solve_with_cut_settings_finds_the_optimum(settings):
+    mip = general_integer()
+    result = solve(mip, cuts=True, **settings)
+    reference = solve(mip, cuts=False)
+    assert result["status"] == "optimal"
+    assert result["objective"] == pytest.approx(reference["objective"], abs=1e-6)
 
 
 def test_auto_separation_backend_is_numba_when_installed():
@@ -6622,36 +6844,145 @@ def test_exact_lane_solves_to_the_optimum(make):
     assert solve(mip, **options)["exact_nodes"]["solved"] == 0
 
 
-def test_adaptive_exact_band():
-    # The auto band is the gap scale over the relative gap, so it widens as
-    # the gap closes, stays within its limits, and waits for an incumbent.
+def auto_band_search(threads=2):
+    """A stand-in for ``_BranchAndBound`` with what the auto band reads."""
     search = types.SimpleNamespace(
         exact_band_auto=True,
-        exact_lane=types.SimpleNamespace(threads=2),
+        exact_lane=types.SimpleNamespace(threads=threads),
         exact_band=jm._EXACT_BAND_MIN,
         exact_band_range=[jm._EXACT_BAND_MIN] * 2,
+        band_scale=jm._EXACT_BAND_GAP_SCALE,
+        band_scale_range=[jm._EXACT_BAND_GAP_SCALE] * 2,
+        band_edge_sums={"exact": [0.0, 0.0, 0], "device": [0.0, 0.0, 0]},
+        band_rates=(None, None),
+        band_tunes=0,
+        band_capped=False,
+        band_cap_nodes=None,
+        exact_reserved=[],
+        open=[],
+        exact_jobs=0,
+        exact_seconds=0.0,
+        batch_period=None,
         incumbent=None,
         bound=90.0,
     )
+    B = jm._BranchAndBound
     search.global_bound = lambda: search.bound
     search.gap = lambda bound: jm._relative_gap(search.incumbent[0], bound)
-    adapt = lambda: jm._BranchAndBound.adapt_exact_band(search)
-    adapt()
+    for name in (
+        "tune_band_scale", "record_band_edge", "band_cap_size", "band_capacity_top"
+    ):
+        setattr(search, name, getattr(B, name).__get__(search))
+    search.adapt = lambda: B.adapt_exact_band(search)
+    return search
+
+
+def test_adaptive_exact_band():
+    # The auto band is the scale over the relative gap, so it widens as
+    # the gap closes, stays within its limits, and waits for an incumbent.
+    search = auto_band_search()
+    search.adapt()
     assert search.exact_band == jm._EXACT_BAND_MIN  # no incumbent: no change
     search.incumbent = (100.0, None)
     bands = []
     for bound in (-1e5, 0.0, 50.0, 75.0, 90.0, 100.0):
         search.bound = bound
-        adapt()
+        search.adapt()
         bands.append(search.exact_band)
     assert bands[0] == jm._EXACT_BAND_MIN  # a 100,100% gap: at the floor
     assert bands[1] == pytest.approx(0.25)  # a 100% gap
     assert bands[2] == pytest.approx(0.5)  # a 50% gap
     assert bands[3] == bands[4] == bands[5] == jm._EXACT_BAND_MAX  # 25% and less
-    assert all(a <= b for a, b in zip(bands, bands[1:]))
     assert search.exact_band_range == [jm._EXACT_BAND_MIN, jm._EXACT_BAND_MAX]
     with pytest.raises(ValueError):
         jm.solve(facility_location(), batch_size=4, exact_band="wide")
+
+
+def test_band_scale_follows_the_lift_at_the_edge():
+    # Up while the lane's exact LPs lift more bound a second near the top
+    # of the band than the device's do just above it, down otherwise; not
+    # before each side has its samples, nor while the cap holds the band.
+    search = auto_band_search()
+    node = lambda side: types.SimpleNamespace(band_edge=side)  # noqa: E731
+    n = jm._EXACT_BAND_TUNE_SAMPLES
+
+    def feed(exact_rate, device_rate, count=n):
+        for _ in range(count):
+            search.record_band_edge(node("exact"), "exact", exact_rate, 1.0)
+            search.record_band_edge(node("device"), "device", device_rate, 1.0)
+
+    start = search.band_scale
+    feed(2.0, 1.0, n - 1)
+    search.tune_band_scale()
+    assert search.band_scale == start and search.band_tunes == 0
+    feed(2.0, 1.0, 1)
+    search.tune_band_scale()
+    assert search.band_scale == pytest.approx(start * jm._EXACT_BAND_SCALE_STEP)
+    assert search.band_rates == (2.0, 1.0)
+    feed(1.0, 2.0)
+    search.tune_band_scale()
+    assert search.band_scale == pytest.approx(start)
+    search.band_capped = True
+    feed(2.0, 1.0)
+    search.tune_band_scale()
+    assert search.band_scale == pytest.approx(start) and search.band_tunes == 2
+    search.band_capped = False
+    for _ in range(100):
+        feed(1.0, 2.0)
+        search.tune_band_scale()
+    assert search.band_scale == jm._EXACT_BAND_SCALE_LIMITS[0]
+    # A node tagged for the other side, or untagged, does not count, and
+    # its tag is cleared.
+    other = node("exact")
+    search.record_band_edge(other, "device", 5.0, 1.0)
+    assert other.band_edge is None
+    assert search.band_edge_sums["device"][2] == 0
+
+
+def test_auto_band_in_the_search():
+    mip = generalised_assignment(agents=10, jobs=40)
+    ref = reference(mip)
+    result = jm.solve(
+        mip, max_seconds=120, batch_size=4, exact_nodes=2, exact_band="auto",
+        exact_overflow_share=0.5,
+    )
+    assert result["bound"] <= ref + 1e-6
+    if result["status"] == "optimal":
+        assert_solved(result, mip, ref)
+    stats = result["exact_nodes"]
+    low, high = jm._EXACT_BAND_SCALE_LIMITS
+    assert low <= stats["band_scale_min"] <= stats["band_scale"] <= stats["band_scale_max"] <= high
+    assert jm._EXACT_BAND_MIN <= stats["band_min"] <= stats["band_max"] <= jm._EXACT_BAND_MAX
+    assert stats["band_capped_batches"] >= 0 and stats["band_tunes"] >= 0
+
+
+def test_band_capacity_top_keeps_what_the_threads_reach():
+    search = auto_band_search(threads=2)
+    # Before any lane job: _EXACT_OVERFLOW_KEEP a thread.
+    assert search.band_cap_size() == 2 * jm._EXACT_OVERFLOW_KEEP
+    # A lane job takes 0.5 s and a batch 1 s: two batches hold 4 a thread.
+    search.exact_jobs, search.exact_seconds, search.batch_period = 10, 5.0, 1.0
+    assert search.band_cap_size() == 8
+    # Slow jobs: still one a thread; fast ones: at most the cap's top.
+    search.exact_seconds = 1e3
+    assert search.band_cap_size() == 2 * jm._EXACT_BAND_CAP_PER_THREAD[0]
+    search.exact_seconds = 1e-6
+    assert search.band_cap_size() == 2 * jm._EXACT_BAND_CAP_PER_THREAD[1]
+    search.exact_seconds = 5.0
+    # The 8th lowest bound of the nodes the lane could take: reserved
+    # ones, and open ones not tried and below the root.
+    open_node = lambda bound, tried=False, depth=1: types.SimpleNamespace(  # noqa: E731
+        bound=bound, exact_tried=tried, depth=depth
+    )
+    search.exact_reserved = [(b, i, None) for i, b in enumerate([1.0, 2.0, 3.0])]
+    search.open = [(0, i, open_node(b)) for i, b in enumerate([7.0, 4.0, 6.0, 5.0])]
+    assert search.band_capacity_top() == np.inf  # 7 nodes: under the cap
+    search.open.append((0, 9, open_node(0.5, tried=True)))
+    search.open.append((0, 10, open_node(0.5, depth=0)))
+    assert search.band_capacity_top() == np.inf
+    search.open += [(0, 11, open_node(9.0)), (0, 12, open_node(8.0))]
+    assert search.band_capacity_top() == 8.0
+    assert search.band_cap_nodes == 8
 
 
 @pytest.mark.parametrize("make", [facility_location, generalised_assignment])

@@ -1911,10 +1911,19 @@ _CUT_TIGHT_ROWS = 0.05
 # Knapsack covers (``_knapsack``): slack on a row's capacity relative to
 # ``1 + |b|``, as the feasibility checks (``feasibility_tolerance``) allow.
 _KNAPSACK_TOL = 1e-6
+# ``_substituted_cmir``: a variable bound and a simple one this close to the
+# LP point tie (the coefficient's sign then picks the side).
+_VB_TIE = 1e-6
 # At most this many rows start a separation per round.
 _CUT_MAX_ROWS = 2000
 # Rows aggregated into one c-MIR base inequality, beyond the first.
 _CUT_MAX_AGGREGATION = 2
+# The search's defaults for ``CutSeparator``'s ``aggregation_width`` (first
+# aggregation steps tried per row) and ``cmir_per_row`` (c-MIR cuts kept per
+# row), and for ``select_cuts``'s ``weights``.
+_CUT_AGGREGATION_WIDTH = 3
+_CUT_CMIR_PER_ROW = 3
+_CUT_SCORE_WEIGHTS = (0.1, 0.1, 0.5)
 # Two cuts this parallel (cosine) are duplicates.
 _CUT_MAX_PARALLELISM = 0.99
 # Tree cuts (``tree_cuts``): the least room reserved for them (rows) beyond
@@ -2212,6 +2221,39 @@ def variable_bounds(mip):
     return out
 
 
+def _nearest_variable_bound(kinds, y, x, lower, upper, positive):
+    """The variable bound ``(kind, z, c, d)`` of ``kinds`` (``y``'s entry of
+    ``variable_bounds``) that ``_substituted_cmir`` shifts ``y`` to at
+    ``x``, or ``None`` to keep its simple bounds: the nearest to ``x``, a
+    variable one only when no simple bound is nearer. Bounds within
+    ``_VB_TIE`` tie, and a tie goes to the side whose shifted term the MIR
+    drops: a lower bound when the row's coefficient on ``y`` is positive
+    (``positive``), an upper one when it is negative, as HiGHS's transformed
+    LP does. Unused arcs of a fixed-charge network sit at y = 0 = u·z, at
+    both bounds: shifting an outflow to its VUB put u·z terms into the
+    cut-set inequalities (beasleyC3: x₁ + x₂ >= 1 became x₁ + x₂ + 81·x₃ +
+    81·x₄ − y₃ − y₄ >= 1), too shallow to be chosen."""
+    prefer = "lb" if positive else "ub"
+    x_y = x[y]
+    lb_distance, ub_distance = x_y - lower[y], upper[y] - x_y
+    best_distance = min(lb_distance, ub_distance)
+    held = "lb" if lb_distance <= ub_distance else "ub"
+    best = None
+    for kind in ("ub", "lb"):
+        for z, c, d in kinds[kind]:
+            implied = d + c * x[z]
+            distance = implied - x_y if kind == "ub" else x_y - implied
+            if distance < best_distance - _VB_TIE:
+                better = True
+            elif distance <= best_distance + _VB_TIE:
+                better = kind == prefer or held != prefer
+            else:
+                better = False
+            if better:
+                best_distance, best, held = distance, (kind, z, c, d), kind
+    return best
+
+
 def _substituted_cmir(idx, a, b, x, lower, upper, is_int, max_divisors, bounds):
     """
     ``cmir_cut`` of the row ``a · x[idx] <= b`` with each continuous ``y``
@@ -2230,14 +2272,7 @@ def _substituted_cmir(idx, a, b, x, lower, upper, is_int, max_divisors, bounds):
         if is_int[y] or y not in bounds:
             continue
         a_y, x_y = coef[y], x[y]
-        best_distance = min(x_y - lower[y], upper[y] - x_y)
-        best = None
-        for kind in ("ub", "lb"):
-            for z, c, d in bounds[y][kind]:
-                implied = d + c * x[z]
-                distance = implied - x_y if kind == "ub" else x_y - implied
-                if distance <= best_distance + 1e-9:
-                    best_distance, best = distance, (kind, z, c, d)
+        best = _nearest_variable_bound(bounds[y], y, x, lower, upper, a_y > 0)
         if best is None:
             continue
         kind, z, c, d = best
@@ -2758,25 +2793,20 @@ def _cmir_kernel(a, lo, up, xv, integer, valid, b, max_divisors):
 def _substitution_tables(bounds, x, lower, upper):
     """Per column, the variable bound ``_substituted_cmir`` would shift a
     continuous column to at ``x``: ``kind`` (0: none, 1: upper, 2: lower)
-    and ``z``, ``c``, ``d`` arrays."""
+    and ``z``, ``c``, ``d`` arrays of shape ``(2, n)``, row 0 for a negative
+    coefficient on the column and row 1 for a positive one (they differ
+    only where bounds tie, ``_nearest_variable_bound``)."""
     n = x.size
-    kind_of = np.zeros(n, np.int64)
-    z_of = np.zeros(n, np.int64)
-    c_of, d_of = np.zeros(n), np.zeros(n)
+    kind_of = np.zeros((2, n), np.int64)
+    z_of = np.zeros((2, n), np.int64)
+    c_of, d_of = np.zeros((2, n)), np.zeros((2, n))
     for y, kinds in bounds.items():
-        x_y = x[y]
-        best_distance = min(x_y - lower[y], upper[y] - x_y)
-        best = None
-        for kind in ("ub", "lb"):
-            for z, c, d in kinds[kind]:
-                implied = d + c * x[z]
-                distance = implied - x_y if kind == "ub" else x_y - implied
-                if distance <= best_distance + 1e-9:
-                    best_distance, best = distance, (kind, z, c, d)
-        if best is not None:
-            kind, z, c, d = best
-            kind_of[y] = 1 if kind == "ub" else 2
-            z_of[y], c_of[y], d_of[y] = z, c, d
+        for sign in (0, 1):  # the row's coefficient on y: < 0, > 0
+            best = _nearest_variable_bound(kinds, y, x, lower, upper, sign == 1)
+            if best is not None:
+                kind, z, c, d = best
+                kind_of[sign, y] = 1 if kind == "ub" else 2
+                z_of[sign, y], c_of[sign, y], d_of[sign, y] = z, c, d
     return kind_of, z_of, c_of, d_of
 
 
@@ -2794,16 +2824,19 @@ def _substituted_batch(row, slot, cols, a, b, x, lower, upper, is_int, tables):
     ``None`` or a dict of the new rows' entries and what maps them back."""
     kind_of, z_of, c_of, d_of = tables
     n = x.size
-    sub = (kind_of[cols] > 0) & ~is_int[cols]
+    sign = (a > 0).astype(np.int64)  # the tables' row for each term
+    sub = (kind_of[sign, cols] > 0) & ~is_int[cols]
     if not sub.any():
         return None
     rows = np.unique(row[sub])
     take = np.isin(row, rows)
     row, slot, cols, a, sub = row[take], slot[take], cols[take], a[take], sub[take]
+    sign = sign[take]
     kept, s_idx = ~sub, np.flatnonzero(sub)
-    y, z = cols[s_idx], z_of[cols[s_idx]]
-    c, d = c_of[cols[s_idx]], d_of[cols[s_idx]]
-    kind = kind_of[cols[s_idx]]
+    s_sign = sign[s_idx]
+    y, z = cols[s_idx], z_of[s_sign, cols[s_idx]]
+    c, d = c_of[s_sign, cols[s_idx]], d_of[s_sign, cols[s_idx]]
+    kind = kind_of[s_sign, cols[s_idx]]
     a_y = a[s_idx]
     # Terms over the variables: the kept ones and each substituted y's z.
     v_row = np.concatenate([row[kept], row[s_idx]])
@@ -3982,10 +4015,19 @@ class CutSeparator:
         implied_bounds=None,
         implied_variable_bounds=True,
         device=None,
+        aggregation_width=1,
+        cmir_per_row=1,
     ):
         # The JAX device the batched searches run on (``None``: the default
         # one where the call is made).
         self.device = device
+        # ``aggregation_width``: the first aggregation step of a row tries
+        # the partners of its ``aggregation_width`` best columns to cancel,
+        # each continuing greedily (``_aggregation_path``). ``cmir_per_row``:
+        # the c-MIR cuts kept per row and sense, the most efficacious over
+        # its aggregates (``_path_cuts``).
+        self.aggregation_width = max(1, int(aggregation_width))
+        self.cmir_per_row = max(1, int(cmir_per_row))
         self.flow_covers = flow_covers  # also flow cover cuts (``flow_cover_cut``)
         # Also implied-bound cuts from this ``ImpliedBounds`` (built over
         # bounds no looser than ``lower``/``upper``), and with
@@ -4175,6 +4217,7 @@ class CutSeparator:
             _f64(self.relative), self.variable_bounds is not None, *vb,
             int(self.max_aggregation), bool(self.aggregate_integers),
             bool(self.flow_covers), 64, _COVER_ORDERS, _KNAPSACK_TOL, _CUT_TINY,
+            int(self.aggregation_width), int(self.cmir_per_row),
         )
         names = ("cover", "mir", "flowcover")
         for k in range(family.size):
@@ -4228,16 +4271,18 @@ class CutSeparator:
 
     def _path_cuts(self, path, x, mir, flows):
         """The cuts of one aggregation path from its levels' c-MIR and flow
-        cover cuts: the best c-MIR cut over the levels, each level's flow
-        cover cut, and the cover cuts of the levels beyond the row."""
-        best, best_efficacy = None, 0.0
+        cover cuts: the ``cmir_per_row`` most efficacious c-MIR cuts over
+        the levels (most efficacious first, ties in level order), each
+        level's flow cover cut, and the cover cuts of the levels beyond the
+        row."""
+        mirs = []  # (efficacy, level, cut)
         extra = []
         for level, ((idx, a, b), cut, flow) in enumerate(zip(path, mir, flows)):
             if cut is not None:
                 c_idx, c_coef, c_rhs = cut
                 efficacy = (c_coef @ x[c_idx] - c_rhs) / np.linalg.norm(c_coef)
-                if efficacy > best_efficacy:
-                    best, best_efficacy = cut, efficacy
+                if efficacy > 0.0:
+                    mirs.append((efficacy, level, cut))
             if flow is not None:
                 extra.append(("flowcover", *flow))
             if level > 0:
@@ -4247,7 +4292,9 @@ class CutSeparator:
                         idx, a, b, x, self.lower, self.upper, self.is_binary
                     )
                 ]
-        return ([("mir", *best)] if best is not None else []) + extra
+        mirs.sort(key=lambda item: (-item[0], item[1]))
+        best = [("mir", *cut) for _, _, cut in mirs[: self.cmir_per_row]]
+        return best + extra
 
     def aggregated_mir(self, r, s, x):
         """Cuts from row ``r`` (times ``s``) and its aggregates
@@ -4291,68 +4338,99 @@ class CutSeparator:
 
     def _aggregation_path(self, r, s, x):
         """Row ``r`` (times ``s``) and its aggregates with up to
-        ``max_aggregation`` more rows, as ``[(idx, a, b), ...]``: each adds
-        the row that cancels the continuous variable furthest from its
+        ``max_aggregation`` more rows, as ``[(idx, a, b), ...]``: each step
+        adds the row that cancels the continuous variable furthest from its
         bounds (or, with ``aggregate_integers`` and none left, the integer
         term ``|aⱼ|·min(fⱼ, 1 − fⱼ)`` largest at ``x``), preferring the
-        tightest rows."""
+        tightest rows (``_cancel_order``, ``_partner``).
+
+        With ``aggregation_width`` above 1 the first step also cancels the
+        next best columns, up to that many in all, each with its own partner
+        row, and each of these branches continues greedily. The row comes
+        first, then each branch's aggregates in turn; a branch that would
+        add the same multiple of the same row as an earlier one is
+        skipped."""
         idx, a = self.row(r)
         a, b = s * a, s * self.b[r]
-        used = {r}
-        path = []
-        for level in range(self.max_aggregation + 1):
-            path.append((idx, a, b))
-            if level == self.max_aggregation:
-                break
-            continuous = ~self.is_int[idx]
-            with np.errstate(invalid="ignore"):
-                distance = np.minimum(
-                    x[idx] - self.lower[idx], self.upper[idx] - x[idx]
+        path = [(idx, a, b)]
+        if self.max_aggregation <= 0 or idx.size == 0:
+            return path
+        starts = []
+        for pos in self._cancel_order(idx, a, x)[: self.aggregation_width]:
+            partner = self._partner(idx[pos], a[pos], {r})
+            if partner is not None and partner not in [p for _, p in starts]:
+                starts.append((idx[pos], partner))
+        for col, (r2, lam) in starts:
+            used = {r}
+            level_idx, level_a, level_b = idx, a, b
+            for level in range(self.max_aggregation):
+                if level > 0:
+                    order = self._cancel_order(level_idx, level_a, x)
+                    if order.size == 0:
+                        break
+                    pos = order[0]
+                    col = level_idx[pos]
+                    partner = self._partner(col, level_a[pos], used)
+                    if partner is None:
+                        break
+                    r2, lam = partner
+                level_idx, level_a, level_b = self._add_row(
+                    level_idx, level_a, level_b, col, r2, lam
                 )
-            distance = np.where(continuous, np.nan_to_num(distance, posinf=1e30), -1.0)
-            pos = int(np.argmax(distance))
-            if distance[pos] <= 1e-6:
-                if not self.aggregate_integers:
+                used.add(r2)
+                if level_idx.size == 0:
                     break
-                frac = x[idx] - np.floor(x[idx])
-                score = np.where(
-                    self.is_int[idx], np.abs(a) * np.minimum(frac, 1.0 - frac), -1.0
-                )
-                pos = int(np.argmax(score))
-                if score[pos] <= 1e-6:
-                    break
-            col, coef = idx[pos], a[pos]
-            start, end = self.A_csc.indptr[col], self.A_csc.indptr[col + 1]
-            partner = None
-            for r2, a2 in sorted(
-                zip(self.A_csc.indices[start:end], self.A_csc.data[start:end]),
-                key=lambda item: self.relative[item[0]],
-            ):
-                if r2 in used or a2 == 0:
-                    continue
-                lam = -coef / a2
-                if lam < 0 and not self.is_eq[r2]:
-                    continue  # a <= row can only be added with a weight >= 0
-                partner = (r2, lam)
-                break
-            if partner is None:
-                break
-            r2, lam = partner
-            idx2, a2 = self.row(r2)
-            merged_idx, inverse = np.unique(
-                np.concatenate([idx, idx2]), return_inverse=True
-            )
-            merged = np.bincount(
-                inverse, np.concatenate([a, lam * a2]), minlength=merged_idx.size
-            )
-            merged[merged_idx == col] = 0.0
-            nonzero = np.abs(merged) > 1e-12 * np.abs(merged).max(initial=1.0)
-            idx, a = merged_idx[nonzero], merged[nonzero]
-            b = b + lam * self.b[r2]
-            used.add(r2)
-            if idx.size == 0:
-                break
+                path.append((level_idx, level_a, level_b))
         return path
+
+    def _cancel_order(self, idx, a, x):
+        """The positions in ``idx`` worth cancelling, best first: continuous
+        columns by their distance from their nearer bound at ``x``; when no
+        continuous one is more than 1e-6 from a bound, with
+        ``aggregate_integers``, integer ones by ``|aⱼ|·min(fⱼ, 1 − fⱼ)``.
+        Scores of 1e-6 or less are left out; ties keep the row's order."""
+        continuous = ~self.is_int[idx]
+        with np.errstate(invalid="ignore"):
+            distance = np.minimum(x[idx] - self.lower[idx], self.upper[idx] - x[idx])
+        score = np.where(continuous, np.nan_to_num(distance, posinf=1e30), -1.0)
+        if score.max(initial=-1.0) <= 1e-6:
+            if not self.aggregate_integers:
+                return np.empty(0, np.int64)
+            frac = x[idx] - np.floor(x[idx])
+            score = np.where(
+                self.is_int[idx], np.abs(a) * np.minimum(frac, 1.0 - frac), -1.0
+            )
+        order = np.argsort(-score, kind="stable")
+        return order[score[order] > 1e-6]
+
+    def _partner(self, col, coef, used):
+        """The tightest row outside ``used`` that cancels the term
+        ``coef·x[col]``, with its weight, as ``(row, weight)``; ``None``
+        when none can (a <= row only takes a weight >= 0)."""
+        start, end = self.A_csc.indptr[col], self.A_csc.indptr[col + 1]
+        for r2, a2 in sorted(
+            zip(self.A_csc.indices[start:end], self.A_csc.data[start:end]),
+            key=lambda item: self.relative[item[0]],
+        ):
+            if r2 in used or a2 == 0:
+                continue
+            lam = -coef / a2
+            if lam < 0 and not self.is_eq[r2]:
+                continue  # a <= row can only be added with a weight >= 0
+            return int(r2), float(lam)
+        return None
+
+    def _add_row(self, idx, a, b, col, r2, lam):
+        """``a · x[idx] <= b`` plus ``lam`` times row ``r2``, with the
+        cancelled column ``col`` and near-zero terms removed."""
+        idx2, a2 = self.row(r2)
+        merged_idx, inverse = np.unique(np.concatenate([idx, idx2]), return_inverse=True)
+        merged = np.bincount(
+            inverse, np.concatenate([a, lam * a2]), minlength=merged_idx.size
+        )
+        merged[merged_idx == col] = 0.0
+        nonzero = np.abs(merged) > 1e-12 * np.abs(merged).max(initial=1.0)
+        return merged_idx[nonzero], merged[nonzero], b + lam * self.b[r2]
 
 
 def violated_cuts(cuts, x, min_efficacy=1e-4):
@@ -4374,10 +4452,35 @@ def violated_cuts(cuts, x, min_efficacy=1e-4):
     return [cuts[i] for i in np.flatnonzero(efficacy >= min_efficacy)]
 
 
-def select_cuts(cuts, x, n, min_efficacy=1e-4, max_cuts=100):
+def select_cuts(
+    cuts,
+    x,
+    n,
+    min_efficacy=1e-4,
+    max_cuts=100,
+    weights=None,
+    objective=None,
+    is_int=None,
+    incumbent=None,
+):
     """The cuts that ``x`` violates by an efficacy (distance) of at least
-    ``min_efficacy``, most efficacious first, skipping near-duplicates, at
-    most ``max_cuts`` of them.
+    ``min_efficacy``, best first, skipping near-duplicates, at most
+    ``max_cuts`` of them.
+
+    Without ``weights``, best is most efficacious. With ``weights =
+    (w_obj, w_int, w_dir)``, as SCIP's hybrid cut selector, a cut ``a·x <=
+    b`` scores
+
+        efficacy / max efficacy
+            + w_obj · |cos(a, objective)|
+            + w_int · (share of its terms on ``is_int`` columns)
+            + w_dir · (directed cutoff distance / its max),
+
+    each term in [0, 1]. The directed cutoff distance is how far the cut
+    lies from ``x`` along the segment to ``incumbent``, ``(a·x − b)·‖d‖ /
+    (−a·d)`` with ``d = incumbent − x`` (at least the efficacy); it is the
+    efficacy where ``a·d >= 0``. A term whose data is not given (or zero)
+    is left out.
 
     All candidates' efficacies come from one pass, and a chosen cut's
     cosines with every candidate from one sparse product, so the greedy pass
@@ -4398,10 +4501,51 @@ def select_cuts(cuts, x, n, min_efficacy=1e-4, max_cuts=100):
     keep = np.flatnonzero(efficacy >= min_efficacy)
     if keep.size == 0:
         return []
-    order = keep[np.argsort(-efficacy[keep], kind="stable")]
+    score = efficacy
+    if weights is not None and any(weights):
+        score = _cut_scores(
+            efficacy, keep, rows, cols, vals, norm, lengths, x, weights,
+            objective, is_int, incumbent,
+        )
+    order = keep[np.argsort(-score[keep], kind="stable")]
     with np.errstate(divide="ignore", invalid="ignore"):
         directions = sp.csr_matrix((vals / norm[rows], (rows, cols)), shape=(k, n))
     return [cuts[i] for i in _spread_out(directions, order, max_cuts)]
+
+
+def _cut_scores(
+    efficacy, keep, rows, cols, vals, norm, lengths, x, weights, objective,
+    is_int, incumbent,
+):
+    """``select_cuts``'s scores (meaningful at ``keep`` only)."""
+    w_obj, w_int, w_dir = weights
+    k = efficacy.size
+    score = np.zeros(k)
+    score[keep] = efficacy[keep] / efficacy[keep].max()
+    if w_obj and objective is not None and np.shape(objective) == x.shape:
+        objective = np.asarray(objective, np.float64)
+        c_norm = np.linalg.norm(objective)
+        if c_norm > 0:
+            dot = np.bincount(rows, vals * objective[cols], minlength=k)
+            score[keep] += w_obj * np.abs(dot[keep]) / (norm[keep] * c_norm)
+    if w_int and is_int is not None and np.shape(is_int) == x.shape:
+        integer = np.bincount(
+            rows, np.asarray(is_int, bool)[cols].astype(np.float64), minlength=k
+        )
+        score[keep] += w_int * integer[keep] / np.maximum(lengths[keep], 1)
+    if w_dir and incumbent is not None and np.shape(incumbent) == x.shape:
+        d = np.asarray(incumbent, np.float64) - x
+        length = np.linalg.norm(d)
+        if length > 0:
+            toward = np.bincount(rows, vals * d[cols], minlength=k)[keep]
+            violation = efficacy[keep] * norm[keep]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                directed = np.where(
+                    toward < 0, violation * length / -toward, efficacy[keep]
+                )
+            directed = np.maximum(np.nan_to_num(directed), efficacy[keep])
+            score[keep] += w_dir * directed / directed.max()
+    return score
 
 
 def _spread_out(directions, order, max_cuts, held=None):
@@ -6684,6 +6828,7 @@ class _Node:
         "converge",
         "exact_basis",
         "exact_sides",
+        "band_edge",
     )
 
     def __init__(
@@ -6717,6 +6862,9 @@ class _Node:
         # Whether its LP runs to convergence on the device, over batches,
         # instead of being truncated (``exact_overflow_share``).
         self.converge = False
+        # ``"exact"`` or ``"device"`` when it was taken near the top of the
+        # auto band, for ``tune_band_scale``.
+        self.band_edge = None
         # A key in ``_BranchAndBound.basis_store``: the HiGHS basis its exact
         # LP starts from (its parent's; ``None``: none), and once the lane
         # has solved it, its own optimal one, for its children; with its
@@ -7766,11 +7914,24 @@ _EXACT_OVERFLOW_KEEP = 4
 # side gets (SCIP's limits for its strong branching LPs).
 _EXACT_STRONG_AUTO = (10, 500)
 # The adaptive band (``exact_band="auto"``): its limits, and the scale it
-# grows by as the relative gap closes (``_EXACT_BAND_GAP_SCALE / gap``: half
-# the gap at a 50% gap, all of it from 25% down).
+# grows by as the relative gap closes (``band_scale / gap``; at the starting
+# scale, half the gap at a 50% gap, all of it from 25% down).
 _EXACT_BAND_MIN = 0.001
 _EXACT_BAND_MAX = 1.0
 _EXACT_BAND_GAP_SCALE = 0.25
+# The band's cap (``band_capacity_top``): the lane's threads keep the nodes
+# each clears in this many batches, within these per thread (before any
+# lane job has finished: ``_EXACT_OVERFLOW_KEEP``).
+_EXACT_BAND_HORIZON_BATCHES = 2.0
+_EXACT_BAND_CAP_PER_THREAD = (1, 16)
+# Tuning the scale (``tune_band_scale``): the factor it moves by, its
+# limits, and the samples each side of the band's edge needs first.
+_EXACT_BAND_SCALE_STEP = 1.25
+_EXACT_BAND_SCALE_LIMITS = (0.01, 4.0)
+_EXACT_BAND_TUNE_SAMPLES = 8
+# The edge of the band whose lift is measured: its top half for the lane,
+# and as far again above it for the device.
+_EXACT_BAND_EDGE = 0.5
 
 # Root cut rounds (``cut_age``): the rounds in a row a cut stays in the LP
 # while idle (slack, with a zero dual), as HiGHS's LP age limit.
@@ -8031,6 +8192,9 @@ class _BranchAndBound:
         probing_cliques=True,
         implied_variable_bounds=True,
         max_aggregation=None,
+        aggregation_width=_CUT_AGGREGATION_WIDTH,
+        cmir_per_row=_CUT_CMIR_PER_ROW,
+        cut_score_weights=_CUT_SCORE_WEIGHTS,
         exact_nodes=0,
         exact_node_seconds=10.0,
         exact_band=0.005,
@@ -8237,8 +8401,16 @@ class _BranchAndBound:
             raise ValueError(
                 f"aggregate_integers must be 'auto', True or False, not {aggregate_integers!r}"
             )
+        # ``"auto"``: on for small MIPs, and for every MIP with the numba
+        # separation backend, where a round costs milliseconds anyway.
         self.aggregate_integers = (
-            small if aggregate_integers == "auto" else bool(aggregate_integers)
+            (
+                small
+                or separation_backend in ("auto", "numba")
+                and _numba_separate() is not None
+            )
+            if aggregate_integers == "auto"
+            else bool(aggregate_integers)
         )
         # Rows added to a c-MIR aggregate (``max_aggregation``; ``None``: 4
         # with integer aggregation, else ``_CUT_MAX_AGGREGATION``).
@@ -8247,6 +8419,21 @@ class _BranchAndBound:
             if max_aggregation is None
             else int(max_aggregation)
         )
+        # The first aggregation steps tried per row, and the c-MIR cuts kept
+        # per row (``CutSeparator``).
+        self.aggregation_width = max(1, int(aggregation_width))
+        self.cmir_per_row = max(1, int(cmir_per_row))
+        # ``select_cuts``'s weights for objective parallelism, integer
+        # support and directed cutoff distance (``None``: efficacy alone).
+        self.cut_score_weights = (
+            None if cut_score_weights is None else tuple(map(float, cut_score_weights))
+        )
+        if self.cut_score_weights is not None and len(self.cut_score_weights) != 3:
+            raise ValueError(
+                "cut_score_weights must be None or three weights (objective "
+                f"parallelism, integer support, directed cutoff distance), not "
+                f"{cut_score_weights!r}"
+            )
         # Rounds are cheap with Gomory cuts on (slack ones are dropped every
         # round), and the bound keeps climbing past five on larger MIPs.
         many_rounds = self.gomory
@@ -8495,6 +8682,23 @@ class _BranchAndBound:
             raise ValueError(f"exact_band must be a number or 'auto', not {exact_band!r}")
         self.exact_band = _EXACT_BAND_MIN if self.exact_band_auto else float(exact_band)
         self.exact_band_range = [self.exact_band, self.exact_band]
+        # The auto band's scale (``tune_band_scale``) and cap
+        # (``band_capacity_top``): the lift and seconds of the nodes each
+        # side solved near the band's top since the last tune, as
+        # ``[lift, seconds, nodes]``, the last rates compared, and the
+        # time between batch launches (an average).
+        self.band_scale = _EXACT_BAND_GAP_SCALE
+        self.band_scale_range = [self.band_scale, self.band_scale]
+        self.band_edge_sums = {"exact": [0.0, 0.0, 0], "device": [0.0, 0.0, 0]}
+        self.band_rates = (None, None)
+        self.band_tunes = 0
+        self.band_capped = False
+        self.band_capped_batches = 0
+        self.band_cap_nodes = None
+        self.batch_period = None
+        self.last_launch = None
+        self.last_raw_bound = None
+        self.band_bound = -np.inf  # the global bound ``exact_band_top`` saw
         self.exact_reserved = []
         # Nodes the lane has finished that ``collect_exact`` has not yet
         # evaluated: in no other list, so the global bound counts them here.
@@ -10836,6 +11040,7 @@ class _BranchAndBound:
     def _evaluate(self, node, lower, upper, lp, result):
         terms = self.result_terms(result, lower, upper)
         raw, rigorous = self.bound_over(terms, lower, upper)
+        self.last_raw_bound = raw
         bound = max(self.round_bound(raw), node.bound)
         self.active_bound = bound
         spent = node.epochs + result["epochs"]
@@ -11576,6 +11781,13 @@ class _BranchAndBound:
                 "band": self.exact_band,
                 "band_min": self.exact_band_range[0],
                 "band_max": self.exact_band_range[1],
+                "band_scale": self.band_scale,
+                "band_scale_min": self.band_scale_range[0],
+                "band_scale_max": self.band_scale_range[1],
+                "band_tunes": self.band_tunes,
+                "band_rates": self.band_rates,
+                "band_cap_nodes": self.band_cap_nodes,
+                "band_capped_batches": self.band_capped_batches,
             },
             "mip_start_accepted": self.mip_start_accepted,
             "one_opt_finds": self.one_opt_finds,
@@ -11841,7 +12053,7 @@ class _BranchAndBound:
                 separators, x, lower, upper, 2 * self.max_cuts_per_round
             )
             candidates += inout or []
-            found = select_cuts(candidates, x, n, max_cuts=self.max_cuts_per_round)
+            found = self.select_cuts(candidates, x, n, self.max_cuts_per_round)
             self.inout_result(found, inout)
             self.archive_cuts(found)
             # Every violated candidate goes into the pool, as HiGHS's, for
@@ -12055,7 +12267,7 @@ class _BranchAndBound:
                 separators, x, lower, upper, 2 * self.max_cuts_per_round
             )
             candidates += inout or []
-            found = select_cuts(candidates, x, n, max_cuts=self.max_cuts_per_round)
+            found = self.select_cuts(candidates, x, n, self.max_cuts_per_round)
             self.inout_result(found, inout)
             self.archive_cuts(found)
             self.pool_cuts(violated_cuts(candidates, x))
@@ -12507,6 +12719,21 @@ class _BranchAndBound:
         with self._separator_lock:
             return [cut for separator in self.node_separators() for cut in separator(x)]
 
+    def select_cuts(self, candidates, x, n, max_cuts):
+        """``select_cuts`` with this search's ``cut_score_weights``: the
+        objective, the cut integrality and the incumbent."""
+        incumbent = self.incumbent
+        return select_cuts(
+            candidates,
+            x,
+            n,
+            max_cuts=max_cuts,
+            weights=self.cut_score_weights,
+            objective=self.base.c,
+            is_int=self.cut_int,
+            incumbent=None if incumbent is None else incumbent[1],
+        )
+
     def zero_half(self, x, lower, upper, max_cuts, mip=None):
         """Zero-half cuts at ``x`` (``zero_half_cuts``) from the LP's rows as
         searched, the cuts in it included,
@@ -12618,6 +12845,8 @@ class _BranchAndBound:
             upper,
             aggregate_integers=self.aggregate_integers,
             max_aggregation=self.max_aggregation,
+            aggregation_width=self.aggregation_width,
+            cmir_per_row=self.cmir_per_row,
             flow_covers=self.use_flow_covers,
             backend=self.separation_backend,
             device=self.separation_device,
@@ -12839,7 +13068,7 @@ class _BranchAndBound:
         candidates = self.node_separated(x)
         candidates += self.zero_half(x, lower, upper, 2 * per_point, mip=mip)
         candidates = [c for c in candidates if c[1].size <= self.tree_cut_max_nnz]
-        selected = select_cuts(candidates, x, mip.num_variables, max_cuts=per_point)
+        selected = self.select_cuts(candidates, x, mip.num_variables, per_point)
         return selected, violated_cuts(candidates, x)
 
     def submit_cut_job(self, points):
@@ -14859,32 +15088,115 @@ class _BranchAndBound:
     def exact_band_top(self):
         """The top of the band the lane keeps (``exact_band``): the global
         bound plus ``exact_band`` of the gap to the cutoff; ``-inf`` (no
-        band) without the lane, a band or a cutoff."""
+        band) without the lane, a band or a cutoff. With ``"auto"``, no
+        higher than the lane's capacity (``band_capacity_top``)."""
         if self.exact_lane is None or self.exact_band <= 0.0:
             return -np.inf
         cutoff = self.cutoff()
-        bound = self.global_bound()
+        bound = self.band_bound = self.global_bound()
         if not (np.isfinite(cutoff) and np.isfinite(bound)):
             return -np.inf
-        return bound + self.exact_band * max(cutoff - bound, 0.0)
+        top = bound + self.exact_band * max(cutoff - bound, 0.0)
+        if self.exact_band_auto:
+            cap = self.band_capacity_top()
+            self.band_capped = cap < top
+            self.band_capped_batches += self.band_capped
+            top = min(top, cap)
+        return top
+
+    def band_cap_size(self):
+        """The nodes the lane's queue keeps (``band_capacity_top``): each
+        thread's share is the nodes it clears in
+        ``_EXACT_BAND_HORIZON_BATCHES`` batches (the mean seconds of a lane
+        job against the mean time between batch launches), within
+        ``_EXACT_BAND_CAP_PER_THREAD``; ``_EXACT_OVERFLOW_KEEP`` a thread
+        before both are known."""
+        threads = self.exact_lane.threads
+        if not self.exact_jobs or not self.batch_period or self.exact_seconds <= 0.0:
+            return _EXACT_OVERFLOW_KEEP * threads
+        per_job = self.exact_seconds / self.exact_jobs
+        share = _EXACT_BAND_HORIZON_BATCHES * self.batch_period / per_job
+        low, high = _EXACT_BAND_CAP_PER_THREAD
+        return threads * int(min(high, max(low, round(share))))
+
+    def band_capacity_top(self):
+        """The bound of the ``band_cap_size``-th lowest node the lane could
+        take (reserved, or open and not yet tried): a band no higher holds
+        only what the threads reach within a couple of batches, and the
+        device takes the rest at once instead of leaving it to wait.
+        ``inf`` when fewer nodes are open."""
+        k = self.band_cap_size()
+        self.band_cap_nodes = k
+        bounds = [entry[0] for entry in self.exact_reserved]
+        bounds += [
+            entry[2].bound
+            for entry in self.open
+            if not entry[2].exact_tried and entry[2].depth > 0
+        ]
+        if len(bounds) < k:
+            return np.inf
+        return heapq.nsmallest(k, bounds)[-1]
 
     def adapt_exact_band(self):
         """With ``exact_band="auto"``, once a batch: the band is
-        ``_EXACT_BAND_GAP_SCALE`` over the relative gap (``gap``), within
+        ``band_scale`` over the relative gap (``gap``), within
         [``_EXACT_BAND_MIN``, ``_EXACT_BAND_MAX``], so its share of the gap
-        grows as the gap closes and its width stays near 25% of the
-        incumbent's value: a quarter of the gap at a 100% gap, half at 50%,
-        all of it from 25% down. Nodes past what the threads keep go to the
-        device by ``exact_overflow_share``."""
+        grows as the gap closes: at the starting scale (0.25) a quarter of
+        the gap at a 100% gap, half at 50%, all of it from 25% down. The
+        scale itself moves with the lift each side gets near the band's top
+        (``tune_band_scale``), and the band's top stops at what the threads
+        can reach (``band_capacity_top``)."""
         if not self.exact_band_auto or self.exact_lane is None:
             return
         if self.incumbent is None:
             return  # no band before an incumbent
+        self.tune_band_scale()
         gap = self.gap(self.global_bound())
-        band = _EXACT_BAND_MAX if gap <= 0.0 else _EXACT_BAND_GAP_SCALE / gap
+        band = _EXACT_BAND_MAX if gap <= 0.0 else self.band_scale / gap
         self.exact_band = min(_EXACT_BAND_MAX, max(_EXACT_BAND_MIN, band))
         low, high = self.exact_band_range
         self.exact_band_range = [min(low, self.exact_band), max(high, self.exact_band)]
+
+    def record_band_edge(self, node, side, lift, seconds):
+        """Count a node that ``side`` (``"exact"`` or ``"device"``) solved
+        near the auto band's top for ``tune_band_scale``: the bound its LP
+        gained (``lift``, at most to the cutoff) in ``seconds`` of that
+        side's time. Only a node tagged for that side when it was taken
+        (``node.band_edge``) counts: one the lane gave back, or the band
+        overflowed to the device, does not. The tag is cleared."""
+        tagged, node.band_edge = node.band_edge, None
+        if tagged != side or not np.isfinite(lift) or seconds <= 0.0:
+            return
+        sums = self.band_edge_sums[side]
+        sums[0] += max(lift, 0.0)
+        sums[1] += seconds
+        sums[2] += 1
+
+    def tune_band_scale(self):
+        """Move the auto band's scale (``band_scale``) once each side of the
+        band's top has solved ``_EXACT_BAND_TUNE_SAMPLES`` nodes since the
+        last move: up by ``_EXACT_BAND_SCALE_STEP`` when the lane's exact
+        LPs near the top lifted more bound a thread-second than the
+        device's LPs just above it did a device-second, else down, within
+        ``_EXACT_BAND_SCALE_LIMITS``. The rates are compared at the edge,
+        where the choice is made: at the bottom of the band exact LPs
+        always win. While the cap (``band_capacity_top``) holds the band
+        down, the scale does not set it, and stays."""
+        exact, device = self.band_edge_sums["exact"], self.band_edge_sums["device"]
+        if min(exact[2], device[2]) < _EXACT_BAND_TUNE_SAMPLES:
+            return
+        exact_rate = exact[0] / exact[1]
+        device_rate = device[0] / device[1]
+        self.band_rates = (exact_rate, device_rate)
+        self.band_edge_sums = {"exact": [0.0, 0.0, 0], "device": [0.0, 0.0, 0]}
+        if self.band_capped:
+            return
+        step = _EXACT_BAND_SCALE_STEP if exact_rate > device_rate else 1.0 / _EXACT_BAND_SCALE_STEP
+        low, high = _EXACT_BAND_SCALE_LIMITS
+        self.band_scale = min(high, max(low, self.band_scale * step))
+        self.band_tunes += 1
+        lo, hi = self.band_scale_range
+        self.band_scale_range = [min(lo, self.band_scale), max(hi, self.band_scale)]
 
     @staticmethod
     def basis_shape(mip):
@@ -14988,6 +15300,7 @@ class _BranchAndBound:
         del reserved[-take:]
         for node in nodes:
             node.exact_tried = node.converge = True
+            node.band_edge = None
         self.overflow_nodes += len(nodes)
         return nodes
 
@@ -15090,8 +15403,10 @@ class _BranchAndBound:
         if node.bound >= self.cutoff():
             self.close(node.bound)
             return
+        lp_seconds = seconds - strong_seconds
         if status == "infeasible":
             self.exact_infeasible += 1
+            self.record_band_edge(node, "exact", self.cutoff() - node.bound, lp_seconds)
             self.close(max(node.bound, self.cutoff_bound()))
             return
         solution = None
@@ -15100,6 +15415,7 @@ class _BranchAndBound:
         if solution is None:
             # Unsolved, or for rows the search no longer has (a restart).
             self.exact_failed += 1
+            node.band_edge = None
             self.push(node)
             return
         self.exact_solved += 1
@@ -15121,7 +15437,7 @@ class _BranchAndBound:
         strong = self.exact_strong_children(
             node, box, version, solution, children, known
         )
-        self.evaluate_exact(node, box, solution, strong, known)
+        self.evaluate_exact(node, box, solution, strong, known, lp_seconds)
 
     def exact_solution(self, node, x, y_eq, y_ineq, version):
         """A HiGHS solution (Jaddle's dual convention) as a ``SaddleState``
@@ -15296,14 +15612,22 @@ class _BranchAndBound:
             exact_strong=strong,
         )
 
-    def evaluate_exact(self, node, box, solution, strong=None, known=None):
+    def evaluate_exact(
+        self, node, box, solution, strong=None, known=None, lp_seconds=None
+    ):
         """Evaluate ``node`` with an exact LP ``solution`` (and the lane's
         strong children, ``strong``) as a batch member is evaluated;
-        ``known``: the lane's bounds (``exact_lane_bounds``), if usable."""
+        ``known``: the lane's bounds (``exact_lane_bounds``), if usable;
+        ``lp_seconds``: its LP's time on the lane (``record_band_edge``)."""
         lower, upper = box
         raw, _ = self.known_bound(known, "node", solution, lower, upper)
         if np.isfinite(raw):
             self.exact_gain += max(raw - node.bound, 0.0)
+        if lp_seconds is not None:
+            self.record_band_edge(
+                node, "exact", min(raw, self.cutoff()) - node.bound, lp_seconds
+            )
+        node.band_edge = None
         self.nodes += 1
         result = dict(
             solution=solution,
@@ -15332,9 +15656,25 @@ class _BranchAndBound:
         with no node to solve."""
         members, boxes = [], []
         in_flight = 0 if self.in_flight is None else len(self.in_flight["members"])
+        now = time.perf_counter()
+        if self.last_launch is not None:
+            period = now - self.last_launch
+            self.batch_period = (
+                period
+                if self.batch_period is None
+                else 0.9 * self.batch_period + 0.1 * period
+            )
+        self.last_launch = now
         self.feed_exact()
         self.adapt_exact_band()
         band_top = self.exact_band_top()
+        # The auto band's edges (``tune_band_scale``): its top half for the
+        # lane, and as far again above it for the device.
+        edge_low = edge_high = band_top
+        if self.exact_band_auto and np.isfinite(band_top):
+            depth = max(band_top - self.band_bound, 0.0)
+            edge_low = band_top - _EXACT_BAND_EDGE * depth
+            edge_high = band_top + _EXACT_BAND_EDGE * depth
         if self.exact_overflow_share > 0.0:
             # The top of a band too deep for the lane, solved to convergence
             # on the device (``overflow_band``).
@@ -15366,13 +15706,18 @@ class _BranchAndBound:
             if node.bound >= self.cutoff():
                 self.close(node.bound)
                 continue
-            if from_heap and node.bound <= band_top and self.exact_eligible(node):
+            eligible = from_heap and self.exact_eligible(node)
+            if eligible and node.bound <= band_top:
                 # In the band the lane keeps (``exact_band``): it waits for
                 # an exact LP instead of a truncated one.
+                if node.bound >= edge_low and edge_low < band_top:
+                    node.band_edge = "exact"
                 heapq.heappush(
                     self.exact_reserved, (node.bound, next(self.counter), node)
                 )
                 continue
+            if eligible and node.bound <= edge_high and band_top < edge_high:
+                node.band_edge = "device"
             box = self.expand(node.changes)
             if np.any(box[0] > box[1]):
                 # Emptied by reduced-cost fixing of the root box.
@@ -15402,7 +15747,11 @@ class _BranchAndBound:
         )
         self.batches += 1
         return dict(
-            members=members, boxes=boxes, handle=handle, version=self.cut_version
+            members=members,
+            boxes=boxes,
+            handle=handle,
+            version=self.cut_version,
+            launched=now,
         )
 
     def process_batch(self, batch):
@@ -15434,6 +15783,10 @@ class _BranchAndBound:
                 for result in results
             ]
         evaluating = time.perf_counter()
+        # A member's share of the device's time, for ``record_band_edge``.
+        member_seconds = (evaluating - batch.get("launched", evaluating)) / max(
+            len(members), 1
+        )
         results, requeued = self.after_node_solves(members, boxes, results)
         self.deferring = self.batch_on_device()
         try:
@@ -15452,6 +15805,9 @@ class _BranchAndBound:
                 lower, upper = boxes[i]
                 requeues = self.batch_requeues
                 self.evaluate(node, lower, upper, None, result)
+                if node.band_edge is not None:
+                    lift = min(self.last_raw_bound, self.cutoff()) - node.bound
+                    self.record_band_edge(node, "device", lift, member_seconds)
                 if self.batch_requeues > requeues:
                     # Back in the queue unconverged: a slice of its LP, not a
                     # node. It counts when it finishes.
@@ -16285,6 +16641,9 @@ def solve(
     probing_cliques=True,
     implied_variable_bounds=True,
     max_aggregation=6,
+    aggregation_width=_CUT_AGGREGATION_WIDTH,
+    cmir_per_row=_CUT_CMIR_PER_ROW,
+    cut_score_weights=_CUT_SCORE_WEIGHTS,
     exact_nodes=16,
     exact_node_seconds=10.0,
     exact_band=0.25,
@@ -16496,15 +16855,22 @@ def solve(
       flow set over those variable bounds. MIR cuts come from single rows
       and from aggregates of up to three rows that cancel continuous
       variables; with ``aggregate_integers``
-      (``"auto"``, the default: on for MIPs with at most 10,000 nonzeros),
-      aggregates of up to five rows also cancel the most fractional integer
-      term, so pure-integer rows combine. On lseu that lifts the root bound
+      (``"auto"``, the default: on for MIPs with at most 10,000 nonzeros,
+      and for every MIP with the numba separation backend, where a round
+      costs milliseconds), aggregates of up to five rows also cancel the
+      most fractional integer term, so pure-integer rows combine. On lseu that lifts the root bound
       (exact LPs) from 1,061 to 1,100. ``max_aggregation`` (default 6) sets the
       rows added to an aggregate instead (``None``: 2, or 4 with
       ``aggregate_integers``); on map06, whose rows bound continuous
       variables through chains of other continuous variables, 6 with
       probing's variable bounds (below) takes the root bound (exact LPs)
-      from −395.8 to −393.9. Cover and MIR cuts are separated by
+      from −395.8 to −393.9. The first aggregation step of a row tries the
+      partner rows of its ``aggregation_width`` best columns to cancel
+      (default 3), each continuing greedily, so a row gives up to
+      ``aggregation_width × max_aggregation`` aggregates instead of
+      ``max_aggregation``; the ``cmir_per_row`` most efficacious c-MIR cuts
+      over a row's aggregates are kept (default 3; 1 keeps the best only,
+      as before). Cover and MIR cuts are separated by
       ``CutSeparator``:
       up to three covers per row (``cover_cuts``), each lifted exactly by
       a dynamic program over the knapsack. With coefficient tightening,
@@ -16513,7 +16879,15 @@ def solve(
       round keeps at most
       ``max_cuts_per_round`` cuts (default 500) with efficacy (distance cut
       off) at least 1e-4 that are not near-parallel, retires cuts that are
-      slack, and re-solves the LP warm. With 10 a round, the strongest
+      slack, and re-solves the LP warm. Candidates are ranked as SCIP's
+      hybrid cut selector ranks them (``select_cuts``): efficacy over the
+      round's largest, plus ``cut_score_weights = (w_obj, w_int, w_dir)``
+      (default ``(0.1, 0.1, 0.5)``) times the cut's |cosine| with the
+      objective, its share of integer columns, and its directed cutoff
+      distance (how far it lies along the segment to the incumbent) over the
+      round's largest; ``None`` ranks by efficacy alone, as before. Tree
+      cut rounds pick each node point's candidates the same way, then
+      merge the points' picks by efficacy. With 10 a round, the strongest
       covers took every slot on bab5 and no Gomory cut got in: 100 takes
       its root bound (with clique cuts) from −113,254 to −111,358, and
       ns1830653's from 10,621 to 11,622, HiGHS's root bound. A cut leaves
@@ -17442,6 +17816,9 @@ def solve(
         probing_cliques=probing_cliques,
         implied_variable_bounds=implied_variable_bounds,
         max_aggregation=max_aggregation,
+        aggregation_width=aggregation_width,
+        cmir_per_row=cmir_per_row,
+        cut_score_weights=cut_score_weights,
         exact_nodes=exact_nodes,
         exact_node_seconds=exact_node_seconds,
         exact_band=exact_band,
@@ -17597,6 +17974,13 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
                 "band": 0.0,
                 "band_min": 0.0,
                 "band_max": 0.0,
+                "band_scale": _EXACT_BAND_GAP_SCALE,
+                "band_scale_min": _EXACT_BAND_GAP_SCALE,
+                "band_scale_max": _EXACT_BAND_GAP_SCALE,
+                "band_tunes": 0,
+                "band_rates": (None, None),
+                "band_cap_nodes": None,
+                "band_capped_batches": 0,
             },
             "inout_cuts": 0,
             "inout_rounds": 0,

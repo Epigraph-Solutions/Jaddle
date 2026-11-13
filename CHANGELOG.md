@@ -4,6 +4,20 @@
 
 ### Added
 
+- Wider c-MIR aggregation (`aggregation_width`, default 3): the first
+  aggregation step of each tight row tries the partner rows of its best
+  three columns to cancel, not only the best, and each branch continues
+  greedily. `aggregation_width=1` gives the earlier paths exactly.
+- More c-MIR cuts per row (`cmir_per_row`, default 3): the most
+  efficacious cuts over a row's aggregates, not only the best one.
+- Scored cut selection (`cut_score_weights`, default `(0.1, 0.1, 0.5)`),
+  after SCIP's hybrid selector: normalised efficacy plus weighted
+  objective parallelism, integer support and directed cutoff distance
+  toward the incumbent. `None` ranks by efficacy alone, as before.
+- `aggregate_integers="auto"` is now on for every MIP when the numba
+  separation backend is in use (it was on only for MIPs with at most
+  10,000 nonzeros).
+
 - Proximity search on the sub-MIP lane (`proximity_seconds`, default 10 s
   a call, marked `"X"`; Fischetti & Monaci). HiGHS keeps the objective as
   a row under the cutoff and searches the whole box for the feasible point
@@ -158,6 +172,21 @@
   intersecting its members' neighbour sets instead of checking each
   candidate against each member: the same cuts, about 4× faster on
   30n20b8's node points (2.3–4.5 s a call to 0.6–1.1 s).
+
+### Fixed
+
+- c-MIR's variable-bound substitution broke ties the wrong way. When a
+  continuous column's variable bound and simple bound are equally close to
+  the LP point, it now takes the side whose shifted term the MIR drops: a
+  lower bound for a positive coefficient, an upper one for a negative one,
+  as HiGHS does. Before, it always took the variable bound. A
+  fixed-charge network's unused arcs sit at y = 0 = u·z, so each outflow
+  was shifted to its VUB, and the cut-set inequalities came out with u·z
+  terms (x₁ + x₂ ≥ 1 became x₁ + x₂ + 81·x₃ + 81·x₄ − y₃ − y₄ ≥ 1) too
+  shallow to be selected. On beasleyC3 with exact cut rounds, the root
+  LP after one round goes from 351 to 462, after ten from 631 to about
+  675, and after thirty from 721 to 735 (HiGHS's root: 733). The same
+  fix applies in all three backends (numpy, JAX, numba).
 
 ## 0.3.1
 
