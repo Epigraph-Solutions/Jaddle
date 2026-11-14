@@ -36,7 +36,7 @@ import time
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["XLA_FLAGS"] = (
-    "--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=4"
+    "--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=16"
 )
 
 import highspy
@@ -147,7 +147,9 @@ def run_jaddle(path, args):
     started = time.time()
     result = jm.solve(
         path,
-        branching="auto",
+        branching="pseudocost",
+        node_selection="best_first",
+        reliability_threshold=8,
         mip_rel_gap=1e-5,
         verbose=True,
         symmetry=True,
@@ -156,35 +158,41 @@ def run_jaddle(path, args):
         presolve=True,
         exact_nodes=16,
         exact_band="auto",
-        exact_overflow_share=0,
-        exact_strong_lookahead=2,
-        exact_strong_candidates=2,
-        jump_threads=1,
-        batch_size=8,
+        exact_overflow_share=0.0,
+        exact_strong_lookahead=4,
+        exact_strong_candidates=8,
+        batch_size=16,
         max_seconds=args.max_seconds,
         tree_cut_every=150,
         cut_pool_size=1e4,
         tree_cut_rows=1e3,
-        max_cut_rows=5000,
-        cut_rounds=20,
+        max_cut_rows=2000,
+        cut_rounds=50,
         conflict_pool_size=5000,
         root_lp="jaddle",
-        lp_tolerance=1e-6,
-        precision="float64",
-        root_crossover=True,
-        cut_round_lp="jaddle",
-        node_precision="float64",
-        node_lp_tolerance=1e-4,
+        # lp_tolerance=1e-6,
+        # precision="float64",
+        # root_crossover=True,
+        cut_round_lp="highs",
+        node_precision="float32",
+        node_lp_tolerance=1e-3,
         # node_crossover=True,
+        # node_crossover_seconds=60,
         # Sign repair of loose node duals on wide continuous columns before
         # their Lagrangian bound is taken (jm.DualRepair).
         dual_repair=True,
         mir_cuts=True,
-        gomory_cuts=True,
+        gomory_cuts=False,
         cuts=True,
         tree_cuts=True,
-        proximity_seconds=10,
-        rens_seconds=10,
+        proximity_seconds=20,
+        proximity_gap_share=0.6,
+        jump_gap_share=0.2,
+        jump_threads=4,
+        rens_seconds=20,
+        rens_fixing_rate=0.9,
+        rins_seconds=20,
+        rins_fixing_rate=0.9,
         one_opt=True,
         # Dual-guided fixing on the sub-MIP lane: the root's largest
         # reduced costs fix integers at their preferred bound, HiGHS
@@ -195,7 +203,7 @@ def run_jaddle(path, args):
         # projected_pdhg=True,
         gpu_dive_every=10,
         # objective_level_seconds=45,
-        restarts=1,
+        restarts=0,
         # Cutoff probing: strong branching on every free integer against
         # the cutoff, on CPU threads, fixing the root box (on by default).
         cutoff_probing=True,

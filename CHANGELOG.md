@@ -4,6 +4,22 @@
 
 ### Added
 
+- Aggressive proximity search and improving jumps (`proximity_gap_share`,
+  `jump_gap_share`, default 0: any improvement). The next point must close
+  that share of the gap between the incumbent and the search's bound, as
+  in Fischetti and Monaci's proximity search with a large improvement
+  step. Proximity's cutoff is set there. The improving jumps (background
+  and root) start their objective row there and drop it as far again
+  after each point they find. A call that finds nothing halves the share,
+  which drops to 0 below a sixteenth of the setting; a find restores it.
+- Larger RINS and RENS neighbourhoods. `rins_fixing_rate` (default 1)
+  fixes only that share, drawn at random, of the integers where the
+  incumbent and the point agree, on the HiGHS lane and in the Jaddle
+  sub-search alike. On the lane the adaptive rate starts there and never
+  rises above it, and its floor is 0.4, or the setting if lower.
+  `rens_fixing_rate` (default 1) fixes only that share of the integral
+  integers. The rest get their whole box: `[floor, ceil]` of a whole
+  number would fix them anyway.
 - Dual-guided fixing (`dual_fix_seconds`, default 0: off; needs
   `submip_solver="highs"`). The root LP's reduced costs rank the free
   integers of the root box. The share `dual_fix_rate` (default 0.7) with
@@ -221,6 +237,14 @@
 
 ### Fixed
 
+- The exact lane's pseudocosts (`exact_nodes`) stopped learning once each
+  candidate was reliable. Lane nodes branch by them alone, but only the
+  lane's strong branching fed them, and it skips reliable candidates. On
+  binkar10_1 (170 binaries, `reliability_threshold=4`) they froze after
+  about 1,700 strong LPs while the lane solved 44,000 of the 46,000 nodes.
+  A lane node's exact LP gain over its parent's exact LP now feeds them,
+  except on a split strong branching already measured, and except when
+  the value was taken before a tree-cut re-solve (it may be the device's).
 - The reported bound could pass the optimum. A Lagrangian bound that drops
   wrong-sign reduced costs at infinite bounds (within `reduced_cost_tol =
   lp_tolerance·(1+‖c‖₂)`) is not a bound, but node bounds took it and the
@@ -243,6 +267,13 @@
   meanwhile, by an exact node evaluated during batch building or by the
   heartbeat, skipped it: buildingenergy showed 33,340 between lines of
   33,246. Both bounds now count nodes in transit.
+- Root cut rounds stop once a round selects no new cut. At a loose PDHG
+  point (`lp_tolerance=1e-3`) a cut already in the LP could pass the
+  selection's efficacy again. A round of only those re-added rows the LP
+  had, so it was never empty and the loop went on. Cuts the LP keeps (same
+  columns and coefficients, a right-hand side no tighter) no longer count.
+  A tighter version still does, and so does an idle cut that the round
+  drops and selects again.
 - A search could restart after its gap had closed. A new incumbent lowers
   the cutoff, root reduced-cost fixing against it fixed the share a restart
   needs, and the restart check came before the tree's convergence check,

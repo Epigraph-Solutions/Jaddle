@@ -7387,6 +7387,53 @@ def test_exact_strong_branching_in_the_search():
     assert totals["strong_lps"] > 0 and totals["children_reused"] > 0
 
 
+def test_exact_lane_learns_pseudocosts_from_its_nodes(monkeypatch):
+    # Without strong branching (in the lane or at the root) the lane's
+    # pseudocosts learn only from its nodes' exact LPs over their exact
+    # parents'.
+    real = jm._BranchAndBound.evaluate_exact
+    searches = []
+
+    def spy(self, node, *args, **kwargs):
+        if not searches or searches[-1] is not self:
+            searches.append(self)
+        return real(self, node, *args, **kwargs)
+
+    monkeypatch.setattr(jm._BranchAndBound, "evaluate_exact", spy)
+    options = dict(
+        batch_size=4, cuts=False, probing=False, exact_nodes=2,
+        exact_strong_candidates=0, exact_root_candidates=0,
+    )
+    learnt = 0
+    for make in (facility_location, generalised_assignment):
+        mip = make()
+        assert_solved(solve(mip, **options), mip, reference(mip))
+        search = searches[-1]
+        assert search.exact_strong_lps == 0
+        assert np.all(search.exact_pc_sum >= 0.0)
+        # Every observation the lane made is one the device made too.
+        assert np.all(search.exact_pc_count <= search.pc_count)
+        learnt += search.exact_pc_count.sum()
+    assert learnt > 0
+
+
+def test_exact_pseudocosts_skip_strong_branched_splits():
+    # A node's gain feeds the lane's pseudocosts only when its LP and its
+    # parent's are exact and strong branching did not measure the split.
+    mip = knapsack()
+    search = jm._BranchAndBound(mip, **jm_settings())
+    node = jm._Node(0.0, 1, None, None, (0, True, 0.5, 1.0))
+    for learns, exact, counted in (
+        (True, True, 1), (False, True, 0), (True, False, 0),
+    ):
+        node.learns_exact = learns
+        before = search.exact_pc_count.sum()
+        search.update_pseudocost(node, 2.0, exact=exact)
+        assert search.exact_pc_count.sum() - before == counted
+    assert search.exact_pc_sum[0, 0] == pytest.approx(2.0)  # (2 − 1) / 0.5
+    assert search.pc_count[0, 0] == 3  # the device's learn from all three
+
+
 def test_solve_with_implied_variable_bounds_and_long_aggregation():
     mip = coverage_chains(1)
     ref = reference(mip)
@@ -8705,3 +8752,86 @@ def test_nodes_in_transit_hold_the_bounds(monkeypatch):
     search.in_transit = []  # landed (the tree loop's next iteration)
     assert search.global_bound() == 470.0
     assert search.proven_bound() == 465.0
+
+
+def test_root_rounds_count_only_new_cuts(monkeypatch):
+    search = search_for(generalised_assignment(), monkeypatch, cut_age=3)
+    idx = np.array([0, 1, 2], np.int32)
+    coef = np.array([1.0, 1.0, 1.0])
+    search.cut_list = [
+        dict(family="mir", idx=idx, coef=coef, rhs=2.0, age=0),
+        dict(family="mir", idx=np.array([3, 4]), coef=np.ones(2), rhs=1.0, age=3),
+    ]
+    same = ("mir", idx.astype(np.int64), coef, 2.0)  # the held cut again
+    looser = ("mir", idx, coef, 2.5)
+    tighter = ("mir", idx, coef, 1.5)
+    other = ("cover", np.array([5, 6]), np.ones(2), 1.0)
+    idle = ("mir", np.array([3, 4]), np.ones(2), 1.0)  # leaves the LP this round
+    kept = search.new_cuts([same, looser, tighter, other, idle])
+    assert [cut[3] for cut in kept] == [1.5, 1.0, 1.0]
+    assert search.new_cuts([same, looser]) == []
+    # The exact loop's own age limit.
+    assert search.new_cuts([idle], age_limit=5) == []
+
+
+def test_rens_fixing_rate_fixes_a_share_of_the_integral_integers(monkeypatch):
+    mip = generalised_assignment()
+    search = search_for(mip, monkeypatch, rens_fixing_rate=0.5)
+    n = mip.num_variables
+    x = np.where(np.arange(n) % 10 == 0, 0.5, 1.0)  # 90 integral, 10 fractional
+    lower, upper = search.rens_box(x, mip.lower, mip.upper, 0.5, 1e-6)
+    fixed = lower == upper
+    fractional = np.arange(n) % 10 == 0
+    assert not fixed[fractional].any()
+    assert 25 <= fixed.sum() <= 65  # about half of the 90
+    # The integral integers left free keep the whole box ([floor, ceil] of
+    # a whole number would fix them anyway).
+    free = ~fixed & ~fractional
+    assert free.any()
+    assert np.all(lower[free] == 0.0) and np.all(upper[free] == 1.0)
+    # The fractional ones get [floor, ceil] = [0, 1] either way.
+    assert np.all(lower[fractional] == 0.0) and np.all(upper[fractional] == 1.0)
+    full = search_for(mip, monkeypatch)
+    lower, upper = full.rens_box(x, mip.lower, mip.upper, 0.5, 1e-6)
+    assert np.array_equal(lower == upper, ~fractional)
+
+
+def test_rins_fixing_rate_starts_and_caps_the_adaptive_rate(monkeypatch):
+    search = search_for(generalised_assignment(), monkeypatch, rins_fixing_rate=0.7)
+    search.submip_budget = 10.0
+    assert search.rins_fixing_rate == 0.7
+    search.adapt_rins_fixing(False, 10.0)  # out of time: at most the setting
+    assert search.rins_fixing_rate == 0.7
+    for _ in range(10):
+        search.adapt_rins_fixing(False, 1.0)  # empty early: down to 0.4
+    assert search.rins_fixing_rate == pytest.approx(0.4)
+    low = search_for(generalised_assignment(), monkeypatch, rins_fixing_rate=0.2)
+    low.submip_budget = 10.0
+    low.adapt_rins_fixing(False, 1.0)
+    assert low.rins_fixing_rate == pytest.approx(0.2)  # its own floor
+    with pytest.raises(ValueError, match="rens_fixing_rate"):
+        solve(knapsack(), rens_fixing_rate=0.0)
+
+
+def test_gap_share_targets(monkeypatch):
+    search = search_for(
+        generalised_assignment(), monkeypatch, proximity_gap_share=0.25,
+        jump_gap_share=0.5,
+    )
+    search.incumbent = (500.0, np.zeros(search.mip.num_variables))
+    monkeypatch.setattr(jm._BranchAndBound, "global_bound", lambda self: 400.0)
+    assert search.gap_target(0.25) == pytest.approx(475.0)
+    assert search.gap_target(0.0) == search.cutoff(box=False)
+    # The cutoff when it is lower (a gap smaller than the tolerances).
+    assert search.gap_target(1e-9) == search.cutoff(box=False)
+    assert search.jump_improve_step() == pytest.approx(50.0)
+    # Halved after a call that finds nothing, 0 below a sixteenth, back
+    # to the setting after a find.
+    share = 0.25
+    for expected in (0.125, 0.0625, 0.03125, 0.015625, 0.0):
+        share = search.adapt_gap_share(share, 0.25, False)
+        assert share == pytest.approx(expected)
+    assert search.adapt_gap_share(0.0, 0.25, True) == 0.25
+    assert search.adapt_gap_share(0.0, 0.0, False) == 0.0
+    with pytest.raises(ValueError, match="jump_gap_share"):
+        solve(knapsack(), jump_gap_share=1.0)

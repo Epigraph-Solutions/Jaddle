@@ -7245,6 +7245,8 @@ class _Node:
         "branch_value",
         "exact_tried",
         "exact_known",
+        "exact_lp",
+        "learns_exact",
         "converge",
         "exact_basis",
         "exact_sides",
@@ -7286,6 +7288,12 @@ class _Node:
         # Whether ``warm`` is an optimal vertex of its LP (from the exact
         # lane's strong branching): the lane evaluates it without a solve.
         self.exact_known = False
+        # Whether its LP was evaluated exactly (``evaluate_exact``), and
+        # whether its own gain feeds the lane's exact pseudocosts: its
+        # parent's LP was exact and the lane did not strong-branch the
+        # split that made it (whose sides already gave that gain).
+        self.exact_lp = False
+        self.learns_exact = False
         # Whether its LP runs to convergence on the device, over batches,
         # instead of being truncated (``exact_overflow_share``).
         self.converge = False
@@ -8963,10 +8971,14 @@ class _BranchAndBound:
         trivial_heuristic=True,
         submip_solver="highs",
         rins_tolerance=0.1,
+        rins_fixing_rate=1.0,
+        rens_fixing_rate=1.0,
         crossover_seconds=10.0,
         crossover_solutions=3,
         crossover_min_fixed=0.5,
         proximity_seconds=10.0,
+        proximity_gap_share=0.0,
+        jump_gap_share=0.0,
         first_solution_seconds=0.0,
         dual_fix_seconds=0.0,
         dual_fix_rate=0.7,
@@ -9585,6 +9597,17 @@ class _BranchAndBound:
         self.crossover_solutions = int(crossover_solutions)
         self.crossover_min_fixed = float(crossover_min_fixed)
         self.proximity_seconds = float(proximity_seconds or 0.0)
+        # Aggressive targets (``gap_target``): the share of the gap a new
+        # point must close, for proximity search and the improving jumps;
+        # the setting and the share in use (``adapt_gap_share``).
+        for name, share in (
+            ("proximity_gap_share", proximity_gap_share),
+            ("jump_gap_share", jump_gap_share),
+        ):
+            if not 0.0 <= float(share) < 1.0:
+                raise ValueError(f"{name} must be in [0, 1), not {share!r}")
+        self.proximity_gap_max = self.proximity_gap_share = float(proximity_gap_share)
+        self.jump_gap_max = self.jump_gap_share = float(jump_gap_share)
         # Dual-guided fixing on the sub-MIP lane (``dual_fix_box``): its
         # seconds a call, the share of the free integers it fixes (moved
         # as RINS's, ``adapt_dual_fixing``), and its calls and finds.
@@ -9633,8 +9656,22 @@ class _BranchAndBound:
         self.submip_lane_seconds = 0.0
         # The share of the agreeing integers RINS fixes on the lane
         # (``adapt_rins_fixing``), and the draws that pick them.
-        self.rins_fixing_rate = 1.0
+        # ``rins_fixing_rate`` (the start and the ceiling; below 1, a larger
+        # neighbourhood) and the floor it adapts down to.
+        for name, rate in (
+            ("rins_fixing_rate", rins_fixing_rate),
+            ("rens_fixing_rate", rens_fixing_rate),
+        ):
+            if not 0.0 < float(rate) <= 1.0:
+                raise ValueError(f"{name} must be in (0, 1], not {rate!r}")
+        self.rins_fixing_max = float(rins_fixing_rate)
+        self.rins_fixing_min = min(_RINS_MIN_FIXING, self.rins_fixing_max)
+        self.rins_fixing_rate = self.rins_fixing_max
         self.rins_rng = np.random.default_rng(0)
+        # The share of the integral integers RENS fixes (``rens_box``), drawn
+        # at random; the rest keep ``[floor, ceil]``.
+        self.rens_fixing_rate = float(rens_fixing_rate)
+        self.rens_rng = np.random.default_rng(1)
         self.rins_finds = 0
         self.crossover_calls = 0
         self.crossover_finds = 0
@@ -11341,11 +11378,24 @@ class _BranchAndBound:
         self.pc_sum[0 if down else 1, var] += gain
         self.pc_count[0 if down else 1, var] += 1
 
-    def update_pseudocost(self, node, value):
+    def update_pseudocost(self, node, value, exact=False):
+        """Record the gain of the branching that made ``node``, whose LP
+        value is ``value``. With ``exact`` (its LP was the lane's, and
+        ``node.learns_exact``: its parent's too, the split not strong-branched)
+        the gain feeds the lane's exact pseudocosts as well. The lane's
+        branching ranks by those alone, so without it they learnt only from
+        strong branching, which stops once each candidate is reliable: on
+        binkar10_1 (170 binaries, ``reliability_threshold=4``) they froze
+        after about 1,700 strong LPs while the lane solved 44,000 nodes."""
         var, down, distance, parent_value = node.branch
         if parent_value is None or distance <= 0:
             return
-        self.record_gain(var, down, max(value - parent_value, 0.0) / distance)
+        gain = max(value - parent_value, 0.0) / distance
+        self.record_gain(var, down, gain)
+        if exact and node.learns_exact:
+            side = 0 if down else 1
+            self.exact_pc_sum[side, var] += gain
+            self.exact_pc_count[side, var] += 1
 
     def tree_elapsed(self):
         """Seconds spent in the tree so far, over every round between
@@ -12158,6 +12208,10 @@ class _BranchAndBound:
             )
             # The exact lane's strong child solved its LP already.
             child.exact_known = strong is not None and strong[down].exact
+            # Its exact LP's gain over this node's exact one feeds the
+            # lane's pseudocosts (``update_pseudocost``) unless strong
+            # branching measured it.
+            child.learns_exact = node.exact_lp and strong is None
             # Its exact LP starts from its strong side's basis, else from
             # this node's (``basis_store``).
             child.exact_basis = (node.exact_sides or {}).get(
@@ -12335,12 +12389,18 @@ class _BranchAndBound:
             # in for the LP value, for the pseudocosts and its children's
             # parent value, which would otherwise rarely learn.
             value = float(raw) if np.isfinite(raw) else None
+        # An exact LP (the lane's, or the root's): its children's exact
+        # gains over it feed the lane's pseudocosts (``learns_exact``).
+        node.exact_lp = result.get("stop_reason") == "exact"
         if node.branch is not None and value is not None:
             # The gain of the branching alone: the LP before this node's
             # re-solve with new tree cuts (``refresh_cuts``), whose gain is
-            # the cuts', not the branched variable's.
+            # the cuts', not the branched variable's. That value may be the
+            # device's, so it feeds only the device's pseudocosts.
             self.update_pseudocost(
-                node, value if node.branch_value is None else node.branch_value
+                node,
+                value if node.branch_value is None else node.branch_value,
+                exact=node.exact_lp and node.branch_value is None,
             )
         if bound >= self.cutoff():
             self.record_cutoff(node.branch)
@@ -13343,6 +13403,7 @@ class _BranchAndBound:
             )
             candidates += inout or []
             found = self.select_cuts(candidates, x, n, self.max_cuts_per_round)
+            found = self.new_cuts(found)  # none: the round adds nothing, so stop
             self.inout_result(found, inout)
             self.archive_cuts(found)
             # Every violated candidate goes into the pool, as HiGHS's, for
@@ -13564,6 +13625,7 @@ class _BranchAndBound:
             )
             candidates += inout or []
             found = self.select_cuts(candidates, x, n, self.max_cuts_per_round)
+            found = self.new_cuts(found, age_limit)  # none: the round adds nothing, so stop
             self.inout_result(found, inout)
             self.archive_cuts(found)
             self.pool_cuts(violated_cuts(candidates, x))
@@ -14048,6 +14110,40 @@ class _BranchAndBound:
             is_int=self.cut_int,
             incumbent=None if incumbent is None else incumbent[1],
         )
+
+    def new_cuts(self, cuts, age_limit=None):
+        """``cuts`` less those the LP keeps (``cut_list``, those younger than
+        ``age_limit``, default ``cut_age``: an idle cut the round drops and
+        selects again stays): the same columns and coefficients at a
+        right-hand side no tighter. At a loose
+        PDHG point (``lp_tolerance=1e-3``) a cut in the LP can still pass
+        the selection's efficacy and be chosen again, so a round of only
+        those added nothing new, yet the loop went on. A tighter version of
+        a held cut counts as new."""
+        def key(idx, coef):
+            return (
+                np.asarray(idx, np.int64).tobytes(),
+                np.asarray(coef, np.float64).tobytes(),
+            )
+
+        if age_limit is None:
+            age_limit = self.cut_age
+        held = {}
+        for cut in self.cut_list:
+            if cut["age"] >= age_limit:
+                continue
+            k = key(cut["idx"], cut["coef"])
+            held[k] = min(held.get(k, np.inf), float(cut["rhs"]))
+        out = []
+        for cut in cuts:
+            _, idx, coef, rhs = cut
+            rhs_held = held.get(key(idx, coef))
+            if rhs_held is not None and float(rhs) >= rhs_held - 1e-12 * (
+                1.0 + abs(rhs_held)
+            ):
+                continue
+            out.append(cut)
+        return out
 
     def zero_half(self, x, lower, upper, max_cuts, mip=None):
         """Zero-half cuts at ``x`` (``zero_half_cuts``) from the LP's rows as
@@ -14863,9 +14959,10 @@ class _BranchAndBound:
         fixing rates. A job that found nothing and ended early (within
         ``_RINS_EARLY_SHARE`` of its seconds: HiGHS proved the box empty
         below the cutoff) had too small a neighbourhood, so the rate drops
-        by ``_RINS_FIXING_STEP``, to at least ``_RINS_MIN_FIXING``; one
-        that ran out of time had too large a one, and the rate rises back
-        towards 1. On 30n20b8 the incumbent and the node points agree on
+        by ``_RINS_FIXING_STEP``, to at least ``_RINS_MIN_FIXING`` (or
+        ``rins_fixing_rate``, if lower); one that ran out of time had too
+        large a one, and the rate rises back towards ``rins_fixing_rate``
+        (default 1). On 30n20b8 the incumbent and the node points agree on
         96% of the integers, nearly all zeros of the time-indexed binaries;
         fixing all of them left HiGHS an empty box in 0.02 s on every call,
         while fixing 80% of them found 453 → 353 in 0.8 s."""
@@ -14873,9 +14970,11 @@ class _BranchAndBound:
             return
         if seconds < _RINS_EARLY_SHARE * self.submip_budget:
             rate = self.rins_fixing_rate * _RINS_FIXING_STEP
-            self.rins_fixing_rate = max(_RINS_MIN_FIXING, rate)
+            self.rins_fixing_rate = max(self.rins_fixing_min, rate)
         else:
-            self.rins_fixing_rate = min(1.0, self.rins_fixing_rate / _RINS_FIXING_STEP)
+            self.rins_fixing_rate = min(
+                self.rins_fixing_max, self.rins_fixing_rate / _RINS_FIXING_STEP
+            )
 
     def dual_fix_box(self, seconds):
         """Dual-guided fixing's neighbourhood of the root box: the free
@@ -15024,6 +15123,41 @@ class _BranchAndBound:
         self.crossover_calls += 1
         return True
 
+    def gap_target(self, share):
+        """The objective a heuristic's next point must reach: the cutoff,
+        or with ``share`` > 0, ``incumbent − share·(incumbent − bound)`` when
+        that is lower (the search's bound: a target, not a proof), as
+        proximity search with a large improvement step (Fischetti and Monaci
+        2014) takes bigger strides than one that accepts any improvement."""
+        cutoff = self.cutoff(box=False)
+        if share <= 0.0 or self.incumbent is None:
+            return cutoff
+        gap = self.incumbent[0] - self.global_bound()
+        if not (np.isfinite(gap) and gap > 0.0):
+            return cutoff
+        return min(cutoff, self.incumbent[0] - share * gap)
+
+    def jump_improve_step(self):
+        """The improving jumps' ``improve_step``: the objective step, or with
+        ``jump_gap_share`` in use, that share of the gap when larger."""
+        step = self.objective_step
+        if self.jump_gap_share <= 0.0 or self.incumbent is None:
+            return step
+        gap = self.incumbent[0] - self.global_bound()
+        if not (np.isfinite(gap) and gap > 0.0):
+            return step
+        return max(step or 0.0, self.jump_gap_share * gap)
+
+    @staticmethod
+    def adapt_gap_share(share, setting, found):
+        """A gap share after a call: back to ``setting`` when it ``found`` a
+        better point, else halved, and 0 (any improvement) once below a
+        sixteenth of the setting, until the next find."""
+        if setting <= 0.0 or found:
+            return setting
+        share *= 0.5
+        return share if share >= setting / 16.0 else 0.0
+
     def proximity(self):
         """Proximity search on the sub-MIP lane (``_proximity_job``,
         Fischetti & Monaci): the whole base box under the cutoff, searched
@@ -15035,7 +15169,9 @@ class _BranchAndBound:
         if seconds <= 0:
             return False
         base, ints = self.base, self.is_int
-        center, cutoff = self.incumbent[1], self.cutoff(box=False)
+        # With ``proximity_gap_share``, a point that closes that share of
+        # the gap (``gap_target``).
+        center, cutoff = self.incumbent[1], self.gap_target(self.proximity_gap_share)
         key = ("proximity", center[ints].tobytes(), cutoff)
         if key in self.rins_seen:
             return False
@@ -15104,6 +15240,10 @@ class _BranchAndBound:
                 self.adapt_rins_fixing(False, seconds)
             elif kind == "dualfix":
                 self.adapt_dual_fixing(False, seconds)
+            elif kind == "proximity":
+                self.proximity_gap_share = self.adapt_gap_share(
+                    self.proximity_gap_share, self.proximity_gap_max, False
+                )
             self.proximity_empty += empty
             return
         before = None if self.incumbent is None else self.incumbent[0]
@@ -15119,6 +15259,9 @@ class _BranchAndBound:
             self.rins_finds += improved
         elif kind == "proximity":
             self.proximity_finds += improved
+            self.proximity_gap_share = self.adapt_gap_share(
+                self.proximity_gap_share, self.proximity_gap_max, improved
+            )
         elif kind == "rens":
             self.rens_finds += improved
         elif kind == "first":
@@ -15444,10 +15587,12 @@ class _BranchAndBound:
                 max_iterations=limit,
                 deadline=time.time() + seconds,
                 seed=2 + self.jump_slices,
-                cutoff=self.cutoff(box=False),
+                # ``jump_gap_share``: below that share of the gap, and as far
+                # again after each point.
+                cutoff=self.gap_target(self.jump_gap_share),
                 backend="numba",
                 improve=True,
-                improve_step=self.objective_step,
+                improve_step=self.jump_improve_step(),
                 info=warm,
             )
 
@@ -15504,6 +15649,10 @@ class _BranchAndBound:
             self.worker_finds += improved
             if kind == "jumprestart":
                 self.jump_restart_finds += improved
+            if kind in ("jump", "jumprestart"):
+                self.jump_gap_share = self.adapt_gap_share(
+                    self.jump_gap_share, self.jump_gap_max, improved
+                )
         if schedule:
             self.schedule_improve_jump()
 
@@ -15619,9 +15768,12 @@ class _BranchAndBound:
         """RENS's neighbourhood of the point ``x`` within ``[lower,
         upper]``: the integers within ``tolerance`` of a whole number (in
         the box) fixed there, the others restricted to ``[floor, ceil]``;
-        the continuous variables keep the base MIP's bounds. ``None`` when
-        fewer than ``min_fixed`` of the integers are fixed, or the box is
-        empty."""
+        the continuous variables keep the base MIP's bounds. With
+        ``rens_fixing_rate`` below 1, only that share of the integral
+        integers (drawn at random) is fixed, and the rest keep the whole
+        box: ``[floor, ceil]`` of a whole number is that number, so the
+        neighbourhood grows only if they do. ``None`` when fewer than
+        ``min_fixed`` of the integers are integral, or the box is empty."""
         ints = self.is_int
         x = np.asarray(x, np.float64)
         near = np.round(x)
@@ -15630,14 +15782,20 @@ class _BranchAndBound:
         )
         if integral.sum() < min_fixed * ints.sum():
             return None
+        released = np.zeros_like(integral)
+        if self.rens_fixing_rate < 1.0:
+            # A larger neighbourhood (``rens_fixing_rate``).
+            kept = self.rens_rng.random(integral.size) < self.rens_fixing_rate
+            released = integral & ~kept
+            integral &= kept
         sub_lower = np.where(
             ints, np.maximum(lower, np.floor(x + tolerance)), self.base.lower
         )
         sub_upper = np.where(
             ints, np.minimum(upper, np.ceil(x - tolerance)), self.base.upper
         )
-        sub_lower = np.where(integral, near, sub_lower)
-        sub_upper = np.where(integral, near, sub_upper)
+        sub_lower = np.where(integral, near, np.where(released, lower, sub_lower))
+        sub_upper = np.where(integral, near, np.where(released, upper, sub_upper))
         if np.any(sub_lower > sub_upper):
             return None
         return sub_lower, sub_upper
@@ -16113,6 +16271,9 @@ class _BranchAndBound:
         agree = ints & (np.abs(np.asarray(x, np.float64) - incumbent) <= self.int_tol)
         if seconds <= 0 or agree.sum() < min_fixed * ints.sum():
             return None
+        if self.rins_fixing_rate < 1.0:
+            # A larger neighbourhood (``rins_fixing_rate``).
+            agree &= self.rins_rng.random(agree.size) < self.rins_fixing_rate
         # The same neighbourhood with the same cutoff has been searched.
         key = (agree.tobytes(), incumbent[agree].tobytes(), self.cutoff())
         if key in self.rins_seen:
@@ -16217,13 +16378,20 @@ class _BranchAndBound:
             max_iterations=limit,
             deadline=None if not np.isfinite(deadline) else deadline,
             seed=seed,
-            cutoff=self.cutoff(box=False),
+            cutoff=self.gap_target(self.jump_gap_share),
             backend="numba",
             improve=True,
-            improve_step=self.objective_step,
+            improve_step=self.jump_improve_step(),
         )
+        before = self.incumbent[0] if self.incumbent is not None else None
         if feasible:
             self.try_incumbent(x, "J", warm)
+        improved = self.incumbent is not None and (
+            before is None or self.incumbent[0] < before
+        )
+        self.jump_gap_share = self.adapt_gap_share(
+            self.jump_gap_share, self.jump_gap_max, improved
+        )
 
     def jump(self, start, lower, upper, warm, deadline, seed):
         """``feasibility_jump`` on the MIP as given from ``start``; a point it
@@ -18556,10 +18724,14 @@ def solve(
     trivial_heuristic=True,
     submip_solver="highs",
     rins_tolerance=0.1,
+    rins_fixing_rate=1.0,
+    rens_fixing_rate=1.0,
     crossover_seconds=10.0,
     crossover_solutions=3,
     crossover_min_fixed=0.5,
     proximity_seconds=10.0,
+    proximity_gap_share=0.0,
+    jump_gap_share=0.0,
     first_solution_seconds=0.0,
     dual_fix_seconds=0.0,
     dual_fix_rate=0.7,
@@ -19217,7 +19389,12 @@ def solve(
       ``rins_every`` nodes once there is an incumbent, and after each new
       incumbent from another source: the integers on which the incumbent
       and the node's LP point agree are fixed, and the rest is searched for
-      a better solution, marked ``"N"``. With ``submip_solver="highs"``
+      a better solution, marked ``"N"``. ``rins_fixing_rate`` (default 1)
+      fixes only that share of them, drawn at random, for a larger
+      neighbourhood; with the HiGHS lane it is also where the adaptive
+      rate starts and the most it rises to (``adapt_rins_fixing``; it
+      falls to 0.4, or to ``rins_fixing_rate`` if lower). With
+      ``submip_solver="highs"``
       (default) HiGHS searches it on a CPU thread (``_SubMipLane``, one
       job at a time, pruned at the cutoff) while the device keeps solving
       node LPs; an integer agrees when the point is within
@@ -19256,6 +19433,15 @@ def solve(
       call per incumbent and cutoff; it takes turns on the lane with RINS
       and crossover. Results: ``proximity_calls``, ``proximity_finds`` and
       ``proximity_empty`` (calls HiGHS showed had no better point).
+      ``proximity_gap_share`` (default 0) makes it aggressive, as Fischetti
+      and Monaci's large improvement steps: the point must close that share
+      of the gap between the incumbent and the search's bound. A call that
+      finds nothing halves the share, which drops to 0 (any improvement)
+      below a sixteenth of the setting, and a find restores it.
+      ``jump_gap_share`` (default 0) does the same for the improving
+      feasibility jumps (background and root): their objective row starts
+      that share of the gap below the incumbent and drops as far again
+      after each point they find.
     * **Before the first incumbent** (needs ``submip_solver="highs"``):
       RINS, proximity search and crossover start from an incumbent, so
       until there is one the lane runs, in turn, HiGHS's MIP solver on the
@@ -19353,7 +19539,9 @@ def solve(
       ``root_crossover`` allows) are fixed and the fractional ones
       restricted to their floor and ceiling, and that sub-MIP is searched
       by a Jaddle sub-search (``sub_search``, up to ``rens_nodes`` nodes),
-      marked ``"E"``. It needs no incumbent.
+      marked ``"E"``. It needs no incumbent. ``rens_fixing_rate`` (default
+      1) fixes only that share of the integral integers, drawn at random,
+      the others keeping their floor and ceiling: a larger neighbourhood.
     * **Early root jumps** (``root_jump_seconds``, default 60; ``0``:
       off). With background workers and the numba jump, each jump lane
       (``jump_threads``) starts the feasibility jump from the bounds nearest
@@ -19844,10 +20032,14 @@ def solve(
         trivial_heuristic=trivial_heuristic,
         submip_solver=submip_solver,
         rins_tolerance=rins_tolerance,
+        rins_fixing_rate=rins_fixing_rate,
+        rens_fixing_rate=rens_fixing_rate,
         crossover_seconds=crossover_seconds,
         crossover_solutions=crossover_solutions,
         crossover_min_fixed=crossover_min_fixed,
         proximity_seconds=proximity_seconds,
+        proximity_gap_share=proximity_gap_share,
+        jump_gap_share=jump_gap_share,
         first_solution_seconds=first_solution_seconds,
         dual_fix_seconds=dual_fix_seconds,
         dual_fix_rate=dual_fix_rate,
