@@ -163,6 +163,45 @@
 
 ### Changed
 
+- Children of exact lane nodes go straight back to the lane
+  (`exact_direct`, on by default). A child with its parent's basis and a
+  bound in the band is queued for the lane without a device LP first,
+  while the lane's queue has room, so the lane keeps itself fed between
+  batches. Before, every node waited for a batch to screen it: on
+  binkar10_1 (CPU) batches came 1.3 s apart, nearly every node was
+  promoted anyway, and the 16 threads were idle over 90% of the time. New
+  result key `exact_nodes["direct"]`.
+- A node's conflict pass is skipped when the pool, the cutoff and the root
+  box are as they were when its box last went through
+  (`conflict_passes_skipped` in the result): a child was propagated when
+  it was made and again when it was picked up.
+- Pool-only tree cut refreshes keep to 5% of the tree's time, apart from
+  `tree_cut_share` (new result keys `tree_pool_skipped`,
+  `tree_pool_seconds`): with 8 nodes a batch they took a quarter of the
+  tree on binkar10_1.
+
+- Exact lane nodes start from their parent's basis. A node whose parent
+  the lane solved is solved by dual simplex from the parent's kept
+  optimal basis (`exact_basis_memory`); before, every screened node was
+  crossed over from its own PDHG point and the basis was thrown away. A
+  node without a basis, or whose basis start runs out of time, is still
+  crossed over. On binkar10_1 (90 s, CPU, benchmark settings, one run
+  each): 36 pivots a node against 1,133, 4,833 nodes against 2,148, bound
+  6739.3 against 6724.5 (optimum 6742.2).
+- The tree's pool refresh asks the cut pool once for all of a batch's
+  points (`_CutPool.best_violated`: one product, each cut at its best
+  point) instead of once a point with each cut scored again in Python
+  (on binkar10_1, 1.5 million calls in 45 refreshes).
+- Both pools drop by use, not age. A full conflict pool drops the proof
+  that has gone longest without tightening or closing a box (new result
+  key `conflict_evictions`: `evicted`, `unused`); a full cut pool drops
+  the cuts no node point has violated for longest, a tenth at a time.
+- Open nodes of equal bound are taken by the lower estimate of their best
+  solution (bound plus the pseudocost gains of rounding the parent's
+  fractional integers, `_Node.estimate`), then the deeper first; before,
+  the deeper first only. Bounds tie whenever an objective step rounds
+  them.
+
 - Open nodes take less host memory, with the search unchanged (every
   number read back is bit for bit the one stored). A node's warm start is
   kept packed: mostly-zero arrays (inequality duals, binaries at 0) as

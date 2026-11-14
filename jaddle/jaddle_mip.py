@@ -1445,7 +1445,11 @@ class ConflictPool:
     excludes the node. The global box is the root's, which reduced-cost
     fixing may tighten: valid for solutions better than the cutoff, which
     is all pruning needs. Proofs with more than ``max_nnz`` variables after
-    sparsifying are dropped, and the pool keeps the newest ``max_rows``.
+    sparsifying are dropped. The pool keeps ``max_rows``: a full one drops
+    the row that has gone longest without use (``stamps``: when each was
+    added, or last had room to tighten or close a box that propagation
+    then changed), so a proof that keeps pruning outlives newer ones that
+    never fire.
     """
 
     def __init__(self, n, integrality, max_rows=2000, max_nnz=None, tol=1e-6):
@@ -1455,7 +1459,18 @@ class ConflictPool:
         self.max_nnz = max(25, self.n // 10) if max_nnz is None else int(max_nnz)
         self.tol = tol
         # (idx, coef, offset, objective): rhs = offset (+ cutoff if objective).
-        self.rows = collections.deque()
+        self.rows = []
+        # Counts the changes to what the pool propagates (its rows, the
+        # global row and the cutoff): a box propagated at one version
+        # gains nothing from another pass at the same one.
+        self.version = 0
+        # Each row's last use (a tick of ``_clock``), for eviction.
+        self.stamps = []
+        self._clock = 0
+        self.evicted = 0
+        self.evicted_unused = 0  # of them, never used after being added
+        self._fresh = []  # whether each row is unused since it was added
+        self._sides = None  # the propagator's rows, split by sign
         self.added = {"objective": 0, "farkas": 0, "nogood": 0}
         self._propagator = None
         self._objective = None  # mask of objective rows in the propagator
@@ -1480,6 +1495,7 @@ class ConflictPool:
         that, so the row stays valid). Returns whether a row is held."""
         self.global_row = None
         self._propagator = None
+        self.version += 1
         r = np.asarray(r, np.float64)
         if not np.isfinite(constant) or not np.abs(r).max(initial=0.0) > 0.0:
             return False
@@ -1583,8 +1599,16 @@ class ConflictPool:
             if not (np.isfinite(least) and least > rhs + self.tol * (1.0 + abs(rhs))):
                 return False
         if len(self.rows) >= self.max_rows:
-            self.rows.popleft()
+            # The row idle longest (the oldest among those never used).
+            out = min(range(len(self.rows)), key=self.stamps.__getitem__)
+            self.evicted += 1
+            self.evicted_unused += self._fresh[out]
+            del self.rows[out], self.stamps[out], self._fresh[out]
+        self._clock += 1
         self.rows.append((idx, coef, float(offset), bool(objective)))
+        self.stamps.append(self._clock)
+        self._fresh.append(True)
+        self.version += 1
         self.added[kind] += 1
         self._propagator = None
         return True
@@ -1594,6 +1618,8 @@ class ConflictPool:
 
     def set_cutoff(self, cutoff):
         """The cutoff that objective proofs use from now on."""
+        if self._cutoff != float(cutoff):
+            self.version += 1
         self._cutoff = float(cutoff)
         if self._propagator is not None:
             self._propagator.row_upper[:] = self._offsets + np.where(
@@ -1626,7 +1652,37 @@ class ConflictPool:
             self._propagator = BoundPropagator(
                 A, np.full(len(rows), -np.inf), row_upper, self.is_int, tol=self.tol
             )
-        return self._propagator(lower, upper, max_passes=max_passes)
+            positive, negative = A.maximum(0.0).tocsr(), A.minimum(0.0).tocsr()
+            positive.eliminate_zeros()
+            negative.eliminate_zeros()
+            self._sides = (A, positive, negative)
+        out = self._propagator(lower, upper, max_passes=max_passes)
+        if out[2] or out[0] is not lower or out[1] is not upper:
+            if out[2] or np.any(out[0] != lower) or np.any(out[1] != upper):
+                self._credit(lower, upper)
+        return out
+
+    def _credit(self, lower, upper):
+        """Stamp the rows that had room to act on the box ``[lower,
+        upper]`` (called when propagation changed or closed it): those
+        whose least activity leaves less room under the right-hand side
+        than their widest term spans, so they tighten a bound or exclude
+        the box."""
+        A, positive, negative = self._sides
+        k = len(self.rows)
+        if k == 0:
+            return
+        with np.errstate(invalid="ignore", over="ignore"):
+            least = positive @ lower + negative @ upper
+            room = self._propagator.row_upper - least
+            span = np.abs(A.data) * (upper - lower)[A.indices]
+            widest = np.maximum.reduceat(span, A.indptr[:-1])
+            used = np.flatnonzero((room < widest)[:k])
+        if used.size:
+            self._clock += 1
+            for i in used.tolist():
+                self.stamps[i] = self._clock
+                self._fresh[i] = False
 
 
 def tighten_coefficients(mip, lower, upper):
@@ -7253,6 +7309,8 @@ class _Node:
         "band_edge",
         "screened",
         "proven",
+        "estimate",
+        "conflict_stamp",
     )
 
     def __init__(
@@ -7310,6 +7368,14 @@ class _Node:
         # strong sides' keys by ``(var, down)``.
         self.exact_basis = None
         self.exact_sides = None
+        # The objective estimated for its best solution (``branch``: its
+        # bound plus the pseudocost gains of rounding its parent's
+        # fractional integers), which orders nodes of equal bound; ``None``:
+        # its bound.
+        self.estimate = None
+        # ``_BranchAndBound.conflict_stamp()`` when its box last went
+        # through the conflict pool (``None``: never).
+        self.conflict_stamp = None
 
     @property
     def warm(self):
@@ -8028,12 +8094,15 @@ class _ExactLane:
 
     Each thread keeps one HiGHS instance for the rows it last solved (a tree
     cut refresh changes them). A node arrives screened (its own device LP
-    solved, ``_BranchAndBound.promote_to_lane``) with that PDHG point,
-    which the thread crosses over to an optimal vertex
-    (``jaddle_linear.crossover``) and then re-solves from the vertex's
-    basis on its instance, so strong branching goes on from an optimal
-    basis. Without a point (the root, or an unscreened node), dual simplex
-    starts from the basis it is given, else from the thread's last one.
+    solved, ``_BranchAndBound.promote_to_lane``) with that PDHG point. A
+    node whose parent was solved here starts dual simplex from the
+    parent's optimal basis instead: on binkar10_1 that took 36 pivots a
+    node against 1,133 for a crossover of its point, and the lane solved
+    2.5 times the nodes. Without a basis (its parent was a device node),
+    the thread crosses the point over to an optimal vertex
+    (``jaddle_linear.crossover``) and re-solves from the vertex's basis on
+    its instance, so strong branching goes on from an optimal basis.
+    Without either, dual simplex starts from the thread's last basis.
     HiGHS releases the GIL while it solves. Jobs are functions of NumPy and
     SciPy arrays only (JAX's settings are per thread).
     """
@@ -8062,13 +8131,15 @@ class _ExactLane:
     ):
         """Queue ``node``'s LP over ``lp_box`` (the LP's bounds over its box
         ``box``) for ``mip``'s rows as of cut block ``version``. With
-        ``start`` (a ``SaddleState`` of host arrays: the node's screened
-        PDHG point), HiGHS crosses it over to an optimal vertex
+        ``basis`` (a ``highspy.HighsBasis`` for ``mip``'s rows: the
+        parent's optimal one), the LP is solved by dual simplex from it.
+        Without one, or when that does not finish in time, with ``start``
+        (a ``SaddleState`` of host arrays: the node's screened PDHG point)
+        HiGHS crosses it over to an optimal vertex
         (``jaddle_linear.crossover``) and the LP is re-solved from that
         vertex's basis on the thread's instance (no pivots when it holds);
         a crossover that does not prove a vertex optimal in time fails the
-        job. Without ``start``, the LP is solved by dual simplex from
-        ``basis`` (a ``highspy.HighsBasis`` for ``mip``'s rows) when given.
+        job. With neither, dual simplex starts from the thread's last basis.
         Then, with a ``strong`` request, strong branching on it
         (``_exact_strong``, with ``strong_options``: its ``lookahead`` and
         ``objective_bound``). With ``keep``, the job also returns the node's
@@ -8082,18 +8153,27 @@ class _ExactLane:
             started = time.time()
             highs = self._held(mip)
             crossed = None
-            if start is not None:
+            out, pivots = None, 0
+            if basis is not None:
+                # The kept basis first (the parent's optimal one: a bound
+                # change away, so dual simplex needs few pivots).
+                out = _exact_node_lp(highs, mip, lower, upper, self.seconds, basis)
+                pivots = int(highs.getInfo().simplex_iteration_count)
+                if out[0] == "failed" and start is not None:
+                    out = None  # not solved in time: the crossover instead
+            if out is None and start is not None:
                 crossed = self.cross_over(mip, lower, upper, start)
-            if crossed is not None and crossed["basis"] is None:
+            if out is not None:
+                pass
+            elif crossed is not None and crossed["basis"] is None:
                 out = ("failed", None, None, None)
-                pivots = 0
             else:
                 left = self.seconds - (time.time() - started)
                 out = _exact_node_lp(
                     highs, mip, lower, upper, max(left, 0.1),
-                    basis if crossed is None else crossed["basis"],
+                    None if crossed is None else crossed["basis"],
                 )
-                pivots = int(highs.getInfo().simplex_iteration_count)
+                pivots += int(highs.getInfo().simplex_iteration_count)
             extra = dict(
                 pivots=pivots,
                 warm=basis is not None and crossed is None,
@@ -8752,6 +8832,11 @@ _CUT_POOL_MIN_EFFICACY = 1e-4
 # freely, then within ``tree_cut_share`` of its time; a slot idle for this
 # many refreshes in a row may take a new cut.
 _TREE_CUT_GRACE_SECONDS = 2.0
+# Pool-only refreshes (``tree_pool_every``) take at most this share of the
+# tree's time: with small batches there is one a batch, and on binkar10_1
+# at 8 nodes a batch they took a quarter of the tree (all of
+# ``tree_cut_share``), leaving none for separation.
+_TREE_POOL_SHARE = 0.05
 _TREE_CUT_IDLE_REFRESHES = 2
 # Hybrid branching scores (``branching_scores``): the weights of the
 # conflict, cutoff and inference parts beside the bound gains (SCIP's
@@ -8768,8 +8853,12 @@ _RESTART_ROOT_SHARE = 0.025
 _RESTART_TREE_SHARE = 0.10
 class _CutPool:
     """
-    The global cut pool: every cut the root and tree rounds have found, the
-    newest ``size`` of them: ``coef·x[idx] <= rhs`` by key (``_cut_key``).
+    The global cut pool: the cuts the root and tree rounds have found,
+    ``size`` of them: ``coef·x[idx] <= rhs`` by key (``_cut_key``). A full
+    pool drops the cuts that have gone longest without use (``stamps``:
+    when each was last added or found violated by a node point), a tenth
+    of the pool at a time, so a cut the tree keeps violating outlives
+    newer ones no point has come near since.
     Each was separated over the root box of its time, which only shrinks,
     so each holds at every later node, across restarts too. ``violated``
     finds those an LP point cuts off, to go back into the LP.
@@ -8777,7 +8866,9 @@ class _CutPool:
 
     def __init__(self, size):
         self.size = int(size)
-        self.cuts = {}  # key -> (family, idx, coef, rhs), oldest first
+        self.cuts = {}  # key -> (family, idx, coef, rhs)
+        self.stamps = {}  # key -> the tick of its last use
+        self._clock = 0
         self._block = None  # (keys, CSR rows, rhs) of ``cuts``
 
     def __len__(self):
@@ -8787,13 +8878,21 @@ class _CutPool:
         """Keep ``cuts`` (``(family, idx, coef, rhs)``); returns their keys."""
         keys = []
         changed = False
+        self._clock += 1
         for cut in cuts:
             key = _cut_key(cut)
-            changed |= self.cuts.pop(key, None) is None
-            self.cuts[key] = cut  # the newest now
+            if key not in self.cuts:
+                self.cuts[key] = cut
+                changed = True
+            self.stamps[key] = self._clock
             keys.append(key)
-        while len(self.cuts) > self.size:
-            self.cuts.pop(next(iter(self.cuts)))
+        if len(self.cuts) > self.size:
+            # Down to nine tenths, so a full pool is not sorted at every
+            # add; never one of this call's cuts while older ones remain.
+            keep = min(self.size, max(self.size - self.size // 10, len(keys)))
+            idle = sorted(self.cuts, key=self.stamps.__getitem__)
+            for key in idle[: len(self.cuts) - keep]:
+                del self.cuts[key], self.stamps[key]
             changed = True
         if changed:
             # Only a new or evicted cut stales the block (``violated``):
@@ -8804,7 +8903,16 @@ class _CutPool:
     def violated(self, x, exclude=(), min_efficacy=_CUT_POOL_MIN_EFFICACY):
         """The kept cuts that ``x`` violates by an efficacy of at least
         ``min_efficacy``, other than those keyed in ``exclude``."""
-        if not self.cuts:
+        return [cut for _, _, cut in self.best_violated([x], exclude, min_efficacy)]
+
+    def best_violated(self, points, exclude=(), min_efficacy=_CUT_POOL_MIN_EFFICACY):
+        """The kept cuts that any of ``points`` violates by an efficacy of
+        at least ``min_efficacy``, other than those keyed in ``exclude``:
+        ``(key, efficacy, cut)`` each, the efficacy its largest over the
+        points, in one product for all of them. (A tree refresh asked point
+        by point and then scored each cut again in Python: on binkar10_1,
+        1.5 million calls in 45 refreshes.)"""
+        if not self.cuts or not len(points):
             return []
         if self._block is None:
             keys = list(self.cuts)
@@ -8816,19 +8924,23 @@ class _CutPool:
                     np.concatenate([cut[1] for cut in cuts]).astype(np.int64),
                     np.concatenate([[0], np.cumsum(lengths)]),
                 ),
-                shape=(len(cuts), x.shape[0]),
+                shape=(len(cuts), np.shape(points[0])[0]),
             )
             norms = np.sqrt(rows.multiply(rows).sum(axis=1)).A1
             rhs = np.array([cut[3] for cut in cuts], np.float64)
             self._block = (keys, rows, rhs, np.maximum(norms, 1e-12))
         keys, rows, rhs, norms = self._block
-        efficacy = (rows @ x - rhs) / norms
-        exclude = set(exclude)
-        return [
-            self.cuts[keys[i]]
-            for i in np.flatnonzero(efficacy >= min_efficacy)
-            if keys[i] not in exclude
-        ]
+        X = np.column_stack([np.asarray(x, np.float64) for x in points])
+        efficacy = ((rows @ X).max(axis=1) - rhs) / norms
+        exclude = exclude if isinstance(exclude, (set, frozenset)) else set(exclude)
+        self._clock += 1
+        found = []
+        for i in np.flatnonzero(efficacy >= min_efficacy).tolist():
+            key = keys[i]
+            self.stamps[key] = self._clock  # in use, held in the LP or not
+            if key not in exclude:
+                found.append((key, float(efficacy[i]), self.cuts[key]))
+        return found
 
 
 def _as_cut(cut):
@@ -9038,6 +9150,7 @@ class _BranchAndBound:
         exact_basis_memory=2e9,
         exact_strong_lookahead=None,
         exact_strong_cutoff=False,
+        exact_direct=True,
         exact_root_candidates=128,
         exact_root_seconds=60.0,
         exact_root_iterations=None,
@@ -9421,6 +9534,7 @@ class _BranchAndBound:
         self.last_refresh_nodes = 0
         self.last_pool_nodes = 0  # the last pool refresh (``tree_pool_every``)
         self.tree_pool_refreshes = 0
+        self.tree_pool_skipped = 0
         # The heuristic clock (``heuristic_due``): the multiple of each
         # schedule's period it last ran at.
         self.heuristic_fired = {}
@@ -9592,6 +9706,13 @@ class _BranchAndBound:
         # whether its sides stop at the cutoff.
         self.exact_strong_lookahead = int(exact_strong_lookahead or 0)
         self.exact_strong_cutoff = bool(exact_strong_cutoff)
+        # Children of lane nodes go straight back to the lane
+        # (``send_to_lane``); the band's top as of the last batch launched.
+        self.exact_direct = bool(exact_direct)
+        self.exact_direct_nodes = 0
+        self.conflict_passes_skipped = 0
+        self.tree_pool_seconds = 0.0
+        self.lane_band_top = -np.inf
         self.exact_strong_lps = 0
         self.exact_strong_seconds = 0.0
         self.exact_reused = 0
@@ -10527,7 +10648,11 @@ class _BranchAndBound:
     def key(self, node, order):
         if self.diving():
             return (-order,)
-        return (node.bound, -node.depth, order)
+        # Equal bounds (common with an objective step, which rounds them:
+        # on CMS750_4 hundreds of open nodes sit at each level) go by the
+        # lower estimate (``_Node.estimate``), then to the deeper node.
+        estimate = node.bound if node.estimate is None else node.estimate
+        return (node.bound, estimate, -node.depth, order)
 
     def push(self, node):
         if node.cut_version is None:
@@ -11283,9 +11408,27 @@ class _BranchAndBound:
                     return lower, upper, True
         return lower, upper, False
 
+    def conflict_stamp(self):
+        """What a conflict pass over a node's box depends on besides the
+        box: the pool's version (rows, global row, cutoff) and the root box
+        (replaced, not changed in place, by reduced-cost fixing)."""
+        if self.conflicts is None:
+            return None
+        return (self.conflicts.version, id(self.root_lower), id(self.root_upper))
+
     def prune_by_conflicts(self, node, lower, upper):
         """Conflict propagation at a node about to be solved. Returns the
-        tightened box, or ``None`` when the node is closed without its LP."""
+        tightened box, or ``None`` when the node is closed without its LP.
+        Skipped when nothing has changed since the node's box last went
+        through the pool (``_Node.conflict_stamp``: set when ``branch``
+        made it): a child sent straight to the exact lane is picked up
+        moments after its own pass, and the second was a third of the
+        propagation time on binkar10_1."""
+        stamp = self.conflict_stamp()
+        if stamp is not None and node.conflict_stamp == stamp:
+            self.conflict_passes_skipped += 1
+            return lower, upper
+        node.conflict_stamp = stamp
         lower, upper, infeasible = self.conflict_propagate(lower, upper)
         if infeasible:
             self.conflict_pruned += 1
@@ -12218,6 +12361,20 @@ class _BranchAndBound:
             gain = (f if down else 1.0 - f) * mean
         return child.bound + gain
 
+    def estimate_rest(self, x, var):
+        """The pseudocost gain of making every fractional integer of ``x``
+        but ``var`` integral, each in its cheaper direction: what a child of
+        the split on ``var`` adds to ``_child_estimate`` for its best
+        solution's objective (the best-estimate rule's, as SCIP's)."""
+        frac = self.is_int & (np.abs(x - np.round(x)) > self.int_tol)
+        frac[var] = False
+        candidates = np.flatnonzero(frac)
+        if candidates.size == 0:
+            return 0.0
+        down, up = self.pseudocost_estimates(x, candidates)
+        rest = float(np.minimum(down, up).sum())
+        return rest if np.isfinite(rest) else 0.0
+
     def _child_score(self, child, xv, var, bound):
         """``(1 + inferences) / (1 + cost / unit)`` for choosing the child
         to plunge into: ``cost`` the child's estimated bound gain over the
@@ -12259,6 +12416,7 @@ class _BranchAndBound:
         if not self.is_int[var]:
             self.implied_branchings += 1  # an implied integer (``branch_implied``)
         children = []
+        rest = self.estimate_rest(x, var)
         for side, down in enumerate((True, False)):
             # The split alone, to count the bounds propagation tightens
             # beyond it (the child's inferences).
@@ -12354,6 +12512,9 @@ class _BranchAndBound:
                 (var, down), node.exact_basis
             )
             self.hold_basis(child.exact_basis)
+            child.estimate = max(self._child_estimate(child, xv, var) + rest, child_bound)
+            # Its box has just been through the conflict pool.
+            child.conflict_stamp = self.conflict_stamp()
             children.append(child)
         self.release_bases(node)  # the children hold what they start from
         # The child to plunge into (``children.pop()``) or, in a dive, to pop
@@ -12401,7 +12562,39 @@ class _BranchAndBound:
             else:
                 self.plunges_stopped += 1
         for child in children:
-            self.push(child)
+            if not self.send_to_lane(child):
+                self.push(child)
+
+    def send_to_lane(self, child):
+        """Queue a new child for the exact lane at once (``exact_direct``),
+        without a device LP first, when its parent was solved there (it
+        holds the parent's basis, a bound change from its own optimum), its
+        bound is in the lane's band as of the last batch launched, and the
+        lane's queue has room (``_EXACT_OVERFLOW_KEEP`` a thread, with the
+        jobs running). The lane then keeps itself fed between batches
+        (``await_device`` services it): on binkar10_1 nearly every node was
+        promoted after its device LP anyway, the batches came 1.3 s apart,
+        and the 16 threads were idle over 90% of the time. Returns whether
+        it was queued."""
+        lane = self.exact_lane
+        if (
+            lane is None
+            or not self.exact_direct
+            or child.exact_basis is None
+            or self.exact_plunge_active
+            or not np.isfinite(self.lane_band_top)
+            or child.bound > self.lane_band_top
+            or child.bound >= self.cutoff()
+            or not self.exact_eligible(child)
+            or len(self.exact_reserved) + len(lane.jobs)
+            >= _EXACT_OVERFLOW_KEEP * lane.threads
+        ):
+            return False
+        if child.cut_version is None:
+            child.cut_version = self.cut_version
+        heapq.heappush(self.exact_reserved, (child.bound, next(self.counter), child))
+        self.exact_direct_nodes += 1
+        return True
 
     def plunge_reaches(self, child, bound):
         """Whether a plunge may continue into ``child`` (``plunge_gap``):
@@ -13146,6 +13339,8 @@ class _BranchAndBound:
             "tree_cut_async_jobs": self.tree_cut_async_jobs,
             "exact_bounds_reused": self.exact_bounds_reused,
             "tree_pool_refreshes": self.tree_pool_refreshes,
+            "tree_pool_skipped": self.tree_pool_skipped,
+            "tree_pool_seconds": self.tree_pool_seconds,
             "tree_cut_requeued": self.tree_cut_requeued,
             "tree_cut_seconds": self.tree_cut_seconds,
             "tree_cut_pool_hits": self.tree_cut_pool_hits,
@@ -13224,6 +13419,13 @@ class _BranchAndBound:
                 if self.conflicts is not None
                 else {"objective": 0, "farkas": 0, "nogood": 0}
             ),
+            "conflict_evictions": {
+                "evicted": 0 if self.conflicts is None else self.conflicts.evicted,
+                "unused": (
+                    0 if self.conflicts is None else self.conflicts.evicted_unused
+                ),
+            },
+            "conflict_passes_skipped": self.conflict_passes_skipped,
             "conflict_pruned": self.conflict_pruned,
             "conflict_tightenings": self.conflict_tightenings,
             "bound_stops": self.bound_stops,
@@ -13290,6 +13492,7 @@ class _BranchAndBound:
                 "strong_iterations": self.exact_strong_iterations,
                 "warm_bases": self.exact_warm_bases,
                 "promoted": self.band_promotions,
+                "direct": self.exact_direct_nodes,
                 "crossovers": self.exact_crossovers,
                 "crossover_failed": self.exact_crossover_failed,
                 "crossover_seconds": self.exact_crossover_seconds,
@@ -14653,6 +14856,14 @@ class _BranchAndBound:
                 self.last_refresh_nodes = self.nodes
             self.last_pool_nodes = self.nodes
             return None
+        if (
+            pool
+            and tree > _TREE_CUT_GRACE_SECONDS
+            and self.tree_pool_seconds > _TREE_POOL_SHARE * tree
+        ):
+            self.tree_pool_skipped += 1
+            self.last_pool_nodes = self.nodes
+            return None
         if self.out_of_time():
             return None
         return "full" if full else "pool"
@@ -14740,7 +14951,10 @@ class _BranchAndBound:
                 self.push(requeue)
                 requeued.add(i)
             self.tree_cut_requeued += len(requeued)
-        self.tree_cut_seconds += time.time() - started
+        spent = time.time() - started
+        self.tree_cut_seconds += spent
+        if kind == "pool":
+            self.tree_pool_seconds += spent
         return results, requeued
 
     def separate_at(self, x, mip, lower, upper):
@@ -14884,10 +15098,12 @@ class _BranchAndBound:
 
         pooled = set()
         with self._shared_lock:
-            for x in points:
-                for cut in self.cut_pool.violated(x, held):
-                    consider(cut, x)
-                    pooled.add(_cut_key(cut))
+            for key, efficacy, cut in self.cut_pool.best_violated(points, held):
+                if cut[1].size == 0 or cut[1].size > self.tree_cut_max_nnz:
+                    continue
+                pooled.add(key)
+                if key not in best or efficacy > best[key][0]:
+                    best[key] = (efficacy, cut)
         separated = []  # every violated candidate, for the pool
         # The worker's cuts from an earlier refresh's points, judged at
         # those points as a separation here would judge them.
@@ -17605,9 +17821,11 @@ class _BranchAndBound:
         if node.exact_basis is not None:
             basis = self.take_basis(node.exact_basis)
             node.exact_basis = None
-        # The node's screened PDHG point (``promote_to_lane``): the lane
-        # crosses it over to a vertex, whose basis then starts its LP.
-        # Without one (not screened), dual simplex from ``basis``.
+        # Dual simplex from ``basis`` (the parent's, when the lane solved
+        # it). The node's screened PDHG point (``promote_to_lane``) goes
+        # too: without a basis, or when the basis does not get there in
+        # time, the lane crosses the point over to a vertex, whose basis
+        # then starts its LP.
         start = None
         warm = self.fit_warm(node)
         if node.screened and warm is not None and warm[0] is not None:
@@ -17616,7 +17834,6 @@ class _BranchAndBound:
                 dual_ineq=np.asarray(warm[0].dual_ineq, np.float64),
                 dual_eq=np.asarray(warm[0].dual_eq, np.float64),
             )
-            basis = None
         self.exact_lane.submit(
             node,
             box,
@@ -17972,7 +18189,7 @@ class _BranchAndBound:
         self.last_launch = now
         self.feed_exact()
         self.adapt_exact_band()
-        band_top = self.exact_band_top()
+        band_top = self.lane_band_top = self.exact_band_top()
         # The auto band's edges (``tune_band_scale``): its top half for the
         # lane, and as far again above it for the device.
         edge_low = edge_high = band_top
@@ -19047,6 +19264,7 @@ def solve(
     exact_basis_memory=2e9,
     exact_strong_lookahead=None,
     exact_strong_cutoff=False,
+    exact_direct=True,
     exact_root_candidates=128,
     exact_root_seconds=60.0,
     exact_root_iterations=None,
@@ -19416,7 +19634,8 @@ def solve(
       tableau rows a round tries for Gomory cuts, nearest ½ first. Every
       candidate a root or tree round separates that its point violates,
       not only those chosen for the LP, joins the global cut pool
-      (``_CutPool``, the newest ``cut_pool_size``, default 10,000), as
+      (``_CutPool``, ``cut_pool_size`` of them, default 10,000; a full
+      pool drops the cuts that no node point has violated for longest), as
       HiGHS's does; the tree's refreshes take cuts back from it.
     * **Tree cuts** (``tree_cuts``, on by default). After the root cuts,
       the LP's cut block gets a fixed capacity: ``tree_cut_rows`` cuts with
@@ -19429,7 +19648,9 @@ def solve(
       ``0``: off), a pool refresh takes back the pooled cuts the points
       violate, without separating or ageing (steps 2-5 with the pool as
       the only candidates), as HiGHS checks its cut pool at every node.
-      A full refresh:
+      Pool refreshes take at most 5% of the tree's time
+      (``result["tree_pool_skipped"]`` counts those left out,
+      ``"tree_pool_seconds"`` their time). A full refresh:
 
       1. each slot's cut ages by one if it is idle (slack, with a zero
          dual) at every point, else back to 0;
@@ -19525,8 +19746,11 @@ def solve(
       bounds differ from the root's (the others go to the right-hand side),
       kept only when that still excludes the node and has at most
       ``conflict_max_nnz`` variables (default ``max(25, n // 10)``), and the
-      newest ``conflict_pool_size`` (2000) are propagated at every node
-      before its LP, alternating with the rows. A node they show empty is
+      pool's ``conflict_pool_size`` (2000) are propagated at every node
+      before its LP, alternating with the rows. A full pool drops the proof
+      that has gone longest without tightening or closing a box
+      (``result["conflict_evictions"]``: ``evicted``, and ``unused``, those
+      of them never used). A node they show empty is
       closed without its LP (``conflict_pruned`` in the result).
     * **Integral objective.** When every objective value is a multiple of
       a step ``g`` (``objective_step``: integer variables with costs that
@@ -19647,7 +19871,11 @@ def solve(
       hold the global bound get the next LP instead. The better the
       incumbent, the shorter the plunges; ``1.0`` keeps only the depth
       limit. ``result["plunges_stopped"]`` counts them;
-      ``"best_first"`` and ``"depth_first"`` do one throughout.
+      ``"best_first"`` and ``"depth_first"`` do one throughout. Open nodes
+      of equal bound are taken by the lower estimate of their best
+      solution (the bound plus the pseudocost gains of rounding the
+      parent's fractional integers, each in its cheaper direction), then
+      the deeper first.
     * **Incumbents.** A node LP point with integral integers (within
       ``integrality_tolerance``), and the LP point rounded at every
       ``heuristic_every``-th node (default 0: off), are rounded and checked. So is a node
@@ -20063,6 +20291,11 @@ def solve(
       after that many in a row that did not beat the best gain product so
       far are not split, as SCIP's strong branching looks ahead (with 3,
       30n20b8 went from 14 to 10 sides a node, ns1830653 from 4.2 to 2.4).
+      With ``exact_direct`` (default ``True``) a child of a lane node
+      whose bound is in the band goes straight back to the lane, from its
+      parent's basis, without a device LP first, while the lane's queue has
+      room (``result["exact_nodes"]["direct"]`` counts them); ``False``
+      screens every node on the device first.
       With ``exact_strong_cutoff`` (default ``False``) a side stops once
       its dual objective passes the cutoff (HiGHS's ``objective_bound``):
       its duals' bound closes it either way. A side stopped early still has feasible duals,
@@ -20398,6 +20631,7 @@ def solve(
         exact_basis_memory=exact_basis_memory,
         exact_strong_lookahead=exact_strong_lookahead,
         exact_strong_cutoff=exact_strong_cutoff,
+        exact_direct=exact_direct,
         exact_root_candidates=exact_root_candidates,
         exact_root_seconds=exact_root_seconds,
         exact_root_iterations=exact_root_iterations,
@@ -20553,6 +20787,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
                 "pivots": 0,
                 "strong_iterations": 0,
                 "warm_bases": 0,
+                "direct": 0,
                 "overflow_nodes": 0,
                 "overflow_converged": 0,
                 "band": 0.0,
@@ -20572,6 +20807,8 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "tree_cut_async_jobs": 0,
             "exact_bounds_reused": 0,
             "tree_pool_refreshes": 0,
+            "tree_pool_skipped": 0,
+            "tree_pool_seconds": 0.0,
             "tree_cut_requeued": 0,
             "tree_cut_seconds": 0.0,
             "tree_cut_pool_hits": 0,

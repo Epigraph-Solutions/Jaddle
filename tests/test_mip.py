@@ -7082,8 +7082,10 @@ def test_exact_lane_solves_to_the_optimum(make):
         stats = result["exact_nodes"]
         assert stats["bound_gain"] >= 0.0
         assert stats["band_min"] <= stats["band"] <= stats["band_max"]
-        # A lane node was promoted after its device LP and crossed over.
-        assert stats["solved"] <= stats["crossovers"] <= stats["promoted"]
+        # A lane node was promoted after its device LP, and started from
+        # its parent's basis or was crossed over.
+        assert stats["crossovers"] <= stats["promoted"]
+        assert stats["solved"] <= stats["crossovers"] + stats["warm_bases"]
         solved += stats["solved"]
     assert (solved > 0) == (make is not facility_location)
     assert solve(mip, **options)["exact_nodes"]["solved"] == 0
@@ -7409,10 +7411,12 @@ def test_exact_node_lp_from_the_parents_basis(make):
 
 
 @pytest.mark.parametrize("tree_cuts", [True, False])
-def test_exact_lane_crosses_over_screened_points(tree_cuts, monkeypatch):
-    # A lane node starts from a crossover of its own device LP's point (it
-    # was screened first), across tree cut refreshes too, not from its
-    # parent's basis; the LP then re-solves from the crossover's basis.
+def test_exact_lane_starts_from_the_parent_basis_or_a_crossover(
+    tree_cuts, monkeypatch
+):
+    # A lane node whose parent the lane solved starts dual simplex from the
+    # parent's kept basis; the others start from a crossover of their own
+    # device LP's point (screened first), across tree cut refreshes too.
     starts = []
     real = jm._ExactLane.cross_over
 
@@ -7430,14 +7434,19 @@ def test_exact_lane_crosses_over_screened_points(tree_cuts, monkeypatch):
     on = solve(mip, **options)
     assert_solved(on, mip, ref)
     stats = on["exact_nodes"]
-    assert stats["crossovers"] == len(starts) > 0
+    assert stats["crossovers"] == len(starts)  # none, when all had a basis
     assert stats["crossover_failed"] == 0 and stats["solved"] > 0
-    assert stats["warm_bases"] == 0  # no node LP started from a kept basis
+    assert stats["warm_bases"] > 0  # node LPs started from a kept basis
+    assert stats["solved"] <= stats["crossovers"] + stats["warm_bases"]
     # Host arrays only: the lane's threads touch no JAX.
     assert all(isinstance(start.primal, np.ndarray) for start in starts)
+    # With no basis kept, every lane node is crossed over.
+    del starts[:]
     off = solve(mip, exact_basis_memory=0, **options)
     assert_solved(off, mip, ref)
-    assert off["exact_nodes"]["solved"] > 0
+    stats = off["exact_nodes"]
+    assert stats["solved"] > 0 and stats["warm_bases"] == 0
+    assert 0 < stats["solved"] <= stats["crossovers"] == len(starts)
 
 
 def test_basis_store_drops_bases_no_node_holds(monkeypatch):
@@ -7621,14 +7630,17 @@ def test_lane_nodes_are_screened_and_failed_crossovers_go_back(monkeypatch):
     mip = generalised_assignment()
     ref = reference(mip)
     options = dict(batch_size=4, cuts=False, probing=False, exact_nodes=2, exact_band=0.5)
-    result = solve(mip, **options)
+    # (``exact_direct=False``: no child goes straight back to the lane.)
+    result = solve(mip, exact_direct=False, **options)
     assert_solved(result, mip, ref)
     assert submitted and all(submitted)
+    assert result["exact_nodes"]["direct"] == 0
     monkeypatch.setattr(
         jm._ExactLane, "cross_over",
         lambda self, mip, lower, upper, start: dict(basis=None, seconds=0.0, pivots=0),
     )
-    failed = solve(mip, **options)
+    # (No basis kept: a node with its parent's would not cross over.)
+    failed = solve(mip, exact_basis_memory=0, **options)
     assert_solved(failed, mip, ref)
     stats = failed["exact_nodes"]
     assert stats["crossovers"] == stats["crossover_failed"] == stats["failed"] > 0
@@ -9085,3 +9097,193 @@ def test_gap_share_targets(monkeypatch):
     assert search.adapt_gap_share(0.0, 0.0, False) == 0.0
     with pytest.raises(ValueError, match="jump_gap_share"):
         solve(knapsack(), jump_gap_share=1.0)
+
+
+# %% Pool eviction by use, pool lookups over several points, node estimates
+def test_cut_pool_drops_the_cuts_idle_longest():
+    pool = jm._CutPool(3)
+    cut = lambda j: ("mir", np.array([j]), np.array([1.0]), 0.5)  # x_j <= 0.5
+    keys = pool.add([cut(0), cut(1), cut(2)])
+    # A point violates cut 0 only: it is in use, the others idle.
+    x = np.array([1.0, 0.0, 0.0, 0.0])
+    assert [k for k, _, _ in pool.best_violated([x])] == [keys[0]]
+    (new,) = pool.add([cut(3)])
+    assert len(pool) == 3
+    assert keys[0] in pool.cuts and new in pool.cuts  # the oldest, but used
+    assert keys[1] not in pool.cuts  # the oldest of the idle ones went
+
+
+def test_cut_pool_best_violated_takes_each_cut_at_its_best_point():
+    pool = jm._CutPool(10)
+    cuts = [
+        ("mir", np.array([0, 1]), np.array([3.0, 4.0]), 1.0),
+        ("cover", np.array([2]), np.array([1.0]), 0.5),
+        ("mir", np.array([1]), np.array([2.0]), 5.0),  # never violated
+    ]
+    keys = pool.add(cuts)
+    points = [np.array([1.0, 0.0, 0.0]), np.array([1.0, 1.0, 0.0]), np.zeros(3)]
+    found = {key: (eff, cut) for key, eff, cut in pool.best_violated(points)}
+    assert set(found) == {keys[0]}
+    assert found[keys[0]][0] == pytest.approx((7.0 - 1.0) / 5.0)
+    # As ``violated`` point by point; excluded keys are left out.
+    for x in points:
+        one = {jm._cut_key(c) for c in pool.violated(x)}
+        assert one == {k for k, _, _ in pool.best_violated([x])}
+    assert pool.best_violated(points, exclude={keys[0]}) == []
+    assert pool.best_violated([]) == []
+
+
+def test_conflict_pool_drops_the_row_idle_longest():
+    n = 4
+    pool = jm.ConflictPool(n, np.ones(n, bool), max_rows=2)
+    pool.add_nogood([0, 1], [])  # x0 + x1 <= 1
+    pool.add_nogood([2, 3], [])  # x2 + x3 <= 1
+    lower, upper = np.zeros(n), np.ones(n)
+    # The first row tightens this box (x0 = 1 fixes x1 = 0); the second cannot.
+    lo = lower.copy()
+    lo[0] = 1.0
+    out = pool.propagate(lo, upper.copy())
+    assert out[1][1] == 0.0 and not out[2]
+    pool.add_nogood([0, 3], [])
+    kept = {tuple(row[0].tolist()) for row in pool.rows}
+    assert kept == {(0, 1), (0, 3)}  # the older row stayed: it was used
+    assert pool.evicted == 1 and pool.evicted_unused == 1
+    # Without any use, the oldest goes, as before.
+    pool.add_nogood([1, 2], [])
+    assert {tuple(row[0].tolist()) for row in pool.rows} == {(0, 3), (1, 2)}
+    assert pool.evicted == 2 and pool.evicted_unused == 1
+
+
+def test_nodes_of_equal_bound_go_by_estimate(monkeypatch):
+    import heapq
+
+    mip = general_integer()
+    search = search_for(mip, monkeypatch, node_selection="best_first")
+    try:
+        nodes = [jm._Node(1.0, depth, None, None, None) for depth in (1, 5, 2)]
+        nodes[0].estimate, nodes[1].estimate, nodes[2].estimate = 3.0, 4.0, None
+        low = jm._Node(0.5, 0, None, None, None)
+        low.estimate = 9.0
+        for node in nodes + [low]:
+            search.push(node)
+        order = [heapq.heappop(search.open)[2] for _ in range(4)]
+        # The bound first; then no estimate counts as the bound, then the
+        # lower estimate, whatever the depth.
+        assert order == [low, nodes[2], nodes[0], nodes[1]]
+        # An estimate: the bound, the split's own gain and the other
+        # fractional integers' cheaper sides.
+        x = np.zeros(mip.num_variables)
+        ints = np.flatnonzero(search.is_int)[:3]
+        x[ints] = [0.5, 0.25, 0.9]
+        search.pc_sum[:], search.pc_count[:] = 2.0, 1.0
+        assert search.estimate_rest(x, ints[0]) == pytest.approx(2.0 * (0.25 + 0.1))
+    finally:
+        if search.exact_lane is not None:
+            search.exact_lane.shutdown()
+
+
+# %% Direct lane feeding, repeated conflict passes, pool refresh budget
+def test_lane_children_go_straight_back_to_the_lane(monkeypatch):
+    # A child of a lane node with its parent's basis and a bound in the band
+    # is queued for the lane without a device LP; ``exact_direct=False``
+    # screens every node first.
+    submitted = []
+    real_submit = jm._BranchAndBound.submit_exact
+
+    def submit(self, node, box):
+        submitted.append(node.screened)
+        return real_submit(self, node, box)
+
+    monkeypatch.setattr(jm._BranchAndBound, "submit_exact", submit)
+    mip = generalised_assignment()
+    ref = reference(mip)
+    options = dict(batch_size=4, cuts=False, probing=False, exact_nodes=2, exact_band=1.0)
+    result = solve(mip, **options)
+    assert_solved(result, mip, ref)
+    stats = result["exact_nodes"]
+    assert stats["direct"] > 0 and stats["direct"] >= submitted.count(False) > 0
+    assert stats["warm_bases"] > 0
+
+
+def test_send_to_lane_needs_a_basis_the_band_and_room(monkeypatch):
+    mip = generalised_assignment()
+    search = search_for(
+        mip, monkeypatch, batch_size=4, cuts=False, probing=False, exact_nodes=2,
+        node_selection="best_first",
+    )
+    try:
+        warm = (types.SimpleNamespace(primal=np.zeros(1)), None)
+
+        def child(bound, basis=7):
+            node = jm._Node(bound, 1, None, None, None)
+            node._warm, node.exact_basis = warm, basis
+            return node
+
+        monkeypatch.setattr(jm._Node, "has_warm_solution", lambda self: True)
+        assert not search.send_to_lane(child(1.0))  # no band yet (no batch)
+        search.lane_band_top = 2.0
+        assert not search.send_to_lane(child(3.0))  # above the band
+        assert not search.send_to_lane(child(1.0, basis=None))  # no basis
+        assert search.send_to_lane(child(1.0))
+        assert search.exact_direct_nodes == len(search.exact_reserved) == 1
+        room = jm._EXACT_OVERFLOW_KEEP * search.exact_lane.threads
+        while len(search.exact_reserved) < room:
+            assert search.send_to_lane(child(1.0))
+        assert not search.send_to_lane(child(1.0))  # the queue is full
+        search.exact_reserved.clear()
+        search.exact_direct = False
+        assert not search.send_to_lane(child(1.0))
+    finally:
+        search.exact_lane.shutdown()
+
+
+def test_conflict_pass_is_skipped_until_something_changes(monkeypatch):
+    mip = general_integer()
+    search = search_for(mip, monkeypatch)
+    try:
+        calls = []
+        real = jm._BranchAndBound.conflict_propagate
+
+        def spy(self, lower, upper):
+            calls.append(1)
+            return real(self, lower, upper)
+
+        monkeypatch.setattr(jm._BranchAndBound, "conflict_propagate", spy)
+        search.root_lower = np.asarray(mip.lower, np.float64).copy()
+        search.root_upper = np.asarray(mip.upper, np.float64).copy()
+        node = jm._Node(0.0, 1, None, None, None)
+        box = search.expand(node.changes)
+        assert search.prune_by_conflicts(node, *box) is not None and len(calls) == 1
+        assert search.prune_by_conflicts(node, *box) is not None and len(calls) == 1
+        assert search.conflict_passes_skipped == 1
+        search.conflicts.add_nogood([int(np.flatnonzero(search.is_int)[0])], [])
+        assert search.prune_by_conflicts(node, *box) is not None and len(calls) == 2
+        search.conflicts.set_cutoff(123.0)  # a new cutoff moves objective rows
+        search.prune_by_conflicts(node, *box)
+        search.root_lower = search.root_lower.copy()  # a new root box
+        search.prune_by_conflicts(node, *box)
+        assert len(calls) == 4
+    finally:
+        if search.exact_lane is not None:
+            search.exact_lane.shutdown()
+
+
+def test_pool_refreshes_keep_to_their_share_of_the_tree(monkeypatch):
+    mip = general_integer()
+    search = search_for(mip, monkeypatch)
+    try:
+        search.use_tree_cuts, search.slot_version = True, np.ones(1, int)
+        search.cut_pool.add([("mir", np.array([0]), np.array([1.0]), 0.5)])
+        search.tree_cut_every, search.tree_pool_every = 0, 1
+        search.nodes, search.last_pool_nodes = 5, 0
+        monkeypatch.setattr(search, "tree_elapsed", lambda: 100.0)
+        monkeypatch.setattr(search, "out_of_time", lambda: False)
+        search.tree_cut_seconds = search.tree_pool_seconds = 4.0
+        assert search.tree_cuts_due() == "pool"
+        search.tree_pool_seconds = 100.0 * jm._TREE_POOL_SHARE + 1.0
+        search.tree_cut_seconds = search.tree_pool_seconds
+        assert search.tree_cuts_due() is None
+        assert search.tree_pool_skipped == 1 and search.last_pool_nodes == 5
+    finally:
+        if search.exact_lane is not None:
+            search.exact_lane.shutdown()

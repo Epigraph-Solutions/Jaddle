@@ -150,30 +150,23 @@ def run_jaddle(path, args):
     started = time.time()
     result = jm.solve(
         path,
-        branching="pseudocost",
-        node_selection="best_first",
+        branching="auto",
+        node_selection="hybrid",
         reliability_threshold=8,
-        mip_rel_gap=1e-5,
+        mip_rel_gap=1e-4,
         verbose=True,
         symmetry=True,
         log_every_seconds=10,
         device=args.device,
         presolve=True,
-        # The exact band (jm._BranchAndBound.promote_to_lane): every node is
-        # screened on the device; one still in the band after its LP goes
-        # to the exact_nodes threads (16), which cross its PDHG point over to a
-        # vertex and strong-branch it (exact_strong_lookahead). The point
-        # is the batch's (batch_epochs), so a looser one costs the
-        # crossover more repair pivots; exact_node_seconds bounds each
-        # node's crossover and re-solve. exact_band=0: only nodes that still
-        # hold the global bound after their device LP.
         exact_band="auto",
         exact_node_seconds=20.0,
         exact_strong_lookahead=4,
+        plunge_depth=2,
         batch_size=64,
         max_seconds=args.max_seconds,
         conflict_pool_size=5000,
-        precision="float64",
+        precision="float32",
         lp_tolerance=1e-3,
         # root_refinement=1e-6,
         # root_crossover=True,
@@ -182,16 +175,15 @@ def run_jaddle(path, args):
         # their Lagrangian bound is taken (jm.DualRepair).
         dual_repair=True,
         cuts=True,
+        tree_cuts=True,
         mir_cuts=True,
         gomory_cuts=False,
-        batch_epochs=1,
-        tree_cut_every=150,
-        max_cut_rows=2000,
+        batch_epochs=2,
+        tree_cut_every=10,
+        max_cut_rows=1e4,
         cut_rounds=50,
-        proximity_seconds=20,
-        proximity_gap_share=0.6,
-        jump_gap_share=0.2,
         jump_threads=4,
+        proximity_seconds=20,
         rens_seconds=20,
         rins_seconds=20,
         one_opt=True,
@@ -210,8 +202,6 @@ def run_jaddle(path, args):
         cutoff_probing=True,
         # Row aggregation for the separators: with mir_cuts=False the
         # aggregates still give cover and flow cover cuts.
-        max_aggregation=8,
-        aggregation_width=5,
     )
     row.update(
         {
