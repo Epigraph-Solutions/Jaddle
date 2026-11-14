@@ -4378,7 +4378,7 @@ def solve_with_presolve(
     return result
 
 
-def crossover(lp, solution, highs_options=None):
+def crossover(lp, solution, highs_options=None, host=False):
     """
     Cross a first-order solution over to a vertex: an optimal basic solution
     of ``lp`` with its basis, computed by HiGHS from ``solution``.
@@ -4427,8 +4427,10 @@ def crossover(lp, solution, highs_options=None):
 
     Returns a dict:
 
-    * ``"solution"``: a ``SaddleState`` at the vertex, or ``solution``
-      unchanged if HiGHS stopped without a primal-dual solution.
+    * ``"solution"``: a ``SaddleState`` at the vertex (NumPy arrays with
+      ``host=True``, so the call touches no JAX, e.g. on a worker thread;
+      JAX arrays otherwise), or ``solution`` unchanged if HiGHS stopped
+      without a primal-dual solution.
     * ``"objective"``: ``cᵀx`` there.
     * ``"converged"``: whether HiGHS proved the vertex optimal; ``"status"``
       is its model status (``"kOptimal"``, ``"kTimeLimit"``, ...).
@@ -4529,10 +4531,11 @@ def crossover(lp, solution, highs_options=None):
         dual_eq, dual_ineq = hh.highs_duals_to_jaddle(
             np.asarray(vertex.row_dual), np.asarray(model.row_lower_), b
         )
+        wrap = np.asarray if host else jnp.asarray
         solution = SaddleState(
-            primal=jnp.asarray(vertex.col_value),
-            dual_ineq=jnp.asarray(dual_ineq),
-            dual_eq=jnp.asarray(dual_eq),
+            primal=wrap(vertex.col_value),
+            dual_ineq=wrap(dual_ineq),
+            dual_eq=wrap(dual_eq),
         )
     return {
         "solution": solution,
@@ -6393,6 +6396,16 @@ def _slack_form_base(lp: JaddleLP) -> JaddleLP:
     )
 
 
+def _pow2_floor(value):
+    """``value`` rounded down to a power of 2. A correction solve's
+    tolerances go through it: ``solve()`` compiles a program per distinct
+    tolerance (they are static settings), and each round's raw tolerances
+    are new numbers, so every correction solve compiled its own. Rounded,
+    they repeat across rounds and calls (a node LP's refinement reuses the
+    last node's programs), at most a factor 2 tighter."""
+    return float(2.0 ** np.floor(np.log2(value)))
+
+
 def _pow2_scale(residual, previous, growth, max_scale):
     """Gleixner's scale factor 1 / residual, rounded down to a power of 2 (so
     scaling and unscaling are exact), at least 1, and capped at ``growth``
@@ -6472,8 +6485,24 @@ def _apply_correction(lp, x, y_eq, y_ineq, correction, scale_p, scale_d):
     )
 
 
-def solve_with_refinement(
+# Main-solve arguments the correction solves of ``refine`` must not get: the
+# polishing set, and ``bound_target``, which is in the original LP's
+# objective units, not the correction LP's.
+_REFINE_DROPPED_KWARGS = _POLISH_DROPPED_KWARGS | {"bound_target"}
+
+
+def _check_refinement_options(inner_tol, max_rounds, max_scale_growth, max_scale):
+    if not 0.0 < inner_tol < 1.0:
+        raise ValueError("inner_tol must be in (0, 1)")
+    if max_rounds < 0:
+        raise ValueError("max_rounds must be >= 0")
+    if max_scale_growth <= 1.0 or max_scale < 1.0:
+        raise ValueError("max_scale_growth must be > 1 and max_scale >= 1")
+
+
+def refine(
     lp: JaddleLP,
+    solution,
     tol=1e-8,
     primal_feasibility_tolerance=None,
     dual_feasibility_tolerance=None,
@@ -6488,12 +6517,14 @@ def solve_with_refinement(
     **kwargs,
 ):
     """
-    ``solve()`` with iterative refinement (Gleixner, Steffy & Wolter, INFORMS
-    JOC 2016).
+    Iterative refinement (Gleixner, Steffy & Wolter, INFORMS JOC 2016) of a
+    given point of ``lp``: the refinement rounds of ``solve_with_refinement``
+    without its first solve, from ``solution`` (a ``SaddleState``, e.g. a
+    loose ``solve()`` result's). A point that is already certified takes no
+    round.
 
-    A first solve stops at the loose ``inner_tol``. Each refinement round then
-    builds the correction LP at the current point (x*, y*): the same problem
-    in the shifted, scaled variables ẑ = scale_p (z - z*) and
+    Each round builds the correction LP at the current point (x*, y*): the
+    same problem in the shifted, scaled variables ẑ = scale_p (z - z*) and
     ŷ = scale_d (y - y*), whose right-hand side is the primal residual and
     whose objective is the reduced cost, both blown up to O(1) (see
     ``_correction_lp``). It is solved loosely from zero and the scaled-down
@@ -6517,12 +6548,14 @@ def solve_with_refinement(
     worst residual-to-tolerance ratio.
 
     Args:
+        solution: The starting point, a ``SaddleState`` of ``lp`` (with an
+            empty constraint block padded to one row, as ``solve()`` returns
+            it, or not).
         tol: Default for the three tolerances below.
         primal_feasibility_tolerance, dual_feasibility_tolerance,
             dual_gap_tolerance: As in ``solve()``; ``None`` means ``tol``.
-        inner_tol: Relative tolerance of the first solve, and the per-round
-            reduction asked of each correction solve.
-        max_rounds: Refinement rounds after the first solve.
+        inner_tol: The per-round reduction asked of each correction solve.
+        max_rounds: Refinement rounds at most.
         max_scale_growth: Per-round growth cap on each scale factor.
         max_scale: Absolute cap on each scale factor.
         fix_threshold: Experimental. Columns and slacks near a bound whose
@@ -6532,34 +6565,67 @@ def solve_with_refinement(
             correction LP. 100 helped small random LPs but wrecked stp3d's
             dual (DFR 1e-4 -> 1.15 in one round): a row whose columns are all
             fixed leaves its correction dual free to drift.
-        max_epochs: Epoch budget across the first solve and every round.
+        max_epochs: Epoch budget across every round.
         max_seconds: Wall-clock budget for the whole call.
-        **kwargs: Passed to ``solve()``. The correction solves get them too,
-            except the start point, ``k_init``, ``vertex_bias``,
-            ``primal_stop`` and ``reference_objective``.
+        **kwargs: Passed to the correction solves (``solve()``), except the
+            start point, ``k_init``, ``vertex_bias``, ``primal_stop``,
+            ``reference_objective`` and ``bound_target``.
 
     Returns:
-        ``solve()``'s result dict for the first solve, with ``"solution"`` the
-        best point, ``"converged"`` / ``"stop_reason"`` describing it,
-        ``"epochs"`` summed over every solve, ``"solve_seconds"`` and
-        ``"corrected_seconds"`` set to the whole call's wall time, and a
-        ``"refinement"`` dict: ``rounds``, ``epochs_per_round``, ``scales``
+        A dict: ``"solution"`` the best point, ``"converged"`` whether it is
+        certified, ``"stop_reason"`` (``"certificate"``, ``"max_rounds"``,
+        ``"time_limit"``, ``"max_epochs"``, ``"refinement_stalled"``, or a
+        correction solve's ``"interrupted"`` / ``"cancelled"``), ``"epochs"``
+        summed over the rounds, ``"solve_seconds"`` the call's wall time, and
+        a ``"refinement"`` dict: ``rounds``, ``epochs_per_round``, ``scales``
         (``(scale_p, scale_d)`` per round) and ``history`` (relative PFR, DFR
-        and gap after the first solve and each round).
+        and gap of the start point and after each round).
     """
-    entry_time = time.time()
+    return _refine(
+        lp,
+        solution,
+        tol,
+        primal_feasibility_tolerance,
+        dual_feasibility_tolerance,
+        dual_gap_tolerance,
+        inner_tol,
+        max_rounds,
+        max_scale_growth,
+        max_scale,
+        fix_threshold,
+        max_epochs,
+        max_seconds,
+        time.time(),
+        kwargs,
+    )
+
+
+def _refine(
+    lp,
+    solution,
+    tol,
+    primal_feasibility_tolerance,
+    dual_feasibility_tolerance,
+    dual_gap_tolerance,
+    inner_tol,
+    max_rounds,
+    max_scale_growth,
+    max_scale,
+    fix_threshold,
+    max_epochs,
+    max_seconds,
+    entry_time,
+    kwargs,
+):
+    """``refine`` with its clock started at ``entry_time`` (so
+    ``solve_with_refinement``'s budget covers its first solve too)."""
     if not isinstance(lp, JaddleLP):
         lp = to_jaddle_sparse(lp)
     # solve() pads an empty constraint class with a zero row and returns duals
     # of that padded size; pad here so the certificate below sees the same LP.
     lp = __pad_empty_blocks(lp)
-    _require_no_cones(lp, "solve_with_refinement")
-    if not 0.0 < inner_tol < 1.0:
-        raise ValueError("inner_tol must be in (0, 1)")
-    if max_rounds < 0:
-        raise ValueError("max_rounds must be >= 0")
-    if max_scale_growth <= 1.0 or max_scale < 1.0:
-        raise ValueError("max_scale_growth must be > 1 and max_scale >= 1")
+    _require_no_cones(lp, "refine")
+    _check_refinement_options(inner_tol, max_rounds, max_scale_growth, max_scale)
 
     p_tol = tol if primal_feasibility_tolerance is None else primal_feasibility_tolerance
     d_tol = tol if dual_feasibility_tolerance is None else dual_feasibility_tolerance
@@ -6568,9 +6634,10 @@ def solve_with_refinement(
     norm = kwargs.get("termination_norm", "l2")
     cert_options = {"norm": norm, "dual_residual": kwargs.get("dual_residual", "pdlp")}
     verbose = kwargs.get("verbose", False)
-    sub_kwargs = {k: v for k, v in kwargs.items() if k not in _POLISH_DROPPED_KWARGS}
+    sub_kwargs = {k: v for k, v in kwargs.items() if k not in _REFINE_DROPPED_KWARGS}
     b_norm = float(_vector_norm(lp.b, norm))
     c_norm = float(_vector_norm(lp.c, norm))
+    dtype = lp.c.dtype
 
     def seconds_left():
         if max_seconds is None:
@@ -6601,28 +6668,23 @@ def solve_with_refinement(
             cert[gap_key],
         )
 
-    loose = max(inner_tol, min(p_tol, d_tol, g_tol))
-    result = solve(
-        lp,
-        primal_feasibility_tolerance=max(p_tol, loose),
-        dual_feasibility_tolerance=max(d_tol, loose),
-        dual_gap_tolerance=max(g_tol, loose),
-        max_epochs=max_epochs,
-        max_seconds=max_seconds,
-        **kwargs,
+    # At the LP's precision (a point may come from a solve at another).
+    state = SaddleState(
+        primal=jnp.asarray(solution.primal, dtype),
+        dual_ineq=jnp.asarray(solution.dual_ineq, dtype),
+        dual_eq=jnp.asarray(solution.dual_eq, dtype),
     )
-    epochs = result["epochs"]
-    state = result["solution"]
     cert = certify(state)
     best, best_cert = state, cert
     history = [history_entry(cert)]
     epochs_per_round, scales = [], []
-    stop_reason = result["stop_reason"]
+    stop_reason = None
+    epochs = 0
     base = None
     scale_p = scale_d = 1.0
 
     rounds = 0
-    while best_cert["score"] > 1.0 and stop_reason not in ("interrupted",):
+    while best_cert["score"] > 1.0:
         if rounds >= max_rounds:
             stop_reason = "max_rounds"
             break
@@ -6665,11 +6727,17 @@ def solve_with_refinement(
         g_target = max(g_tol * gap_den, inner_tol * gap_abs) * scale_p * scale_d
         b_hat = float(_vector_norm(correction_lp.b, norm))
         c_hat = float(_vector_norm(correction_lp.c, norm))
+        # Rounded down to powers of 2, so the correction solves share
+        # compiled programs (``_pow2_floor``).
         sub_tolerances = {
-            "primal_feasibility_tolerance": min(inner_tol, p_target / (1.0 + b_hat)),
-            "dual_feasibility_tolerance": min(inner_tol, d_target / (1.0 + c_hat)),
-            "dual_gap_tolerance": min(
-                inner_tol, g_target / (1.0 + 2.0 * gap_abs * scale_p * scale_d)
+            "primal_feasibility_tolerance": _pow2_floor(
+                min(inner_tol, p_target / (1.0 + b_hat))
+            ),
+            "dual_feasibility_tolerance": _pow2_floor(
+                min(inner_tol, d_target / (1.0 + c_hat))
+            ),
+            "dual_gap_tolerance": _pow2_floor(
+                min(inner_tol, g_target / (1.0 + 2.0 * gap_abs * scale_p * scale_d))
             ),
         }
         if verbose:
@@ -6691,8 +6759,8 @@ def solve_with_refinement(
         epochs += sub["epochs"]
         epochs_per_round.append(sub["epochs"])
         scales.append((scale_p, scale_d))
-        if sub["stop_reason"] == "interrupted":
-            stop_reason = "interrupted"
+        if sub["stop_reason"] in ("interrupted", "cancelled"):
+            stop_reason = sub["stop_reason"]
             break
         state = _apply_correction(
             lp, x, y_eq, y_ineq, sub["solution"], scale_p, scale_d
@@ -6713,19 +6781,119 @@ def solve_with_refinement(
             break
 
     certified = best_cert["score"] <= 1.0
+    return {
+        "solution": best,
+        "converged": certified,
+        "stop_reason": "certificate" if certified else stop_reason,
+        "epochs": epochs,
+        "solve_seconds": time.time() - entry_time,
+        "refinement": {
+            "rounds": rounds,
+            "epochs_per_round": epochs_per_round,
+            "scales": scales,
+            "history": history,
+        },
+    }
+
+
+def solve_with_refinement(
+    lp: JaddleLP,
+    tol=1e-8,
+    primal_feasibility_tolerance=None,
+    dual_feasibility_tolerance=None,
+    dual_gap_tolerance=None,
+    inner_tol=1e-4,
+    max_rounds=8,
+    max_scale_growth=2.0**12,
+    max_scale=2.0**40,
+    fix_threshold=None,
+    max_epochs=None,
+    max_seconds=None,
+    **kwargs,
+):
+    """
+    ``solve()`` with iterative refinement (Gleixner, Steffy & Wolter, INFORMS
+    JOC 2016): a first solve stops at the loose ``inner_tol``, then
+    ``refine`` takes its point to the final tolerances (see ``refine`` for
+    the rounds).
+
+    Args:
+        tol: Default for the three tolerances below.
+        primal_feasibility_tolerance, dual_feasibility_tolerance,
+            dual_gap_tolerance: As in ``solve()``; ``None`` means ``tol``.
+        inner_tol: Relative tolerance of the first solve, and the per-round
+            reduction asked of each correction solve.
+        max_rounds: Refinement rounds after the first solve.
+        max_scale_growth, max_scale, fix_threshold: As in ``refine``.
+        max_epochs: Epoch budget across the first solve and every round.
+        max_seconds: Wall-clock budget for the whole call.
+        **kwargs: Passed to ``solve()``. The correction solves get them too,
+            except the start point, ``k_init``, ``vertex_bias``,
+            ``primal_stop``, ``reference_objective`` and ``bound_target``.
+
+    Returns:
+        ``solve()``'s result dict for the first solve, with ``"solution"`` the
+        best point, ``"converged"`` / ``"stop_reason"`` describing it,
+        ``"epochs"`` summed over every solve, ``"solve_seconds"`` and
+        ``"corrected_seconds"`` set to the whole call's wall time, and a
+        ``"refinement"`` dict: ``rounds``, ``epochs_per_round``, ``scales``
+        (``(scale_p, scale_d)`` per round) and ``history`` (relative PFR, DFR
+        and gap after the first solve and each round).
+    """
+    entry_time = time.time()
+    if not isinstance(lp, JaddleLP):
+        lp = to_jaddle_sparse(lp)
+    # solve() pads an empty constraint class with a zero row and returns duals
+    # of that padded size; pad here so the certificate sees the same LP.
+    lp = __pad_empty_blocks(lp)
+    _require_no_cones(lp, "solve_with_refinement")
+    _check_refinement_options(inner_tol, max_rounds, max_scale_growth, max_scale)
+
+    p_tol = tol if primal_feasibility_tolerance is None else primal_feasibility_tolerance
+    d_tol = tol if dual_feasibility_tolerance is None else dual_feasibility_tolerance
+    g_tol = tol if dual_gap_tolerance is None else dual_gap_tolerance
+    loose = max(inner_tol, min(p_tol, d_tol, g_tol))
+    result = solve(
+        lp,
+        primal_feasibility_tolerance=max(p_tol, loose),
+        dual_feasibility_tolerance=max(d_tol, loose),
+        dual_gap_tolerance=max(g_tol, loose),
+        max_epochs=max_epochs,
+        max_seconds=max_seconds,
+        **kwargs,
+    )
+    first_epochs = result["epochs"]
+    interrupted = result["stop_reason"] == "interrupted"
+    refined = _refine(
+        lp,
+        result["solution"],
+        tol,
+        p_tol,
+        d_tol,
+        g_tol,
+        inner_tol,
+        0 if interrupted else max_rounds,
+        max_scale_growth,
+        max_scale,
+        fix_threshold,
+        None if max_epochs is None else int(max_epochs) - first_epochs,
+        max_seconds,
+        entry_time,
+        kwargs,
+    )
+    stop_reason = refined["stop_reason"]
+    if interrupted and not refined["converged"]:
+        stop_reason = "interrupted"
+    elif stop_reason is None:
+        stop_reason = result["stop_reason"]
     wall = time.time() - entry_time
-    result["solution"] = best
-    result["converged"] = certified
-    result["stop_reason"] = "certificate" if certified else stop_reason
-    result["epochs"] = epochs
+    result["solution"] = refined["solution"]
+    result["converged"] = refined["converged"]
+    result["stop_reason"] = stop_reason
+    result["epochs"] = first_epochs + refined["epochs"]
     result["solve_seconds"] = wall
     result["corrected_seconds"] = wall
-    result["refinement"] = {
-        "rounds": rounds,
-        "epochs_per_round": epochs_per_round,
-        "scales": scales,
-        "history": history,
-    }
+    result["refinement"] = refined["refinement"]
     return result
 
 

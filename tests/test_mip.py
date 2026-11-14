@@ -2365,6 +2365,108 @@ def test_rejects_bad_node_crossover_options(options):
         solve(knapsack(), **options)
 
 
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_root_and_node_refinement(batch_size):
+    mip = general_integer()
+    # Without root cuts: with them the root closes and no node is refined.
+    result = solve(
+        mip,
+        root_refinement=1e-8,
+        node_refinement=1e-8,
+        batch_size=batch_size,
+        cuts=False,
+    )
+    assert_solved(result, mip, reference(mip))
+    stats = result["refinement"]
+    assert stats["root"] >= 1 and stats["nodes"] > 0
+    assert stats["root_certified"] <= stats["root"]
+    assert stats["nodes_certified"] <= stats["nodes"]
+    assert stats["epochs"] > 0 and stats["seconds"] > 0
+    off = solve(mip, batch_size=batch_size, cuts=False)
+    assert off["refinement"]["root"] == off["refinement"]["nodes"] == 0
+
+
+def test_root_refinement_tightens_the_root_point():
+    mip = general_integer()
+    result = solve(mip, root_refinement=1e-9, max_nodes=1, cuts=False)
+    stats = result["refinement"]
+    assert stats["root"] == 1 and stats["root_certified"] == 1
+
+
+def test_node_refinement_every():
+    mip = general_integer()
+    sparse = solve(mip, node_refinement=1e-8, node_refinement_every=1000, cuts=False)
+    assert_solved(sparse, mip, reference(mip))
+    assert sparse["refinement"]["nodes"] <= 1  # only the node count 0 qualifies
+
+
+def test_refinement_runs_before_crossover(monkeypatch):
+    # With both on, every crossover (root Gomory rounds, nodes) starts from
+    # the point the latest refinement returned.
+    events = []
+    real_refine, real_crossover = jl.refine, jl.crossover
+
+    def refine(lp, solution, **kwargs):
+        out = real_refine(lp, solution, **kwargs)
+        events.append(("refine", out["solution"]))
+        return out
+
+    def crossover(lp, solution, highs_options=None):
+        events.append(("crossover", solution))
+        return real_crossover(lp, solution, highs_options=highs_options)
+
+    monkeypatch.setattr(jm.jl, "refine", refine)
+    monkeypatch.setattr(jm.jl, "crossover", crossover)
+    mip = general_integer()
+    options = {**NO_HEURISTICS, "cuts": True, "gomory_cuts": True}
+    result = solve(
+        mip,
+        root_refinement=1e-8,
+        node_refinement=1e-8,
+        root_crossover=True,
+        node_crossover=True,
+        **options,
+    )
+    assert_solved(result, mip, reference(mip))
+    crossovers = [i for i, (kind, _) in enumerate(events) if kind == "crossover"]
+    assert crossovers and result["node_crossovers"] > 0
+    for i in crossovers:
+        refined = [point for kind, point in events[:i] if kind == "refine"]
+        assert refined
+        # The refined point itself; the cut loop may refit its inequality
+        # duals to the rows left after dropping idle cuts.
+        start, last = events[i][1], refined[-1]
+        np.testing.assert_array_equal(start.primal, last.primal)
+        np.testing.assert_array_equal(start.dual_eq, last.dual_eq)
+
+
+@pytest.mark.parametrize(
+    "value, tol", [(True, 1e-8), (False, None), (None, None), (1e-10, 1e-10)]
+)
+def test_refinement_options_take_true_for_the_default(monkeypatch, value, tol):
+    # True is "on, at 1e-8", not float(True) = 1.0, which every point meets.
+    search = search_for(
+        knapsack(), monkeypatch, root_refinement=value, node_refinement=value
+    )
+    assert search.root_refinement == tol and search.node_refinement == tol
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        dict(root_refinement=0),
+        dict(root_refinement=1.0),
+        dict(node_refinement=-1e-8),
+        dict(node_refinement="tight"),
+        dict(node_refinement_every=0),
+        dict(refinement_options={"tol": 1e-8}),
+    ],
+)
+def test_rejects_bad_refinement_options(options):
+    with pytest.raises(ValueError):
+        solve(knapsack(), **options)
+
+
 # %% Repair
 def broken_assignment(seed=0):
     """A generalised assignment MIP and an integer point that breaks some
@@ -4971,9 +5073,18 @@ def test_root_crossover_makes_reduced_cost_fixing_rigorous(monkeypatch, crossove
         return constant, r
 
     search.dual_terms = noisy
+    search.active_bound = search.active_proven = -np.inf  # as ``_root`` starts
     search.root_exact_terms(lower, upper, result)
     assert search.root_terms_rigorous == crossover
     assert search.root_crossover_used == crossover
+    if crossover:
+        # The exact bound is the root's at once (the log's, and pruning's),
+        # not only once ``evaluate`` reaches the root.
+        exact, _ = search.bound_over(search.root_terms, lower, upper)
+        assert search.active_bound == search.round_bound(exact) > -np.inf
+        assert search.active_proven == search.round_bound(exact)
+    else:
+        assert search.active_proven == -np.inf
     x, value = reference_point(mip)
     search.incumbent = (value, x)
     assert search.tighten_root()
@@ -6955,18 +7066,26 @@ def test_exact_lane_bounds_on_its_threads(make):
     "make", [facility_location, generalised_assignment, lambda: coverage_chains(1)]
 )
 def test_exact_lane_solves_to_the_optimum(make):
-    # Without cuts and probing they branch, so the lane gets nodes. (The
-    # root's exact strong branching would solve facility_location's whole
-    # tree at the root, leaving the lane nothing to solve.)
+    # Without cuts and probing they branch. Every node is screened on the
+    # device first, and only those still in the band go to the lane, which
+    # crosses their PDHG points over: facility_location's device LPs close
+    # its tree (3 nodes), so its lane gets nothing; the others' get nodes.
+    # (The root's exact strong branching would solve facility_location's
+    # whole tree at the root.)
     mip = make()
     ref = reference(mip)
     options = dict(batch_size=4, cuts=False, probing=False, exact_root_candidates=0)
+    solved = 0
     for band in (0.005, 0.5, 0.0, "auto"):  # the band kept for the lane; 0: none
         result = solve(mip, exact_nodes=2, exact_band=band, **options)
         assert_solved(result, mip, ref)
         stats = result["exact_nodes"]
-        assert stats["solved"] > 0 and stats["bound_gain"] >= 0.0
+        assert stats["bound_gain"] >= 0.0
         assert stats["band_min"] <= stats["band"] <= stats["band_max"]
+        # A lane node was promoted after its device LP and crossed over.
+        assert stats["solved"] <= stats["crossovers"] <= stats["promoted"]
+        solved += stats["solved"]
+    assert (solved > 0) == (make is not facility_location)
     assert solve(mip, **options)["exact_nodes"]["solved"] == 0
 
 
@@ -7205,6 +7324,40 @@ def test_root_exact_strong_branching_in_the_search():
     ]["candidates"] == 0
 
 
+def test_root_exact_strong_starts_from_the_root_crossover_basis(monkeypatch):
+    # The lane's exact root LP starts from the root crossover's optimal
+    # basis, so it needs (almost) no pivots, where a cold start needs many;
+    # strong branching goes on from it as before.
+    mip = generalised_assignment()
+    ref = reference(mip)
+    options = dict(
+        batch_size=4, cuts=False, probing=False, exact_nodes=2,
+        root_crossover=True, round_repair=True,
+    )
+    starts = []
+    real_root_lp = jm._ExactLane.root_lp
+
+    def root_lp(self, mip, lp_box, seconds, basis=None):
+        starts.append(basis)
+        return real_root_lp(self, mip, lp_box, seconds, basis=basis)
+
+    monkeypatch.setattr(jm._ExactLane, "root_lp", root_lp)
+    warm = solve(mip, **options)
+    assert_solved(warm, mip, ref)
+    assert starts and starts[0] is not None
+    assert warm["root_exact_strong"]["warm"]
+    assert warm["root_exact_strong"]["candidates"] > 0
+    monkeypatch.setattr(jm._BranchAndBound, "current_root_basis", lambda self: None)
+    starts.clear()
+    cold = solve(mip, **options)
+    assert_solved(cold, mip, ref)
+    assert starts == [None] and not cold["root_exact_strong"]["warm"]
+    assert warm["root_exact_strong"]["pivots"] < cold["root_exact_strong"]["pivots"]
+    assert warm["root_exact_strong"]["bound"] == pytest.approx(
+        cold["root_exact_strong"]["bound"], rel=1e-9
+    )
+
+
 def test_root_exact_strong_seeds_the_pseudocosts(monkeypatch):
     mip = generalised_assignment()
     real = jm._BranchAndBound.root_exact_strong
@@ -7256,9 +7409,18 @@ def test_exact_node_lp_from_the_parents_basis(make):
 
 
 @pytest.mark.parametrize("tree_cuts", [True, False])
-def test_exact_lane_children_start_from_their_parents_basis(tree_cuts):
-    # The lane's nodes branch here, so their children reach the lane with
-    # the basis kept for them, across tree cut refreshes too.
+def test_exact_lane_crosses_over_screened_points(tree_cuts, monkeypatch):
+    # A lane node starts from a crossover of its own device LP's point (it
+    # was screened first), across tree cut refreshes too, not from its
+    # parent's basis; the LP then re-solves from the crossover's basis.
+    starts = []
+    real = jm._ExactLane.cross_over
+
+    def spy(self, mip, lower, upper, start):
+        starts.append(start)
+        return real(self, mip, lower, upper, start)
+
+    monkeypatch.setattr(jm._ExactLane, "cross_over", spy)
     mip = generalised_assignment()
     ref = reference(mip)
     options = dict(
@@ -7267,11 +7429,15 @@ def test_exact_lane_children_start_from_their_parents_basis(tree_cuts):
     )
     on = solve(mip, **options)
     assert_solved(on, mip, ref)
-    assert on["exact_nodes"]["pivots"] > 0
-    assert on["exact_nodes"]["warm_bases"] > 0
+    stats = on["exact_nodes"]
+    assert stats["crossovers"] == len(starts) > 0
+    assert stats["crossover_failed"] == 0 and stats["solved"] > 0
+    assert stats["warm_bases"] == 0  # no node LP started from a kept basis
+    # Host arrays only: the lane's threads touch no JAX.
+    assert all(isinstance(start.primal, np.ndarray) for start in starts)
     off = solve(mip, exact_basis_memory=0, **options)
     assert_solved(off, mip, ref)
-    assert off["exact_nodes"]["warm_bases"] == 0
+    assert off["exact_nodes"]["solved"] > 0
 
 
 def test_basis_store_drops_bases_no_node_holds(monkeypatch):
@@ -7387,6 +7553,89 @@ def test_exact_strong_branching_in_the_search():
     assert totals["strong_lps"] > 0 and totals["children_reused"] > 0
 
 
+def test_promote_to_lane_screens_on_the_device_bound(monkeypatch):
+    # A node solved on the device goes to the lane only while its own LP's
+    # bound is still in its batch's band, and only once.
+    search = search_for(
+        generalised_assignment(), monkeypatch, exact_nodes=1, batch_size=4,
+        exact_band="auto",
+    )
+    try:
+        monkeypatch.setattr(search, "exact_eligible", lambda node: True)
+        n = search.mip.num_variables
+        solution = jl.SaddleState(
+            primal=np.zeros(n), dual_ineq=np.zeros(1), dual_eq=np.zeros(1)
+        )
+        result = dict(solution=solution, opt_state=None, epochs=3, stop_reason="max_epochs")
+
+        def node():
+            return jm._Node(1.0, 1, None, (None, None), None)
+
+        search.eval_band = None
+        assert not search.promote_to_lane(node(), result, 1.5)  # no batch band
+        search.eval_band = (2.0, 1.6)
+        assert not search.promote_to_lane(node(), result, 2.5)  # lifted out
+        exact = dict(result, stop_reason="exact")
+        assert not search.promote_to_lane(node(), exact, 1.5)  # exact already
+        overflow = node()
+        overflow.converge = True
+        assert not search.promote_to_lane(overflow, result, 1.5)  # the band's overflow
+        low, edge = node(), node()
+        assert search.promote_to_lane(low, result, 1.5)
+        assert search.promote_to_lane(edge, result, 1.8)
+        assert low.screened and low.bound == 1.5 and low.epochs == 3
+        # Its own point, for the crossover (warm starts are stored packed).
+        np.testing.assert_array_equal(low.warm[0].primal, solution.primal)
+        assert low.band_edge is None and edge.band_edge == "exact"  # top part
+        assert [entry[2] for entry in sorted(search.exact_reserved)] == [low, edge]
+        assert not search.promote_to_lane(low, result, 1.5)  # once only
+        assert search.band_promotions == 2
+    finally:
+        search.exact_lane.shutdown()
+
+
+def test_exact_band_zero_keeps_only_the_global_bound(monkeypatch):
+    search = search_for(
+        generalised_assignment(), monkeypatch, exact_nodes=1, batch_size=4, exact_band=0.0
+    )
+    try:
+        monkeypatch.setattr(search, "global_bound", lambda: 5.0)
+        assert search.exact_band_top() == 5.0  # no width, no cutoff needed
+        monkeypatch.setattr(search, "global_bound", lambda: -np.inf)
+        assert search.exact_band_top() == -np.inf
+    finally:
+        search.exact_lane.shutdown()
+
+
+def test_lane_nodes_are_screened_and_failed_crossovers_go_back(monkeypatch):
+    # Every node the lane takes was solved on the device first. A crossover
+    # that finds no vertex sends its node back to the device, once.
+    submitted = []
+    real_submit = jm._BranchAndBound.submit_exact
+
+    def submit(self, node, box):
+        submitted.append(node.screened)
+        return real_submit(self, node, box)
+
+    monkeypatch.setattr(jm._BranchAndBound, "submit_exact", submit)
+    mip = generalised_assignment()
+    ref = reference(mip)
+    options = dict(batch_size=4, cuts=False, probing=False, exact_nodes=2, exact_band=0.5)
+    result = solve(mip, **options)
+    assert_solved(result, mip, ref)
+    assert submitted and all(submitted)
+    monkeypatch.setattr(
+        jm._ExactLane, "cross_over",
+        lambda self, mip, lower, upper, start: dict(basis=None, seconds=0.0, pivots=0),
+    )
+    failed = solve(mip, **options)
+    assert_solved(failed, mip, ref)
+    stats = failed["exact_nodes"]
+    assert stats["crossovers"] == stats["crossover_failed"] == stats["failed"] > 0
+    assert stats["solved"] == 0
+    assert stats["promoted"] == stats["crossovers"]  # none promoted twice
+
+
 def test_exact_lane_learns_pseudocosts_from_its_nodes(monkeypatch):
     # Without strong branching (in the lane or at the root) the lane's
     # pseudocosts learn only from its nodes' exact LPs over their exact
@@ -7405,7 +7654,8 @@ def test_exact_lane_learns_pseudocosts_from_its_nodes(monkeypatch):
         exact_strong_candidates=0, exact_root_candidates=0,
     )
     learnt = 0
-    for make in (facility_location, generalised_assignment):
+    # (facility_location's device LPs close its tree: its lane gets nothing.)
+    for make in (generalised_assignment, lambda: coverage_chains(1)):
         mip = make()
         assert_solved(solve(mip, **options), mip, reference(mip))
         search = searches[-1]

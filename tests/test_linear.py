@@ -477,6 +477,75 @@ def test_refinement_correction_lp_recovers_optimum():
     assert abs(after["objective"] - ref) / (1 + abs(ref)) < 1e-6
 
 
+def test_refine_from_a_loose_point():
+    # refine() alone: no first solve, rounds from the point it is given.
+    lp = random_lp()
+    loose = solve(lp, tol=1e-3, iterations_per_epoch=16)
+    result = jl.refine(
+        lp, loose["solution"], tol=1e-10, iterations_per_epoch=16, max_epochs=4000
+    )
+    assert result["stop_reason"] == "certificate" and result["converged"]
+    refinement = result["refinement"]
+    assert refinement["rounds"] >= 1
+    assert len(refinement["history"]) == refinement["rounds"] + 1
+    assert result["epochs"] == sum(refinement["epochs_per_round"])
+    cert = solve_certificate(lp, result["solution"])
+    assert cert["relative_primal_feasibility_residual"] <= 1e-10
+    assert cert["relative_dual_feasibility_residual"] <= 1e-10
+    assert cert["relative_gap"] <= 1e-10
+
+
+def test_refine_a_certified_point_takes_no_round():
+    lp = random_lp()
+    tight = solve(lp, tol=1e-6)
+    result = jl.refine(lp, tight["solution"], tol=1e-3)
+    assert result["converged"] and result["stop_reason"] == "certificate"
+    assert result["refinement"]["rounds"] == 0 and result["epochs"] == 0
+
+
+def test_refine_drops_bound_target_from_correction_solves(monkeypatch):
+    # bound_target is in the original LP's objective units: a correction LP
+    # given it would stop on a meaningless bound.
+    lp = random_lp()
+    loose = solve(lp, tol=1e-3)
+    seen = []
+    real_solve = jl.solve
+
+    def spy(problem, **kwargs):
+        seen.append(kwargs)
+        return real_solve(problem, **kwargs)
+
+    monkeypatch.setattr(jl, "solve", spy)
+    result = jl.refine(lp, loose["solution"], tol=1e-8, bound_target=-1e30)
+    assert seen and all("bound_target" not in kwargs for kwargs in seen)
+    assert result["refinement"]["rounds"] == len(seen)
+
+
+def test_refine_correction_tolerances_are_powers_of_two(monkeypatch):
+    # solve() compiles a program per distinct tolerance; powers of 2 repeat
+    # across rounds, so the correction solves share compiled programs.
+    lp = random_lp()
+    loose = solve(lp, tol=1e-3)
+    seen = []
+    real_solve = jl.solve
+
+    def spy(problem, **kwargs):
+        seen.append(kwargs)
+        return real_solve(problem, **kwargs)
+
+    monkeypatch.setattr(jl, "solve", spy)
+    jl.refine(lp, loose["solution"], tol=1e-10)
+    assert seen
+    for kwargs in seen:
+        for key in (
+            "primal_feasibility_tolerance",
+            "dual_feasibility_tolerance",
+            "dual_gap_tolerance",
+        ):
+            mantissa, _ = np.frexp(kwargs[key])
+            assert mantissa == 0.5, (key, kwargs[key])
+
+
 def test_solve_with_refinement_epoch_budget():
     result = jl.solve_with_refinement(random_lp(), tol=1e-12, max_epochs=3)
     assert result["stop_reason"] == "max_epochs"

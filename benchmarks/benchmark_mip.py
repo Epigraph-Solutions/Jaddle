@@ -35,9 +35,9 @@ import time
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["XLA_FLAGS"] = (
-    "--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=16"
-)
+# os.environ["XLA_FLAGS"] = (
+#     "--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=16"
+# )
 
 import highspy
 import jax
@@ -126,10 +126,13 @@ def discover_instances(args):
 #   (crossover) agree are fixed, and HiGHS searches the rest; when RINS's
 #   boxes come back empty at once, it fixes only a share of them (its
 #   fixing rate, down to 40%);
-# - 16 CPU threads that solve the nodes within a quarter of the gap of the
-#   global bound exactly with HiGHS's dual simplex and strong-branch them
-#   (8 candidates, each side for up to twice the mean pivots of a node LP,
-#   at most 500), while the device batches the rest.
+# - 16 CPU threads for the exact band: every node is solved on the device
+#   first (screened), and a node whose own LP leaves its bound within a
+#   quarter of the gap of the global bound is not branched on the device but
+#   promoted to the threads, which cross its PDHG point over to an optimal
+#   vertex with HiGHS and strong-branch it (8 candidates, each side for up to
+#   twice the mean pivots of a node LP, at most 500). A crossover that finds
+#   no vertex in `exact_node_seconds` sends the node back to the device.
 #
 # The log marks incumbents from the jump `J`, repair `R`, RINS `N` and
 # crossover `C`. The background threads make runs unrepeatable.
@@ -156,69 +159,59 @@ def run_jaddle(path, args):
         log_every_seconds=10,
         device=args.device,
         presolve=True,
-        exact_nodes=16,
+        # The exact band (jm._BranchAndBound.promote_to_lane): every node is
+        # screened on the device; one still in the band after its LP goes
+        # to the exact_nodes threads (16), which cross its PDHG point over to a
+        # vertex and strong-branch it (exact_strong_lookahead). The point
+        # is the batch's (batch_epochs), so a looser one costs the
+        # crossover more repair pivots; exact_node_seconds bounds each
+        # node's crossover and re-solve. exact_band=0: only nodes that still
+        # hold the global bound after their device LP.
         exact_band="auto",
-        exact_overflow_share=0.0,
+        exact_node_seconds=20.0,
         exact_strong_lookahead=4,
-        exact_strong_candidates=8,
-        batch_size=16,
+        batch_size=64,
         max_seconds=args.max_seconds,
-        tree_cut_every=150,
-        cut_pool_size=1e4,
-        tree_cut_rows=1e3,
-        max_cut_rows=2000,
-        cut_rounds=50,
         conflict_pool_size=5000,
-        root_lp="jaddle",
-        # lp_tolerance=1e-6,
-        # precision="float64",
+        precision="float64",
+        lp_tolerance=1e-3,
+        # root_refinement=1e-6,
         # root_crossover=True,
         cut_round_lp="highs",
-        node_precision="float32",
-        node_lp_tolerance=1e-3,
-        # node_crossover=True,
-        # node_crossover_seconds=60,
         # Sign repair of loose node duals on wide continuous columns before
         # their Lagrangian bound is taken (jm.DualRepair).
         dual_repair=True,
+        cuts=True,
         mir_cuts=True,
         gomory_cuts=False,
-        cuts=True,
-        tree_cuts=True,
+        batch_epochs=1,
+        tree_cut_every=150,
+        max_cut_rows=2000,
+        cut_rounds=50,
         proximity_seconds=20,
         proximity_gap_share=0.6,
         jump_gap_share=0.2,
         jump_threads=4,
         rens_seconds=20,
-        rens_fixing_rate=0.9,
         rins_seconds=20,
-        rins_fixing_rate=0.9,
         one_opt=True,
+        first_solution_seconds=40,
         # Dual-guided fixing on the sub-MIP lane: the root's largest
         # reduced costs fix integers at their preferred bound, HiGHS
         # searches the rest (jm._BranchAndBound.dual_fix_box).
-        dual_fix_seconds=10,
+        dual_fix_seconds=20,
         # Integer-projected PDHG at the root before the pump: PDHG with the
         # integers' projection a rounding, 8 lanes batched on the device.
         # projected_pdhg=True,
-        gpu_dive_every=10,
         # objective_level_seconds=45,
-        restarts=0,
+        restarts=5,
         # Cutoff probing: strong branching on every free integer against
         # the cutoff, on CPU threads, fixing the root box (on by default).
         cutoff_probing=True,
-        cutoff_probing_threads=4,
-        cutoff_probing_seconds=60,
-        cutoff_probing_iterations=1000,
-        # c-MIR separation and cut selection (the defaults; for the earlier
-        # behaviour: aggregation_width=1, cmir_per_row=1,
-        # cut_score_weights=None, aggregate_integers=False on large MIPs).
-        restart_presolve=True,
-        aggregate_integers="auto",
+        # Row aggregation for the separators: with mir_cuts=False the
+        # aggregates still give cover and flow cover cuts.
         max_aggregation=8,
         aggregation_width=5,
-        cmir_per_row=5,
-        cut_score_weights=(0.1, 0.1, 0.5),  # objective, integer, directed
     )
     row.update(
         {
@@ -268,8 +261,14 @@ def print_details(result):
         f"bound gained {exact['bound_gain']:.3g} in all; strong branching "
         f"{exact['strong_lps']} LPs in {exact['strong_seconds']:.1f}s, "
         f"{exact['children_reused']} children reused; "
-        f"{exact['pivots'] / max(1, exact['solved']):.0f} pivots a node, "
-        f"{exact['warm_bases']} from the parent's basis"
+        f"{exact['pivots'] / max(1, exact['solved']):.0f} pivots a node"
+    )
+    print(
+        f"Exact band: {exact['promoted']} nodes promoted after their device LP; "
+        f"{exact['crossovers']} crossovers ({exact['crossover_failed']} found no "
+        f"vertex) in {exact['crossover_seconds']:.1f}s, "
+        f"{exact['crossover_pivots'] / max(1, exact['crossovers']):.0f} pivots each; "
+        f"band {exact['band']:.3g} (range {exact['band_min']:.3g}-{exact['band_max']:.3g})"
     )
     repairs = result["dual_repairs"]
     print(
@@ -282,6 +281,7 @@ def print_details(result):
         f"Root exact strong branching: {root['candidates']} candidates, "
         f"{root['lps']} LPs ({root['fixed']} sides empty) in {root['seconds']:.1f}s, "
         f"exact root bound {root['bound']}"
+        + (", from the root crossover's basis" if root.get("warm") else "")
     )
     print(
         f"Sub-MIPs (HiGHS): RINS {result['rins_finds']} finds in {result['rins_calls']} "

@@ -7251,6 +7251,7 @@ class _Node:
         "exact_basis",
         "exact_sides",
         "band_edge",
+        "screened",
         "proven",
     )
 
@@ -7297,6 +7298,9 @@ class _Node:
         # Whether its LP runs to convergence on the device, over batches,
         # instead of being truncated (``exact_overflow_share``).
         self.converge = False
+        # Whether ``warm`` is its own device LP's point, solved before it was
+        # promoted to the exact lane's band (``promote_to_lane``).
+        self.screened = False
         # ``"exact"`` or ``"device"`` when it was taken near the top of the
         # auto band, for ``tune_band_scale``.
         self.band_edge = None
@@ -8023,11 +8027,13 @@ class _ExactLane:
     branch on.
 
     Each thread keeps one HiGHS instance for the rows it last solved (a tree
-    cut refresh changes them). A node re-solves from the basis it is given
-    (its parent's optimal one, ``exact_basis_memory``), else from the
-    thread's last basis, usually an unrelated node's: on presolved map06 a
-    child took 0.5–1.6 s from its parent's basis (870–3,100 pivots) against
-    1.8–2.9 s (3,400–5,200) from another node's; the root LP takes 3 s.
+    cut refresh changes them). A node arrives screened (its own device LP
+    solved, ``_BranchAndBound.promote_to_lane``) with that PDHG point,
+    which the thread crosses over to an optimal vertex
+    (``jaddle_linear.crossover``) and then re-solves from the vertex's
+    basis on its instance, so strong branching goes on from an optimal
+    basis. Without a point (the root, or an unscreened node), dual simplex
+    starts from the basis it is given, else from the thread's last one.
     HiGHS releases the GIL while it solves. Jobs are functions of NumPy and
     SciPy arrays only (JAX's settings are per thread).
     """
@@ -8052,12 +8058,18 @@ class _ExactLane:
 
     def submit(
         self, node, box, lp_box, mip, version, strong=None, basis=None, keep=False,
-        bound_terms=None, strong_options=None,
+        bound_terms=None, strong_options=None, start=None,
     ):
         """Queue ``node``'s LP over ``lp_box`` (the LP's bounds over its box
-        ``box``) for ``mip``'s rows as of cut block ``version``, from
-        ``basis`` (a ``highspy.HighsBasis`` for ``mip``'s rows) when given,
-        then, with a ``strong`` request, strong branching on it
+        ``box``) for ``mip``'s rows as of cut block ``version``. With
+        ``start`` (a ``SaddleState`` of host arrays: the node's screened
+        PDHG point), HiGHS crosses it over to an optimal vertex
+        (``jaddle_linear.crossover``) and the LP is re-solved from that
+        vertex's basis on the thread's instance (no pivots when it holds);
+        a crossover that does not prove a vertex optimal in time fails the
+        job. Without ``start``, the LP is solved by dual simplex from
+        ``basis`` (a ``highspy.HighsBasis`` for ``mip``'s rows) when given.
+        Then, with a ``strong`` request, strong branching on it
         (``_exact_strong``, with ``strong_options``: its ``lookahead`` and
         ``objective_bound``). With ``keep``, the job also returns the node's
         optimal basis and its strong sides' bases, for the children. With
@@ -8069,13 +8081,30 @@ class _ExactLane:
         def job():
             started = time.time()
             highs = self._held(mip)
-            out = _exact_node_lp(highs, mip, lower, upper, self.seconds, basis)
+            crossed = None
+            if start is not None:
+                crossed = self.cross_over(mip, lower, upper, start)
+            if crossed is not None and crossed["basis"] is None:
+                out = ("failed", None, None, None)
+                pivots = 0
+            else:
+                left = self.seconds - (time.time() - started)
+                out = _exact_node_lp(
+                    highs, mip, lower, upper, max(left, 0.1),
+                    basis if crossed is None else crossed["basis"],
+                )
+                pivots = int(highs.getInfo().simplex_iteration_count)
             extra = dict(
-                pivots=int(highs.getInfo().simplex_iteration_count),
-                warm=basis is not None,
+                pivots=pivots,
+                warm=basis is not None and crossed is None,
                 mip=mip,
                 basis=None,
                 sides={},
+                crossover=None if crossed is None else dict(
+                    seconds=crossed["seconds"],
+                    pivots=crossed["pivots"],
+                    converged=crossed["basis"] is not None,
+                ),
             )
             if keep and out[0] == "optimal":
                 extra["basis"] = highs.getBasis()
@@ -8109,15 +8138,58 @@ class _ExactLane:
             held = self.local.held = (mip, _highs_rows(mip))
         return held[1]
 
-    def root_lp(self, mip, lp_box, seconds):
+    def _held_rows(self, mip):
+        """This thread's host copy of ``mip``'s rows for crossover: ``(c,
+        A_eq, b_eq, A_ineq, b_ineq)`` with SciPy matrices, the equality rows
+        first, as ``_highs_rows`` orders them (so a crossover basis fits
+        the thread's instance), the cut block's explicit zeros dropped."""
+        rows = getattr(self.local, "rows", None)
+        if rows is None or rows[0] is not mip:
+            A = sp.csr_matrix(mip.A, dtype=np.float64, copy=True)
+            A.eliminate_zeros()
+            b = np.asarray(mip.b, np.float64)
+            k = mip.n_eq
+            rows = self.local.rows = (
+                mip,
+                (np.asarray(mip.c, np.float64), A[:k], b[:k], A[k:], b[k:]),
+            )
+        return rows[1]
+
+    def cross_over(self, mip, lower, upper, start):
+        """Cross ``start`` (host arrays) over to an optimal vertex of
+        ``mip``'s LP over ``[lower, upper]`` with HiGHS, single-threaded,
+        within the lane's ``seconds``. Returns ``{"basis", "seconds",
+        "pivots"}``: ``basis`` the optimal vertex's (for ``_highs_rows``'s
+        rows), ``None`` when HiGHS did not prove it optimal in time."""
+        c, A_eq, b_eq, A_ineq, b_ineq = self._held_rows(mip)
+        lp = LP(c, A_eq, b_eq, A_ineq, b_ineq, lower, upper)
+        try:
+            crossed = jl.crossover(
+                lp,
+                start,
+                highs_options={"time_limit": self.seconds, "parallel": "off"},
+                host=True,
+            )
+        except Exception:
+            return dict(basis=None, seconds=0.0, pivots=0)
+        basis = crossed["basis"] if crossed["converged"] else None
+        return dict(
+            basis=basis,
+            seconds=crossed["seconds"],
+            pivots=crossed["pushes"] + crossed["simplex_iterations"],
+        )
+
+    def root_lp(self, mip, lp_box, seconds, basis=None):
         """The root LP over ``lp_box`` on one of the threads, waited for
-        (the lane is idle at the root): ``((status, x, y_eq, y_ineq),
-        basis, pivots)``, ``basis`` the optimal one (else ``None``)."""
+        (the lane is idle at the root), from ``basis`` (a
+        ``highspy.HighsBasis`` for ``mip``'s rows, such as the root
+        crossover's) when given: ``((status, x, y_eq, y_ineq), basis,
+        pivots)``, ``basis`` the optimal one (else ``None``)."""
         lower, upper = (np.array(b, np.float64) for b in lp_box)
 
         def job():
             highs = self._held(mip)
-            out = _exact_node_lp(highs, mip, lower, upper, seconds)
+            out = _exact_node_lp(highs, mip, lower, upper, seconds, basis=basis)
             pivots = int(highs.getInfo().simplex_iteration_count)
             return out, highs.getBasis() if out[0] == "optimal" else None, pivots
 
@@ -8774,6 +8846,30 @@ def _cut_key(cut):
     )
 
 
+# ``root_refinement=True`` / ``node_refinement=True``: refine to this.
+_DEFAULT_REFINEMENT_TOLERANCE = 1e-8
+
+
+def _refinement_tolerance(name, value):
+    """The refinement tolerance an option gives: ``None`` / ``False`` off,
+    ``True`` the default (``_DEFAULT_REFINEMENT_TOLERANCE``), else a
+    positive tolerance. A bool is checked first: ``float(True)`` is 1.0, a
+    tolerance every point meets, so refinement would never take a round."""
+    if value is None or value is False:
+        return None
+    if value is True:
+        return _DEFAULT_REFINEMENT_TOLERANCE
+    try:
+        tol = float(value)
+    except (TypeError, ValueError):
+        tol = np.nan
+    if not 0.0 < tol < 1.0:
+        raise ValueError(
+            f"{name} must be True, False, None or a tolerance in (0, 1), not {value!r}"
+        )
+    return tol
+
+
 class _BranchAndBound:
     # Where batched search spends the main thread (``result["batch_timing"]``):
     # blocked on the device for a batch's LPs or its children, evaluating
@@ -8914,6 +9010,10 @@ class _BranchAndBound:
         node_crossover=False,
         node_crossover_every=1,
         node_crossover_seconds=2.0,
+        root_refinement=None,
+        node_refinement=None,
+        node_refinement_every=1,
+        refinement_options=None,
         node_precision=None,
         jump_backend="auto",
         parallel_heuristics=False,
@@ -9076,8 +9176,11 @@ class _BranchAndBound:
             )
         self.root_crossover = root_crossover
         self.root_crossover_used = False
-        # The last root crossover: (the MIP it was for, its SaddleState).
+        # The last root crossover: (the MIP it was for, its SaddleState),
+        # and its optimal basis (``highspy.HighsBasis``, or ``None``), which
+        # seeds the exact lane's root LP (``root_exact_strong``).
         self.root_vertex_state = None
+        self.root_vertex_basis = None
         # Round and repair (``round_repair``): roundings of LP points whose
         # integers HiGHS fixes, solving the rest exactly.
         self.use_round_repair = bool(round_repair)
@@ -9427,6 +9530,13 @@ class _BranchAndBound:
         self.basis_keys = itertools.count()
         self.exact_pivots = 0
         self.exact_warm_bases = 0
+        # Lane jobs started by crossover from a screened point
+        # (``promote_to_lane``): calls, those that found no optimal vertex
+        # in time, their seconds and pivots (pushes and repair).
+        self.exact_crossovers = 0
+        self.exact_crossover_failed = 0
+        self.exact_crossover_seconds = 0.0
+        self.exact_crossover_pivots = 0
         # The band of the queue kept for the lane (``exact_band``): nodes
         # within this share of the gap above the global bound wait in
         # ``exact_reserved`` (a heap like ``open``) for an exact LP, and the
@@ -9455,6 +9565,10 @@ class _BranchAndBound:
         self.last_launch = None
         self.last_raw_bound = None
         self.band_bound = -np.inf  # the global bound ``exact_band_top`` saw
+        # The band of the batch being evaluated, ``(top, edge_low)``
+        # (``promote_to_lane``), and the nodes promoted to the lane so far.
+        self.eval_band = None
+        self.band_promotions = 0
         self.exact_reserved = []
         # Nodes the lane has finished that ``collect_exact`` has not yet
         # evaluated: in no other list, so the global bound counts them here.
@@ -9492,7 +9606,8 @@ class _BranchAndBound:
             None if exact_root_iterations is None else int(exact_root_iterations)
         )
         self.root_exact_stats = dict(
-            candidates=0, lps=0, fixed=0, pivots=0, seconds=0.0, bound=None
+            candidates=0, lps=0, fixed=0, pivots=0, seconds=0.0, bound=None,
+            warm=False,
         )
         # Cutoff probing (``_ProbeLane``): rounds over the root box's free
         # integers on CPU threads, once per cutoff, again while a round
@@ -9783,6 +9898,26 @@ class _BranchAndBound:
         self.node_crossover_vertices = 0  # calls that proved a vertex optimal
         self.node_crossover_integral = 0  # vertices integral, PDHG point not
         self.node_crossover_seconds = 0.0
+        # Iterative refinement (``jaddle_linear.refine``) of root LPs
+        # (``root_refinement``) and node LPs (``node_refinement``, every
+        # ``node_refinement_every`` nodes) to a tight tolerance, before any
+        # crossover of the same point, which then starts from the refined one.
+        self.root_refinement = _refinement_tolerance("root_refinement", root_refinement)
+        self.node_refinement = _refinement_tolerance("node_refinement", node_refinement)
+        if int(node_refinement_every) < 1:
+            raise ValueError("node_refinement_every must be at least 1")
+        self.node_refinement_every = int(node_refinement_every)
+        self.refinement_options = dict(refinement_options or {})
+        for key in ("tol", "max_seconds", "cancel"):
+            if key in self.refinement_options:
+                raise ValueError(
+                    f"refinement_options cannot set {key!r} (root_refinement / "
+                    "node_refinement and the search's time limit set it)"
+                )
+        self.refinement_stats = dict(
+            root=0, root_certified=0, nodes=0, nodes_certified=0,
+            rounds=0, epochs=0, seconds=0.0,
+        )
         self._child_kernels = None  # (mip, _ChildKernels)
         self.deferring = False  # a batch is being evaluated
         self.deferred_branches = []
@@ -10817,6 +10952,7 @@ class _BranchAndBound:
         self.cut_list = []
         self.set_mip(self.base)
         self.root_vertex_state = None
+        self.root_vertex_basis = None
         self.root_vertex_x = None
         self.root_terms = None
         self.root_terms_rigorous = False
@@ -12380,6 +12516,10 @@ class _BranchAndBound:
             self.root_terms_rigorous = rigorous and np.isfinite(raw)
         if self.global_redcost_fixing and not root:
             self.global_fix(terms)  # this LP's duals over the root box
+        # Still in the lane's band after its device LP: to the lane, before
+        # its gain feeds the pseudocosts (the lane's exact LP will).
+        if self.promote_to_lane(node, result, bound):
+            return
         converged = result["converged"]
         x = np.asarray(result["solution"].primal, np.float64)
         if converged:
@@ -12409,6 +12549,31 @@ class _BranchAndBound:
             if rigorous:
                 self.learn(terms, lower, upper)
             return
+        if self.node_refinement_due() and not (root and self.root_refinement):
+            # A tight-tolerance point of the node LP (``node_refinement``):
+            # its duals may raise the bound or make it rigorous, and a node
+            # crossover below starts from it. Children warm-start from it.
+            # (The root's LP was refined already with ``root_refinement``.)
+            if lp is None:
+                lp = self.node_lp(lower, upper)
+            refined = self.refine_lp(lp, result, self.node_refinement, root=False)
+            if refined is not result:
+                result = refined
+                x = np.asarray(result["solution"].primal, np.float64)
+                converged = result["converged"]
+                new_terms = self.dual_terms(result["solution"])
+                new_raw, new_rigorous = self.bound_over(new_terms, lower, upper)
+                exact = new_rigorous and not rigorous and np.isfinite(new_raw)
+                if new_raw > raw or exact:
+                    terms, raw, rigorous = new_terms, new_raw, new_rigorous
+                    bound = max(self.round_bound(raw), node.bound)
+                    self.active_bound = bound
+                    self.prove(node, raw, rigorous)
+                if bound >= self.cutoff():
+                    self.close(bound, rigorous, node.proven)
+                    if rigorous:
+                        self.learn(terms, lower, upper)
+                    return
         warm = (result["solution"], result["opt_state"])
         if self.node_crossover_due():
             # An exact vertex of the node LP: its point is integral far more
@@ -13111,6 +13276,7 @@ class _BranchAndBound:
             "node_crossover_vertices": self.node_crossover_vertices,
             "node_crossover_integral": self.node_crossover_integral,
             "node_crossover_seconds": self.node_crossover_seconds,
+            "refinement": dict(self.refinement_stats),
             "exact_nodes": {
                 "solved": self.exact_solved,
                 "infeasible": self.exact_infeasible,
@@ -13123,6 +13289,11 @@ class _BranchAndBound:
                 "pivots": self.exact_pivots,
                 "strong_iterations": self.exact_strong_iterations,
                 "warm_bases": self.exact_warm_bases,
+                "promoted": self.band_promotions,
+                "crossovers": self.exact_crossovers,
+                "crossover_failed": self.exact_crossover_failed,
+                "crossover_seconds": self.exact_crossover_seconds,
+                "crossover_pivots": self.exact_crossover_pivots,
                 "overflow_nodes": self.overflow_nodes,
                 "overflow_converged": self.overflow_converged,
                 "band": self.exact_band,
@@ -13141,6 +13312,82 @@ class _BranchAndBound:
             "plunges_stopped": self.plunges_stopped,
             "implied_branchings": self.implied_branchings,
         }
+
+    def node_refinement_due(self):
+        """Whether this node's LP point is refined (``node_refinement``,
+        every ``node_refinement_every`` nodes, time permitting)."""
+        return (
+            self.node_refinement is not None
+            and self.nodes % self.node_refinement_every == 0
+            and not self.out_of_time()
+        )
+
+    def refine_lp(self, lp, result, tol, root):
+        """
+        ``result``'s point refined to the relative tolerance ``tol`` by
+        iterative refinement (``jaddle_linear.refine``) on ``lp``, the LP at
+        the search's precision (``node_lp``), with ``lp_options`` and
+        ``refinement_options``, within the time left. Returns ``result``
+        with the refined point (the best seen: never worse than the start),
+        or ``result`` itself when it was not refined (an interrupted,
+        timed-out or exact LP, or no time left). The step sizes
+        (``opt_state``) stay the solve's, for warm starts. ``converged``
+        stays true for a converged LP (the refined point is at least as
+        accurate); ``stop_reason`` becomes ``"certificate"`` once the point
+        reaches ``tol``, and ``"interrupted"`` if Ctrl-C stopped a round.
+        ``root`` picks the statistics (``refinement``).
+        """
+        if result["stop_reason"] in ("interrupted", "time_limit", "exact"):
+            return result
+        if self.out_of_time():
+            return result
+        kwargs = {
+            key: value
+            for key, value in self.lp_kwargs.items()
+            if key
+            not in (
+                "primal_feasibility_tolerance",
+                "dual_feasibility_tolerance",
+                "dual_gap_tolerance",
+            )
+        }
+        kwargs.update(self.refinement_options)
+        started = time.time()
+        refined = jl.refine(
+            lp,
+            result["solution"],
+            tol=tol,
+            max_seconds=self.seconds_left(),
+            cancel=self.interrupt,
+            **kwargs,
+        )
+        stats = self.refinement_stats
+        stats["seconds"] += time.time() - started
+        stats["epochs"] += refined["epochs"]
+        stats["rounds"] += refined["refinement"]["rounds"]
+        key = "root" if root else "nodes"
+        stats[key] += 1
+        stats[key + "_certified"] += bool(refined["converged"])
+        self.lp_epochs += refined["epochs"]
+        out = dict(result)
+        out["solution"] = refined["solution"]
+        out["epochs"] = result["epochs"] + refined["epochs"]
+        out["converged"] = bool(result["converged"] or refined["converged"])
+        out["refinement"] = refined["refinement"]
+        if refined["converged"]:
+            out["stop_reason"] = "certificate"
+        elif refined["stop_reason"] in ("interrupted", "cancelled"):
+            out["stop_reason"] = "interrupted"
+        if self.verbose and root:
+            history = refined["refinement"]["history"][-1]
+            print(
+                f"Root LP refinement: {refined['refinement']['rounds']} rounds, "
+                f"{refined['epochs']} epochs, {time.time() - started:.2f}s, "
+                f"PFR {history[0]:.1e}, DFR {history[1]:.1e}, gap {history[2]:.1e}"
+                f" ({'certified' if refined['converged'] else refined['stop_reason']}"
+                f" at {tol:.0e})"
+            )
+        return out
 
     def node_crossover_due(self):
         """Whether this node's LP point is crossed over (``node_crossover``,
@@ -13221,6 +13468,8 @@ class _BranchAndBound:
         self.root_vertex_state = (
             mip, SaddleState(primal=x, dual_ineq=y_ineq, dual_eq=y_eq)
         )
+        basis = highs.getBasis()
+        self.root_vertex_basis = basis if basis.valid else None
         # The LP's dual blocks (``jl.solve`` pads an empty one to a row).
         dual_eq = np.zeros(lp.A_eq.shape[0])
         dual_ineq = np.zeros(lp.A_ineq.shape[0])
@@ -13251,9 +13500,24 @@ class _BranchAndBound:
         )
         if not crossed["converged"] or crossed["basis"] is None:
             return None, None
-        # Its exact duals, for ``root_exact_terms`` (while the rows stay).
+        # Its exact duals, for ``root_exact_terms`` (while the rows stay),
+        # and its basis, for the exact lane's root LP.
         self.root_vertex_state = (self.mip, crossed["solution"])
+        self.root_vertex_basis = crossed["basis"]
         return np.asarray(crossed["solution"].primal, np.float64), crossed["basis"]
+
+    def current_root_basis(self):
+        """The optimal basis of the last root crossover if it was for the
+        current rows (``self.mip``) and fits their HiGHS model
+        (``_highs_rows``: a status per column and row), else ``None``."""
+        state, basis = self.root_vertex_state, self.root_vertex_basis
+        if state is None or state[0] is not self.mip or basis is None:
+            return None
+        if len(basis.col_status) != self.mip.num_variables or len(
+            basis.row_status
+        ) != self.mip.A.shape[0]:
+            return None
+        return basis
 
     def current_root_vertex(self):
         """The primal point of the last root crossover if it was for the
@@ -13296,6 +13560,12 @@ class _BranchAndBound:
         if exact_rigorous and np.isfinite(exact_bound):
             self.root_terms, self.root_terms_rigorous = exact, True
             self.root_crossover_used = True
+            # The root's bound from now, not only once ``evaluate`` reaches
+            # the root: it is in no list until then, so the log's bound is
+            # its PDHG one (-inf on buildingenergy) through root strong
+            # branching. Rigorous for the root box, so it may prune too.
+            self.active_bound = max(self.active_bound, self.round_bound(exact_bound))
+            self.raise_root_proven(exact_bound, True)
             if self.verbose:
                 print(
                     f"Root crossover: exact duals, bound "
@@ -13995,12 +14265,17 @@ class _BranchAndBound:
         it. No infeasibility detection: its chunked host checks cost more
         than the re-solve on large LPs."""
         target = self.node_bound_target()
-        return self.solve_lp(
-            self.node_lp(lower, upper),
+        lp = self.node_lp(lower, upper)
+        result = self.solve_lp(
+            lp,
             warm,
             max_epochs,
             **({} if target is None else {"bound_target": target}),
         )
+        if self.root_refinement is not None and result["stop_reason"] != "bound_target":
+            # Before the round's crossover (Gomory cuts), which starts from it.
+            result = self.refine_lp(lp, result, self.root_refinement, root=True)
+        return result
 
     def age_cuts(self, solution):
         """Count, for each cut in the LP (``cut_list``), the re-solves in a
@@ -15701,6 +15976,7 @@ class _BranchAndBound:
             dive_every=0,
             tree_heuristics=False,
             node_crossover=False,
+            node_refinement=None,
             batch_size=1,
             verbose=False,
             parallel_heuristics=False,
@@ -15718,6 +15994,7 @@ class _BranchAndBound:
         # Nor the root sweep or crossover (the sub-MIP has no incumbent to fix with).
         settings["root_strong_candidates"] = 0
         settings["root_crossover"] = False
+        settings["root_refinement"] = None
         settings["round_repair"] = False
         settings["exact_nodes"] = 0
         settings["mip_start"] = None
@@ -17034,15 +17311,61 @@ class _BranchAndBound:
             and not self.out_of_time()
         )
 
+    def promote_to_lane(self, node, result, bound):
+        """
+        Promote a node the device has just solved (screened) to the exact
+        lane when its LP's bound ``bound`` is still in the band of the batch
+        it was solved in (``eval_band``, from ``exact_band_top``): instead
+        of branching on its truncated PDHG point, it waits in the lane's
+        queue (``exact_reserved``, lowest first) with that point as its warm
+        start, which the lane crosses over to an optimal vertex
+        (``submit_exact``). A node the device's LP pruned, or lifted out of
+        the band, never takes a thread. Only nodes the lane may take
+        (``exact_eligible``), not exact ones, not the band's overflow
+        (``converge``), and not during an exact plunge. Returns whether the
+        node was promoted.
+        """
+        band = self.eval_band
+        if (
+            band is None
+            or not np.isfinite(band[0])
+            or bound > band[0]
+            or bound >= self.cutoff()
+            or result.get("stop_reason") == "exact"
+            or node.converge
+            or node.screened
+            or self.exact_plunge_active
+            or not self.exact_eligible(node)
+        ):
+            return False
+        band_top, edge_low = band
+        node.bound = bound
+        node.warm = (result["solution"], result["opt_state"])
+        node.cut_version = self.cut_version
+        node.epochs += result["epochs"]
+        node.screened = True
+        if self.exact_band_auto and edge_low < band_top and bound >= edge_low:
+            node.band_edge = "exact"
+        heapq.heappush(self.exact_reserved, (bound, next(self.counter), node))
+        self.band_promotions += 1
+        return True
+
     def exact_band_top(self):
         """The top of the band the lane keeps (``exact_band``): the global
-        bound plus ``exact_band`` of the gap to the cutoff; ``-inf`` (no
-        band) without the lane, a band or a cutoff. With ``"auto"``, no
-        higher than the lane's capacity (``band_capacity_top``)."""
-        if self.exact_lane is None or self.exact_band <= 0.0:
+        bound plus ``exact_band`` of the gap to the cutoff; with
+        ``exact_band=0``, the global bound itself; ``-inf`` (no band)
+        without the lane, or (with a width) without a cutoff. With
+        ``"auto"``, no higher than the lane's capacity
+        (``band_capacity_top``). Nodes are screened against it after their
+        device LP (``promote_to_lane``)."""
+        if self.exact_lane is None:
             return -np.inf
-        cutoff = self.cutoff()
         bound = self.band_bound = self.global_bound()
+        if self.exact_band <= 0.0:
+            # No width: only the nodes that still hold the global bound
+            # after their device LP go to the lane.
+            return bound if np.isfinite(bound) else -np.inf
+        cutoff = self.cutoff()
         if not (np.isfinite(cutoff) and np.isfinite(bound)):
             return -np.inf
         top = bound + self.exact_band * max(cutoff - bound, 0.0)
@@ -17228,13 +17551,6 @@ class _BranchAndBound:
         finally:
             self._lane_busy = busy
 
-    def wants_exact(self, node):
-        """Without a band (``exact_band=0``): whether the lane takes
-        ``node``, popped from the top of the heap, now. Once the heap is in
-        bound order its top holds the global bound, so the lane takes the
-        lowest-bound nodes whenever it has room."""
-        return self.exact_eligible(node) and self.exact_lane.room()
-
     def overflow_band(self, limit):
         """Up to ``limit`` of the highest-bound nodes reserved for the exact
         lane past the ``_EXACT_OVERFLOW_KEEP`` a thread it keeps, taken out
@@ -17289,6 +17605,18 @@ class _BranchAndBound:
         if node.exact_basis is not None:
             basis = self.take_basis(node.exact_basis)
             node.exact_basis = None
+        # The node's screened PDHG point (``promote_to_lane``): the lane
+        # crosses it over to a vertex, whose basis then starts its LP.
+        # Without one (not screened), dual simplex from ``basis``.
+        start = None
+        warm = self.fit_warm(node)
+        if node.screened and warm is not None and warm[0] is not None:
+            start = SaddleState(
+                primal=np.asarray(warm[0].primal, np.float64),
+                dual_ineq=np.asarray(warm[0].dual_ineq, np.float64),
+                dual_eq=np.asarray(warm[0].dual_eq, np.float64),
+            )
+            basis = None
         self.exact_lane.submit(
             node,
             box,
@@ -17307,6 +17635,7 @@ class _BranchAndBound:
                     self.node_bound_target() if self.exact_strong_cutoff else None
                 ),
             ),
+            start=start,
         )
 
     def collect_exact(self):
@@ -17352,6 +17681,12 @@ class _BranchAndBound:
         self.exact_pivots += extra["pivots"]
         self.exact_jobs += 1
         self.exact_warm_bases += bool(extra["warm"])
+        crossed = extra.get("crossover")
+        if crossed is not None:
+            self.exact_crossovers += 1
+            self.exact_crossover_failed += not crossed["converged"]
+            self.exact_crossover_seconds += crossed["seconds"]
+            self.exact_crossover_pivots += crossed["pivots"]
         status, x, y_eq, y_ineq = outcome
         if node.bound >= self.cutoff():
             self.close(node.bound, proven=node.proven)
@@ -17509,9 +17844,17 @@ class _BranchAndBound:
         deadline = started + budget
         mip = self.mip
         lp_box = (self.lp_lower(lower), self.lp_upper(upper))
-        (status, x, y_eq, y_ineq), basis, pivots = lane.root_lp(mip, lp_box, budget)
+        # From the root crossover's optimal basis when there is one: the box
+        # can only have narrowed since (reduced-cost fixing), so the dual
+        # simplex starts dual feasible. A cold solve of buildingenergy's
+        # root LP did not finish in its 15.8 s.
+        start = self.current_root_basis()
+        (status, x, y_eq, y_ineq), basis, pivots = lane.root_lp(
+            mip, lp_box, budget, basis=start
+        )
         stats = self.root_exact_stats
         stats["pivots"] += pivots
+        stats["warm"] = start is not None
         if status != "optimal" or basis is None:
             stats["seconds"] += time.time() - started
             return None
@@ -17671,17 +18014,11 @@ class _BranchAndBound:
             if node.bound >= self.cutoff():
                 self.close(node.bound, proven=node.proven)
                 continue
+            # Every node's LP is screened on the device first: one still in
+            # the band after it goes to the exact lane (``promote_to_lane``).
+            # A node just above the band is the device's side of its edge.
             eligible = from_heap and self.exact_eligible(node)
-            if eligible and node.bound <= band_top:
-                # In the band the lane keeps (``exact_band``): it waits for
-                # an exact LP instead of a truncated one.
-                if node.bound >= edge_low and edge_low < band_top:
-                    node.band_edge = "exact"
-                heapq.heappush(
-                    self.exact_reserved, (node.bound, next(self.counter), node)
-                )
-                continue
-            if eligible and node.bound <= edge_high and band_top < edge_high:
+            if eligible and band_top < node.bound <= edge_high:
                 node.band_edge = "device"
             box = self.expand(node.changes)
             if np.any(box[0] > box[1]):
@@ -17697,9 +18034,6 @@ class _BranchAndBound:
             if node.exact_known and self.exact_lane is not None:
                 # Solved already by the lane's strong branching.
                 self.evaluate_known(node, box)
-                continue
-            if from_heap and self.exact_band <= 0.0 and self.wants_exact(node):
-                self.submit_exact(node, box)
                 continue
             members.append(node)
             boxes.append(box)
@@ -17720,6 +18054,8 @@ class _BranchAndBound:
             handle=handle,
             version=self.cut_version,
             launched=now,
+            # The band its members are screened against (``promote_to_lane``).
+            band=(band_top, edge_low),
         )
 
     def process_batch(self, batch):
@@ -17758,6 +18094,7 @@ class _BranchAndBound:
         )
         results, requeued = self.after_node_solves(members, boxes, results)
         self.deferring = self.batch_on_device()
+        self.eval_band = batch.get("band")
         try:
             for i, (node, result) in enumerate(zip(members, results)):
                 self.batch_waiting = members[i + 1 :]
@@ -17773,7 +18110,13 @@ class _BranchAndBound:
                     continue
                 lower, upper = boxes[i]
                 requeues = self.batch_requeues
+                promotions = self.band_promotions
                 self.evaluate(node, lower, upper, None, result)
+                if self.band_promotions > promotions:
+                    # Screened into the lane's band: it counts as a node
+                    # when the lane has solved it (``evaluate_exact``).
+                    self.nodes -= 1
+                    continue
                 if node.band_edge is not None:
                     lift = min(self.last_raw_bound, self.cutoff()) - node.bound
                     self.record_band_edge(node, "device", lift, member_seconds)
@@ -17785,6 +18128,7 @@ class _BranchAndBound:
                 self.log(" ", None)
         finally:
             self.deferring = False
+            self.eval_band = None
             self.batch_waiting = []
             self.batch_evaluate_seconds += time.perf_counter() - evaluating
         self.flush_roundings()
@@ -18265,6 +18609,11 @@ class _BranchAndBound:
             if detection["status"] == "dual_infeasible":
                 return self.result("unbounded_or_infeasible")
             result = detection["result"]
+        if self.root_refinement is not None:
+            # A tight-tolerance root point (``root_refinement``): every root
+            # crossover after it (``root_crossover``, RENS, round and
+            # repair, Gomory rounds) starts from the refined point.
+            result = self.refine_lp(lp, result, self.root_refinement, root=True)
         self.nodes += 1
         # The root LP's bound holds for the root box whatever its duals, so
         # it is the global bound from now (the first incumbent's line, and
@@ -18419,6 +18768,9 @@ class _BranchAndBound:
         # re-solve's 33,242.52, and the tree's bound stayed there.
         if np.isfinite(rounds_bound):
             root.bound = max(root.bound, rounds_bound)
+        # And the root crossover's exact bound (``root_exact_terms``).
+        if np.isfinite(self.active_bound):
+            root.bound = max(root.bound, self.active_bound)
         root.proven = max(root.proven, self.active_proven)
         # The root branched as an exact lane node (``exact_root_candidates``).
         result = self.root_exact_strong(root, lower, upper, result) or result
@@ -18655,6 +19007,10 @@ def solve(
     node_crossover=False,
     node_crossover_every=1,
     node_crossover_seconds=2.0,
+    root_refinement=None,
+    node_refinement=None,
+    node_refinement_every=1,
+    refinement_options=None,
     heuristic_seconds=10.0,
     conflicts=True,
     conflict_pool_size=2000,
@@ -19616,19 +19972,30 @@ def solve(
       also triggers RINS at the next node.
     * **Exact nodes** (``exact_nodes``, default 16; ``0``: off). With
       batched search, ``exact_nodes`` CPU threads solve the LPs of the
-      nodes that hold the global bound exactly with HiGHS's dual simplex,
-      while the device solves the rest in batches (``_ExactLane``). Once
-      the heap is in bound order (after the first incumbent), the nodes
-      within ``exact_band`` (default 0.25) of the gap above the global
-      bound are kept for the threads, lowest first (two queued a thread),
-      and the device never takes them: a truncated LP rarely lifts such a
-      node's bound, and splitting it only doubles the nodes that hold the
-      global bound (on map06 with the lane taking only the heap's top, the
-      device split the bottom of the queue faster than the lane solved it,
-      and the bound did not move). The device takes the rest of the queue,
-      which feeds the heuristics and prunes near the cutoff. With
-      ``exact_band=0`` a thread instead takes the heap's top whenever it has
-      room, and the device the rest. With ``exact_band="auto"`` the band
+      nodes that hold the global bound exactly, while the device solves
+      the rest in batches (``_ExactLane``). Every node is screened first:
+      its LP is solved on the device in its batch like any other. Once
+      the heap is in bound order (after the first incumbent), a node whose
+      own LP leaves its bound within ``exact_band`` (default 0.25) of the
+      gap above the global bound (as of its batch) is not branched on its
+      truncated PDHG point but promoted to the threads' queue, lowest
+      first (two queued a thread), with that point. A thread crosses the
+      point over to an optimal vertex with HiGHS
+      (``jaddle_linear.crossover``, single-threaded) and re-solves the LP
+      from the vertex's basis, so the node gets exact duals and a vertex
+      to branch on. Nodes whose device LP prunes them, or lifts them out
+      of the band, never take a thread: a truncated LP rarely lifts a node
+      that holds the bound, so those are the ones the threads get, and
+      the device does not split them (on map06 with the lane taking only
+      the heap's top, the device split the bottom of the queue faster
+      than the lane solved it, and the bound did not move). On
+      buildingenergy the earlier band, which reserved nodes on their
+      parents' bounds and solved them by dual simplex from the parent's
+      basis, finished none of 122 in its 10 s each, where the root's
+      crossover took 2.6 s. The device takes the rest of the queue, which
+      feeds the heuristics and prunes near the cutoff. With
+      ``exact_band=0`` only nodes that still hold the global bound after
+      their device LP are promoted. With ``exact_band="auto"`` the band
       widens as the gap closes: once a batch it is 0.25 over the relative
       gap, within [0.001, 1] (a quarter of the gap at a 100% gap, half at
       50%, all of it from 25% down), so its width stays near 25% of the
@@ -19638,26 +20005,27 @@ def solve(
       ``exact_overflow_share`` hands its top to the device. The
       ``exact_nodes`` stats report
       the band at the end (``band``) and its range (``band_min``,
-      ``band_max``). A node goes to the lane at most once.
-      HiGHS re-solves from the parent's optimal basis (below), else from
-      the thread's last basis, within ``exact_node_seconds`` (10) a node;
+      ``band_max``), the nodes promoted (``promoted``) and the lane's
+      crossovers (``crossovers``, ``crossover_failed``,
+      ``crossover_seconds``, ``crossover_pivots``). A node goes to the lane
+      at most once. Its crossover and re-solve take at most
+      ``exact_node_seconds`` (10) a node;
       the node is then evaluated as a batch member, with the exact solution in place of the PDHG one: its bound is the exact
       duals' Lagrangian bound (rigorous at any duals), it branches on the
       vertex, and its children's bounds come from those duals over their
-      boxes. A node HiGHS proves infeasible closes; one it does not finish
-      goes back to the queue for the device. Truncated PDHG node LPs rarely
+      boxes. A node HiGHS proves infeasible closes; one whose crossover
+      finds no optimal vertex in time goes back to the queue for the
+      device, which branches on it. Truncated PDHG node LPs rarely
       lift a node's bound above its parent's, so without exact LPs the
       global bound can stall while the tree grows (map06: 7,800 nodes
       moved it 3 units); a map06 node took HiGHS 1.1–1.6 s.
-      Each lane node's optimal basis (and each strong side's) is kept for
-      its children (``exact_basis_memory``, default 2e9: the bytes the
-      kept bases may take, about one a column and row each, oldest dropped
-      first; ``0``: off), and a child's LP starts from it instead of from
-      whatever node its thread solved last, as branch and bound warm-starts
-      dual simplex. On presolved map06 a child took 870–3,100 pivots
-      (0.5–1.6 s) from its parent's basis against 3,400–5,200 (1.8–2.9 s)
-      from another node's. A device node's children keep the basis it
-      would have started from.
+      Each strong side's optimal basis is kept for its child
+      (``exact_basis_memory``, default 2e9: the bytes the kept bases may
+      take, about one a column and row each, oldest dropped first; ``0``:
+      off). A lane node's own LP starts from its crossover's basis, not
+      from a kept one (``warm_bases`` stays 0); with the earlier band, on
+      presolved map06, a child took 870–3,100 pivots (0.5–1.6 s) from its
+      parent's basis against 3,400–5,200 (1.8–2.9 s) from another node's.
       The root is not a lane node, so it gets exact strong branching of its
       own (``exact_root_candidates``, default 128; ``None``: every
       fractional integer; ``0``: off, and the PDHG root sweep,
@@ -19732,6 +20100,28 @@ def solve(
       optimal face, so it is integral far less often than a vertex.
       Children still warm-start from the PDHG solution. When HiGHS does not
       prove the vertex optimal in time, the PDHG point is used.
+    * **Iterative refinement** (``root_refinement``, ``node_refinement``,
+      off by default; each ``True`` for a relative tolerance of 1e-8, or a
+      tolerance such as ``1e-10``). The LP's
+      point at ``lp_tolerance`` / ``node_lp_tolerance`` is refined to that
+      tolerance by iterative refinement (``jaddle_linear.refine``: correction
+      LPs in the shifted, scaled residuals, each solved loosely by PDHG) on
+      the LP at the search's precision, with ``lp_options`` and
+      ``refinement_options`` (a dict of ``refine`` options such as
+      ``max_rounds`` or ``inner_tol``), within the time left. Refinement
+      keeps the best point seen, so it never makes the point worse.
+      ``root_refinement`` refines every root LP solve: the first and each
+      cut round's re-solve. ``node_refinement`` refines every
+      ``node_refinement_every`` (1) node LP that its bound does not close,
+      on the host, one node at a time (as node crossover; it costs
+      throughput). The refined duals' Lagrangian bound replaces the node's
+      when higher or newly rigorous, and the refined point is used for
+      branching, the integrality test and the children's warm starts. With
+      crossover on as well (``root_crossover``, the Gomory rounds' and
+      RENS's crossovers, ``node_crossover``), the LP is refined first and
+      the crossover starts from the refined point. A root bound made
+      rigorous by refinement needs no crossover for exact duals, so
+      ``root_crossover`` then skips that one.
     * **Objective-aware propagation.** Once there is a cutoff, the
       propagation inside fix-and-propagate and dives includes the row
       ``c·x <= cutoff``, so they reject roundings that cannot improve on the
@@ -19833,6 +20223,11 @@ def solve(
       crossovers (``node_crossover``), those that proved a vertex optimal,
       the vertices that were integral where the PDHG point was not, and
       their time.
+    * ``"refinement"``: iterative refinement (``root_refinement``,
+      ``node_refinement``): the root and node LPs refined (``"root"``,
+      ``"nodes"``), those certified at the refinement tolerance
+      (``"root_certified"``, ``"nodes_certified"``), and the correction
+      ``"rounds"``, ``"epochs"`` and ``"seconds"`` in all.
     * ``"coefficients_tightened"``: coefficients cut by coefficient
       tightening; ``"tree_cuts_added"``: cuts added in the tree;
       ``"tree_cuts_dropped"``: violated tree cuts left out for want of room
@@ -19933,6 +20328,10 @@ def solve(
         node_crossover=node_crossover,
         node_crossover_every=node_crossover_every,
         node_crossover_seconds=node_crossover_seconds,
+        root_refinement=root_refinement,
+        node_refinement=node_refinement,
+        node_refinement_every=node_refinement_every,
+        refinement_options=refinement_options,
         node_precision=node_precision,
         jump_backend=jump_backend,
         parallel_heuristics=parallel_heuristics,
