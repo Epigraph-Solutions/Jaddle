@@ -30,14 +30,17 @@ import argparse
 import csv
 import gc
 import glob
-import os
 import time
+import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=5"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-# os.environ["XLA_FLAGS"] = (
-#     "--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=16"
-# )
+
+import jax
+
+jax.config.update("jax_bcoo_cusparse_lowering", True)
+jax.config.update("jax_optimization_level", "O3")
 
 import highspy
 import jax
@@ -155,12 +158,22 @@ def run_jaddle(path, args):
         device=args.device,
         verbose=True,
         log_every_seconds=10,
-        batch_size=128,
-        root_lp="jaddle",
-        # precision="float64",
-        # lp_tolerance=1e-4,
-        # root_refinement=1e-6,
+        batch_size=32,
         cut_round_lp="highs",
+        # tree="lean",
+        # lp_options=dict(verbose=True, log_every=10),
+        root_lp="jaddle",
+        lp_tolerance=1e-3,
+        precision="float32",
+        root_crossover=True,
+        # tree="lean",
+        # Implied-bound cuts and probing cliques: root bound on pg5_34
+        # -15,209 -> -14,367 (HiGHS's), timtab1 347k -> 476k, neos-911970
+        # 23 -> 52, for at most 3 s of probing.
+        probing=False,
+        cuts=True,
+        max_cut_rows=1e5,
+        tree_cut_rows=5e4,
         # # All rounding heuristics.
         # heuristic_every=10,  # plain rounding of node LP points ("H")
         # round_repair=True,  # round and repair, at the root and in the tree ("U")
@@ -237,6 +250,17 @@ def print_details(result):
         f"{exact['crossover_pivots'] / max(1, exact['crossovers']):.0f} pivots each; "
         f"band {exact['band']:.3g} (range {exact['band_min']:.3g}-{exact['band_max']:.3g})"
     )
+    lean = result.get("lean_tree")
+    if lean:
+        print(
+            f"Lean tree: {lean['nodes']} nodes on {lean['threads']} threads in "
+            f"{lean['seconds']:.1f}s ({lean['nodes'] / max(lean['seconds'], 1e-9):.0f}/s); "
+            f"{lean['lps']} LPs in {lean['lp_seconds']:.1f}s "
+            f"({lean['pivots'] / max(1, lean['lps']):.0f} pivots each), strong branching "
+            f"{lean['strong_lps']} LPs in {lean['strong_seconds']:.1f}s, "
+            f"{lean['fixings']} fixings, {lean['infeasible']} infeasible, "
+            f"{lean['failed']} unsolved"
+        )
     repairs = result["dual_repairs"]
     print(
         f"Dual repair: {repairs['improved']} of {repairs['tried']} node bounds raised "

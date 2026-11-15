@@ -244,10 +244,10 @@ print(f"Swarm: {n_binaries} binaries, {len(problem.constraints)} constraints")
 problem.solve(
     solver=JaddleSolver(),
     max_seconds=60,
-    device="gpu",
+    device="cpu",
     verbose=True,
     log_every_seconds=10,
-    batch_size=128,
+    tree="lean",
 )
 stats = problem.solver_stats.extra_stats
 if p[0].value is None:

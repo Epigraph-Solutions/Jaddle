@@ -8744,6 +8744,72 @@ def test_sub_searches_leave_the_levels_to_their_parent(monkeypatch):
     assert made == [True, False]
 
 
+# %% The lean tree (tree="lean")
+# The root's heuristics off, so the tree itself has to find and prove the
+# optimum (with them on, small models often close at the root; with cuts
+# on, most of these close at the root too, so ``cuts=False`` makes a tree:
+# generalised_assignment's has about 1,200 nodes).
+LEAN_ONLY = dict(
+    tree="lean",
+    feasibility_jump=False,
+    round_repair=False,
+    feasibility_pump=False,
+    bulk_rounding=False,
+    parallel_rounding=False,
+    rins_seconds=0,
+    rens_seconds=0,
+    near_integral_tolerance=0,
+)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [knapsack, general_integer, facility_location, generalised_assignment,
+     lambda: fixed_charge()[0]],
+)
+@pytest.mark.parametrize("cuts", [True, False])
+def test_lean_tree_solves(make, cuts):
+    mip = make()
+    result = solve(mip, **LEAN_ONLY, cuts=cuts)
+    assert_solved(result, mip, reference(mip))
+    stats = result["lean_tree"]
+    if stats is not None:  # None: the root closed the search
+        assert stats["nodes"] >= 1 and stats["lps"] >= stats["nodes"]
+        assert stats["failed"] == 0
+
+
+def test_lean_tree_runs_its_nodes():
+    """generalised_assignment without cuts needs a tree: the lean one
+    searches it on the threads asked for, without the exact lane."""
+    mip = generalised_assignment()
+    result = solve(mip, **LEAN_ONLY, cuts=False, lean_threads=3)
+    assert_solved(result, mip, reference(mip))
+    stats = result["lean_tree"]
+    assert stats is not None and stats["threads"] == 3
+    assert stats["nodes"] > 1
+    assert result["exact_nodes"]["solved"] == 0  # no exact lane, no device tree
+
+
+def test_lean_tree_node_limit_keeps_a_valid_bound():
+    mip = generalised_assignment()
+    ref = reference(mip)
+    result = solve(mip, **LEAN_ONLY, cuts=False, max_nodes=3)
+    assert result["status"] in ("node_limit", "optimal")
+    slack = 1e-6 * (1 + abs(ref))
+    if mip.maximise:
+        assert result["bound"] >= ref - slack
+    else:
+        assert result["bound"] <= ref + slack
+    assert_proven_bound(result, mip.maximise)
+
+
+def test_lean_tree_rejects_bad_options():
+    with pytest.raises(ValueError, match="tree"):
+        solve(knapsack(), tree="highs")
+    with pytest.raises(ValueError, match="lean_threads"):
+        solve(knapsack(), tree="lean", lean_threads=0)
+
+
 # %% Exact root cut rounds (cut_round_lp="highs")
 @pytest.mark.parametrize(
     "make", [facility_location, generalised_assignment, lambda: fixed_charge()[0]]
