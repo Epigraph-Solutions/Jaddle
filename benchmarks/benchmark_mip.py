@@ -150,58 +150,35 @@ def run_jaddle(path, args):
     started = time.time()
     result = jm.solve(
         path,
-        branching="auto",
-        node_selection="hybrid",
-        reliability_threshold=8,
-        mip_rel_gap=1e-4,
-        verbose=True,
-        symmetry=True,
-        log_every_seconds=10,
-        device=args.device,
         presolve=True,
-        exact_band="auto",
-        exact_node_seconds=20.0,
-        exact_strong_lookahead=4,
-        plunge_depth=2,
-        batch_size=64,
         max_seconds=args.max_seconds,
-        conflict_pool_size=5000,
-        precision="float32",
-        lp_tolerance=1e-3,
+        device=args.device,
+        verbose=True,
+        log_every_seconds=10,
+        batch_size=128,
+        root_lp="jaddle",
+        # precision="float64",
+        # lp_tolerance=1e-4,
         # root_refinement=1e-6,
-        # root_crossover=True,
         cut_round_lp="highs",
-        # Sign repair of loose node duals on wide continuous columns before
-        # their Lagrangian bound is taken (jm.DualRepair).
-        dual_repair=True,
-        cuts=True,
-        tree_cuts=True,
-        mir_cuts=True,
-        gomory_cuts=False,
-        batch_epochs=2,
-        tree_cut_every=10,
-        max_cut_rows=1e4,
-        cut_rounds=50,
-        jump_threads=4,
-        proximity_seconds=20,
-        rens_seconds=20,
-        rins_seconds=20,
-        one_opt=True,
-        first_solution_seconds=40,
-        # Dual-guided fixing on the sub-MIP lane: the root's largest
-        # reduced costs fix integers at their preferred bound, HiGHS
-        # searches the rest (jm._BranchAndBound.dual_fix_box).
-        dual_fix_seconds=20,
-        # Integer-projected PDHG at the root before the pump: PDHG with the
-        # integers' projection a rounding, 8 lanes batched on the device.
-        # projected_pdhg=True,
-        # objective_level_seconds=45,
-        restarts=5,
-        # Cutoff probing: strong branching on every free integer against
-        # the cutoff, on CPU threads, fixing the root box (on by default).
-        cutoff_probing=True,
-        # Row aggregation for the separators: with mir_cuts=False the
-        # aggregates still give cover and flow cover cuts.
+        # All rounding heuristics.
+        heuristic_every=10,  # plain rounding of node LP points ("H")
+        round_repair=True,  # round and repair, at the root and in the tree ("U")
+        fix_and_propagate=True,
+        bulk_rounding=True,
+        batch_roundings=True,
+        tree_heuristics=True,
+        tree_heuristic_every=10,
+        parallel_rounding=True,
+        near_integral_tolerance=1e-1,
+        # The other primal heuristics that are off by default.
+        dive_every=10,
+        gpu_dive_every=10,
+        feasibility_pump=True,
+        root_crossover=True,
+        node_crossover=True,
+        projected_pdhg=True,
+        block_decomposition=True,
     )
     row.update(
         {

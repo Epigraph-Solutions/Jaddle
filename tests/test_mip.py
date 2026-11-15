@@ -2400,6 +2400,39 @@ def test_node_refinement_every():
     assert sparse["refinement"]["nodes"] <= 1  # only the node count 0 qualifies
 
 
+def test_node_refinement_has_its_own_time_limit(monkeypatch):
+    """A node's refinement gets ``node_refinement_seconds`` (and no more
+    than the time left); the root's gets the time left."""
+    limits = {"root": [], "node": []}
+    real_refine_lp = jm._BranchAndBound.refine_lp
+    real_refine = jl.refine
+    where = []
+
+    def refine_lp(self, lp, result, tol, root):
+        where.append("root" if root else "node")
+        try:
+            return real_refine_lp(self, lp, result, tol, root)
+        finally:
+            where.pop()
+
+    def refine(lp, solution, **kwargs):
+        limits[where[-1]].append(kwargs["max_seconds"])
+        return real_refine(lp, solution, **kwargs)
+
+    monkeypatch.setattr(jm._BranchAndBound, "refine_lp", refine_lp)
+    monkeypatch.setattr(jm.jl, "refine", refine)
+    mip = general_integer()
+    options = dict(root_refinement=1e-8, node_refinement=1e-8, cuts=False)
+    result = solve(mip, node_refinement_seconds=0.5, **options)
+    assert_solved(result, mip, reference(mip))
+    assert limits["node"] and all(limit == 0.5 for limit in limits["node"])
+    assert limits["root"] and all(limit is None for limit in limits["root"])
+    limits["root"].clear(), limits["node"].clear()
+    # Within the time left, when that is less.
+    solve(mip, node_refinement_seconds=1e6, max_seconds=1000, **options)
+    assert limits["node"] and all(limit <= 1000 for limit in limits["node"])
+
+
 def test_refinement_runs_before_crossover(monkeypatch):
     # With both on, every crossover (root Gomory rounds, nodes) starts from
     # the point the latest refinement returned.
@@ -2459,6 +2492,7 @@ def test_refinement_options_take_true_for_the_default(monkeypatch, value, tol):
         dict(node_refinement=-1e-8),
         dict(node_refinement="tight"),
         dict(node_refinement_every=0),
+        dict(node_refinement_seconds=0),
         dict(refinement_options={"tol": 1e-8}),
     ],
 )
@@ -4398,6 +4432,136 @@ def test_rejects_a_bad_separation_backend():
         jm.CutSeparator(knapsack(), np.zeros(15), np.ones(15), backend="torch")
 
 
+# %% Faster separation rounds: threads, cover lifting, c-MIR flips
+
+
+def test_rejects_bad_separation_threads():
+    for bad in (0, -1, 1.5, True, "many"):
+        with pytest.raises(ValueError, match="separation_threads"):
+            solve(knapsack(), separation_threads=bad)
+    assert jm._separation_threads("auto") >= 1
+    assert jm._separation_threads(3) == 3
+
+
+def test_row_chunks_keep_every_row_in_order():
+    rng = np.random.default_rng(0)
+    lengths = rng.integers(0, 400, 300)
+    lengths[::50] = 5000  # a few long rows
+    A_ptr = np.concatenate([[0], np.cumsum(lengths)])
+    rows = rng.permutation(300)[:250]
+    for threads in (2, 4, 16):
+        chunks = jm._row_chunks(rows, A_ptr, 1000, threads)
+        assert 1 < len(chunks) <= threads * jm._CHUNKS_PER_THREAD
+        assert all(chunk.size for chunk in chunks)
+        assert np.array_equal(np.concatenate(chunks), rows)
+    assert len(jm._row_chunks(rows, A_ptr, 1000, 1)) == 1
+    # Little work, or scratch over many columns: fewer chunks.
+    assert len(jm._row_chunks(rows[:2], np.arange(301), 1000, 8)) == 1
+    assert len(jm._row_chunks(rows, A_ptr, 10 * jm._CHUNK_SCRATCH, 4)) <= 4
+
+
+@NEEDS_NUMBA
+@pytest.mark.parametrize(
+    "make",
+    [facility_location, generalised_assignment, lambda: fixed_charge()[0]],
+)
+def test_threaded_separation_gives_the_same_cuts(make, monkeypatch):
+    monkeypatch.setattr(jm, "_CHUNK_MIN_WORK", 0)
+    mip = make()
+    x, _ = vertex_and_basis(mip)
+    kwargs = dict(aggregate_integers=True, max_aggregation=4, aggregation_width=3)
+    one = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numba", threads=1, **kwargs)
+    many = jm.CutSeparator(mip, mip.lower, mip.upper, backend="numba", threads=4, **kwargs)
+    rows = one.tight_rows(x)
+    assert len(jm._row_chunks(rows, one.A.indptr, x.size, 4)) > 1
+    ref, got = one(x), many(x)
+    assert len(got) == len(ref) > 0
+    for (fa, ia, ca, ra), (fb, ib, cb, rb) in zip(got, ref):
+        assert fa == fb and ra == rb
+        assert np.array_equal(ia, ib) and np.array_equal(ca, cb)
+
+
+def lift_cover_reference(cover, w, z, capacity):
+    """Sequential lifting with the dynamic program over the cover's items
+    one at a time, and every item outside it lifted."""
+    rhs = cover.size - 1
+    pi = np.zeros(w.size)
+    pi[cover] = 1.0
+    least = np.full(rhs + 1, np.inf)
+    least[0] = 0.0
+    for item in cover:
+        least[1:] = np.minimum(least[1:], least[:-1] + w[item])
+    slack = 1e-9 * (1.0 + abs(capacity))
+    rest = np.setdiff1d(np.arange(w.size), cover)
+    for item in rest[np.lexsort((-w[rest], -z[rest]))]:
+        room = capacity - w[item] + slack
+        alpha = rhs if room < 0 else rhs - int(np.flatnonzero(least <= room).max())
+        if alpha <= 0:
+            continue
+        pi[item] = alpha
+        least[alpha:] = np.minimum(least[alpha:], least[: rhs + 1 - alpha] + w[item])
+    return pi
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_lift_cover_stops_only_when_not_violated(seed):
+    rng = np.random.default_rng(seed)
+    k = int(rng.integers(6, 40))
+    w = rng.integers(1, 30, k).astype(np.float64)
+    capacity = float(rng.integers(int(w.max()), max(int(w.sum()) - 1, int(w.max()) + 1)))
+    z = np.where(rng.random(k) < 0.5, 0.0, rng.random(k))
+    order = np.argsort(-z, kind="stable")
+    end = int(np.argmax(np.cumsum(w[order]) > capacity)) + 1
+    if not np.cumsum(w[order])[-1] > capacity:
+        return
+    cover = np.sort(order[:end])
+    ref = lift_cover_reference(cover, w, z, capacity)
+    violated = ref @ z - (cover.size - 1) > 1e-6
+    got = jm._lift_cover(cover, w, z, capacity)
+    if violated:
+        assert np.array_equal(got, ref)
+    else:
+        # Not violated: no cut (``None``), or lifted in full when no item
+        # outside the cover is at zero.
+        assert got is None or np.array_equal(got, ref)
+    numba_kernel = jm._numba_separate()
+    if numba_kernel is not None:
+        ok, pi = numba_kernel._lift_cover(cover, w, z, capacity)
+        assert ok == (got is not None)
+        if ok:
+            assert np.array_equal(pi, ref)
+
+
+def test_cmir_tries_a_bounded_number_of_flips(monkeypatch):
+    # A long row with every integer strictly inside its bounds: each flip
+    # is a pass over the row, so only the first ``_CMIR_FLIP_WORK // k``.
+    rng = np.random.default_rng(1)
+    k = 400
+    idx = np.arange(k)
+    a = rng.integers(1, 9, k).astype(np.float64)
+    x = rng.uniform(0.2, 0.8, k)
+    lower, upper = np.zeros(k), np.ones(k)
+    is_int = np.ones(k, bool)
+    b = float(np.floor(a @ x)) + 0.5
+    calls = []
+    original = jm._cmir_for
+
+    def counted(*args):
+        calls.append(1)
+        return original(*args)
+
+    monkeypatch.setattr(jm, "_cmir_for", counted)
+    full = jm._cmir_search(idx, a, b, x, lower, upper, is_int, 64)
+    tried_full = len(calls)
+    monkeypatch.setattr(jm, "_CMIR_FLIP_WORK", 10 * k)
+    monkeypatch.setattr(jm, "_CMIR_MIN_FLIPS", 4)
+    calls.clear()
+    capped = jm._cmir_search(idx, a, b, x, lower, upper, is_int, 64)
+    assert tried_full - len(calls) == k - 10
+    for cut in (full, capped):
+        assert cut is not None and cut_efficacy(cut, x) > 1e-9
+
+
 def test_flow_cover_cuts_are_valid_and_cut_off_the_vertex():
     mip, u, _ = fixed_charge()
     x, _ = vertex_and_basis(mip)
@@ -4488,6 +4652,32 @@ def test_clique_cuts_are_valid(seed):
             assert family == "clique"
             assert coef @ x[idx] > rhs
             assert np.all(points[:, idx] @ coef <= rhs + 1e-12)
+
+
+@pytest.mark.parametrize("seed", range(6))
+@pytest.mark.parametrize("lift_checks", [3, 7, 40, 20_000])
+def test_clique_lifting_on_masks_matches_sets(seed, lift_checks, monkeypatch):
+    # Points with many literals at zero, so cliques are lifted, and budgets
+    # small enough to run out part-way through a clique and a round.
+    mip = random_binary_rows(seed)
+    graph = jm.ConflictGraph([mip], mip.lower, mip.upper)
+    monkeypatch.setattr(jm, "_CLIQUE_LIFT_CHECKS", lift_checks)
+    monkeypatch.setattr(jm, "_CLIQUE_ROUND_CHECKS", 5 * lift_checks)
+    rng = np.random.default_rng(seed)
+    found = 0
+    for _ in range(8):
+        x = np.where(rng.random(mip.num_variables) < 0.5, 0.0, rng.uniform(0, 1, mip.num_variables))
+        monkeypatch.setattr(jm, "_CLIQUE_MASK_BYTES", 256 * 1024 * 1024)
+        assert graph._masks() is not None
+        on_masks = graph.cuts(x)
+        monkeypatch.setattr(jm, "_CLIQUE_MASK_BYTES", -1)
+        assert graph._masks() is None
+        on_sets = graph.cuts(x)
+        assert len(on_masks) == len(on_sets)
+        for (_, ia, ca, ra), (_, ib, cb, rb) in zip(on_masks, on_sets):
+            assert np.array_equal(ia, ib) and np.array_equal(ca, cb) and ra == rb
+        found += len(on_sets)
+    assert found > 0 or seed in (3, 4)  # those rows give no violated clique
 
 
 def odd_cliques(k=5):
@@ -8581,9 +8771,9 @@ def test_exact_cut_rounds_solve(make, monkeypatch):
 
     real_compact = jm._BranchAndBound.compact_cuts
 
-    def compact_cuts(self, lower, upper, result):
+    def compact_cuts(self, lower, upper, result, duals=None):
         self.exact_rows_at_end = list(self.cut_list)
-        return real_compact(self, lower, upper, result)
+        return real_compact(self, lower, upper, result, duals)
 
     monkeypatch.setattr(jm, "_highs_rows", highs_rows)
     monkeypatch.setattr(jm._BranchAndBound, "exact_cut_loop", exact_cut_loop)
@@ -8595,6 +8785,116 @@ def test_exact_cut_rounds_solve(make, monkeypatch):
         assert stats["cuts"] > 0 and stats["lp_bound"] is not None
         # The LP with the cuts is still a relaxation.
         assert mip.sign * (stats["lp_bound"] - ref) <= 1e-6 * (1 + abs(ref))
+
+
+def _cut_lp_value(search, cuts, lower, upper):
+    """The value of the root LP with ``cuts`` (HiGHS)."""
+    base = search.base
+    mip = base.with_rows(*jm._cut_rows(cuts, base.num_variables))
+    highs = jm._highs_rows(mip)
+    status, x, _, _ = jm._exact_node_lp(highs, mip, lower, upper, 60.0)
+    assert status == "optimal"
+    return float(np.asarray(base.c, np.float64) @ x)
+
+
+@pytest.mark.parametrize(
+    "options, from_rounds",
+    [
+        (dict(cut_round_lp="highs", exact_nodes=0), True),
+        (dict(cut_round_lp="jaddle", exact_nodes=2, batch_size=4), False),
+        (dict(cut_round_lp="jaddle", exact_nodes=0), None),
+    ],
+)
+def test_compact_cuts_keeps_the_cuts_with_a_dual(monkeypatch, options, from_rounds):
+    """With exact duals (the exact rounds' last solve, or one HiGHS solve
+    when the exact lane is on) the tree starts with only the cuts whose
+    dual is nonzero, and the root LP's value is the same; without them,
+    with the cuts not idle at the last re-solve."""
+    seen = []
+    real_compact = jm._BranchAndBound.compact_cuts
+    real_duals = jm._BranchAndBound.exact_cut_duals
+
+    def exact_cut_duals(self, lower, upper):
+        out = real_duals(self, lower, upper)
+        seen[-1]["solved"] = out
+        return out
+
+    def compact_cuts(self, lower, upper, result, duals=None):
+        before = list(self.cut_list)
+        # The ages now: the re-solve after a rebuild ages the cuts again.
+        seen.append(
+            dict(given=duals, solved=None, ages=[cut["age"] for cut in before])
+        )
+        # Any drop rebuilds the block here (the rule under test, not the
+        # quarter of the nonzeros a rebuild must save).
+        monkeypatch.setattr(jm, "_cut_block", lambda cuts, n, *a, **k: tight_block(cuts, n))
+        try:
+            out = real_compact(self, lower, upper, result, duals)
+        finally:
+            monkeypatch.setattr(jm, "_cut_block", real_block)
+        seen[-1].update(
+            before=before,
+            after=list(self.cut_list),
+            values=[
+                _cut_lp_value(self, cuts, lower, upper)
+                for cuts in (before, self.cut_list)
+            ],
+        )
+        return out
+
+    real_block = jm._cut_block
+
+    def tight_block(cuts, n):
+        # No padding: a block that is always smaller with fewer cuts.
+        A, b = jm._cut_rows(cuts, n)
+        return sp.csr_matrix(A), np.asarray(b, np.float64)
+
+    monkeypatch.setattr(jm._BranchAndBound, "compact_cuts", compact_cuts)
+    monkeypatch.setattr(jm._BranchAndBound, "exact_cut_duals", exact_cut_duals)
+    mip = general_integer()  # its root stays open after the cut rounds
+    result = solve(mip, gomory_cuts=False, **options)
+    assert_solved(result, mip, reference(mip))
+    assert any(call["before"] for call in seen)
+    for call in seen:
+        if not call["before"]:
+            continue
+        duals = call["given"] if from_rounds else call["solved"]
+        if from_rounds is None:
+            assert call["given"] is None and call["solved"] is None
+            kept = [
+                cut for cut, age in zip(call["before"], call["ages"]) if age == 0
+            ]
+        else:
+            assert duals is not None and len(duals) == len(call["before"])
+            assert (call["solved"] is None) == from_rounds  # no second solve
+            scale = 1e-9 * (1.0 + np.abs(duals).max(initial=0.0))
+            kept = [cut for cut, y in zip(call["before"], duals) if y > scale]
+            # The LP's value is the same without the zero-dual cuts.
+            before, after = call["values"]
+            assert abs(after - before) <= 1e-6 * (1 + abs(before))
+        if len(kept) < len(call["before"]):
+            assert [id(cut) for cut in call["after"]] == [id(cut) for cut in kept]
+
+
+def test_device_kernels_count_their_padded_entries(monkeypatch):
+    """``batch_on_device`` (``children_backend="auto"``) sizes the kernels by
+    the entries they are padded to for a full tree cut block, not by the
+    rows' own nonzeros."""
+    mip = general_integer()
+    search = search_for(mip, monkeypatch, batch_size=64, tree_cuts=True)
+    try:
+        monkeypatch.setattr(jm, "_SMALL_MIP_NNZ", 0)
+        assert search.batch_on_device()
+        # A reserved tree cut block of four million entries.
+        search.use_tree_cuts, search.slot_version = True, [0]
+        search.tree_nnz_cap = 1 << 22
+        assert search.kernel_nnz_capacity() >= 1 << 22
+        assert not search.batch_on_device()
+        search.children_backend = "jax"  # asked for: whatever the size
+        assert search.batch_on_device()
+    finally:
+        if search.exact_lane is not None:
+            search.exact_lane.shutdown()
 
 
 def test_exact_cut_rounds_strengthen_the_root(monkeypatch):

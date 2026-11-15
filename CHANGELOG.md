@@ -163,6 +163,54 @@
 
 ### Changed
 
+- The tree starts with the root cuts that carry the bound. When the cut
+  rounds end, `compact_cuts` keeps only the cuts with a nonzero dual when
+  it has exact duals: the last solve's with `cut_round_lp="highs"`, or one
+  HiGHS solve of the root LP when the exact lane is on (`exact_nodes`
+  with batches; within `exact_root_seconds` and a tenth of the time
+  left). The LP's value is the same without the others, and they stay in
+  the cut pool for the tree's refreshes. Before, every cut tight at the
+  last re-solve stayed. On beasleyC3 about 550 of 5,100 root cuts have a
+  nonzero dual and 3,400 are tight (mostly flow covers); with the 550 a
+  lane strong branching LP takes 21 ms where it took 156. Without exact
+  duals (PDHG rounds, no lane) the rule is as before.
+- A node's iterative refinement (`node_refinement`) stops after
+  `node_refinement_seconds` (new option, 2 s), as a node crossover does.
+  Its only limit was the time left, and it runs on the host: on beasleyC3
+  one node's refinement to 1e-6 ran for 108 s and held the node loop up.
+- `benchmarks/benchmark_mip.py` no longer sets `node_crossover`,
+  `node_refinement`, `max_cut_rows=1e5` or `tree_cut_rows=1e5`. On
+  beasleyC3 the node crossovers took 198 of the tree's 203 s, and the cut
+  row caps padded the tree LP to 132,000 rows (6,500 with entries). In
+  150 s there: 6,550 nodes (51/s) with 754 found and a bound of 739, where
+  240 s gave 86 nodes, 758 and 736.
+- Faster cut separation rounds (`jaddle._separate_numba`), with the same
+  cuts unless noted:
+  - A round's rows are spread over `separation_threads` threads (new
+    option; default `"auto"`: the CPUs, at most 16; also
+    `CutSeparator(threads=...)`), in chunks of about equal work. The
+    kernel holds no GIL and a row's cuts depend on no other row.
+  - Lifting a cover starts its dynamic program from the cover's sorted
+    weights (it ran one pass per cover item), lifts the items the LP
+    point uses first, and stops when the cut cannot be violated. On
+    eil33-2's root the aggregated rows give covers of 1,200 items, nine
+    in ten not violated, and this was 90% of a round.
+  - The c-MIR search scores each divisor and flip without building the
+    cut, and builds only the one it keeps.
+  - A c-MIR search tries at most `200,000 / k` complementation flips on a
+    row of `k` entries (at least 16), the integers farthest from a bound
+    first. This changes cuts only on rows of more than a few hundred
+    entries with more fractional integers than that.
+  - Clique separation grows a clique through the positive literals'
+    neighbours among themselves, and lifts it on bit masks
+    (`ConflictGraph._lift_clique`), where it built the union of whole
+    cliques for every literal met: on eil33-2 (32 cliques of 1,400
+    literals) a call late in the root's rounds went from 0.5–0.9 s to
+    0.025 s.
+
+  A round at the root LP point went from 3.1 s to 0.08 s on eil33-2,
+  3.9 s to 0.09 s on bab5, 1.0 s to 0.08 s on air05 and about 290 s to
+  3.5 s on rmine11 (16 threads).
 - Children of exact lane nodes go straight back to the lane
   (`exact_direct`, on by default). A child with its parent's basis and a
   bound in the band is queued for the lane without a device LP first,
@@ -276,6 +324,15 @@
 
 ### Fixed
 
+- With a large tree cut pool (`tree_cut_rows`) the device kernels for a
+  batch's children and for strong branching ran out of memory.
+  `children_backend="auto"` and the strong screen sized them by the rows'
+  nonzeros, but their arrays are padded to a full tree cut block. With
+  `tree_cut_rows=1e5` on beasleyC3, 44,000 nonzeros were padded to 4.2
+  million and the children of a batch of 64 asked for 39 GB: the solve
+  ran past its time limit and ended in `RESOURCE_EXHAUSTED`. Both now
+  count the padded entries, so such a MIP's children are built on the
+  host.
 - The exact lane's pseudocosts (`exact_nodes`) stopped learning once each
   candidate was reliable. Lane nodes branch by them alone, but only the
   lane's strong branching fed them, and it skips reliable candidates. On

@@ -2169,20 +2169,31 @@ def _lift_cover(cover, w, z, capacity):
     used by the LP point first) gets ``α_j = |C| − 1 − max{π · z : w · z <=
     capacity − w_j}`` over the items placed so far, solved exactly by a
     dynamic program over the (integer) values ``π``: ``least[v]`` is the
-    least weight reaching value ``v``. Returns the coefficients ``π``."""
+    least weight reaching value ``v`` (for the cover alone, its ``v``
+    lightest items). Returns the coefficients ``π``, or ``None`` when the
+    lifted cut is not violated by more than 1e-6.
+
+    The items the LP point uses are lifted first, and the violation ``π · z
+    − (|C| − 1)`` is final once only items at zero are left, so a cut that
+    is not violated stops there. On eil33-2's root the aggregated rows give
+    covers of 1,200 items on average, nine in ten not violated: a dynamic
+    program over the cover item by item (quadratic in its size) and the
+    lifting of every item at zero were most of a separation round (3.1 s
+    with them, 0.7 s without, on one thread)."""
     rhs = cover.size - 1
     pi = np.zeros(w.size)
     pi[cover] = 1.0
-    least = np.full(rhs + 1, np.inf)
-    least[0] = 0.0
-    for item in cover:
-        update = least[:-1] + w[item]
-        least[1:] = np.minimum(least[1:], update)
+    least = np.concatenate(([0.0], np.cumsum(np.sort(w[cover])[:rhs])))
     slack = 1e-9 * (1.0 + abs(capacity))
     outside = np.ones(w.size, dtype=bool)
     outside[cover] = False
     rest = np.flatnonzero(outside)  # sorted, as np.setdiff1d gave, without its sort
+    decided = False
     for item in rest[np.lexsort((-w[rest], -z[rest]))]:
+        if not decided and z[item] <= 0.0:
+            decided = True
+            if pi @ z - rhs <= 1e-6:
+                return None
         room = capacity - w[item] + slack
         if room < 0:
             alpha = rhs  # z_item = 1 alone breaks the row
@@ -2256,6 +2267,8 @@ def cover_cuts(idx, a, b, x, lower, upper, is_binary, max_covers=_COVER_ORDERS):
         if in_cover - rhs_z + rhs_z * outside <= 1e-6:
             continue
         pi = _lift_cover(cover, w, z, capacity)
+        if pi is None:
+            continue
         violation = pi @ z - rhs_z
         if violation <= 1e-6:
             continue
@@ -2487,6 +2500,17 @@ def _substituted_cmir(idx, a, b, x, lower, upper, is_int, max_divisors, bounds):
     return cut if _efficacy(cut, x) > 1e-9 else None
 
 
+# The complementation flips ``_cmir_search`` tries on a row of ``k`` entries:
+# each one costs a pass over the row, so at most ``_CMIR_FLIP_WORK // k`` of
+# them (the integers farthest from a bound, which come first), and at least
+# ``_CMIR_MIN_FLIPS``. Rows of up to a few hundred entries try every flip.
+# On rmine11's root the aggregates run to 2,800 entries with 1,500 integers
+# inside their bounds, and trying them all took a round 290 s (on one
+# thread) to find no cut.
+_CMIR_FLIP_WORK = 200_000
+_CMIR_MIN_FLIPS = 16
+
+
 def _cmir_search(idx, a, b, x, lower, upper, is_int, max_divisors):
     """The search of ``cmir_cut`` over simple bounds."""
     lo, up, xv, integer = lower[idx], upper[idx], x[idx], is_int[idx]
@@ -2524,7 +2548,9 @@ def _cmir_search(idx, a, b, x, lower, upper, is_int, max_divisors):
             & (xv < up - 1e-6)
         )
     distance = np.minimum(xv - lo, up - xv)
-    for j in np.flatnonzero(inside)[np.argsort(-distance[inside], kind="stable")]:
+    flips = max(_CMIR_MIN_FLIPS, _CMIR_FLIP_WORK // max(a.size, 1))
+    order = np.flatnonzero(inside)[np.argsort(-distance[inside], kind="stable")]
+    for j in order[:flips]:
         flipped = use_upper.copy()
         flipped[j] = not flipped[j]
         cut = _cmir_for(a, b, xv, lo, up, integer, flipped, best_delta)
@@ -2937,18 +2963,26 @@ def _cmir_kernel(a, lo, up, xv, integer, valid, b, max_divisors):
     distance = jnp.minimum(xv - lo, up - xv)
     order = jnp.argsort(jnp.where(inside, -distance, jnp.inf), axis=1, stable=True)
     slots = jnp.arange(a.shape[1])
+    # At most this many flips a row (``_CMIR_FLIP_WORK``).
+    flips = jnp.maximum(
+        _CMIR_MIN_FLIPS, _CMIR_FLIP_WORK // jnp.maximum(jnp.sum(valid, axis=1), 1)
+    )
 
     def flip_step(k, carry):
         use, best = carry
         j = order[:, k]
         active = has & jnp.take_along_axis(inside, j[:, None], axis=1)[:, 0]
+        active = active & (k < flips)
         flipped = use ^ (slots[None, :] == j[:, None])
         ok, eff, _, _ = evaluate(flipped, best_delta)
         take = active & ok & (eff > best + 1e-12)
         return jnp.where(take[:, None], flipped, use), jnp.where(take, eff, best)
 
     use_upper, best = jax.lax.fori_loop(
-        0, jnp.max(jnp.sum(inside, axis=1)), flip_step, (use_upper, best)
+        0,
+        jnp.max(jnp.minimum(jnp.sum(inside, axis=1), flips)),
+        flip_step,
+        (use_upper, best),
     )
     ok, eff, coef, rhs = evaluate(use_upper, best_delta)
     ok = has_int & finite & has & ok & (eff > 1e-9)
@@ -3622,6 +3656,9 @@ _CLIQUE_MAX_PROBING_EDGES = 2_000_000
 _CLIQUE_MAX_STARTS = 2000
 _CLIQUE_LIFT_CHECKS = 20_000
 _CLIQUE_ROUND_CHECKS = 1_000_000  # and in one round, over all its cliques
+# ``ConflictGraph.cuts`` lifts on bit masks (an integer of 2n bits a clique,
+# and one a literal met in the call) while they fit in this many bytes.
+_CLIQUE_MASK_BYTES = 256 * 1024 * 1024
 
 
 class ConflictGraph:
@@ -3806,11 +3843,74 @@ class ConflictGraph:
 
     def neighbours(self, u):
         """The literals in conflict with ``u``."""
+        # The cliques as sets, made once: a union of sets, not of arrays
+        # turned into lists on every call (half of ``cuts`` on eil33-2,
+        # whose 32 cliques hold 1,400 literals each).
+        sets = getattr(self, "_clique_sets", None)
+        if sets is None or len(sets) != len(self.cliques):
+            sets = self._clique_sets = [frozenset(c.tolist()) for c in self.cliques]
         out = set(self.extra.get(u, ()))
-        for k in self.literal_cliques.get(u, ()):
-            out.update(self.cliques[k].tolist())
+        out.update(*(sets[k] for k in self.literal_cliques.get(u, ())))
         out.discard(u)
         return out
+
+    def _masks(self):
+        """Each clique's literals as the bits of an integer, made once, or
+        ``None`` when they would take more than ``_CLIQUE_MASK_BYTES``."""
+        if len(self.cliques) * (self.n // 4 + 1) > _CLIQUE_MASK_BYTES:
+            return None
+        masks = getattr(self, "_clique_masks", None)
+        if masks is None or len(masks) != len(self.cliques):
+            masks = []
+            for clique in self.cliques:
+                bits = np.zeros(2 * self.n, bool)
+                bits[clique] = True
+                masks.append(
+                    int.from_bytes(np.packbits(bits, bitorder="little").tobytes(), "little")
+                )
+            self._clique_masks = masks
+        return masks
+
+    @staticmethod
+    def _lift_clique(clique, checks, mask_of, at_zero):
+        """Lift ``clique`` (a list, extended in place) with the neighbours
+        of its first literal among ``at_zero`` (bits), lowest first: each
+        one costs ``len(clique)`` checks while ``checks`` last, and joins
+        when it conflicts with every member (``mask_of``: a literal's
+        neighbours as bits). Returns the checks left (may be negative).
+
+        The same literals as testing each candidate against a set of the
+        common neighbours, but a join is a few operations on integers and
+        the candidates between two joins are counted, not visited. On
+        eil33-2, where a cut gains about 100 literals from neighbourhoods
+        of 10,000, the lifting was most of a call's 0.5–0.9 s."""
+        members = 0
+        for member in clique:
+            members |= 1 << member
+        candidates = mask_of(clique[0]) & ~members & at_zero
+        common = candidates
+        for member in clique[1:]:
+            common &= mask_of(member)
+        size = len(clique)
+        position = 0  # the candidates below it are done
+        while checks > 0:
+            ahead = candidates >> position
+            live = common >> position
+            if live:
+                step = (live & -live).bit_length() - 1
+                skipped = (ahead & ((1 << step) - 1)).bit_count()
+            else:
+                skipped = ahead.bit_count()
+            if not live or skipped * size >= checks:
+                # The candidates left, or the checks, run out before a join.
+                return checks - min(skipped, -(-checks // size)) * size
+            checks -= (skipped + 1) * size
+            literal = position + step
+            clique.append(literal)
+            common &= mask_of(literal)
+            size += 1
+            position = literal + 1
+        return checks
 
     def cuts(self, x, max_cuts=200, min_violation=1e-6):
         """Clique cuts violated by ``x``, as ``("clique", idx, coef, rhs)``.
@@ -3839,39 +3939,94 @@ class ConflictGraph:
                 cache[u] = self.neighbours(u)
             return cache[u]
 
-        for s in starts.tolist():
-            neighbours = neighbours_of(s)
-            positive = sorted(
-                (l for l in neighbours if value[l] > 1e-9), key=lambda l: (-value[l], l)
+        # A clique grows through literals with positive values only, so
+        # growing needs each literal's neighbours among those: from the
+        # positive members of its cliques, without the union of the whole
+        # cliques (on eil33-2, 10,000 literals a start, walked in Python:
+        # 0.5–0.9 s a call late in the root's rounds). The whole
+        # neighbourhoods are built only to lift a violated clique.
+        positive_literals = np.flatnonzero(in_graph & (value > 1e-9)).tolist()
+        clique_positive = collections.defaultdict(set)
+        for u in positive_literals:
+            for k in self.literal_cliques.get(u, ()):
+                clique_positive[k].add(u)
+        positive_set = set(positive_literals)
+        positive_cache = {}
+
+        def positive_neighbours(u):
+            if u not in positive_cache:
+                out = set()
+                edges = self.extra.get(u)
+                if edges:
+                    out.update(positive_set.intersection(edges))
+                out.update(*(clique_positive[k] for k in self.literal_cliques.get(u, ())))
+                out.discard(u)
+                positive_cache[u] = out
+            return positive_cache[u]
+
+        # Lifting on bit masks (``_lift_clique``) when the cliques' fit in
+        # ``_CLIQUE_MASK_BYTES``; else on sets of literals.
+        masks = self._masks()
+        mask_cache = {}
+        at_zero = 0
+        if masks is not None:
+            at_zero = int.from_bytes(
+                np.packbits(value <= 1e-9, bitorder="little").tobytes(), "little"
             )
+
+        def mask_of(u):
+            """The literals in conflict with ``u``, as bits."""
+            found = mask_cache.get(u)
+            if found is None:
+                if len(mask_cache) * (self.n // 4 + 1) > _CLIQUE_MASK_BYTES:
+                    mask_cache.clear()
+                found = 0
+                for k in self.literal_cliques.get(u, ()):
+                    found |= masks[k]
+                for v in self.extra.get(u, ()):
+                    found |= 1 << v
+                found &= ~(1 << u)
+                mask_cache[u] = found
+            return found
+
+        for s in starts.tolist():
+            near = positive_neighbours(s)
             clique = [s]
             # The literals in conflict with every member so far: a literal
             # joins when it is one of them. Checking each candidate against
             # each member instead took 11–21 million checks a call on
             # 30n20b8, whose short PDHG node solves leave 1,400–2,600
             # binaries just off zero.
-            common = set(neighbours)
-            for l in positive:
+            common = set(near)
+            for l in sorted(near, key=lambda l: (-value[l], l)):
                 if l in common:
                     clique.append(l)
-                    common &= neighbours_of(l)
+                    common &= positive_neighbours(l)
             if value[clique].sum() <= 1.0 + min_violation:
                 continue
             key = frozenset(clique)
             if key in seen:
                 continue
             seen.add(key)
-            checks = min(_CLIQUE_LIFT_CHECKS, round_checks)
-            for l in sorted(neighbours - key):
-                if checks <= 0:
-                    break
-                if value[l] > 1e-9:
-                    continue
-                checks -= len(clique)
-                if l in common:
-                    clique.append(l)
-                    common &= neighbours_of(l)
-            round_checks -= min(_CLIQUE_LIFT_CHECKS, round_checks) - max(checks, 0)
+            budget = min(_CLIQUE_LIFT_CHECKS, round_checks)
+            if masks is not None:
+                checks = self._lift_clique(clique, budget, mask_of, at_zero)
+            else:
+                neighbours = neighbours_of(s)
+                common = set(neighbours)
+                for member in clique[1:]:
+                    common &= neighbours_of(member)
+                checks = budget
+                for l in sorted(neighbours - key):
+                    if checks <= 0:
+                        break
+                    if value[l] > 1e-9:
+                        continue
+                    checks -= len(clique)
+                    if l in common:
+                        clique.append(l)
+                        common &= neighbours_of(l)
+            round_checks -= budget - max(checks, 0)
             literals = np.array(sorted(clique), np.int64)
             idx = literals // 2
             coef = np.where(literals % 2 == 0, 1.0, -1.0)
@@ -4183,10 +4338,14 @@ class CutSeparator:
         aggregation_width=1,
         cmir_per_row=1,
         mir_cuts=True,
+        threads="auto",
     ):
         # The JAX device the batched searches run on (``None``: the default
         # one where the call is made).
         self.device = device
+        # The threads a numba round's rows are spread over (``"auto"``: the
+        # CPUs, at most 16); the cuts are the same on any number.
+        self.threads = _separation_threads(threads)
         # ``aggregation_width``: the first aggregation step of a row tries
         # the partners of its ``aggregation_width`` best columns to cancel,
         # each continuing greedily (``_aggregation_path``). ``cmir_per_row``:
@@ -4388,21 +4547,35 @@ class CutSeparator:
             cleaned = _clean_cut(idx, coef, rhs, self.lower, self.upper)
             if cleaned is not None:
                 out.append((family, *cleaned))
-        family, ptr, idx, coef, rhs = _numba_separate().separate(
-            rows, x, lower, upper, is_int, is_binary,
-            A_ptr, A_idx, A_val, b, is_eq, C_ptr, C_row, C_val,
-            _f64(self.relative), self.variable_bounds is not None, *vb,
-            int(self.max_aggregation), bool(self.aggregate_integers),
-            bool(self.flow_covers), 64, _COVER_ORDERS, _KNAPSACK_TOL, _CUT_TINY,
-            # None of the c-MIR cuts kept without ``mir_cuts``.
-            int(self.aggregation_width), int(self.cmir_per_row) if self.mir_cuts else 0,
-        )
-        names = ("cover", "mir", "flowcover")
-        for k in range(family.size):
-            start, end = ptr[k], ptr[k + 1]
-            out.append(
-                (names[family[k]], idx[start:end].copy(), coef[start:end].copy(), float(rhs[k]))
+        separate = _numba_separate().separate
+        relative = _f64(self.relative)
+
+        def run(chunk):
+            return separate(
+                chunk, x, lower, upper, is_int, is_binary,
+                A_ptr, A_idx, A_val, b, is_eq, C_ptr, C_row, C_val,
+                relative, self.variable_bounds is not None, *vb,
+                int(self.max_aggregation), bool(self.aggregate_integers),
+                bool(self.flow_covers), 64, _COVER_ORDERS, _KNAPSACK_TOL, _CUT_TINY,
+                # None of the c-MIR cuts kept without ``mir_cuts``.
+                int(self.aggregation_width), int(self.cmir_per_row) if self.mir_cuts else 0,
             )
+
+        # A row's cuts depend on no other row, so chunks of the rows run on
+        # threads (the kernel holds no GIL) and their cuts, taken in chunk
+        # order, are the single call's.
+        chunks = _row_chunks(rows, A_ptr, x.size, self.threads)
+        if len(chunks) > 1:
+            results = list(_separation_pool(self.threads).map(run, chunks))
+        else:
+            results = [run(rows)]
+        names = ("cover", "mir", "flowcover")
+        for family, ptr, idx, coef, rhs in results:
+            for k in range(family.size):
+                start, end = ptr[k], ptr[k + 1]
+                out.append(
+                    (names[family[k]], idx[start:end].copy(), coef[start:end].copy(), float(rhs[k]))
+                )
         return out
 
     def _numba_arrays(self):
@@ -5730,6 +5903,60 @@ def _lp_solver(name, option):
     if name not in ("jaddle", "highs"):
         raise ValueError(f"{option} must be 'jaddle' or 'highs', not {name!r}")
     return name
+
+
+def _separation_threads(threads):
+    """The threads a numba separation round runs on (``separation_threads``):
+    ``"auto"`` is the machine's logical CPUs, at most 16."""
+    if threads == "auto":
+        return max(1, min(os.cpu_count() or 1, 16))
+    if isinstance(threads, bool) or not isinstance(threads, (int, np.integer)) or threads < 1:
+        raise ValueError(
+            f"separation_threads must be 'auto' or a positive integer, not {threads!r}"
+        )
+    return int(threads)
+
+
+@functools.cache
+def _separation_pool(threads):
+    """The threads separation rounds share (per size, for the process)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    return ThreadPoolExecutor(threads, thread_name_prefix="jaddle-separate")
+
+
+# A separation round's rows go to the threads in chunks of about equal
+# work (a row's entries, plus ``_CHUNK_ROW_WORK`` for its aggregates), this
+# many per thread so that a few long rows do not hold one thread back; and
+# rounds with less work than ``_CHUNK_MIN_WORK`` run in the calling thread.
+_CHUNKS_PER_THREAD = 8
+_CHUNK_ROW_WORK = 16
+_CHUNK_MIN_WORK = 2000
+# Each chunk's call clears scratch over the columns: at most this many
+# column entries in all (so fewer chunks on MIPs with millions of columns).
+_CHUNK_SCRATCH = 20_000_000
+
+
+def _row_chunks(rows, A_ptr, n, threads):
+    """``rows`` (in order) split into consecutive chunks for ``threads``
+    threads: ``[rows]`` when one thread, or the round is too small to be
+    worth handing over."""
+    if threads <= 1 or rows.size < 2:
+        return [rows]
+    work = (A_ptr[rows + 1] - A_ptr[rows]) + _CHUNK_ROW_WORK
+    total = int(work.sum())
+    if total < _CHUNK_MIN_WORK:
+        return [rows]
+    count = min(
+        rows.size,
+        threads * _CHUNKS_PER_THREAD,
+        max(threads, _CHUNK_SCRATCH // max(n, 1)),
+    )
+    # Cut where the running work passes each multiple of total / count.
+    ends = np.searchsorted(
+        np.cumsum(work), total * np.arange(1, count) / count, side="left"
+    ) + 1
+    return [chunk for chunk in np.split(rows, np.unique(ends)) if chunk.size]
 
 
 def _separation_backend(backend):
@@ -9083,6 +9310,7 @@ class _BranchAndBound:
         implied_integer_cuts=True,
         separation_backend="auto",
         separation_device="cpu",
+        separation_threads="auto",
         node_bound_stop=True,
         dual_repair=True,
         node_lp_tolerance=None,
@@ -9125,6 +9353,7 @@ class _BranchAndBound:
         root_refinement=None,
         node_refinement=None,
         node_refinement_every=1,
+        node_refinement_seconds=2.0,
         refinement_options=None,
         node_precision=None,
         jump_backend="auto",
@@ -9570,6 +9799,8 @@ class _BranchAndBound:
                 f"not {separation_backend!r}"
             )
         self.separation_backend = _separation_backend(separation_backend)
+        # The threads a numba separation round runs on (``separation_threads``).
+        self.separation_threads = _separation_threads(separation_threads)
         # Where the batched separation kernels run (``separation_device``):
         # they run in float64, which consumer GPUs are slow at, on rows
         # small enough that the transfers cost more than the work.
@@ -10028,6 +10259,14 @@ class _BranchAndBound:
         if int(node_refinement_every) < 1:
             raise ValueError("node_refinement_every must be at least 1")
         self.node_refinement_every = int(node_refinement_every)
+        # A node's refinement runs on the host and holds the node loop (and
+        # the exact lane's feeding) up meanwhile, so each call has its own
+        # limit, as a node crossover does: with only the time left as its
+        # limit, one node's refinement ran for 108 s on beasleyC3 without
+        # reaching 1e-6.
+        if node_refinement_seconds <= 0:
+            raise ValueError("node_refinement_seconds must be positive")
+        self.node_refinement_limit = float(node_refinement_seconds)
         self.refinement_options = dict(refinement_options or {})
         for key in ("tol", "max_seconds", "cancel"):
             if key in self.refinement_options:
@@ -12016,8 +12255,9 @@ class _BranchAndBound:
             self._strong_kernels = (self.mip, held[1])  # same shapes: kept
         if self._strong_kernels is None or self._strong_kernels[0] is not self.mip:
             screen = self.strong_screen
-            # Screened boxes are (screen, 2, n) float64 arrays: keep them small.
-            width = max(self.mip.num_variables, self.mip.A.nnz)
+            # Screened boxes are (screen, 2, n) float64 arrays: keep them
+            # small. The entries count as padded (``batch_on_device``).
+            width = max(self.mip.num_variables, self.kernel_nnz_capacity())
             while screen > self.strong_candidates and 2 * screen * width > 2**24:
                 screen //= 2
             kernels = _StrongKernels(
@@ -13530,7 +13770,8 @@ class _BranchAndBound:
         ``result``'s point refined to the relative tolerance ``tol`` by
         iterative refinement (``jaddle_linear.refine``) on ``lp``, the LP at
         the search's precision (``node_lp``), with ``lp_options`` and
-        ``refinement_options``, within the time left. Returns ``result``
+        ``refinement_options``, within the time left (a node's also within
+        ``node_refinement_seconds``). Returns ``result``
         with the refined point (the best seen: never worse than the start),
         or ``result`` itself when it was not refined (an interrupted,
         timed-out or exact LP, or no time left). The step sizes
@@ -13556,11 +13797,14 @@ class _BranchAndBound:
         }
         kwargs.update(self.refinement_options)
         started = time.time()
+        limit = self.seconds_left()
+        if not root:
+            limit = min(self.node_refinement_limit, limit or np.inf)
         refined = jl.refine(
             lp,
             result["solution"],
             tol=tol,
-            max_seconds=self.seconds_left(),
+            max_seconds=limit,
             cancel=self.interrupt,
             **kwargs,
         )
@@ -13581,15 +13825,6 @@ class _BranchAndBound:
             out["stop_reason"] = "certificate"
         elif refined["stop_reason"] in ("interrupted", "cancelled"):
             out["stop_reason"] = "interrupted"
-        if self.verbose and root:
-            history = refined["refinement"]["history"][-1]
-            print(
-                f"Root LP refinement: {refined['refinement']['rounds']} rounds, "
-                f"{refined['epochs']} epochs, {time.time() - started:.2f}s, "
-                f"PFR {history[0]:.1e}, DFR {history[1]:.1e}, gap {history[2]:.1e}"
-                f" ({'certified' if refined['converged'] else refined['stop_reason']}"
-                f" at {tol:.0e})"
-            )
         return out
 
     def node_crossover_due(self):
@@ -14181,7 +14416,10 @@ class _BranchAndBound:
         )
         if result["stop_reason"] in ("interrupted", "time_limit", "bound_target"):
             return result
-        result = self.compact_cuts(lower, upper, result)
+        # The last solve's duals, when the cut list is still the one it
+        # solved (a failed solve leaves cuts it never saw).
+        cut_duals = None if solved is None else solved[2][base_m:]
+        result = self.compact_cuts(lower, upper, result, duals=cut_duals)
         if (
             not result["converged"]
             and result["stop_reason"] != "bound_target"
@@ -14523,18 +14761,69 @@ class _BranchAndBound:
         budgets = [e for e in (self.cut_round_epochs, self.root_max_epochs) if e]
         return min(budgets) if budgets else None
 
-    def compact_cuts(self, lower, upper, result):
-        """Rebuild the cut block for the tree: keep the cuts that were tight
-        or had a dual at the last solve, and size the block to them without
-        the room to grow the rounds reserved. Every node LP then pays only
-        for the cuts it uses. When that shrinks the LP's nonzeros by a
+    def exact_cut_duals(self, lower, upper):
+        """The cuts' duals (in ``cut_list`` order) at an optimal vertex of
+        the root LP with them, from HiGHS's dual simplex, within
+        ``exact_root_seconds`` and a tenth of the time left. ``None`` when
+        HiGHS does not solve the LP in time."""
+        base = self.base
+        limit = self.exact_root_seconds
+        if self.deadline is not None:
+            limit = min(limit, 0.1 * self.seconds_left())
+        try:
+            mip = base.with_rows(*_cut_rows(self.cut_list, base.num_variables))
+            status, _, _, y_ineq = _exact_node_lp(
+                _highs_rows(mip),
+                mip,
+                np.asarray(lower, np.float64),
+                np.asarray(upper, np.float64),
+                limit,
+            )
+        except Exception:
+            return None
+        if status != "optimal":
+            return None
+        return y_ineq[base.A.shape[0] - base.n_eq :]
+
+    def compact_cuts(self, lower, upper, result, duals=None):
+        """Rebuild the cut block for the tree, sized to the cuts it keeps
+        without the room to grow the rounds reserved, so every node LP pays
+        only for the cuts it uses. When that shrinks the LP's nonzeros by a
         quarter or more, the root is re-solved warm on the compact LP (its
-        point must match the rows the children start from)."""
+        point must match the rows the children start from).
+
+        With exact duals of the cuts, only those with a nonzero dual are
+        kept: ``duals`` (in ``cut_list`` order; the exact rounds' last
+        solve), or, when the exact lane will solve the tree's LPs
+        (``exact_nodes``), one HiGHS solve here (``exact_cut_duals``). The
+        optimal duals stay feasible without the rows whose dual is zero, so
+        the LP's value is the same. Otherwise the cuts that were tight or
+        had a dual at the last re-solve are kept (``age_cuts``): PDHG duals
+        after a short re-solve do not say which tight cuts carry the bound.
+
+        Many cuts are tight with a zero dual at a degenerate vertex. On
+        beasleyC3 550 of the 5,100 root cuts had a nonzero dual and 3,400
+        were tight (2,800 of them flow covers, near copies of each other);
+        with the 550 the LP's value was the same (735.13), a strong
+        branching side took 21 ms where it took 156, and an exact lane node
+        0.4 thread-seconds where it took 1.8. The dropped cuts stay in the
+        pool (``pool_cuts``), for the tree's refreshes."""
         if not self.cut_list:
             return result
         base = self.base
         base_m = base.A.shape[0] - base.n_eq
-        kept = [(i, cut) for i, cut in enumerate(self.cut_list) if cut["age"] == 0]
+        if duals is None and self.exact_lane is not None and not self.out_of_time():
+            duals = self.exact_cut_duals(lower, upper)
+        if duals is not None and len(duals) == len(self.cut_list):
+            duals = np.asarray(duals, np.float64)
+            scale = 1e-9 * (1.0 + np.abs(duals).max(initial=0.0))
+            kept = [
+                (i, cut) for i, cut in enumerate(self.cut_list) if duals[i] > scale
+            ]
+        else:
+            kept = [
+                (i, cut) for i, cut in enumerate(self.cut_list) if cut["age"] == 0
+            ]
         A_cuts, b_cuts = _cut_block([cut for _, cut in kept], base.num_variables)
         if base.A.nnz + A_cuts.nnz > 0.75 * self.mip.lp.A.nse:
             return result
@@ -14740,6 +15029,7 @@ class _BranchAndBound:
             mir_cuts=self.use_mir_cuts,
             backend=self.separation_backend,
             device=self.separation_device,
+            threads=self.separation_threads,
             conflict_graph=graph,
             integrality=self.cut_int,
             implied_bounds=implied,
@@ -15881,13 +16171,6 @@ class _BranchAndBound:
             )
         )
         stats["fixed"] += fixed
-        if self.verbose:
-            print(
-                f"Cutoff probing: {fixed} of {probed} integers fixed "
-                f"({sum(out['lps'] for out in results)} LPs, {seconds:.1f}s"
-                + (", box empty" if empty else "")
-                + ")"
-            )
         if empty or np.any(lower > upper):
             stats["empty"] = True
             return False
@@ -18402,12 +18685,18 @@ class _BranchAndBound:
 
     def batch_on_device(self):
         """Whether batched search splits and rounds its members on the
-        device (``children_backend``)."""
+        device (``children_backend``). ``"auto"``: a MIP of more than
+        ``_SMALL_MIP_NNZ`` nonzeros whose kernels stay small. Their arrays
+        are as wide as the entries they are padded to
+        (``kernel_nnz_capacity``: room for a full tree cut block), not as
+        the rows' own nonzeros: with ``tree_cut_rows=1e5`` beasleyC3's
+        44,000 nonzeros were padded to 4.2 million, and the children of a
+        batch of 64 asked for 39 GB."""
         if self.children_backend == "numpy" or self.batch_size < 2:
             return False
         if self.children_backend == "jax":
             return True
-        width = max(self.mip.num_variables, self.mip.A.nnz)
+        width = max(self.mip.num_variables, self.kernel_nnz_capacity())
         return self.mip.A.nnz > _SMALL_MIP_NNZ and 2 * self.batch_size * width <= 2**25
 
     def kernel_nnz_capacity(self):
@@ -18806,15 +19095,6 @@ class _BranchAndBound:
         if result is None:
             result = self.solve_lp(lp, warm, self.root_max_epochs)
         self.root_lp_stats["seconds"] += time.time() - lp_started
-        if self.verbose:
-            stats = self.root_lp_stats
-            highs = (
-                f" (HiGHS {stats['highs_seconds']:.2f}s)" if self.root_lp == "highs" else ""
-            )
-            print(
-                f"Root LP ({self.root_lp}): {stats['seconds']:.2f}s{highs}, "
-                f"{result['epochs']} PDHG epochs"
-            )
         if (
             not result["converged"]
             and result["stop_reason"] not in ("interrupted", "time_limit")
@@ -19129,19 +19409,19 @@ def solve(
     node_selection="hybrid",
     integrality_tolerance=1e-5,
     feasibility_tolerance=1e-6,
-    lp_tolerance=1e-4,
+    lp_tolerance=1e-3,
     node_max_epochs=None,
     root_max_epochs=None,
     infeasibility_tolerance=1e-8,
     heuristic_every=0,
     propagate=True,
     coefficient_tightening=True,
-    cuts=False,
-    cut_rounds=10,
+    cuts=True,
+    cut_rounds=50,
     max_cuts_per_round=500,
     cut_min_progress=None,
     cut_round_epochs=10,
-    gomory_cuts=True,
+    gomory_cuts=False,
     aggregate_integers="auto",
     flow_covers=True,
     mir_cuts=True,
@@ -19159,11 +19439,12 @@ def solve(
     implied_integer_cuts=True,
     separation_backend="auto",
     separation_device="cpu",
+    separation_threads="auto",
     node_bound_stop=True,
     dual_repair=True,
     node_lp_tolerance=1e-3,
     heuristic_effort=0.3,
-    reliability_threshold=4,
+    reliability_threshold=8,
     strong_candidates=8,
     strong_epochs=50,
     strong_max_depth=None,
@@ -19190,15 +19471,15 @@ def solve(
     jump_iterations=None,
     repair=True,
     repair_max_epochs=20,
-    rins_seconds=10.0,
+    rins_seconds=20,
     rins_every=5,
     rins_nodes=200,
-    rens_seconds=0,
+    rens_seconds=20,
     rens_nodes=500,
     dive_every=0,
     dive_depth=20,
-    plunge_depth=4,
-    batch_size="auto",
+    plunge_depth=2,
+    batch_size=1,
     feasibility_pump=False,
     pump_iterations=30,
     pump_tolerance=1e-4,
@@ -19214,7 +19495,7 @@ def solve(
     bulk_rounding=False,
     bulk_starts=4,
     repair_share=0.2,
-    batch_epochs=4,
+    batch_epochs=2,
     children_backend="auto",
     batch_roundings=False,
     tree_heuristics=False,
@@ -19227,10 +19508,11 @@ def solve(
     root_refinement=None,
     node_refinement=None,
     node_refinement_every=1,
+    node_refinement_seconds=2.0,
     refinement_options=None,
     heuristic_seconds=10.0,
     conflicts=True,
-    conflict_pool_size=2000,
+    conflict_pool_size=5000,
     conflict_max_nnz=None,
     presolve=False,
     highs_options=None,
@@ -19243,7 +19525,7 @@ def solve(
     node_precision="float32",
     jump_backend="auto",
     parallel_heuristics=True,
-    symmetry=False,
+    symmetry=True,
     restarts=5,
     restart_presolve=False,
     mip_start=None,
@@ -19256,13 +19538,13 @@ def solve(
     cut_score_weights=_CUT_SCORE_WEIGHTS,
     exact_nodes=16,
     exact_node_seconds=10.0,
-    exact_band=0.25,
+    exact_band="auto",
     exact_strong_candidates=8,
     exact_strong_iterations="auto",
     exact_overflow_share=0.0,
     exact_overflow_epochs=None,
     exact_basis_memory=2e9,
-    exact_strong_lookahead=None,
+    exact_strong_lookahead=4,
     exact_strong_cutoff=False,
     exact_direct=True,
     exact_root_candidates=128,
@@ -19272,7 +19554,7 @@ def solve(
     cutoff_probing_threads=4,
     cutoff_probing_seconds=60.0,
     cutoff_probing_iterations=1000,
-    one_opt=False,
+    one_opt=True,
     objective_propagation=True,
     plunge_gap=0.25,
     branch_implied=True,
@@ -19290,7 +19572,7 @@ def solve(
     gpu_dive_crossover=4,
     exact_plunges=False,
     exact_plunge_share=0.25,
-    jump_threads=1,
+    jump_threads=4,
     jump_restarts=True,
     root_jump_seconds=60.0,
     block_decomposition=False,
@@ -19303,11 +19585,11 @@ def solve(
     crossover_seconds=10.0,
     crossover_solutions=3,
     crossover_min_fixed=0.5,
-    proximity_seconds=10.0,
+    proximity_seconds=20,
     proximity_gap_share=0.0,
     jump_gap_share=0.0,
-    first_solution_seconds=0.0,
-    dual_fix_seconds=0.0,
+    first_solution_seconds=40,
+    dual_fix_seconds=20,
     dual_fix_rate=0.7,
     projected_pdhg=False,
     projected_pdhg_lanes=8,
@@ -19336,7 +19618,7 @@ def solve(
       limit, an infeasible root LP runs until ``max_seconds``. The checks
       between that call's chunks of doubling length cost a feasible root
       about 2.5× (bab5's: 0.8 s and 24 epochs against 0.3 s and 17).
-    * **Symmetry** (``symmetry``, off by default; ``"auto"``: on when
+    * **Symmetry** (``symmetry``, on by default; ``"auto"``: on when
       igraph is installed, ``pip install jaddle[symmetry]``; ``True``
       requires it).
       After coefficient tightening, the column symmetries of the MIP over
@@ -19457,7 +19739,7 @@ def solve(
       points better by more than ``mip_abs_gap``/``mip_rel_gap``, and the
       start is returned when none turns up (``"optimal"`` once the search
       proves there is none).
-    * **1-opt** (``one_opt``, off by default). Every new incumbent is
+    * **1-opt** (``one_opt``, on by default). Every new incumbent is
       passed to ``one_opt``: each integer with a nonzero cost moves in its
       improving direction as far as its bounds and the rows' slack allow,
       largest gains first, continuous variables fixed (source ``"1"``,
@@ -19470,9 +19752,9 @@ def solve(
       without changing the integer-feasible points; the search then runs on
       the tightened rows, and incumbents are still checked against the MIP
       as given.
-    * **Root cuts** (``cuts``, off by default). Up to ``cut_rounds`` rounds
-      (default 10; ``None``: 40 with Gomory cuts on, else 5) of
-      Gomory mixed-integer cuts (``gomory_cuts``, on by default; ``"auto"``
+    * **Root cuts** (``cuts``, on by default). Up to ``cut_rounds`` rounds
+      (default 50; ``None``: 40 with Gomory cuts on, else 5) of
+      Gomory mixed-integer cuts (``gomory_cuts``, off by default; ``"auto"``
       turns them on only for MIPs with at most 10,000 nonzeros, whose
       crossovers take milliseconds), knapsack
       cover cuts (``cover_cut``) and c-MIR cuts on single rows and on
@@ -19557,7 +19839,7 @@ def solve(
       vertex serves as the root's crossover. ``result["root_lp"]`` gives
       the ``solver``, the root LP's ``seconds`` and, of them,
       ``highs_seconds``.
-      With ``cut_round_lp="highs"`` (default ``"jaddle"``) the rounds re-solve
+      With ``cut_round_lp="highs"`` (the default; ``"jaddle"`` for PDHG) the rounds re-solve
       with HiGHS's dual simplex instead, warm from the last basis, with the
       cuts added and dropped as rows (``exact_cut_loop``): each round
       separates at an exact vertex, Gomory cuts come from its basis without
@@ -19585,6 +19867,18 @@ def solve(
       near-ties. At the LP point a round took 19 ms on beasleyC3 against
       127 ms batched in JAX and 390 ms in numpy, 91 ms on air05 against
       1.5 s in both, and 112 ms on dano3_3 against 0.84 s and 3.9 s.
+      The round's rows are spread over ``separation_threads`` threads
+      (default ``"auto"``: the CPUs, at most 16; ``1``: the calling thread
+      only), in chunks of about equal work: a row's cuts depend on no other
+      row, so the cuts are the same on any number. With the lifting of a
+      cover stopped once it cannot be violated (``_lift_cover``), a round
+      at the root LP point went from 3.1 s to 0.08 s on eil33-2, 3.9 s to
+      0.09 s on bab5 and 1.0 s to 0.08 s on air05 (16 threads; 0.7 s,
+      1.0 s and 0.6 s on one), with the same cuts. A c-MIR search tries at
+      most ``200,000 / k`` complementation flips on a row of ``k`` entries
+      (at least 16; rows of a few hundred entries try them all): on
+      rmine11, whose aggregates run to 2,800 entries with 1,500 fractional
+      integers, a round went from about 290 s on one thread to 3.5 s.
       Without numba, ``"auto"`` is ``"jax"``, batched separation:
       once a round has at least 32 base inequalities (rows and their
       aggregates), the c-MIR and flow cover searches run on all of them in
@@ -19746,7 +20040,7 @@ def solve(
       bounds differ from the root's (the others go to the right-hand side),
       kept only when that still excludes the node and has at most
       ``conflict_max_nnz`` variables (default ``max(25, n // 10)``), and the
-      pool's ``conflict_pool_size`` (2000) are propagated at every node
+      pool's ``conflict_pool_size`` (5000) are propagated at every node
       before its LP, alternating with the rows. A full pool drops the proof
       that has gone longest without tightening or closing a box
       (``result["conflict_evictions"]``: ``evicted``, and ``unused``, those
@@ -19765,7 +20059,7 @@ def solve(
       so it compiles once per shape and tree cut refreshes reuse it). The
       nodes are then evaluated in order on
       the host exactly as in the serial search. Members run in lockstep,
-      for at most ``batch_epochs`` (default 4) epochs a call. By default
+      for at most ``batch_epochs`` (default 2) epochs a call. By default
       (``node_max_epochs=None``) a node LP gets that one call and branches
       on its point (truncated node LPs; its Lagrangian bound holds at any
       duals, and its pseudocost gains use that bound when the LP did not
@@ -19775,12 +20069,12 @@ def solve(
       in all. On ns1830653 (GPU, batches of 8) the truncated LPs took the
       tree from 16 to 147 nodes a second, with a higher bound at 60 s.
       Worth it on a GPU; on a CPU the members run one after another. The
-      default, ``"auto"`` (``auto_batch_size``), gives 32 on a CPU and, on
+      default is ``1``, the serial search; ``"auto"`` (``auto_batch_size``) gives 32 on a CPU and, on
       a GPU or TPU, the largest power of two up to 128 whose batch fits in
       three quarters of the device's free memory, from the node LP's size
       (variables, rows and nonzeros, with the tree cut block) and whether
       the children kernels would run; 128 when the device reports no
-      memory. ``1``: the serial search. With ``pipeline_batches`` (default ``True``) the
+      memory. With ``pipeline_batches`` (default ``True``) the
       batches overlap: while the device solves one batch's LPs, the host
       evaluates the batch before (bounds, tree cuts, heuristics, branching),
       and its children are built on the device after the batch in flight,
@@ -19862,7 +20156,7 @@ def solve(
       infeasible children are dropped without an LP solve.
     * **Node selection** (``node_selection``): ``"hybrid"`` (default) dives
       depth first until the first incumbent, then takes the best bound with
-      plunges: after each best-bound node, up to ``plunge_depth`` (default 4) steps
+      plunges: after each best-bound node, up to ``plunge_depth`` (default 2) steps
       continue into its preferred child, so the search keeps reaching leaves
       (and new incumbents) while it raises the bound. A plunge also stops
       at a child whose bound is more than ``plunge_gap`` (default 0.25, as
@@ -19968,7 +20262,7 @@ def solve(
       history. A jump that ends near-feasible is handed to ``repair`` (a
       backtracking search with propagation over the variables around its
       violated rows), marked ``"R"``, for at most ``repair_share`` of the
-      heuristic time left. RINS (``rins_seconds``, default 10 s a call;
+      heuristic time left. RINS (``rins_seconds``, default 20 s a call;
       ``0``: off; ``None``: 5 s) runs once at the root and every
       ``rins_every`` nodes once there is an incumbent, and after each new
       incumbent from another source: the integers on which the incumbent
@@ -20006,7 +20300,7 @@ def solve(
       interior points cost it nothing. RINS and crossover take turns on the
       lane. Results: ``rins_calls``, ``rins_finds``, ``crossover_calls``,
       ``crossover_finds`` and ``submip_lane_seconds``.
-    * **Proximity search** (``proximity_seconds``, default 10 s a call;
+    * **Proximity search** (``proximity_seconds``, default 20 s a call;
       ``0``: off; needs ``submip_solver="highs"``), as Fischetti and
       Monaci's. HiGHS searches the whole base box with the objective as a
       row, ``c·x`` below the cutoff, for the point nearest the incumbent
@@ -20030,7 +20324,7 @@ def solve(
       RINS, proximity search and crossover start from an incumbent, so
       until there is one the lane runs, in turn, HiGHS's MIP solver on the
       whole root box stopped at its first point (``first_solution_seconds``,
-      default 0: off; each call twice as long as the last, as HiGHS starts
+      default 40; each call twice as long as the last, as HiGHS starts
       over; marked ``"W"``) and, with ``rens_seconds``, RENS around the
       latest node LP point (an integer within ``rins_tolerance`` of a whole
       number fixed there, at least 30% of them; marked ``"E"``). With the
@@ -20039,7 +20333,7 @@ def solve(
       while HiGHS on the whole MIP finds its first point, the optimum, at
       20 s. Results: ``first_solution_calls``, ``first_solution_finds``,
       ``rens_calls`` and ``rens_finds``.
-    * **Dual-guided fixing** (``dual_fix_seconds``, default 0: off; a
+    * **Dual-guided fixing** (``dual_fix_seconds``, default 20; a
       call's seconds; needs ``submip_solver="highs"``). The root LP's
       reduced costs ``r = c + Aᵀy`` rank the free integers of the root box:
       the share ``dual_fix_rate`` (default 0.7) with the largest ``|rⱼ|``
@@ -20116,7 +20410,7 @@ def solve(
       ``heuristic_effort``. Rounding up suits integers that count units
       for continuous variables (on buildingenergy the sizing variable's up
       child is where the good points are).
-    * **RENS** (``rens_seconds``, default 0: off; ``None`` gives 5s for
+    * **RENS** (``rens_seconds``, default 20; ``None`` gives 5s for
       MIPs with at most 10,000 nonzeros, else off). After the root heuristics,
       the integers that are integral at an exact root vertex (the cut
       loop's last crossover, else one crossed over for RENS when
@@ -20204,7 +20498,7 @@ def solve(
       the rest in batches (``_ExactLane``). Every node is screened first:
       its LP is solved on the device in its batch like any other. Once
       the heap is in bound order (after the first incumbent), a node whose
-      own LP leaves its bound within ``exact_band`` (default 0.25) of the
+      own LP leaves its bound within ``exact_band`` (default ``"auto"``) of the
       gap above the global bound (as of its batch) is not branched on its
       truncated PDHG point but promoted to the threads' queue, lowest
       first (two queued a thread), with that point. A thread crosses the
@@ -20287,7 +20581,7 @@ def solve(
       end). With 5,000, most sides ran to optimality and strong branching
       took 60-85% of the lane's time; on ns1830653 and 30n20b8 (60 s, CPU)
       ``"auto"`` gave 1.1-1.7 times the nodes. With
-      ``exact_strong_lookahead`` (default ``None``: off) the candidates
+      ``exact_strong_lookahead`` (default 4; ``None``: off) the candidates
       after that many in a row that did not beat the best gain product so
       far are not split, as SCIP's strong branching looks ahead (with 3,
       30n20b8 went from 14 to 10 sides a node, ns1830653 from 4.2 to 2.4).
@@ -20341,7 +20635,8 @@ def solve(
       LPs in the shifted, scaled residuals, each solved loosely by PDHG) on
       the LP at the search's precision, with ``lp_options`` and
       ``refinement_options`` (a dict of ``refine`` options such as
-      ``max_rounds`` or ``inner_tol``), within the time left. Refinement
+      ``max_rounds`` or ``inner_tol``), within the time left, and a node's
+      within ``node_refinement_seconds`` (2) as well. Refinement
       keeps the best point seen, so it never makes the point worse.
       ``root_refinement`` refines every root LP solve: the first and each
       cut round's re-solve. ``node_refinement`` refines every
@@ -20367,7 +20662,7 @@ def solve(
     only, over ``lp_options`` and ``node_lp_tolerance``: serial node solves,
     batched ones (``jaddle_linear.make_solver`` options only; others raise)
     and strong branching's child LPs. Node LPs solve to ``node_lp_tolerance``
-    (default 1e-3; ``None``: ``lp_tolerance``, by default 1e-4; at 1e-3 with
+    (default 1e-3; ``None``: ``lp_tolerance``, by default 1e-3; at 1e-3 with
     float32 node LPs, small MIPs can end ``"unresolved"``) and check
     convergence every 64 iterations (``node_lp_options=None`` means
     ``{"iterations_per_epoch": 64}`` unless ``lp_options`` sets it; ``{}``:
@@ -20564,6 +20859,7 @@ def solve(
         root_refinement=root_refinement,
         node_refinement=node_refinement,
         node_refinement_every=node_refinement_every,
+        node_refinement_seconds=node_refinement_seconds,
         refinement_options=refinement_options,
         node_precision=node_precision,
         jump_backend=jump_backend,
@@ -20597,6 +20893,7 @@ def solve(
         implied_integer_cuts=implied_integer_cuts,
         separation_backend=separation_backend,
         separation_device=separation_device,
+        separation_threads=separation_threads,
         node_bound_stop=node_bound_stop,
         dual_repair=dual_repair,
         node_lp_tolerance=node_lp_tolerance,

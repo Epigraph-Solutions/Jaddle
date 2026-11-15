@@ -26,6 +26,7 @@ import numpy as np
 
 COVER, MIR, FLOW = 0, 1, 2  # cut families, as ``separate`` reports them
 vb_tie = 1e-6  # ``jaddle_mip._VB_TIE``
+cmir_flip_work, cmir_min_flips = 200_000, 16  # ``jaddle_mip._CMIR_FLIP_WORK``
 
 
 # %%
@@ -137,20 +138,32 @@ def _knapsack(idx, a, b, x, lower, upper, is_binary, tol):
 
 @nb.njit(cache=True)
 def _lift_cover(cover, w, z, capacity):
-    """``jaddle_mip._lift_cover``: the lifted coefficients ``π``."""
+    """``jaddle_mip._lift_cover``: ``(violated, π)``; ``π`` is the lifted
+    coefficients when ``violated``."""
     rhs = cover.size - 1
     pi = np.zeros(w.size)
-    least = np.full(rhs + 1, np.inf)
-    least[0] = 0.0
     outside = np.ones(w.size, np.bool_)
     for item in cover:
         pi[item] = 1.0
         outside[item] = False
-        for v in range(rhs, 0, -1):  # downwards: each item once
-            least[v] = min(least[v], least[v - 1] + w[item])
+    # The cover alone reaches value v at least weight with its v lightest.
+    least = np.empty(rhs + 1)
+    least[0] = 0.0
+    lightest = np.sort(w[cover])
+    for v in range(rhs):
+        least[v + 1] = least[v] + lightest[v]
     slack = 1e-9 * (1.0 + abs(capacity))
     rest = np.flatnonzero(outside)
+    decided = False
     for item in rest[_stable_by_two(-z[rest], -w[rest])]:
+        if not decided and z[item] <= 0.0:
+            # Only items at zero are left: the violation is final.
+            decided = True
+            violation = -float(rhs)
+            for q in range(pi.size):
+                violation += pi[q] * z[q]
+            if violation <= 1e-6:
+                return False, pi
         room = capacity - w[item] + slack
         if room < 0:
             alpha = rhs
@@ -164,7 +177,7 @@ def _lift_cover(cover, w, z, capacity):
         pi[item] = alpha
         for v in range(rhs, alpha - 1, -1):
             least[v] = min(least[v], least[v - alpha] + w[item])
-    return pi
+    return True, pi
 
 
 @nb.njit(cache=True)
@@ -237,7 +250,9 @@ def cover_cuts(idx, a, b, x, lower, upper, is_binary, max_covers, tol):
             in_cover += z[item]
         if in_cover - rhs_z + rhs_z * (z_total - in_cover) <= 1e-6:
             continue
-        pi = _lift_cover(cover, w, z, capacity)
+        violated, pi = _lift_cover(cover, w, z, capacity)
+        if not violated:
+            continue
         violation = 0.0
         for q in range(pi.size):
             violation += pi[q] * z[q]
@@ -303,6 +318,42 @@ def _cmir_for(a, b, xv, lo, up, integer, use_upper, delta):
 
 
 @nb.njit(cache=True)
+def _cmir_efficacy(a, b, xv, lo, up, integer, use_upper, delta):
+    """``_cmir_for``'s ``(ok, efficacy)`` alone, without building the cut:
+    the same sums in the same order, so the same bits. The search tries a
+    cut per divisor and per flip, and builds only the one it keeps."""
+    k = a.size
+    beta = b
+    for p in range(k):
+        beta -= a[p] * (up[p] if use_upper[p] else lo[p])
+    beta /= delta
+    f = beta - math.floor(beta)
+    if f < 0.01 or f > 0.99:
+        return False, 0.0
+    squares = 0.0
+    rhs = math.floor(beta)
+    lhs = 0.0
+    for p in range(k):
+        sign = -1.0 if use_upper[p] else 1.0
+        at = a[p] * sign
+        if integer[p]:
+            g = at / delta
+            fj = g - math.floor(g)
+            c = (math.floor(g) + max(fj - f, 0.0) / (1.0 - f)) * sign
+        elif at < 0:
+            c = at / (delta * (1.0 - f)) * sign
+        else:
+            c = 0.0
+        squares += c * c
+        rhs += c * (up[p] if use_upper[p] else lo[p])
+        lhs += c * xv[p]
+    norm = math.sqrt(squares)
+    if norm == 0:
+        return False, 0.0
+    return True, (lhs - rhs) / norm
+
+
+@nb.njit(cache=True)
 def _cmir_core(a, b, xv, lo, up, integer, max_divisors):
     """``jaddle_mip._cmir_search`` over gathered entries: ``(ok, coef,
     rhs)`` with ``coef`` aligned with the entries."""
@@ -331,19 +382,19 @@ def _cmir_core(a, b, xv, lo, up, integer, max_divisors):
     divisors[-1] = 1.0
 
     found = False
-    best_eff, best_coef, best_rhs, best_delta = 0.0, np.empty(0), 0.0, 1.0
+    best_eff, best_delta = 0.0, 1.0
     for delta in divisors:
-        ok, eff, coef, rhs = _cmir_for(a, b, xv, lo, up, integer, use_upper, delta)
+        ok, eff = _cmir_efficacy(a, b, xv, lo, up, integer, use_upper, delta)
         if ok and (not found or eff > best_eff):
             found = True
-            best_eff, best_coef, best_rhs, best_delta = eff, coef, rhs, delta
+            best_eff, best_delta = eff, delta
     if not found:
         return False, np.empty(0), 0.0
     for scale in (2.0, 4.0, 8.0):
         delta = best_delta / scale
-        ok, eff, coef, rhs = _cmir_for(a, b, xv, lo, up, integer, use_upper, delta)
+        ok, eff = _cmir_efficacy(a, b, xv, lo, up, integer, use_upper, delta)
         if ok and eff > best_eff:
-            best_eff, best_coef, best_rhs, best_delta = eff, coef, rhs, delta
+            best_eff, best_delta = eff, delta
     # Complementation flips, for integers strictly inside finite bounds.
     inside = np.empty(k, np.bool_)
     distance = np.empty(k)
@@ -357,15 +408,19 @@ def _cmir_core(a, b, xv, lo, up, integer, max_divisors):
         )
         distance[p] = min(xv[p] - lo[p], up[p] - xv[p])
     which = np.flatnonzero(inside)
-    for j in which[np.argsort(-distance[which], kind="mergesort")]:
-        flipped = use_upper.copy()
-        flipped[j] = not flipped[j]
-        ok, eff, coef, rhs = _cmir_for(a, b, xv, lo, up, integer, flipped, best_delta)
+    flips = max(cmir_min_flips, cmir_flip_work // max(k, 1))
+    for j in which[np.argsort(-distance[which], kind="mergesort")][:flips]:
+        use_upper[j] = not use_upper[j]
+        ok, eff = _cmir_efficacy(a, b, xv, lo, up, integer, use_upper, best_delta)
         if ok and eff > best_eff + 1e-12:
-            best_eff, best_coef, best_rhs = eff, coef, rhs
-            use_upper = flipped
+            best_eff = eff
+        else:
+            use_upper[j] = not use_upper[j]
     if best_eff <= 1e-9:
         return False, np.empty(0), 0.0
+    ok, eff, best_coef, best_rhs = _cmir_for(
+        a, b, xv, lo, up, integer, use_upper, best_delta
+    )
     return True, best_coef, best_rhs
 
 
