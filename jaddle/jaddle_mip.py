@@ -77,7 +77,11 @@ class MIP:
     """
 
     def __init__(self, lp, integrality, offset=0.0, maximise=False, implied=None):
+        exact_c = None
         if isinstance(lp, LP):
+            # The objective at full width: the device LP may store it at
+            # float32, which moves a value of 1e5 by a few 1e-3.
+            exact_c = np.array(lp.c, dtype=np.float64)
             lp = jl.to_jaddle_sparse(lp)
         elif not isinstance(lp, JaddleLP):
             raise TypeError(f"lp must be an LP or JaddleLP, not {type(lp).__name__}")
@@ -118,7 +122,11 @@ class MIP:
 
         # Float64 host copies, for propagation, bounds and feasibility checks.
         host = lp.to_scipy()
-        self.c = np.asarray(host.c, dtype=np.float64)
+        self.c = (
+            exact_c
+            if exact_c is not None and exact_c.shape == host.c.shape
+            else np.asarray(host.c, dtype=np.float64)
+        )
         self.n_eq = host.A_eq.shape[0]
         self.A = sp.vstack([host.A_eq, host.A_ineq], format="csr")
         self.A.eliminate_zeros()
@@ -10528,6 +10536,7 @@ class _BranchAndBound:
         )
         # The root's Lagrangian terms, for reduced-cost fixing of the root box
         # when the incumbent improves, and the incumbent last used for it.
+        self.early_terms = None  # the first root LP's duals, before the cut rounds
         self.root_terms = None
         self.root_terms_rigorous = False
         self.root_fixed_at = None
@@ -15771,16 +15780,13 @@ class _BranchAndBound:
         rigorous. ``None`` when ``seconds`` is not positive, there are no
         root duals, fewer than ``_DUAL_FIX_MIN_FIXED`` of the free integers
         would be fixed, or the box was searched at this cutoff."""
-        if (
-            seconds <= 0
-            or self.root_terms is None
-            or getattr(self, "root_lower", None) is None
-        ):
+        terms = self.root_terms if self.root_terms is not None else self.early_terms
+        if seconds <= 0 or terms is None or getattr(self, "root_lower", None) is None:
             return None
         ints = self.is_int
         lower = self.lp_lower(self.root_lower)
         upper = self.lp_upper(self.root_upper)
-        r = np.asarray(self.root_terms[1], np.float64)
+        r = np.asarray(terms[1], np.float64)
         if r.shape != lower.shape:
             return None
         zero = max(
@@ -15984,7 +15990,9 @@ class _BranchAndBound:
             if box is not None and self.submit_rens(box):
                 return
         if self.incumbent is None:
-            if getattr(self, "root_lower", None) is not None:
+            # Not before the root is done: a whole-MIP job holds the lane for
+            # its seconds, and the jump's first point lands within them.
+            if getattr(self, "root_lower", None) is not None and self.tree_started:
                 self.feed_first_solution()
             return
         order = ("rins", "proximity", "crossover", "dualfix")
@@ -19147,6 +19155,22 @@ class _BranchAndBound:
             # With ``parallel_heuristics`` they run beside the rounds.
             if not self.background_root_heuristics(lower, upper, result):
                 self.root_heuristics(lower, upper, result, improve=False)
+        if cut_loop_due and self.dual_fix_seconds and not self.out_of_time():
+            # The sub-MIP lane is idle through the cut rounds: dual-guided
+            # fixing needs only these duals (not rigorous ones), and the
+            # lane starts it as soon as there is an incumbent.
+            self.early_terms = self.dual_terms(result["solution"])
+            self.collect_submip()
+            lane = self.submip_lane
+            if (
+                lane is not None
+                and not lane.busy()
+                and self.incumbent is not None
+                and self.dual_fix()
+            ):
+                self.submip_last = "dualfix"
+            else:
+                self.feed_submip()
         if cut_loop_due and not self.out_of_time():
             result = self.cut_loop(lower, upper, result)
             if result["stop_reason"] != "interrupted" and self.root_closed():

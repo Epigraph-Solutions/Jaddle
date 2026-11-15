@@ -161,24 +161,24 @@ def run_jaddle(path, args):
         # lp_tolerance=1e-4,
         # root_refinement=1e-6,
         cut_round_lp="highs",
-        # All rounding heuristics.
-        heuristic_every=10,  # plain rounding of node LP points ("H")
-        round_repair=True,  # round and repair, at the root and in the tree ("U")
-        fix_and_propagate=True,
-        bulk_rounding=True,
-        batch_roundings=True,
-        tree_heuristics=True,
-        tree_heuristic_every=10,
-        parallel_rounding=True,
-        near_integral_tolerance=1e-1,
-        # The other primal heuristics that are off by default.
-        dive_every=10,
-        gpu_dive_every=10,
-        feasibility_pump=True,
-        root_crossover=True,
-        node_crossover=True,
-        projected_pdhg=True,
-        block_decomposition=True,
+        # # All rounding heuristics.
+        # heuristic_every=10,  # plain rounding of node LP points ("H")
+        # round_repair=True,  # round and repair, at the root and in the tree ("U")
+        # fix_and_propagate=True,
+        # bulk_rounding=True,
+        # batch_roundings=True,
+        # tree_heuristics=True,
+        # tree_heuristic_every=10,
+        # parallel_rounding=True,
+        # near_integral_tolerance=1e-1,
+        # # The other primal heuristics that are off by default.
+        # dive_every=10,
+        # gpu_dive_every=10,
+        # feasibility_pump=True,
+        # root_crossover=True,
+        # node_crossover=True,
+        # projected_pdhg=True,
+        # block_decomposition=True,
     )
     row.update(
         {
