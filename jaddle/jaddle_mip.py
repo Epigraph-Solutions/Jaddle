@@ -1984,8 +1984,23 @@ class DualRepair:
         return y if changed else None
 
 
+# ``lp_support_empty``: an integer this near a whole number is fixed there.
+_SUPPORT_TOL = 1e-2
+
 # ``DualPolish``: the passes over the rows a node's duals get.
 _DUAL_POLISH_SWEEPS = 3
+# Its sign repair (``dual_sign_fix``): the passes on the total shortfall;
+# those on its square a call, and the most on its square in all;
+# and the margin past zero a reduced cost is taken to, relative to
+# 1 + |cⱼ|.
+_SIGN_FIX_SWEEPS = 10
+_SIGN_FIX_CHUNK = 10
+_SIGN_FIX_SQUARE_SWEEPS = 1000
+_SIGN_FIX_MARGIN = 1e-7
+# The seconds the sign repair may take for a node's duals, and for the
+# root LP's (once before the cut rounds, once after them).
+_SIGN_FIX_SECONDS = 0.25
+_SIGN_FIX_ROOT_SECONDS = 30.0
 # A child's, from its parent's duals over its own box (``polish_child``);
 # and that goes on past this many tries only while this share of them
 # close their child (``child_polish_due``).
@@ -2010,9 +2025,14 @@ class DualPolish:
     where the slope changes sign. Each pass does that for every row in
     turn. It raises and lowers inequality duals (within ``y >= 0``), moves
     equality duals, counts integer columns, and moves a reduced cost off
-    an infinite bound it points at when one row can (a bound that was
-    ``-inf`` or not rigorous can come back rigorous): ``DualRepair`` does
-    none of these.
+    an infinite bound it points at when one row can: ``DualRepair`` does
+    none of these. Before it, the reduced costs that point at an infinite
+    bound are all moved off it together (``dual_sign_fix``), so a bound
+    that was ``-inf`` or not rigorous comes back rigorous: on
+    buildingenergy (every column without an upper bound) a root solve
+    left 19,015 such reduced costs, the ascent alone 1,355, and the sign
+    repair none, in under a second, for a rigorous 32,617.5 where the
+    tolerance's 32,619.9 was not (the LP's optimum: 33,246.2).
 
     Any duals give a valid bound, so the caller keeps the higher of the
     two and the polish cannot cost rigour.
@@ -2026,26 +2046,67 @@ class DualPolish:
         self.ptr = A.indptr.astype(np.int64)
         self.idx = A.indices.astype(np.int64)
         self.val = _f64(A.data)
+        # The rows of each column, for the sign repair's narrow passes.
+        by_column = A.tocsc()
+        self.cptr = by_column.indptr.astype(np.int64)
+        self.cidx = by_column.indices.astype(np.int64)
         self.b = _f64(mip.b)
         self.c = _f64(mip.c)
         self.is_int = np.asarray(is_int, bool)
         self.sweeps = int(sweeps)
+        # How far past zero ``dual_sign_fix`` takes a reduced cost.
+        self.margin = _SIGN_FIX_MARGIN * (1.0 + np.abs(self.c))
 
     def __bool__(self):
         return self.kernel is not None and self.m > 0 and self.sweeps > 0
 
-    def __call__(self, y, lower, upper, target=np.inf, sweeps=None):
+    def sign_fix(self, y, lower, upper, sweeps):
+        """``dual_sign_fix`` from ``y``: ``sweeps`` passes on the total
+        shortfall, then ``_SIGN_FIX_CHUNK`` on its square. Returns
+        ``(y, wrong)``."""
+        return self.kernel.dual_sign_fix(
+            self.c, self.ptr, self.idx, self.val, self.cptr, self.cidx,
+            self.n_eq, _f64(y), _f64(lower), _f64(upper), self.margin, sweeps,
+            _SIGN_FIX_CHUNK, _SIGN_FIX_CHUNK,
+        )
+
+    def __call__(
+        self, y, lower, upper, target=np.inf, sweeps=None,
+        sign_seconds=_SIGN_FIX_SECONDS,
+    ):
         """Polished duals for ``y`` (Jaddle's convention), or ``None`` when
-        no row moves. ``target``: a bound that is high enough to stop at."""
+        no row moves. ``target``: a bound that is high enough to stop at.
+        ``sign_seconds``: how long the sign repair may go on for (it runs
+        ``_SIGN_FIX_CHUNK`` squared passes at least)."""
         y = _f64(y)
         if y.shape[0] != self.m or not np.all(np.isfinite(y)):
             return None
+        lower, upper = _f64(lower), _f64(upper)
+        # Reduced costs that point at an infinite bound first (the bound is
+        # ``-inf``, or not rigorous when they are dropped): moved off it
+        # for all the columns at once (``dual_sign_fix``), where the
+        # ascent's own steps, one row each, leave some. Then the ascent,
+        # which keeps every sign it is given.
+        # Its last few hundred columns, each short by less than 1e-6, take
+        # a few hundred passes (10 s on buildingenergy's 268,000 rows), so
+        # it runs in chunks within ``sign_seconds``. Stopped short, what it
+        # reached is still the ascent's start: the ascent's own steps
+        # often clear the few left.
+        deadline = time.perf_counter() + sign_seconds
+        fixed, wrong = self.sign_fix(y, lower, upper, _SIGN_FIX_SWEEPS)
+        passes = _SIGN_FIX_CHUNK
+        while wrong and passes < _SIGN_FIX_SQUARE_SWEEPS and time.perf_counter() < deadline:
+            fixed, wrong = self.sign_fix(fixed, lower, upper, 0)
+            passes += _SIGN_FIX_CHUNK
+        moved = not np.array_equal(fixed, y)
+        if moved:
+            y = fixed
         y, moves = self.kernel.dual_ascent(
             self.c, self.ptr, self.idx, self.val, self.b, self.n_eq, y,
-            _f64(lower), _f64(upper), self.is_int,
+            lower, upper, self.is_int,
             self.sweeps if sweeps is None else int(sweeps), float(target),
         )
-        return y if moves else None
+        return y if moves or moved else None
 
 
 def reduced_cost_tightening(r, bound, cutoff, lower, upper, integrality):
@@ -7904,6 +7965,7 @@ class _Node:
         "estimate",
         "conflict_stamp",
         "lean_basis",
+        "lean_rows",
         "lean_timeouts",
     )
 
@@ -7973,6 +8035,8 @@ class _Node:
         # The HiGHS basis its LP starts from in the lean tree
         # (``tree="lean"``): its parent's, or its strong side's.
         self.lean_basis = None
+        # The rows ``lean_basis`` was made for (``lean_cuts`` adds rows).
+        self.lean_rows = None
         # Times its lean LP hit its time limit (each retry's limit is 4x).
         self.lean_timeouts = 0
 
@@ -9715,6 +9779,8 @@ class _BranchAndBound:
         dual_polish=True,
         dual_polish_sweeps=_DUAL_POLISH_SWEEPS,
         dual_polish_children=True,
+        support_gate=True,
+        support_gate_dives=True,
         node_lp_tolerance=None,
         heuristic_effort=0.1,
         reliability_threshold=4,
@@ -9835,6 +9901,7 @@ class _BranchAndBound:
         root_lp="jaddle",
         tree="jaddle",
         lean_threads="auto",
+        lean_cuts=False,
         primal_target=None,
         interrupt=None,
     ):
@@ -9995,6 +10062,10 @@ class _BranchAndBound:
         if lean_threads != "auto" and int(lean_threads) < 1:
             raise ValueError(f"lean_threads must be 'auto' or >= 1, not {lean_threads!r}")
         self.lean_threads = lean_threads
+        # Tree cuts in the lean tree (``_lean_cut_round``), and the node
+        # points its next round separates at (``None``: no more rounds).
+        self.lean_cuts = bool(lean_cuts)
+        self.lean_cut_points = None
         # The lean tree's nodes taken by its workers (``_lean_tree``), held
         # in ``open_nodes`` so the global bound counts them.
         self.lean_active = {}
@@ -10256,6 +10327,16 @@ class _BranchAndBound:
         self.child_polish = bool(dual_polish_children) and self.dual_polish_sweeps > 0
         self.child_polish_sweeps = min(self.dual_polish_sweeps, _CHILD_POLISH_SWEEPS)
         self.polished_duals = None
+        # Roundings of an LP point skipped when propagation shows they hold
+        # no solution (``lp_support_empty``, ``support_gate``).
+        self.use_support_gate = bool(support_gate)
+        self.support_gate_stats = collections.Counter(
+            tested=0, empty=0, rens_tested=0, rens_empty=0, dives_skipped=0,
+            seconds=0.0,
+        )
+        # Dives from a point the gate reports are skipped too.
+        self.gate_dives = self.use_support_gate and bool(support_gate_dives)
+        self.support_gate_reported = False
         self.use_tree_cuts = bool(tree_cuts)
         self.tree_cut_every = tree_cut_every
         if int(tree_pool_every) < 0:
@@ -11577,11 +11658,29 @@ class _BranchAndBound:
         self.bound_seconds += time.perf_counter() - started
         return bound
 
-    def lp_bound(self, solution, lower, upper):
-        """The Lagrangian bound of a node's duals over its propagated box."""
-        return self.bound_over(self.dual_terms(solution), lower, upper)
+    def lp_bound(self, solution, lower, upper, result=None, thorough=False):
+        """The Lagrangian bound of a node's duals over its propagated box.
+        With ``result`` (the device LP result ``solution`` is from), the
+        duals are repaired and polished first when that bounds the box
+        higher (``repair_terms``), as a tree node's are: a root or cut
+        round LP's duals, refined or not, can leave a reduced cost
+        pointing at an infinite bound (the bound is then ``-inf``, or not
+        rigorous when it is within the tolerance and dropped), which the
+        polish moves off it. ``thorough``: with the root's time for that
+        (``_SIGN_FIX_ROOT_SECONDS``) instead of a node's."""
+        terms = self.dual_terms(solution)
+        raw, rigorous = self.bound_over(terms, lower, upper)
+        if result is not None:
+            _, raw, rigorous = self.repair_terms(
+                result, terms, raw, rigorous, lower, upper,
+                sign_seconds=_SIGN_FIX_ROOT_SECONDS if thorough else _SIGN_FIX_SECONDS,
+            )
+        return raw, rigorous
 
-    def repair_terms(self, result, terms, raw, rigorous, lower, upper):
+    def repair_terms(
+        self, result, terms, raw, rigorous, lower, upper,
+        sign_seconds=_SIGN_FIX_SECONDS,
+    ):
         """A device LP's ``(terms, raw, rigorous)`` with its duals repaired
         (``DualRepair``, ``dual_repair``) and then polished (``DualPolish``,
         ``dual_polish``) when that bounds the box higher; as given
@@ -11620,7 +11719,8 @@ class _BranchAndBound:
             started = time.perf_counter()
             target = self.node_bound_target()
             polished = polisher(
-                y, lower, upper, np.inf if target is None else target
+                y, lower, upper, np.inf if target is None else target,
+                sign_seconds=sign_seconds,
             )
             stats = self.dual_polish_stats
             stats["tried"] += 1
@@ -11632,10 +11732,13 @@ class _BranchAndBound:
                     A_T=self.A_T,
                 )
                 new_raw, new_rigorous = self.bound_over(new_terms, lower, upper)
-                if new_raw > raw and (new_rigorous or not rigorous):
+                # A rigorous bound wins over one that dropped reduced costs
+                # (which can overshoot the LP's optimum), as a crossover's.
+                exact = new_rigorous and not rigorous and np.isfinite(new_raw)
+                if exact or (new_raw > raw and (new_rigorous or not rigorous)):
                     stats["improved"] += 1
                     stats["made_rigorous"] += bool(new_rigorous and not rigorous)
-                    if np.isfinite(raw):
+                    if np.isfinite(raw) and new_raw > raw:
                         stats["gain"] += float(new_raw - raw)
                     stats["closed"] += bool(
                         self.round_bound(new_raw) >= self.cutoff()
@@ -14190,6 +14293,7 @@ class _BranchAndBound:
             "reduced_cost_tightenings": self.reduced_cost_tightenings,
             "dual_repairs": dict(self.dual_repair_stats),
             "dual_polish": dict(self.dual_polish_stats),
+            "support_gate": dict(self.support_gate_stats),
             "children_pruned": self.children_pruned,
             "lp_repairs": self.lp_repairs,
             "lp_repairs_skipped": self.lp_repairs_skipped,
@@ -14658,7 +14762,7 @@ class _BranchAndBound:
         separators = [self.separator(base, lower, upper)]
         if self.original is not base:
             separators.append(self.separator(self.original, lower, upper))
-        bound, _ = self.lp_bound(result["solution"], lower, upper)
+        bound, _ = self.lp_bound(result["solution"], lower, upper, result)
         self.root_bound_before_cuts = bound
         history = [bound]  # the best bound after each round
         times = [time.time()]  # and when it ended
@@ -14769,7 +14873,7 @@ class _BranchAndBound:
             if result["stop_reason"] in ("interrupted", "time_limit", "bound_target"):
                 return result
             self.age_cuts(result["solution"])
-            new_bound, new_rigorous = self.lp_bound(result["solution"], lower, upper)
+            new_bound, new_rigorous = self.lp_bound(result["solution"], lower, upper, result)
             self.raise_root_proven(new_bound, new_rigorous)
             bound = max(bound, new_bound)
             history.append(bound)
@@ -14888,7 +14992,7 @@ class _BranchAndBound:
         separators = [self.separator(base, lower, upper)]
         if self.original is not base:
             separators.append(self.separator(self.original, lower, upper))
-        bound, _ = self.lp_bound(result["solution"], lower, upper)
+        bound, _ = self.lp_bound(result["solution"], lower, upper, result)
         self.root_bound_before_cuts = bound
         history = [solved[3]]
         times = [time.time()]
@@ -17140,6 +17244,56 @@ class _BranchAndBound:
             search.root_warm = {"solution": solution, "opt_state": None}
         return search.run()["x"]
 
+    def lp_support_empty(self, x, lower, upper):
+        """
+        Whether no solution agrees with the LP point ``x`` on its integral
+        columns (``support_gate``): every integer within ``_SUPPORT_TOL``
+        of a whole number fixed there, the others left between the whole
+        numbers either side, and bound propagation shows the rows cannot
+        hold (with the objective row at the cutoff once there is an
+        incumbent: no better solution).
+
+        Then every solution needs columns the LP does not use, and a
+        search that keeps to the LP's columns (RENS, a dive that follows
+        the LP) has nothing to find: on rail02 the box is empty even at
+        1e-5, and a dive and three sub-MIPs around the LP point found
+        nothing in minutes. It is a proof one way only: a box not shown
+        empty may still hold nothing.
+
+        It is reported (``support_gate`` in the result, and a line in the
+        log), and RENS's own neighbourhood gets the same test before its
+        sub-MIP (``rens``). It does not skip fix-and-propagate or bulk
+        rounding, which let propagation move a column off the LP's value:
+        of 23 small models the box was empty on 4, and on one of those
+        (sp150x300d) fix-and-propagate still found a point. LP dives from
+        such a point are skipped as a guess (``dive``,
+        ``support_gate_dives``).
+        """
+        if not self.use_support_gate:
+            return False
+        started = time.time()
+        stats = self.support_gate_stats
+        stats["tested"] += 1
+        x = np.asarray(x, np.float64)
+        ints = self.is_int
+        near = np.round(x)
+        fixed = ints & (np.abs(x - near) <= _SUPPORT_TOL)
+        lo = np.where(fixed, near, np.where(ints, np.floor(x), lower))
+        up = np.where(fixed, near, np.where(ints, np.ceil(x), upper))
+        lo, up = np.maximum(lo, lower), np.minimum(up, upper)
+        empty = bool(np.any(lo > up))
+        if not empty:
+            empty = bool(self.heuristic_propagator()(lo, up)[2])
+        stats["empty"] += empty
+        stats["seconds"] += time.time() - started
+        if empty and self.verbose and not self.support_gate_reported:
+            self.support_gate_reported = True
+            print(
+                "No solution agrees with an LP point on its integral columns: "
+                "every solution needs columns that LP leaves at a whole number"
+            )
+        return empty
+
     def rens(self, x, lower, upper, warm, min_fixed=0.5):
         """
         RENS (relaxation enforced neighbourhood search) from the root LP
@@ -17153,6 +17307,12 @@ class _BranchAndBound:
         box = self.rens_box(x, lower, upper, min_fixed, self.int_tol)
         if box is None:
             return
+        if self.use_support_gate:
+            # Its neighbourhood shown empty by propagation: no sub-MIP.
+            self.support_gate_stats["rens_tested"] += 1
+            if self.heuristic_propagator()(box[0].copy(), box[1].copy())[2]:
+                self.support_gate_stats["rens_empty"] += 1
+                return
         if self.submip_lane is not None:
             # HiGHS searches it on the lane (``submit_rens``), now or once
             # the lane is free, while the root goes on.
@@ -17322,7 +17482,17 @@ class _BranchAndBound:
         incumbent, the variable closest to it first) or ``"pseudocost"``
         (the cheaper direction by pseudocost); ``None`` rotates through
         them. It stops at ``deadline`` (``None``: ``dive_seconds`` from now).
+
+        Skipped (``support_gate_dives``) when no solution agrees with ``x``
+        on its integral columns (``lp_support_empty``). That is a guess,
+        not a proof: each step re-solves the LP, so a dive can move a
+        column the first point had at a whole number. But it starts from
+        those columns and spends an LP a step, where fix-and-propagate,
+        which the gate leaves alone, spends a propagation.
         """
+        if self.gate_dives and self.lp_support_empty(x, lower, upper):
+            self.support_gate_stats["dives_skipped"] += 1
+            return
         started = time.time()
         if deadline is None:
             deadline = started + self.dive_seconds()
@@ -17932,6 +18102,9 @@ class _BranchAndBound:
         deadline = started + max(0.0, budget - self.root_heuristic_used)
         warm = (result["solution"], result["opt_state"])
         x = np.asarray(result["solution"].primal, np.float64)
+        # Whether the LP's near-integral columns can hold a solution at
+        # all (``lp_support_empty``): reported, not acted on here.
+        self.lp_support_empty(x, lower, upper)
         if self.use_fix_and_propagate:
             candidate = fix_and_propagate(
                 x, lower, upper, self.is_int, self.heuristic_propagator()
@@ -19756,7 +19929,9 @@ class _BranchAndBound:
         # The root LP's bound holds for the root box whatever its duals, so
         # it is the global bound from now (the first incumbent's line, and
         # the heartbeat's through the cut rounds, showed -inf before).
-        raw, rigorous = self.lp_bound(result["solution"], lower, upper)
+        raw, rigorous = self.lp_bound(
+            result["solution"], lower, upper, result, thorough=True
+        )
         self.active_bound = max(self.active_bound, self.round_bound(raw))
         self.raise_root_proven(raw, rigorous)
         if self.root_crossover is True and not rigorous and not self.out_of_time():
@@ -19789,7 +19964,7 @@ class _BranchAndBound:
             # background improving jump works beside them. Without this,
             # rmine13's first incumbent came only after its cut loop.
             self.active_bound = self.round_bound(
-                self.lp_bound(result["solution"], lower, upper)[0]
+                self.lp_bound(result["solution"], lower, upper, result)[0]
             )
             # With ``parallel_heuristics`` they run beside the rounds.
             if not self.background_root_heuristics(lower, upper, result):
@@ -19835,14 +20010,16 @@ class _BranchAndBound:
             result = self.reserve_tree_cuts(result)
             lp = self.node_lp(lower, upper)
         if result["stop_reason"] == "time_limit" or self.out_of_time():
-            bound, rigorous = self.lp_bound(result["solution"], lower, upper)
+            bound, rigorous = self.lp_bound(result["solution"], lower, upper, result)
             self.raise_root_proven(bound, rigorous)
             self.close(bound, rigorous, proven=self.active_proven)
             return self.result("time_limit")
         # Every round's bound holds for the root box (the cuts are valid,
         # and propagation only narrows the box), so keep the rounds' best:
         # the last re-solve's can be lower.
-        raw, rigorous = self.lp_bound(result["solution"], lower, upper)
+        raw, rigorous = self.lp_bound(
+            result["solution"], lower, upper, result, thorough=True
+        )
         self.active_bound = max(self.active_bound, self.round_bound(raw))
         self.raise_root_proven(raw, rigorous)
         rounds_bound = self.active_bound
@@ -20134,8 +20311,9 @@ class _BranchAndBound:
         than ``reliability_threshold`` observations a side, each side for
         ``lean_iteration_cap`` pivots); a strong side whose bound reaches
         the cutoff fixes its variable for both children. Children are
-        not propagated (``_LEAN_PROPAGATE``). There are no device LPs, tree cuts,
-        conflicts or restarts; the sub-MIP lane and the background
+        not propagated (``_LEAN_PROPAGATE``). There are no device LPs,
+        conflicts or restarts, and tree cuts only with ``lean_cuts``
+        (``_lean_cut_round``); the sub-MIP lane and the background
         heuristics run as in the tree.
 
         ``lean_threads="auto"`` starts on one thread and sizes the pool
@@ -20161,9 +20339,18 @@ class _BranchAndBound:
         self.lean_stats = stats = dict(
             threads=threads, nodes=0, lps=0, lp_seconds=0.0, pivots=0,
             strong_lps=0, strong_seconds=0.0, infeasible=0, failed=0,
-            fixings=0, seconds=0.0,
+            fixings=0, seconds=0.0, cut_rounds=0, cuts=0,
         )
         pc_sum, pc_count = self.exact_pc_sum, self.exact_pc_count
+        # Tree cuts (``lean_cuts``): the rows they may add, over the root's.
+        root_rows = len(self.cut_list)
+        if self.tree_cut_rows is None:
+            cut_rows = max(_TREE_CUT_MIN_ROWS, 2 * self.max_tree_cuts_per_round, root_rows)
+        else:
+            cut_rows = self.tree_cut_rows
+        cutting = self.lean_cuts and self.use_tree_cuts and bool(self.tree_cut_every)
+        self.lean_cut_points = [] if cutting else None
+        self.last_refresh_nodes = self.nodes
         state = {"busy": 0, "error": None}
 
         def take():
@@ -20185,14 +20372,20 @@ class _BranchAndBound:
 
         def worker():
             try:
-                highs = _highs_rows(mip)
+                # The rows its ``highs`` holds: the searched ones as it
+                # last saw them (``lean_cuts`` appends to them).
+                with lock:
+                    rows = {"mip": self.mip, "A_T": self.A_T}
+                highs = _highs_rows(rows["mip"])
                 cols = np.arange(n, dtype=np.int32)
                 while True:
                     node = take()
                     if node is None:
                         return
                     try:
-                        self._lean_node(highs, cols, node, lock, pc_sum, pc_count)
+                        if self.mip is not rows["mip"]:
+                            self._lean_add_rows(highs, rows, lock)
+                        self._lean_node(highs, cols, rows, node, lock, pc_sum, pc_count)
                     finally:
                         with lock:
                             self.lean_active.pop(id(node), None)
@@ -20254,6 +20447,8 @@ class _BranchAndBound:
                         emptied = True
                         stop.set()
                     self.log(" ", None)
+                if self.lean_cut_points is not None and not stop.is_set():
+                    self._lean_cut_round(lock, root_rows + cut_rows)
                 stop.wait(0.05)
         except KeyboardInterrupt:
             status = "interrupted"
@@ -20261,6 +20456,7 @@ class _BranchAndBound:
             stop.set()
             for thread in pool:
                 thread.join()
+            self.lean_cut_points = None
             if emptied:
                 self.close_all()  # children the workers made after it
             stats["seconds"] = time.time() - started
@@ -20272,14 +20468,146 @@ class _BranchAndBound:
             status = "time_limit"
         return status
 
-    def _lean_node(self, highs, cols, node, lock, pc_sum, pc_count):
+    def _lean_add_rows(self, highs, rows, lock):
+        """Append the searched rows a worker's ``highs`` lacks (the tree
+        cuts added since its last node, ``_lean_cut_round``) and move
+        ``rows`` (its ``mip`` and ``A_T``) on to them. Cuts are only ever
+        appended, so the rows it holds keep their places."""
+        with lock:
+            mip, A_T = self.mip, self.A_T
+        old = rows["mip"].A.shape[0]
+        A = sp.csr_matrix(mip.A[old:], dtype=np.float64, copy=True)
+        A.eliminate_zeros()
+        A.sort_indices()
+        b = np.asarray(mip.b, np.float64)[old:]
+        highs.addRows(
+            A.shape[0], np.full(b.size, -np.inf), b, A.nnz,
+            A.indptr[:-1].astype(np.int32), A.indices.astype(np.int32), A.data,
+        )
+        rows["mip"], rows["A_T"] = mip, A_T
+
+    def _lean_cut_round(self, lock, max_rows):
+        """A tree cut round of the lean tree (``lean_cuts``), on its main
+        thread: due every ``tree_cut_every`` nodes, within
+        ``tree_cut_share`` of the tree's time (after its first seconds).
+        Candidates are the pooled cuts that the vertices of the
+        ``tree_cut_points`` lowest-bound nodes solved since the last round
+        violate, and the cuts separated at them (``separate_at``: over the
+        root box, so each holds at every node); the most efficacious, none
+        a near-duplicate of a cut in the LP or of another, at most
+        ``max_tree_cuts_per_round``, are appended to ``cut_list`` and the
+        searched rows. Each worker adds them to its HiGHS model before its
+        next node (``_lean_add_rows``); a node on the way keeps the rows it
+        started with, a relaxation of the new ones. Cuts are never taken
+        out (a row's place is what the queued nodes' bases go by): at
+        ``max_rows`` cuts the rounds end. The separation runs outside
+        ``lock``."""
+        with lock:
+            if (
+                self.nodes - self.last_refresh_nodes < self.tree_cut_every
+                or self.out_of_time()
+            ):
+                return
+            self.last_refresh_nodes = self.nodes
+            room = max_rows - len(self.cut_list)
+            if room <= 0:
+                self.lean_cut_points = None
+                return
+            tree = self.tree_elapsed()
+            if (
+                tree > _TREE_CUT_GRACE_SECONDS
+                and self.tree_cut_seconds > self.tree_cut_share * tree
+            ):
+                self.tree_cut_skipped += 1
+                return
+            taken = sorted(self.lean_cut_points, key=lambda point: point[0])
+            del self.lean_cut_points[:]
+            points = [x for _, x in taken[: self.tree_cut_points]]
+            if not points:
+                return
+            mip, base = self.mip, self.base
+            cut_list = list(self.cut_list)
+            lower, upper = self.root_lower.copy(), self.root_upper.copy()
+        started = time.time()
+        n = base.num_variables
+        held = {cut.get("key") or _cut_key(_as_cut(cut)) for cut in cut_list}
+        best = {}  # key -> (efficacy, cut)
+        pooled = set()
+        with self._shared_lock:
+            for key, efficacy, cut in self.cut_pool.best_violated(points, held):
+                if 0 < cut[1].size <= self.tree_cut_max_nnz:
+                    pooled.add(key)
+                    best[key] = (efficacy, cut)
+        separated = []  # every violated candidate, for the pool
+        for x in points:
+            if self.out_of_time():
+                break
+            selected, violated = self.separate_at(x, mip, lower, upper)
+            separated += violated
+            for cut in selected:
+                _, idx, coef, rhs = cut
+                if idx.size == 0:
+                    continue
+                efficacy = (coef @ x[idx] - rhs) / max(np.linalg.norm(coef), 1e-12)
+                key = _cut_key(cut)
+                if efficacy < _CUT_POOL_MIN_EFFICACY or key in held:
+                    continue
+                if key not in best or efficacy > best[key][0]:
+                    best[key] = (efficacy, cut)
+        self.pool_cuts(separated)
+        ranked = sorted(best.items(), key=lambda item: -item[1][0])
+        found = []
+        if ranked:
+
+            def unit_rows(cuts):
+                lengths = np.array([cut[1].size for cut in cuts])
+                at = np.repeat(np.arange(len(cuts)), lengths)
+                cols = np.concatenate([np.asarray(cut[1], np.int64) for cut in cuts])
+                vals = np.concatenate([np.asarray(cut[2], np.float64) for cut in cuts])
+                norm = np.maximum(
+                    np.sqrt(np.bincount(at, vals * vals, minlength=len(cuts))), 1e-12
+                )
+                return sp.csr_matrix((vals / norm[at], (at, cols)), shape=(len(cuts), n))
+
+            taken = _spread_out(
+                unit_rows([cut for _, (_, cut) in ranked]),
+                np.arange(len(ranked)),
+                min(self.max_tree_cuts_per_round, room),
+                held=unit_rows([_as_cut(cut) for cut in cut_list]) if cut_list else None,
+            )
+            found = [(ranked[i][0], ranked[i][1][1]) for i in taken]
+        with lock:
+            stats = self.lean_stats
+            stats["cut_rounds"] += 1
+            self.tree_cut_refreshes += 1
+            if found and base is self.base:
+                cuts = [cut for _, cut in found]
+                self.pool_cuts(cuts)
+                self.archive_cuts(cuts)
+                for key, (family, idx, coef, rhs) in found:
+                    self.cut_list.append(
+                        dict(family=family, idx=idx, coef=coef, rhs=rhs, age=0, key=key)
+                    )
+                self.cut_version += 1
+                self.tree_cuts_added += len(found)
+                self.tree_cut_pool_hits += sum(key in pooled for key, _ in found)
+                self.tree_cut_families.update(cut[0] for cut in cuts)
+                stats["cuts"] += len(found)
+                # The LP's rows only: the propagators keep theirs.
+                self.set_mip(self.lean_mip(), rows_only=True)
+            self.tree_cut_seconds += time.time() - started
+
+    def _lean_node(self, highs, cols, rows, node, lock, pc_sum, pc_count):
         """One node of the lean tree (``_lean_tree``) on a worker's
-        ``highs``: its LP, bound, incumbent check and branching. The search's
-        state is touched under ``lock`` only."""
+        ``highs``, which holds ``rows`` (the searched ``mip`` and its
+        ``A_T``, as the worker last saw them): its LP, bound, incumbent
+        check and branching. The search's state is touched under ``lock``
+        only."""
         import highspy
 
         MS = highspy.HighsModelStatus
-        mip, stats = self.mip, self.lean_stats
+        mip, A_T, stats = rows["mip"], rows["A_T"], self.lean_stats
+        m = mip.A.shape[0]
         with lock:
             cutoff = self.cutoff()
             if node.bound >= cutoff:
@@ -20293,7 +20621,17 @@ class _BranchAndBound:
         n = cols.size
         highs.changeColsBounds(n, cols, lower, upper)
         if node.lean_basis is not None:
-            highs.setBasis(node.lean_basis)
+            basis = node.lean_basis
+            if node.lean_rows is not None and node.lean_rows < m:
+                # Made before the last tree cuts: their rows start basic.
+                wider = highspy.HighsBasis()
+                wider.col_status = list(basis.col_status)
+                wider.row_status = list(basis.row_status) + [
+                    highspy.HighsBasisStatus.kBasic
+                ] * (m - node.lean_rows)
+                wider.valid = True
+                basis = wider
+            highs.setBasis(basis)
         status = None
         for attempt in range(2):
             left = self.seconds_left()
@@ -20334,6 +20672,7 @@ class _BranchAndBound:
                     # from where the simplex stopped.
                     node.lean_timeouts += 1
                     node.lean_basis = highs.getBasis()
+                    node.lean_rows = m
                     stats["timeouts"] = stats.get("timeouts", 0) + 1
                     self.push(node)
                     return
@@ -20348,7 +20687,7 @@ class _BranchAndBound:
         basis = highs.getBasis()
         y_eq, y_ineq = _jaddle_duals(highs, mip)
         out = _exact_side_bound(
-            mip, self.A_T, y_eq, y_ineq, lower, upper, self.is_int, self.reduced_cost_tol
+            mip, A_T, y_eq, y_ineq, lower, upper, self.is_int, self.reduced_cost_tol
         )
         raw, rigorous = out if out is not None else (value, False)
         xi = x[self.is_int]
@@ -20378,6 +20717,14 @@ class _BranchAndBound:
                     self.unresolved_floor = min(self.unresolved_floor, bound)
                 self.close(bound, rigorous, node.proven)
                 return
+            points = self.lean_cut_points
+            if points is not None:
+                # A vertex for the next tree cut round (``lean_cuts``): it
+                # takes those of the lowest bounds.
+                points.append((bound, x))
+                if len(points) > 8 * self.tree_cut_points:
+                    points.sort(key=lambda point: point[0])
+                    del points[self.tree_cut_points :]
             request = (
                 self.is_int, self.int_tol, pc_sum, pc_count,
                 self.exact_strong_candidates, self.lean_iteration_cap(),
@@ -20406,7 +20753,7 @@ class _BranchAndBound:
             if side_status not in ("optimal", "partial"):
                 continue
             out = _exact_side_bound(
-                mip, self.A_T, sy_eq, sy_ineq, lo, up, self.is_int, self.reduced_cost_tol
+                mip, A_T, sy_eq, sy_ineq, lo, up, self.is_int, self.reduced_cost_tol
             )
             if out is None or not np.isfinite(out[0]):
                 continue
@@ -20443,7 +20790,7 @@ class _BranchAndBound:
                 # Strong branching fixed every fractional integer: the
                 # node again, over the fixed box.
                 child = _Node(bound, node.depth, self.compress(lower, upper), None, node.branch, proven=node.proven)
-                child.lean_basis = basis
+                child.lean_basis, child.lean_rows = basis, m
                 self.push(child)
                 return
             est_down, est_up = _pseudocost_estimates(pc_sum, pc_count, x, candidates)
@@ -20491,6 +20838,7 @@ class _BranchAndBound:
                     (var, down, distance, value), proven=child_proven,
                 )
                 child.lean_basis = basis if side_basis is None else side_basis
+                child.lean_rows = m
                 self.push(child)
 
 
@@ -20542,6 +20890,8 @@ def solve(
     dual_polish=True,
     dual_polish_sweeps=_DUAL_POLISH_SWEEPS,
     dual_polish_children=True,
+    support_gate=True,
+    support_gate_dives=True,
     node_lp_tolerance=1e-3,
     heuristic_effort=0.3,
     reliability_threshold=8,
@@ -20700,6 +21050,7 @@ def solve(
     root_lp="jaddle",
     tree="jaddle",
     lean_threads="auto",
+    lean_cuts=False,
     primal_target=None,
 ):
     """
@@ -21121,7 +21472,19 @@ def solve(
       device LPs cost far more than HiGHS's: on pk1 (45 rows) the lean tree
       ran about 2,000 nodes a second against about 160.
       ``result["lean_tree"]`` gives its threads, nodes, LPs, pivots,
-      strong-branching LPs and times.
+      strong-branching LPs and times. ``lean_cuts`` (default ``False``)
+      adds tree cuts to it (with ``tree_cuts`` on): every
+      ``tree_cut_every`` nodes, within ``tree_cut_share`` of the tree's
+      time, the pooled cuts that the vertices of the ``tree_cut_points``
+      lowest-bound nodes solved since the last round violate, and the cuts
+      the root's separators and zero-half separation find at them (over
+      the root box, so they hold at every node), at most
+      ``max_tree_cuts_per_round`` a round, are appended to the searched
+      rows and to each thread's HiGHS model before its next node. Cuts
+      are never taken out again: the rounds end once ``tree_cut_rows``
+      have been added (``None``: as many as the root's, at least
+      ``max(32, 2 * max_tree_cuts_per_round)``). ``result["lean_tree"]``
+      then counts its ``cut_rounds`` and ``cuts``.
     * **Nodes.** Each child is warm-started from its parent's primal-dual
       point and step-size state; with the compiled solver cached, a small
       node takes milliseconds. A node is pruned when its Lagrangian bound
@@ -21378,6 +21741,22 @@ def solve(
       (``ConflictGraph.add_implications``) join the conflict graph of the
       clique cuts, so cliques can grow across rows
       (``result["probing"]["conflicts"]``).
+    * **The support gate** (``support_gate``, on by default). At the root
+      the LP point's integers within 0.01 of a whole number are fixed
+      there and the rows propagated: when that shows the rows cannot
+      hold, every solution needs columns the LP does not use
+      (``lp_support_empty``; a proof one way only). It is reported
+      (``support_gate`` in the result: tested, empty, rens_tested,
+      rens_empty, seconds; and a line in the log), and RENS's own
+      neighbourhood gets the same test before its sub-MIP, which is
+      skipped when it is empty. Fix-and-propagate and bulk rounding still
+      run: propagation lets them leave the LP's columns, and on
+      sp150x300d fix-and-propagate found a point with the box empty. On
+      rail02 the box is empty even at 1e-5. With ``support_gate_dives``
+      (on by default) an LP dive (``dive_every``) from a point the gate
+      reports is skipped (``dives_skipped``): not a proof, since a dive
+      re-solves the LP at each step and can leave the first point's
+      columns, but each of its steps costs an LP.
     * **Primal heuristics.** On the first root LP, before the cut rounds
       (which then judge progress against the gap, with the background
       improving jump running beside them), and again after them, sharing
@@ -22068,6 +22447,8 @@ def solve(
         dual_polish=dual_polish,
         dual_polish_sweeps=dual_polish_sweeps,
         dual_polish_children=dual_polish_children,
+        support_gate=support_gate,
+        support_gate_dives=support_gate_dives,
         node_lp_tolerance=node_lp_tolerance,
         heuristic_effort=heuristic_effort,
         reliability_threshold=reliability_threshold,
@@ -22154,6 +22535,7 @@ def solve(
         root_lp=root_lp,
         tree=tree,
         lean_threads=lean_threads,
+        lean_cuts=lean_cuts,
         primal_target=primal_target,
     )
     return _solve_model(
@@ -22309,6 +22691,10 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "objective_step": None,
             "reduced_cost_tightenings": 0,
             "dual_repairs": {"tried": 0, "improved": 0, "seconds": 0.0},
+            "support_gate": {
+                "tested": 0, "empty": 0, "rens_tested": 0, "rens_empty": 0,
+                "dives_skipped": 0, "seconds": 0.0,
+            },
             "dual_polish": {
                 "tried": 0, "improved": 0, "closed": 0, "made_rigorous": 0,
                 "gain": 0.0, "seconds": 0.0, "child_tried": 0,

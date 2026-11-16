@@ -352,3 +352,235 @@ def dual_ascent(c, ptr, idx, val, b, n_eq, y, lower, upper, is_int, sweeps, targ
         if target < np.inf and box_value(_constant(b, y), r, lo, up) >= target:
             break
     return y, moves
+
+
+# %%
+# Sign repair: reduced costs moved off the infinite bounds they point at
+
+
+@nb.njit(cache=True, nogil=True)
+def _sign_fix_abs(c, ptr, idx, val, n_eq, y, lo, up, margin, sweeps):
+    """Passes of ``dual_sign_fix`` on the total shortfall. Returns ``(y, left)``,
+    ``left`` the shortfall after the last pass."""
+    m = ptr.size - 1
+    y = y.copy()
+    r = c.copy()
+    width = 0
+    for i in range(m):
+        width = max(width, ptr[i + 1] - ptr[i])
+        if y[i] != 0.0:
+            for k in range(ptr[i], ptr[i + 1]):
+                r[idx[k]] += val[k] * y[i]
+    bp = np.empty(2 * width); wt = np.empty(2 * width)
+    history = np.zeros(sweeps + 1)
+    for sweep in range(sweeps + 1):
+        total = 0.0
+        for j in range(c.size):
+            if up[j] == np.inf and r[j] < margin[j]: total += margin[j] - r[j]
+            if lo[j] == -np.inf and r[j] > -margin[j]: total += r[j] + margin[j]
+        history[sweep] = total
+        if total == 0.0 or sweep == sweeps:
+            break
+        for i in range(m):
+            start, end = ptr[i], ptr[i + 1]
+            floor = -y[i] if i >= n_eq else -np.inf
+            right = 0.0; left = 0.0; count = 0
+            for k in range(start, end):
+                a = val[k]
+                if a == 0.0: continue
+                j = idx[k]
+                for side in range(2):
+                    if side == 0:
+                        if up[j] != np.inf: continue
+                        w = (margin[j] - r[j]) / a      # r + a t >= margin
+                        falling = a > 0                # violated before w
+                    else:
+                        if lo[j] != -np.inf: continue
+                        w = (-margin[j] - r[j]) / a    # r + a t <= -margin
+                        falling = a < 0
+                    wa = abs(a)
+                    if falling:
+                        if w > 0: right -= wa
+                        if w >= 0: left -= wa
+                    else:
+                        if w <= 0: right += wa
+                        if w < 0: left += wa
+                    bp[count] = w; wt[count] = wa; count += 1
+            if count == 0: continue
+            t = 0.0
+            if right < -1e-12:
+                order = np.argsort(bp[:count])
+                for q in range(count):
+                    w = bp[order[q]]
+                    if w <= 0: continue
+                    right += wt[order[q]]; t = w
+                    if right >= 0: break
+            elif left > 1e-12 and floor < 0:
+                order = np.argsort(bp[:count])
+                for q in range(count - 1, -1, -1):
+                    w = bp[order[q]]
+                    if w >= 0: continue
+                    if w < floor: t = floor; break
+                    left -= wt[order[q]]; t = w
+                    if left <= 0: break
+            if t == 0.0: continue
+            if t <= floor: t = floor; y[i] = 0.0
+            else: y[i] += t
+            for k in range(start, end):
+                r[idx[k]] += val[k] * t
+    return y, history[min(sweep, sweeps)]
+
+
+@nb.njit(cache=True, nogil=True)
+def _sign_fix_square(
+    c, ptr, idx, val, cptr, cidx, n_eq, y, lo, up, margin, slack, full_sweeps, sweeps
+):
+    """Passes of ``dual_sign_fix`` on the squared shortfall. Returns
+    ``(y, wrong)``, ``wrong`` the reduced costs still pointing at an
+    infinite bound."""
+    m = ptr.size - 1
+    y = y.copy(); r = c.copy()
+    width = 0
+    for i in range(m):
+        width = max(width, ptr[i + 1] - ptr[i])
+        if y[i] != 0.0:
+            for k in range(ptr[i], ptr[i + 1]):
+                r[idx[k]] += val[k] * y[i]
+    bw = np.empty(2 * width); ba = np.empty(2 * width); bd = np.empty(2 * width)
+    hist = np.zeros((sweeps + 1, 2))
+    visit = np.ones(m, np.bool_)
+    done = 0
+    for sweep in range(sweeps + 1):
+        cnt = 0; worst = 0.0
+        # After the first passes over every row, only the rows of the
+        # columns still on the wrong side are visited.
+        narrow = sweep >= full_sweeps
+        if narrow:
+            visit[:] = False
+        for j in range(c.size):
+            bad = False
+            if up[j] == np.inf and r[j] < -slack[j]: cnt += 1; worst = max(worst, -r[j]); bad = True
+            if lo[j] == -np.inf and r[j] > slack[j]: cnt += 1; worst = max(worst, r[j]); bad = True
+            if bad and narrow:
+                for k in range(cptr[j], cptr[j + 1]):
+                    visit[cidx[k]] = True
+        hist[sweep, 0] = cnt; hist[sweep, 1] = worst; done = sweep
+        if cnt == 0 or sweep == sweeps: break
+        for i in range(m):
+            if narrow and not visit[i]:
+                continue
+            start, end = ptr[i], ptr[i + 1]
+            floor = -y[i] if i >= n_eq else -np.inf
+            # each term: v(t) = max(0, d - a t) with its own (a, d); active before w=d/a if a>0, after if a<0
+            count = 0; P = 0.0; Q = 0.0   # over terms active just right of 0 ... recomputed per side
+            for k in range(start, end):
+                a = val[k]
+                if a == 0.0: continue
+                j = idx[k]
+                if up[j] == np.inf:      # need r >= margin: d = margin - r, shrinks by a t
+                    bw[count] = (margin[j] - r[j]) / a; ba[count] = a; bd[count] = margin[j] - r[j]; count += 1
+                if lo[j] == -np.inf:     # need r <= -margin: d = r + margin, grows by a t -> coefficient -a
+                    bw[count] = -(r[j] + margin[j]) / a; ba[count] = -a; bd[count] = r[j] + margin[j]; count += 1
+            if count == 0: continue
+            # derivative at 0: sum over active of -2 a d ; active iff d > 0 (at d == 0, by side)
+            g0 = 0.0
+            for q in range(count):
+                if bd[q] > 0: g0 -= ba[q] * bd[q]
+            if g0 == 0.0: continue
+            order = np.argsort(bw[:count])
+            t = 0.0
+            if g0 < 0:   # move right
+                P = 0.0; Q = 0.0
+                for q in range(count):
+                    a, d = ba[q], bd[q]
+                    if (a > 0 and d > 0) or (a < 0 and d >= 0): P += a * d; Q += a * a   # active for small t > 0
+                pos = 0
+                while pos < count and bw[order[pos]] <= 0: pos += 1
+                while True:
+                    nxt = bw[order[pos]] if pos < count else np.inf
+                    if Q > 0:
+                        ts = P / Q
+                        if ts <= nxt: t = max(ts, 0.0); break
+                    if pos >= count: t = 0.0 if Q == 0 else t; break
+                    q = order[pos]; a, d = ba[q], bd[q]
+                    if a > 0: P -= a * d; Q -= a * a
+                    else: P += a * d; Q += a * a
+                    t = nxt; pos += 1
+                    if Q <= 1e-300 and P >= 0: break
+            else:        # move left
+                P = 0.0; Q = 0.0
+                for q in range(count):
+                    a, d = ba[q], bd[q]
+                    if (a > 0 and d >= 0) or (a < 0 and d > 0): P += a * d; Q += a * a   # active for small t < 0
+                pos = count - 1
+                while pos >= 0 and bw[order[pos]] >= 0: pos -= 1
+                while True:
+                    nxt = bw[order[pos]] if pos >= 0 else -np.inf
+                    if Q > 0:
+                        ts = P / Q
+                        if ts >= nxt: t = min(ts, 0.0); break
+                    if pos < 0: break
+                    q = order[pos]; a, d = ba[q], bd[q]
+                    if a > 0: P += a * d; Q += a * a
+                    else: P -= a * d; Q -= a * a
+                    t = nxt; pos -= 1
+                    if Q <= 1e-300 and P <= 0: break
+                if t < floor: t = floor
+            if t == 0.0 or not np.isfinite(t): continue
+            if i >= n_eq and y[i] + t <= 0.0: t = -y[i]; y[i] = 0.0
+            else: y[i] += t
+            for k in range(start, end):
+                r[idx[k]] += val[k] * t
+    return y, int(hist[done, 0])
+
+
+@nb.njit(cache=True, nogil=True)
+def dual_sign_fix(
+    c, ptr, idx, val, cptr, cidx, n_eq, y, lower, upper, margin, sweeps,
+    full_sweeps, square_sweeps,
+):
+    """
+    Duals near ``y`` whose reduced costs ``r = c + Aᵀy`` point at no
+    infinite bound (``rⱼ >= 0`` where the upper bound is infinite, ``<= 0``
+    where the lower one is), so their Lagrangian bound is finite and
+    rigorous. ``A`` is CSR by row; inequality duals stay ``>= 0``.
+
+    A column's shortfall is how far ``rⱼ`` is from ``marginⱼ`` on the right
+    side of zero. First ``sweeps`` passes take each row's dual to where the
+    row's total shortfall (weighted by ``|aᵢⱼ|``) is least: a weighted
+    median, as ``dual_ascent``'s steps are. Those clear almost every column
+    and then stall where a row would only trade one column's shortfall for
+    another's of the same size (buildingenergy: a column in 26,278 rows
+    ``xₖ − z <= 0`` whose duals sum past its cost). Then up to
+    ``square_sweeps`` passes on the squared shortfall, which such a trade
+    lowers, so they spread what is left until none is: the first
+    ``full_sweeps`` of them over every row, the rest over the rows of the
+    columns still on the wrong side only (``cptr``/``cidx``: the rows of
+    each column). The last of the shortfall goes slowly (on
+    buildingenergy 2,387 columns after the first passes, the largest by
+    2.2; under 1e-4 after 5 squared passes, and 250 to clear the last
+    few hundred, each by less than 1e-6), so those passes have to be
+    cheap.
+
+    Returns ``(y, wrong)``: ``wrong`` reduced costs still point at an
+    infinite bound (0: the bound of ``y`` is rigorous, but for a free
+    column's reduced cost, which is zero only within round-off).
+    """
+    if not (np.any(lower == -np.inf) or np.any(upper == np.inf)):
+        return y.copy(), 0
+    y = y.copy()
+    _clip_duals(y, n_eq)
+    # A free column's reduced cost has no side to be on: it is taken to
+    # zero, and counted as there within round-off.
+    margin = margin.copy()
+    slack = np.zeros(c.size)
+    for j in range(c.size):
+        if lower[j] == -np.inf and upper[j] == np.inf:
+            slack[j] = 1e-3 * margin[j]
+            margin[j] = 0.0
+    if sweeps > 0:
+        y, _ = _sign_fix_abs(c, ptr, idx, val, n_eq, y, lower, upper, margin, sweeps)
+    return _sign_fix_square(
+        c, ptr, idx, val, cptr, cidx, n_eq, y, lower, upper, margin, slack,
+        full_sweeps, square_sweeps,
+    )

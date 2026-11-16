@@ -767,6 +767,51 @@ def test_dual_polish_takes_a_reduced_cost_off_an_infinite_bound():
     assert fixed > 0
 
 
+def test_dual_sign_fix_spreads_what_one_row_cannot_move():
+    # min 3 z + Σ x_k with x_k - z <= 0 and x_k + s_k = 1, nothing bounded
+    # above. With duals of 1.2 on each of the three linking rows the
+    # reduced cost of z is 3 - 3.6 < 0 (the bound is -inf), and every x_k
+    # sits at zero reduced cost: lowering one linking row's dual alone
+    # only moves the shortfall from z to its x_k, so the ascent's steps
+    # stall there. The sign repair moves them together.
+    numba_bound = pytest.importorskip("jaddle._bound_numba")
+    k = 3
+    n = 1 + 2 * k  # z, x_1..x_k, s_1..s_k
+    link = sp.hstack([-np.ones((k, 1)), sp.identity(k), sp.csr_matrix((k, k))])
+    fill = sp.hstack([sp.csr_matrix((k, 1)), sp.identity(k), sp.identity(k)])
+    lp = jl.LP(
+        c=np.concatenate([[3.0], np.ones(k), np.zeros(k)]),
+        A_eq=sp.csc_matrix(fill), b_eq=np.ones(k),
+        A_ineq=sp.csc_matrix(link), b_ineq=np.zeros(k),
+        lower_bounds=np.zeros(n), upper_bounds=np.full(n, np.inf),
+    )
+    mip = jm.MIP(lp, np.zeros(n, bool))
+    optimum, _ = _lp_reference(mip)
+    # Equality duals -2.2 put the x_k at zero reduced cost: 1 + 1.2 - 2.2.
+    y = np.concatenate([np.full(k, -2.2), np.full(k, 1.2)])
+    assert _bound_at(mip, y, tol=0.0)[0] == -np.inf
+    polish = jm.DualPolish(mip, mip.integrality)
+    fixed, wrong = polish.sign_fix(y, mip.lower, mip.upper, jm._SIGN_FIX_SWEEPS)
+    for _ in range(50):
+        if not wrong:
+            break
+        fixed, wrong = polish.sign_fix(fixed, mip.lower, mip.upper, 0)
+    assert wrong == 0 and np.all(fixed[mip.n_eq :] >= 0.0)
+    bound, rigorous = _bound_at(mip, fixed, tol=0.0)
+    assert rigorous and np.isfinite(bound)
+    assert bound <= optimum + 1e-6 * (1 + abs(optimum))
+    # The whole polish: the same, and no lower.
+    polished = polish(y, mip.lower, mip.upper)
+    after, rigorous = _bound_at(mip, polished, tol=0.0)
+    assert rigorous and bound - 1e-9 <= after <= optimum + 1e-6 * (1 + abs(optimum))
+    # Nothing to do without an infinite bound.
+    boxed, wrong = numba_bound.dual_sign_fix(
+        polish.c, polish.ptr, polish.idx, polish.val, polish.cptr, polish.cidx,
+        polish.n_eq, y, np.zeros(n), np.ones(n), polish.margin, 10, 10, 10,
+    )
+    assert wrong == 0 and np.array_equal(boxed, y)
+
+
 def test_dual_polish_kernel_matches_its_python_source():
     numba_bound = pytest.importorskip("jaddle._bound_numba")
     mip = facility_location()
@@ -842,6 +887,75 @@ def test_polish_child_bound_stays_below_the_child_lp():
             assert before - 1e-9 <= after <= optimum + 1e-6 * (1 + abs(optimum))
             raised += after > before + 1e-9
     assert raised > 0
+
+
+def odd_knapsack_equality():
+    """min x1 + x2 + 5 y with 2 x1 + 2 x2 + 3 y = 3 over binaries. The LP
+    takes x1 + x2 = 3/2 and leaves y at 0 (value 3/2); the only integer
+    point is y = 1 (value 5), since 2 x1 + 2 x2 is even."""
+    A = sp.csc_matrix(np.array([[2.0, 2.0, 3.0]]))
+    A_ineq, b_ineq = no_rows(3)
+    lp = jl.LP(
+        c=np.array([1.0, 1.0, 5.0]), A_eq=A, b_eq=np.array([3.0]),
+        A_ineq=A_ineq, b_ineq=b_ineq,
+        lower_bounds=np.zeros(3), upper_bounds=np.ones(3),
+    )
+    return jm.MIP(lp, np.ones(3, bool))
+
+
+def test_support_gate_reports_an_lp_point_no_solution_agrees_with():
+    # The LP point has y at 0, and with y fixed there the row cannot hold:
+    # the gate reports it, and the search still finds the optimum.
+    mip = odd_knapsack_equality()
+    on = solve(mip, fix_and_propagate=True, cuts=False)
+    off = solve(mip, fix_and_propagate=True, cuts=False, support_gate=False)
+    for result in (on, off):
+        assert result["status"] == "optimal"
+        assert result["objective"] == pytest.approx(5.0)
+    assert on["support_gate"]["tested"] >= 1
+    assert on["support_gate"]["empty"] >= 1
+    assert off["support_gate"]["tested"] == 0
+    assert set(on["support_gate"]) == {
+        "tested", "empty", "rens_tested", "rens_empty", "dives_skipped", "seconds",
+    }
+
+
+def test_support_gate_does_not_stop_the_roundings(monkeypatch):
+    # Fix-and-propagate still runs on a point the gate reports: propagation
+    # lets it leave the LP's columns.
+    calls = []
+    real = jm.fix_and_propagate
+
+    def recorded(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(jm, "fix_and_propagate", recorded)
+    result = solve(odd_knapsack_equality(), fix_and_propagate=True, cuts=False)
+    assert result["support_gate"]["empty"] >= 1 and calls
+
+
+
+def test_support_gate_skips_dives_from_a_reported_point(monkeypatch):
+    # A dive from the LP point no solution agrees with (y at 0, where the
+    # row needs y = 1) is skipped before any LP; with the option off, or
+    # the gate off, it goes on to its first LP.
+    mip = odd_knapsack_equality()
+    x = np.array([1.0, 0.5, 0.0])
+    for options, skipped in (
+        ({}, True), ({"support_gate_dives": False}, False), ({"support_gate": False}, False),
+    ):
+        search = search_for(mip, monkeypatch, cuts=False, **options)
+        solved = []
+        monkeypatch.setattr(
+            search, "solve_lp", lambda *args, **kwargs: solved.append(1) or 1 / 0
+        )
+        try:
+            search.dive(x, mip.lower.copy(), mip.upper.copy(), None)
+        except ZeroDivisionError:
+            pass
+        assert bool(solved) != skipped
+        assert search.support_gate_stats["dives_skipped"] == int(skipped)
 
 
 # %% Cutting planes
@@ -9116,6 +9230,45 @@ def test_lean_tree_runs_its_nodes():
     assert stats is not None and stats["threads"] == 3
     assert stats["nodes"] > 1
     assert result["exact_nodes"]["solved"] == 0  # no exact lane, no device tree
+
+
+@pytest.mark.parametrize("threads", [1, 3])
+def test_lean_cuts_add_tree_cuts(threads):
+    """``lean_cuts``: the lean tree separates at its nodes' vertices and
+    appends the cuts to its rows (each thread's HiGHS model takes them, and
+    the queued nodes' bases are widened to them)."""
+    mip = generalised_assignment()
+    options = dict(LEAN_ONLY, cuts=False, tree_cut_every=1, lean_threads=threads)
+    result = solve(mip, **options, lean_cuts=True)
+    assert_solved(result, mip, reference(mip))
+    stats = result["lean_tree"]
+    assert stats["cut_rounds"] >= 1 and stats["cuts"] >= 1
+    assert stats["failed"] == 0
+    assert result["tree_cuts_added"] == stats["cuts"]
+    assert_proven_bound(result, mip.maximise)
+
+
+def test_lean_tree_has_no_tree_cuts_by_default():
+    mip = generalised_assignment()
+    result = solve(mip, **LEAN_ONLY, cuts=False, tree_cut_every=1)
+    stats = result["lean_tree"]
+    assert stats["cut_rounds"] == 0 and stats["cuts"] == 0
+    assert result["tree_cuts_added"] == 0
+    # ``tree_cuts=False`` turns them off with ``lean_cuts`` too.
+    result = solve(
+        mip, **LEAN_ONLY, cuts=False, tree_cut_every=1, lean_cuts=True, tree_cuts=False
+    )
+    assert_solved(result, mip, reference(mip))
+    assert result["tree_cuts_added"] == 0
+
+
+def test_lean_cuts_stop_at_tree_cut_rows():
+    mip = generalised_assignment()
+    result = solve(
+        mip, **LEAN_ONLY, cuts=False, tree_cut_every=1, lean_cuts=True, tree_cut_rows=3
+    )
+    assert_solved(result, mip, reference(mip))
+    assert 1 <= result["tree_cuts_added"] <= 3
 
 
 def test_lean_tree_node_limit_keeps_a_valid_bound():

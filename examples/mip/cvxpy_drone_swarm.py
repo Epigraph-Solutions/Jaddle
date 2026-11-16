@@ -246,8 +246,13 @@ problem.solve(
     max_seconds=180,
     device="cpu",
     verbose=True,
-    log_every_seconds=10,
+    log_every_seconds=10,   
+    gub_cover_cuts=True,
     tree="lean",
+    lean_cuts=True,
+    max_cuts_per_round=int(1e4),
+    cut_pool_size=int(1e5),
+    max_cut_rows=int(1e5),
 )
 stats = problem.solver_stats.extra_stats
 if p[0].value is None:
