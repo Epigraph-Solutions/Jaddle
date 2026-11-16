@@ -13,10 +13,17 @@
 #     python benchmarks/benchmark_mip.py --only air05 mas76       # subset by name
 #     python benchmarks/benchmark_mip.py --max-seconds 120 --no-highs
 #     python benchmarks/benchmark_mip.py --device cpu|gpu|tpu|auto
+#     python benchmarks/benchmark_mip.py --data-dir data/popso \
+#         --primal-targets data/popso/objective_values.csv
 #
 # `--device` picks where Jaddle's search runs (default `cpu`; `auto` puts
 # MIPs with at most 10,000 nonzeros on the CPU and the rest on JAX's default
-# device). `--only` also accepts a path to a model file (.mps, .lp, or another
+# device). `--primal-targets` reads a CSV of `instance,best_obj` (such as
+# data/popso/objective_values.csv) and stops Jaddle's search as soon as its
+# incumbent is that good (`jm.solve(primal_target=...)`, status
+# `primal_target`), so `jaddle_seconds` is the time to the known best
+# solution. Instances without a finite value there run as usual; a
+# `best_obj` of 1e20 or more marks an infeasible instance. `--only` also accepts a path to a model file (.mps, .lp, or another
 # format HiGHS reads), which then runs whatever directory it is in. The MIPLIB
 # files are not shipped with Jaddle; download them from the
 # [MIPLIB website](https://miplib.zib.de/).
@@ -88,6 +95,12 @@ def parse_args():
         "--no-highs", action="store_true", help="skip the HiGHS comparison solve"
     )
     p.add_argument(
+        "--primal-targets",
+        default=None,
+        help="CSV with instance,best_obj columns: stop Jaddle once its "
+        "incumbent reaches the instance's best_obj (default: no target)",
+    )
+    p.add_argument(
         "--csv",
         default=os.path.join(REPO_ROOT, "benchmark_mip_results.csv"),
         help="path to write CSV results (default: benchmark_mip_results.csv)",
@@ -112,6 +125,23 @@ def discover_instances(args):
     for name in sorted(missing):
         print(f"  not found in {args.data_dir}: {name}")
     return instances
+
+
+def load_primal_targets(path):
+    """{instance: best_obj} from a CSV with ``instance,best_obj`` columns,
+    leaving out blank values and the 1e20 that marks an infeasible instance."""
+    if path is None:
+        return {}
+    targets = {}
+    with open(path, newline="") as f:
+        for record in csv.DictReader(f):
+            value = (record.get("best_obj") or "").strip()
+            if not value:
+                continue
+            value = float(value)
+            if abs(value) < 1e20:
+                targets[record["instance"].strip()] = value
+    return targets
 
 
 # %% [markdown]
@@ -142,38 +172,37 @@ def discover_instances(args):
 
 
 # %%
-def run_jaddle(path, args):
+def run_jaddle(path, args, primal_target=None):
     mip = jm.load(path)
     row = {
         "n_vars": mip.num_variables,
         "n_ints": mip.num_integers,
         "n_rows": mip.A.shape[0],
+        "primal_target": primal_target,
     }
     print(f"{row['n_vars']} variables ({row['n_ints']} integer), {row['n_rows']} rows")
+    if primal_target is not None:
+        print(f"Primal target: {primal_target:.10g}")
     started = time.time()
     result = jm.solve(
         path,
         presolve=True,
         max_seconds=args.max_seconds,
+        primal_target=primal_target,
         device=args.device,
         verbose=True,
         log_every_seconds=10,
-        batch_size=32,
-        cut_round_lp="highs",
-        # tree="lean",
+        batch_size=4,
+        cut_rounds=100,
+        cuts=True,
+        dual_repair=True,
+        tree_cuts=True,
         # lp_options=dict(verbose=True, log_every=10),
-        root_lp="jaddle",
-        lp_tolerance=1e-3,
-        precision="float32",
-        root_crossover=True,
         # tree="lean",
         # Implied-bound cuts and probing cliques: root bound on pg5_34
         # -15,209 -> -14,367 (HiGHS's), timtab1 347k -> 476k, neos-911970
         # 23 -> 52, for at most 3 s of probing.
-        probing=False,
-        cuts=True,
-        max_cut_rows=1e5,
-        tree_cut_rows=5e4,
+        probing=True,
         # # All rounding heuristics.
         # heuristic_every=10,  # plain rounding of node LP points ("H")
         # round_repair=True,  # round and repair, at the root and in the tree ("U")
@@ -346,6 +375,7 @@ CSV_FIELDS = [
     "n_vars",
     "n_ints",
     "n_rows",
+    "primal_target",
     "jaddle_status",
     "jaddle_objective",
     "jaddle_bound",
@@ -393,13 +423,17 @@ def main():
         f"Running {len(instances)} instance(s) on {args.device}, Jaddle {limit}"
         f"{', no HiGHS' if args.no_highs else ''}\n"
     )
+    targets = load_primal_targets(args.primal_targets)
+    if args.primal_targets is not None:
+        hits = sum(name in targets for name, _ in instances)
+        print(f"Primal targets for {hits} of {len(instances)} instance(s)\n")
     rows = []
     for name, path in instances:
         size_mb = os.path.getsize(path) / 1e6
         print(f"=== {name} ({size_mb:.1f} MB) ===")
         row = {"problem": name, "size_mb": round(size_mb, 1), "error": ""}
         try:
-            row.update(run_jaddle(path, args))
+            row.update(run_jaddle(path, args, targets.get(name)))
             if not args.no_highs:
                 row.update(run_highs(path, args))
         except Exception as exc:  # keep the sweep going if one instance blows up

@@ -58,6 +58,13 @@ def _stable_by_two(primary, secondary):
     return order[np.argsort(primary[order], kind="mergesort")]
 
 
+# ``jaddle_mip._CUT_MIN_RANGE`` and ``_CUT_MIN_COEF``: a cut whose left side
+# moves by at most the first over the box, or whose largest coefficient is
+# below the second, is round-off and is dropped.
+_CUT_MIN_RANGE = 1e-6
+_CUT_MIN_COEF = 1e-9
+
+
 @nb.njit(cache=True)
 def _clean_cut(idx, coef, rhs, lower, upper, cut_tiny):
     """``jaddle_mip._clean_cut``: ``(ok, idx, coef, rhs)``."""
@@ -81,6 +88,15 @@ def _clean_cut(idx, coef, rhs, lower, upper, cut_tiny):
             worst += w
         rhs -= worst
         idx, coef = idx[~tiny], coef[~tiny]
+    # Round-off (``jaddle_mip._cut_is_roundoff``).
+    largest = 0.0
+    spread = 0.0
+    for k in range(coef.size):
+        a = abs(coef[k])
+        largest = max(largest, a)
+        spread += a * (upper[idx[k]] - lower[idx[k]])
+    if largest < _CUT_MIN_COEF or spread <= _CUT_MIN_RANGE:
+        return False, idx, coef, rhs
     return True, idx, coef, rhs + 1e-9 * (1.0 + abs(rhs))
 
 

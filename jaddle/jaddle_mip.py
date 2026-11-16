@@ -2078,6 +2078,15 @@ def objective_step(c, integrality):
 
 # A coefficient below this fraction of the largest is removed from a cut.
 _CUT_TINY = 1e-6
+# A cut whose left side can move by at most this over the box, or whose
+# largest coefficient is below ``_CUT_MIN_COEF``, is round-off and is
+# dropped (``_clean_cut``): it can cut off no point by more than the
+# feasibility tolerance, yet propagation divides by its coefficients. On
+# app1-1 a MIR cut ``6.2e-9·x <= 1e-9`` (a cancelled ``0 <= 0``) on a binary
+# that is 1 at the optimum fixed it to 0, and the search ended at -2, not -3.
+# (``jaddle._separate_numba`` holds the same two values.)
+_CUT_MIN_RANGE = 1e-6
+_CUT_MIN_COEF = 1e-9
 # Rows whose slack at the LP point is within this fraction of 1 + |b| start
 # a separation.
 _CUT_TIGHT_ROWS = 0.05
@@ -2119,7 +2128,8 @@ def _clean_cut(idx, coef, rhs, lower, upper):
     """Remove tiny coefficients from the cut ``coef · x[idx] <= rhs``, moving
     each one's worst case over the bounds to the right-hand side so the cut
     stays valid, and add a small safety margin. ``None`` if a removed
-    variable has an infinite bound in the way."""
+    variable has an infinite bound in the way, or if what is left is
+    round-off (``_cut_is_roundoff``)."""
     keep = coef != 0.0
     idx, coef = idx[keep], coef[keep]
     if idx.size == 0 or not np.isfinite(rhs):
@@ -2133,7 +2143,21 @@ def _clean_cut(idx, coef, rhs, lower, upper):
             return None
         rhs -= worst.sum()
         idx, coef = idx[~tiny], coef[~tiny]
+    if _cut_is_roundoff(idx, coef, lower, upper):
+        return None
     return idx, coef, rhs + 1e-9 * (1.0 + abs(rhs))
+
+
+def _cut_is_roundoff(idx, coef, lower, upper):
+    """Whether the cut's left side ``coef · x[idx]`` is round-off: its
+    largest coefficient is below ``_CUT_MIN_COEF``, or it moves by at most
+    ``_CUT_MIN_RANGE`` over the box."""
+    magnitude = np.abs(coef)
+    if magnitude.max(initial=0.0) < _CUT_MIN_COEF:
+        return True
+    with np.errstate(invalid="ignore"):
+        spread = float(magnitude @ (upper[idx] - lower[idx]))
+    return spread <= _CUT_MIN_RANGE
 
 
 # Covers tried per row: greedy by (1 − z*)/w, by 1 − z*, and heaviest first.
@@ -7417,6 +7441,7 @@ _STATUS_TEXT = {
     "time_limit": "Time limit reached",
     "node_limit": "Node limit reached",
     "interrupted": "Interrupted",
+    "primal_target": "Primal target reached",
     "unresolved": "Unresolved",
     "unbounded_or_infeasible": "Unbounded or infeasible",
 }
@@ -8699,8 +8724,15 @@ def _cutoff_probe(highs, mip, lower, upper, cols, cutoff, terms, iterations, dea
             return None
         return np.asarray(highs.getSolution().col_value, np.float64), highs.getBasis()
 
+    # Solutions at the cutoff count (``proof_cutoff`` is the largest value a
+    # better one can have), so a side closes only past it by a margin, as
+    # ``round_bound`` allows: on app1-1 (objective step 1) the LP with the
+    # root cuts reached the optimum, -3, at the cutoff -3, and HiGHS's
+    # ``objective_bound`` (and the sides' bounds) at -3 plus round-off closed
+    # the box, so the search ended at -2.
+    limit = float(cutoff) + 1e-6 * (1.0 + abs(float(cutoff)))
     try:
-        highs.setOptionValue("objective_bound", float(cutoff))
+        highs.setOptionValue("objective_bound", limit)
         state = lp()
         if state is None:
             return out
@@ -8742,7 +8774,7 @@ def _cutoff_probe(highs, mip, lower, upper, cols, cutoff, terms, iterations, dea
                     bounded = _exact_side_bound(
                         mip, A_T, y_eq, y_ineq, side_lower, side_upper, is_int, tol
                     )
-                    shut = bounded is not None and bounded[1] and bounded[0] > cutoff
+                    shut = bounded is not None and bounded[1] and bounded[0] > limit
                 highs.changeColBounds(j, lo, up)
                 if shut:
                     closed.append(is_up)
@@ -9473,6 +9505,7 @@ class _BranchAndBound:
         root_lp="jaddle",
         tree="jaddle",
         lean_threads="auto",
+        primal_target=None,
         interrupt=None,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
@@ -9485,6 +9518,11 @@ class _BranchAndBound:
         # catches SIGINT while it runs (``run``).
         self.owns_interrupt = interrupt is None
         self.interrupt = threading.Event() if interrupt is None else interrupt
+        # Stop once an incumbent is at least this good, in the model's own
+        # sense with the offset (``reaches_target``): the search winds down
+        # along the interrupt's path, with status ``"primal_target"``.
+        self.primal_target = None if primal_target is None else float(primal_target)
+        self.target_reached = False
         self.rins_nodes = rins_nodes
         if symmetry not in ("auto", True, False):
             raise ValueError(
@@ -10931,6 +10969,15 @@ class _BranchAndBound:
         """A min-form value (without offset) in the model's own sense."""
         return self.mip.sign * (value + self.mip.offset)
 
+    def reaches_target(self, value):
+        """Whether the min-form ``value`` is at least as good as
+        ``primal_target`` (in the model's sense), to a relative 1e-9."""
+        if self.primal_target is None:
+            return False
+        target = self.primal_target
+        excess = self.mip.sign * (self.model_value(value) - target)
+        return excess <= 1e-9 * (1.0 + abs(target))
+
     # -- node keys -----------------------------------------------------------
     def diving(self):
         return self.node_selection == "depth_first" or (
@@ -11827,6 +11874,10 @@ class _BranchAndBound:
             )
         )
         self.log(source, bound, force=True)
+        if not self.target_reached and self.reaches_target(value):
+            # As Ctrl-C does: the search stops with this point.
+            self.target_reached = True
+            self.request_interrupt()
         if switch and self.node_selection == "hybrid":
             self.rekey()
         if self.use_one_opt and source != "1":
@@ -13586,6 +13637,8 @@ class _BranchAndBound:
         self.collect_heuristics(schedule=False)
         if status == "time_limit" and self.interrupt.is_set():
             status = "interrupted"  # it took the time-limit path
+        if self.target_reached and status in ("time_limit", "interrupted"):
+            status = "primal_target"
         search_bound = self.global_bound()
         bound = self.proven_bound()
         if status == "optimal":
@@ -16598,6 +16651,8 @@ class _BranchAndBound:
             parallel_heuristics=False,
             block_decomposition=False,
             trivial_heuristic=False,
+            # The parent stops on its target, with the sub-MIP's point.
+            primal_target=None,
             interrupt=self.interrupt,
         )
         if settings["branching"] in ("auto", "reliability"):
@@ -20181,6 +20236,7 @@ def solve(
     root_lp="jaddle",
     tree="jaddle",
     lean_threads="auto",
+    primal_target=None,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -21284,10 +21340,14 @@ def solve(
     and presolves.
 
     Stops when the gap closes, the tree is empty, or at ``max_nodes``,
-    ``max_seconds`` (wall clock, from entry) or Ctrl-C. With
-    ``presolve=True``, HiGHS's presolve does not count towards
-    ``max_seconds`` or ``"seconds"``, as in ``jl.solve_with_presolve``: it is
-    timed on its own (``"presolve_seconds"``).
+    ``max_seconds`` (wall clock, from entry), Ctrl-C, or ``primal_target``:
+    a value in the model's own sense (offset included) at which the search
+    stops as soon as an incumbent is at least as good (``<=`` for a
+    minimisation, ``>=`` for a maximisation, to a relative 1e-9), with
+    status ``"primal_target"``. With ``presolve=True``, HiGHS's presolve
+    does not count towards ``max_seconds`` or ``"seconds"``, as in
+    ``jl.solve_with_presolve``: it is timed on its own
+    (``"presolve_seconds"``).
 
     Returns a dict:
 
@@ -21310,7 +21370,7 @@ def solve(
       ``"unbounded_or_infeasible"`` (the LP relaxation is unbounded),
       ``"unresolved"`` (the search ended, but nodes closed without proof
       leave the gap open; see ``"unresolved_nodes"``), ``"time_limit"``,
-      ``"node_limit"`` or ``"interrupted"``; ``"converged"`` is
+      ``"node_limit"``, ``"primal_target"`` or ``"interrupted"``; ``"converged"`` is
       ``status == "optimal"``. ``"interrupted"`` is Ctrl-C: as with
       ``jl.solve``, the first press ends the search with the best point so
       far and a valid bound (it stops as a time limit would, the LP being
@@ -21591,6 +21651,7 @@ def solve(
         root_lp=root_lp,
         tree=tree,
         lean_threads=lean_threads,
+        primal_target=primal_target,
     )
     return _solve_model(
         model, presolve, precision, highs_options, feasibility_tolerance, settings

@@ -243,7 +243,7 @@ print(f"Swarm: {n_binaries} binaries, {len(problem.constraints)} constraints")
 # %%
 problem.solve(
     solver=JaddleSolver(),
-    max_seconds=60,
+    max_seconds=180,
     device="cpu",
     verbose=True,
     log_every_seconds=10,

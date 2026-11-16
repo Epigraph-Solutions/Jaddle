@@ -9653,3 +9653,77 @@ def test_pool_refreshes_keep_to_their_share_of_the_tree(monkeypatch):
     finally:
         if search.exact_lane is not None:
             search.exact_lane.shutdown()
+
+
+def test_primal_target_stops_at_first_good_incumbent():
+    # A loose target (minimise -value: any packing reaches 0) stops the
+    # search at its first incumbent, with that point.
+    mip = knapsack(n=40)
+    result = solve(mip, primal_target=0.0)
+    assert result["status"] in ("primal_target", "optimal")
+    assert result["objective"] <= 0.0
+    assert mip.is_feasible(result["x"])
+    assert_proven_bound(result, mip.maximise)
+
+
+def test_primal_target_at_optimum():
+    mip = knapsack()
+    ref = reference(mip)
+    result = solve(mip, primal_target=ref)
+    assert result["status"] in ("primal_target", "optimal")
+    assert abs(result["objective"] - ref) <= 1e-6 * (1 + abs(ref))
+    assert mip.is_feasible(result["x"])
+
+
+def test_primal_target_out_of_reach_solves_to_optimality():
+    # Better than the optimum: never reached, so the search proves it.
+    mip = knapsack()
+    ref = reference(mip)
+    result = solve(mip, primal_target=ref - 10.0)
+    assert_solved(result, mip, ref)
+
+
+def test_primal_target_maximisation_with_presolve(tmp_path):
+    # In the model's own sense with the offset: ``>=`` for a maximisation.
+    base = knapsack()
+    mip = jm.MIP(base.lp, base.integrality, offset=1.5, maximise=True)
+    path = tmp_path / "knapsack.mps"
+    write_mps(mip, path)
+    ref = reference(mip)
+    result = solve(path, presolve=True, primal_target=ref)
+    assert result["status"] in ("primal_target", "optimal")
+    assert abs(result["objective"] - ref) <= 1e-6 * (1 + abs(ref))
+    loose = solve(path, presolve=True, primal_target=1.5)
+    assert loose["status"] in ("primal_target", "optimal")
+    assert loose["objective"] >= 1.5
+
+
+def test_clean_cut_drops_roundoff_cuts():
+    # app1-1: MIR left ``6.2e-9·x <= 1e-9`` on a binary (a cancelled
+    # ``0 <= 0``); propagation divided by it and fixed x = 0, cutting off
+    # the optimum.
+    lower, upper = np.zeros(3), np.ones(3)
+    assert jm._clean_cut(np.array([0]), np.array([6.2e-9]), 1e-9, lower, upper) is None
+    # Below _CUT_MIN_COEF even on an unbounded column.
+    free = np.full(3, np.inf)
+    assert jm._clean_cut(np.array([0]), np.array([1e-12]), 0.0, lower, free) is None
+    # Small coefficients on a wide range are a real cut.
+    wide = np.full(3, 1e4)
+    kept = jm._clean_cut(np.array([0, 1]), np.array([1e-3, 2e-3]), 1.0, lower, wide)
+    assert kept is not None and kept[0].tolist() == [0, 1]
+    kept = jm._clean_cut(np.array([0, 1]), np.array([1.0, 1.0]), 1.0, lower, upper)
+    assert kept is not None
+
+
+def test_numba_clean_cut_drops_roundoff_cuts():
+    sn = pytest.importorskip("jaddle._separate_numba")
+    lower, upper = np.zeros(3), np.ones(3)
+    ok, *_ = sn._clean_cut(
+        np.array([0], np.int64), np.array([6.2e-9]), 1e-9, lower, upper, 1e-6
+    )
+    assert not ok
+    ok, idx, _, _ = sn._clean_cut(
+        np.array([0, 1], np.int64), np.array([1.0, 1.0]), 1.0, lower, upper, 1e-6
+    )
+    assert ok and idx.tolist() == [0, 1]
+
