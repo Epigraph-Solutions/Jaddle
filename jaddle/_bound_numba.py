@@ -147,3 +147,208 @@ def exact_side_bound(
             continue
         total += t
     return _constant(b, y) + total, rigorous
+
+
+@nb.njit(cache=True, nogil=True)
+def box_value(constant, r, lo, up):
+    """``constant + Σⱼ min(rⱼloⱼ, rⱼupⱼ)``, or ``-inf`` when a reduced cost
+    points at an infinite bound (no tolerance: ``dual_ascent``'s own test)."""
+    total = 0.0
+    for j in range(r.size):
+        t = _term(r[j], lo[j], up[j])
+        if not np.isfinite(t):
+            return -np.inf
+        total += t
+    return constant + total
+
+
+# ``dual_ascent``: a step that ends at a wall (a reduced cost that would
+# point at an infinite bound past it) stops this far inside, relative to
+# 1 + |t|, so the reduced cost recomputed from the duals keeps its sign.
+_WALL_MARGIN = 1e-10
+# A row moves only when its slope is more than this share of its terms.
+_SLOPE_TOL = 1e-12
+
+
+@nb.njit(cache=True, nogil=True)
+def _row_step(idx, val, start, end, bi, floor, r, lo, up, bp, wt):
+    """The step ``t`` of one row's dual that maximises the Lagrangian bound
+    along it (``dual_ascent``), with ``t >= floor``. ``bp``/``wt`` are
+    scratch of at least the row's length."""
+    tlo, thi = floor, np.inf
+    for k in range(start, end):
+        a = val[k]
+        if a == 0.0:
+            continue
+        j = idx[k]
+        if lo[j] == -np.inf:  # rⱼ + a·t <= 0
+            w = -r[j] / a
+            if a > 0:
+                thi = min(thi, w)
+            else:
+                tlo = max(tlo, w)
+        if up[j] == np.inf:  # rⱼ + a·t >= 0
+            w = -r[j] / a
+            if a > 0:
+                tlo = max(tlo, w)
+            else:
+                thi = min(thi, w)
+    if not tlo <= thi:
+        return 0.0
+    t0 = 0.0
+    if tlo > 0.0:
+        t0 = tlo
+        margin = _WALL_MARGIN * (1.0 + abs(t0))
+        if t0 + margin <= thi:
+            t0 += margin
+    elif thi < 0.0:
+        t0 = thi
+        margin = _WALL_MARGIN * (1.0 + abs(t0))
+        if t0 - margin >= tlo:
+            t0 -= margin
+    # The slopes just right and left of t0, and the kinks either side.
+    right = -bi
+    left = -bi
+    scale = abs(bi)
+    count = 0
+    for k in range(start, end):
+        a = val[k]
+        if a == 0.0:
+            continue
+        j = idx[k]
+        l, u = lo[j], up[j]
+        if l == -np.inf:
+            if u == np.inf:
+                continue  # a free column: the interval is its one point
+            right += a * u
+            left += a * u
+            scale += abs(a * u)
+        elif u == np.inf or l == u:
+            right += a * l
+            left += a * l
+            scale += abs(a * l)
+        else:
+            w = -r[j] / a
+            at_l, at_u = a * l, a * u
+            scale += max(abs(at_l), abs(at_u))
+            # Before its kink a column sits where −a points, after it at a's.
+            before = at_u if a > 0 else at_l
+            after = at_l if a > 0 else at_u
+            if w > t0:
+                right += before
+                left += before
+            elif w < t0:
+                right += after
+                left += after
+            else:
+                right += after
+                left += before
+                continue
+            bp[count] = w
+            wt[count] = abs(a) * (u - l)
+            count += 1
+    tol = _SLOPE_TOL * scale + 1e-300
+    if right > tol and t0 < thi:
+        order = np.argsort(bp[:count])
+        t = t0
+        for q in range(count):
+            w = bp[order[q]]
+            if w <= t0:
+                continue
+            if w > thi:
+                break
+            t = w
+            right -= wt[order[q]]
+            if right <= 0.0:
+                return t
+        if thi < np.inf:
+            margin = _WALL_MARGIN * (1.0 + abs(thi))
+            return thi - margin if thi - margin >= t else t
+        return t  # unbounded above (the row is infeasible): its last kink
+    if left < -tol and t0 > tlo:
+        order = np.argsort(bp[:count])
+        t = t0
+        for q in range(count - 1, -1, -1):
+            w = bp[order[q]]
+            if w >= t0:
+                continue
+            if w < tlo:
+                break
+            t = w
+            left += wt[order[q]]
+            if left >= 0.0:
+                return t
+        if tlo == floor:
+            return tlo
+        if tlo > -np.inf:
+            margin = _WALL_MARGIN * (1.0 + abs(tlo))
+            return tlo + margin if tlo + margin <= t else t
+        return t
+    return t0
+
+
+@nb.njit(cache=True, nogil=True)
+def dual_ascent(c, ptr, idx, val, b, n_eq, y, lower, upper, is_int, sweeps, target):
+    """
+    Coordinate ascent on the Lagrangian bound
+    ``g(y) = −bᵀy + Σⱼ min(rⱼlⱼ, rⱼuⱼ)``, ``r = c + Aᵀy``, from the duals
+    ``y``, with ``A`` as CSR arrays (by row) and the continuous bounds
+    widened as ``widened_box_bound`` does.
+
+    ``g`` is concave and piecewise linear. Along row ``i`` its slope is
+    ``aᵢ·x − bᵢ`` at the box vertex ``x`` the reduced costs pick, which
+    falls by ``|aᵢⱼ|(uⱼ − lⱼ)`` as ``rⱼ`` crosses zero at
+    ``t = −rⱼ/aᵢⱼ``: the row's dual moves to where the slope changes sign
+    (``_row_step``), within ``yᵢ >= 0`` on an inequality row and the
+    interval where no reduced cost of the row points at an infinite bound.
+    Rows are taken in order, each from the reduced costs the last left,
+    for ``sweeps`` passes, or until a pass moves nothing or the bound
+    reaches ``target``.
+
+    Returns ``(y, moves)``; ``y`` is a new array.
+    """
+    m = b.size
+    n = c.size
+    y = y.copy()
+    _clip_duals(y, n_eq)
+    lo = np.empty(n)
+    up = np.empty(n)
+    for j in range(n):
+        cont = not is_int[j]
+        lo[j] = _widen(lower[j], True, cont)
+        up[j] = _widen(upper[j], False, cont)
+    r = c.copy()
+    width = 0
+    for i in range(m):
+        width = max(width, ptr[i + 1] - ptr[i])
+        yi = y[i]
+        if yi != 0.0:
+            for k in range(ptr[i], ptr[i + 1]):
+                r[idx[k]] += val[k] * yi
+    bp = np.empty(width)
+    wt = np.empty(width)
+    moves = 0
+    for _ in range(sweeps):
+        moved = 0
+        for i in range(m):
+            start, end = ptr[i], ptr[i + 1]
+            if start == end:
+                continue
+            floor = -y[i] if i >= n_eq else -np.inf
+            t = _row_step(idx, val, start, end, b[i], floor, r, lo, up, bp, wt)
+            if t == 0.0:
+                continue
+            if t <= floor:
+                t = floor
+                y[i] = 0.0
+            else:
+                y[i] += t
+            for k in range(start, end):
+                r[idx[k]] += val[k] * t
+            moved += 1
+        moves += moved
+        if moved == 0:
+            break
+        if target < np.inf and box_value(_constant(b, y), r, lo, up) >= target:
+            break
+    return y, moves

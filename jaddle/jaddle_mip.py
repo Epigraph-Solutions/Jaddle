@@ -1984,6 +1984,70 @@ class DualRepair:
         return y if changed else None
 
 
+# ``DualPolish``: the passes over the rows a node's duals get.
+_DUAL_POLISH_SWEEPS = 3
+# A child's, from its parent's duals over its own box (``polish_child``);
+# and that goes on past this many tries only while this share of them
+# close their child (``child_polish_due``).
+_CHILD_POLISH_SWEEPS = 2
+_CHILD_POLISH_TRIAL = 200
+_CHILD_POLISH_SHARE = 0.01
+
+
+class DualPolish:
+    """
+    Dual ascent on the Lagrangian bound (``box_bound``) from a node LP's
+    approximate duals, on the host (``jaddle._bound_numba.dual_ascent``;
+    needs numba, and is off without it).
+
+    The bound ``g(y) = −bᵀy + Σⱼ min(rⱼlⱼ, rⱼuⱼ)`` charges every reduced
+    cost ``rⱼ = cⱼ + (Aᵀy)ⱼ`` at the bound it points at, so the errors of
+    a first-order solve's duals (at ``node_lp_tolerance``) each cost the
+    bound the width of a box. ``g`` is concave and piecewise linear, and
+    along one row's dual its maximiser is exact: the slope is the row's
+    residual ``aᵢ·x − bᵢ`` at the box vertex the reduced costs pick, and
+    it falls as each ``rⱼ`` crosses zero, so the dual moves to the kink
+    where the slope changes sign. Each pass does that for every row in
+    turn. It raises and lowers inequality duals (within ``y >= 0``), moves
+    equality duals, counts integer columns, and moves a reduced cost off
+    an infinite bound it points at when one row can (a bound that was
+    ``-inf`` or not rigorous can come back rigorous): ``DualRepair`` does
+    none of these.
+
+    Any duals give a valid bound, so the caller keeps the higher of the
+    two and the polish cannot cost rigour.
+    """
+
+    def __init__(self, mip, is_int, sweeps=_DUAL_POLISH_SWEEPS):
+        self.kernel = _numba_bound()
+        A = sp.csr_matrix(mip.A)
+        self.m = A.shape[0]
+        self.n_eq = mip.n_eq
+        self.ptr = A.indptr.astype(np.int64)
+        self.idx = A.indices.astype(np.int64)
+        self.val = _f64(A.data)
+        self.b = _f64(mip.b)
+        self.c = _f64(mip.c)
+        self.is_int = np.asarray(is_int, bool)
+        self.sweeps = int(sweeps)
+
+    def __bool__(self):
+        return self.kernel is not None and self.m > 0 and self.sweeps > 0
+
+    def __call__(self, y, lower, upper, target=np.inf, sweeps=None):
+        """Polished duals for ``y`` (Jaddle's convention), or ``None`` when
+        no row moves. ``target``: a bound that is high enough to stop at."""
+        y = _f64(y)
+        if y.shape[0] != self.m or not np.all(np.isfinite(y)):
+            return None
+        y, moves = self.kernel.dual_ascent(
+            self.c, self.ptr, self.idx, self.val, self.b, self.n_eq, y,
+            _f64(lower), _f64(upper), self.is_int,
+            self.sweeps if sweeps is None else int(sweeps), float(target),
+        )
+        return y if moves else None
+
+
 def reduced_cost_tightening(r, bound, cutoff, lower, upper, integrality):
     """
     Integer bounds tightened by reduced costs: integer values that cannot
@@ -2201,7 +2265,7 @@ def _knapsack(idx, a, b, x, lower, upper, is_binary):
     return cols, w, complemented, z, capacity
 
 
-def _lift_cover(cover, w, z, capacity):
+def _lift_cover(cover, w, z, capacity, floor=None):
     """Sequential up-lifting of the cover inequality ``Σ_C z <= |C| − 1``
     over the knapsack ``w · z <= capacity``. Each item outside ``C`` (most
     used by the LP point first) gets ``α_j = |C| − 1 − max{π · z : w · z <=
@@ -2217,9 +2281,13 @@ def _lift_cover(cover, w, z, capacity):
     covers of 1,200 items on average, nine in ten not violated: a dynamic
     program over the cover item by item (quadratic in its size) and the
     lifting of every item at zero were most of a separation round (3.1 s
-    with them, 0.7 s without, on one thread)."""
+    with them, 0.7 s without, on one thread).
+
+    ``floor`` (``gub_cover_cuts``): coefficients the items outside ``C``
+    hold already and keep at least; the dynamic program counts an item
+    only for what its own lifting gives it."""
     rhs = cover.size - 1
-    pi = np.zeros(w.size)
+    pi = np.zeros(w.size) if floor is None else np.array(floor, np.float64)
     pi[cover] = 1.0
     least = np.concatenate(([0.0], np.cumsum(np.sort(w[cover])[:rhs])))
     slack = 1e-9 * (1.0 + abs(capacity))
@@ -2239,11 +2307,40 @@ def _lift_cover(cover, w, z, capacity):
             alpha = rhs - int(np.flatnonzero(least <= room).max())
         if alpha <= 0:
             continue
-        pi[item] = alpha
+        pi[item] = max(alpha, pi[item])
         if alpha <= rhs:
             update = least[: rhs + 1 - alpha] + w[item]
             least[alpha:] = np.minimum(least[alpha:], update)
     return pi
+
+
+# ``_class_covers``: the weights of a row that get a cover of their own.
+_COVER_CLASSES = 8
+
+
+def _class_covers(w, z, threshold):
+    """For each weight ``v`` that enough items of the knapsack share, the
+    cover of ``⌊threshold/v⌋ + 1`` of them (minimal: one fewer fits), those
+    with the largest ``z``; for the ``_COVER_CLASSES`` weights whose cover
+    the LP point uses most, and uses at all. Sorted index arrays."""
+    by_weight = np.argsort(w, kind="stable")
+    found = []
+    start = 0
+    while start < by_weight.size:
+        v = w[by_weight[start]]
+        end = start + 1
+        while end < by_weight.size and w[by_weight[end]] == v:
+            end += 1
+        need = int(math.floor(threshold / v)) + 1
+        if 2 <= need <= end - start:
+            members = by_weight[start:end]
+            cover = members[np.argsort(-z[members], kind="stable")[:need]]
+            mass = float(z[cover].sum())
+            if mass > 1e-9:
+                found.append((mass, np.sort(cover)))
+        start = end
+    found.sort(key=lambda item: -item[0])
+    return [cover for _, cover in found[:_COVER_CLASSES]]
 
 
 def cover_cuts(idx, a, b, x, lower, upper, is_binary, max_covers=_COVER_ORDERS):
@@ -2257,8 +2354,17 @@ def cover_cuts(idx, a, b, x, lower, upper, is_binary, max_covers=_COVER_ORDERS):
     whose weights exceed the capacity, so not all of it can be 1:
     ``Σ_C z <= |C| − 1``. Covers are built greedily in up to ``max_covers``
     orders at the LP point (by ``(1 − z*)/w``, by ``1 − z*``, heaviest
-    first), made minimal, and lifted exactly (``_lift_cover``). Returns a
-    list of ``(idx, coef, rhs)`` for ``coef · x[idx] <= rhs``.
+    first), made minimal, and lifted exactly (``_lift_cover``). Then one
+    cover for each weight the row repeats (``_class_covers``): as many
+    items of that weight as overfill the row, those the LP point uses
+    most. The greedy orders stop at the fewest items that overfill, so
+    in a bin-packing row ``Σ wᵢxᵢ <= 4y`` (weights 1 to 4) they only ever
+    find a heavy item with one other, the lifted cut "one heavy item a
+    bin"; the cover of three items of weight 2 lifts to
+    ``2·(threes and fours) + twos <= 2y``, which summed over the bins of
+    neos-631710 bounds them at 202.5 (the optimum is 203) where the LP
+    has 188.25. Returns a list of ``(idx, coef, rhs)`` for
+    ``coef · x[idx] <= rhs``.
     """
     knapsack = _knapsack(idx, a, b, x, lower, upper, is_binary)
     if knapsack is None:
@@ -2276,7 +2382,7 @@ def cover_cuts(idx, a, b, x, lower, upper, is_binary, max_covers=_COVER_ORDERS):
         np.lexsort((-w, 1.0 - z)),
         np.argsort(-w, kind="stable"),
     )[:max_covers]
-    seen, cuts = set(), []
+    covers = []
     for order in orders:
         exceeds = np.cumsum(w[order]) > threshold
         if not exceeds.any():
@@ -2290,7 +2396,11 @@ def cover_cuts(idx, a, b, x, lower, upper, is_binary, max_covers=_COVER_ORDERS):
             if total - w[cover[position]] > threshold:
                 total -= w[cover[position]]
                 keep[position] = False
-        cover = np.sort(cover[keep])
+        covers.append(np.sort(cover[keep]))
+    if max_covers >= _COVER_ORDERS:
+        covers.extend(_class_covers(w, z, threshold))
+    seen, cuts = set(), []
+    for cover in covers:
         key = cover.tobytes()
         if key in seen:
             continue
@@ -2313,6 +2423,154 @@ def cover_cuts(idx, a, b, x, lower, upper, is_binary, max_covers=_COVER_ORDERS):
         members = np.flatnonzero(pi)
         coef = np.where(complemented[members], -pi[members], pi[members])
         rhs = rhs_z - pi[members][complemented[members]].sum()
+        # Covers often lift to the same cut: each cut once.
+        lifted = (members.tobytes(), coef.tobytes(), float(rhs))
+        if lifted in seen:
+            continue
+        seen.add(lifted)
+        cuts.append((violation / np.linalg.norm(pi[members]), cols[members], coef, rhs))
+    cuts.sort(key=lambda cut: -cut[0])
+    return [cut[1:] for cut in cuts]
+
+
+def _gub_partition(A, b, is_binary, conflict_graph=None):
+    """
+    Disjoint sets of binaries of which at most one is 1 in any feasible
+    point (generalised upper bounds), for ``gub_cover_cuts``: ``gub[j]`` is
+    the set of column ``j``, or −1.
+
+    A row ``a·x <= b`` (an equality row too) over binaries with positive
+    coefficients is such a set when its two smallest coefficients pass
+    ``b`` together; so is a clique of ``conflict_graph`` on uncomplemented
+    literals. The largest sets come first, each taking its columns no set
+    has yet (a part of a set is a set); a set left with one column is none.
+    Returns ``None`` without any.
+    """
+    A = sp.csr_matrix(A)
+    is_binary = np.asarray(is_binary, bool)
+    sets = []
+    lengths = np.diff(A.indptr)
+    for r in np.flatnonzero(lengths >= 2):
+        start, end = A.indptr[r], A.indptr[r + 1]
+        cols, a = A.indices[start:end], A.data[start:end]
+        if not (is_binary[cols].all() and a.min() > 0):
+            continue
+        two = np.partition(a, 1)[:2].sum()
+        if two > b[r] + _KNAPSACK_TOL * (1.0 + abs(b[r])):
+            sets.append(np.asarray(cols, np.int64))
+    if conflict_graph is not None:
+        for clique in conflict_graph.cliques:
+            if clique.size >= 2 and not (clique & 1).any():
+                cols = clique >> 1
+                if is_binary[cols].all():
+                    sets.append(cols)
+    gub = np.full(A.shape[1], -1, np.int64)
+    count = 0
+    for k in np.argsort([-c.size for c in sets], kind="stable"):
+        free = sets[k][gub[sets[k]] < 0]
+        if free.size >= 2:
+            gub[free] = count
+            count += 1
+    return gub if count else None
+
+
+def gub_cover_cuts(idx, a, b, x, lower, upper, is_binary, gub):
+    """
+    Lifted cover cuts from the row ``a · x[idx] <= b`` that use the sets
+    ``gub`` (``_gub_partition``: at most one column of a set is 1), most
+    violated first; ``[]`` when no two of the row's items share a set
+    (``cover_cuts`` has those).
+
+    The knapsack is ``cover_cuts``'; a complemented item is a set of its
+    own. Each set stands for one item, the one the LP point uses most, and
+    a cover is built over the sets as ``cover_cuts`` builds one over items
+    (the same three orders, by the sets' LP mass and their items'
+    weights), then made minimal. Only one item of a set can be 1, so its
+    items at least as heavy as the one it stands for overfill the row just
+    as well and enter the cut with it:
+
+        Σ_{sets in C} Σ_{j in the set, wⱼ >= its item's} zⱼ <= |C| − 1.
+
+    The other items are lifted by ``_lift_cover``, whose dynamic program
+    leaves the sets out: it can only take the value that fits beside an
+    item for more than it is, so the coefficients hold and are not always
+    the largest. An item already in the cut keeps the larger of the two.
+    """
+    knapsack = _knapsack(idx, a, b, x, lower, upper, is_binary)
+    if knapsack is None:
+        return []
+    cols, w, complemented, z, capacity = knapsack
+    group = np.where(complemented, -1, gub[cols])
+    k = cols.size
+    label = np.empty(k, np.int64)
+    count, previous = 0, -1
+    for p in np.argsort(group, kind="stable"):
+        if group[p] < 0 or group[p] != previous:
+            count += 1
+        label[p] = count - 1
+        previous = group[p]
+    size = np.bincount(label, minlength=count)
+    if size.max() < 2:
+        return []
+    threshold = capacity + 1e-9 * (1.0 + abs(capacity))
+    z_int = np.round(z)
+    if np.all(np.abs(z - z_int) <= 1e-9) and w @ z_int <= threshold:
+        return []
+    # The item each set stands for: the most used, then the heaviest.
+    rep = np.full(count, -1, np.int64)
+    for p in range(k):
+        q = rep[label[p]]
+        if q < 0 or z[p] > z[q] or (z[p] == z[q] and w[p] > w[q]):
+            rep[label[p]] = p
+    wr = w[rep]
+    heavy = w >= wr[label]  # the items that enter the cut with their set
+    mass = np.bincount(label, weights=np.where(heavy, z, 0.0), minlength=count)
+    orders = (
+        np.argsort((1.0 - mass) / wr, kind="stable"),
+        np.lexsort((-wr, 1.0 - mass)),
+        np.argsort(-wr, kind="stable"),
+    )
+    z_total = z.sum()
+    seen, cuts = set(), []
+    for order in orders:
+        exceeds = np.cumsum(wr[order]) > threshold
+        if not exceeds.any():
+            continue
+        chosen = order[: np.argmax(exceeds) + 1]
+        total = wr[chosen].sum()
+        keep = np.ones(chosen.size, dtype=bool)
+        for position in np.argsort(mass[chosen], kind="stable"):
+            if total - wr[chosen[position]] > threshold:
+                total -= wr[chosen[position]]
+                keep[position] = False
+        chosen = np.sort(chosen[keep])
+        if size[chosen].max() < 2:
+            continue  # a cover of single items: ``cover_cuts``'
+        key = chosen.tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        rhs_z = chosen.size - 1.0
+        in_cover = mass[chosen].sum()
+        if in_cover - rhs_z + max(rhs_z, 1.0) * (z_total - in_cover) <= 1e-6:
+            continue
+        inside = np.zeros(count, dtype=bool)
+        inside[chosen] = True
+        floor = np.where(inside[label] & heavy, 1.0, 0.0)
+        pi = _lift_cover(np.sort(rep[chosen]), w, z, capacity, floor)
+        if pi is None:
+            continue
+        violation = pi @ z - rhs_z
+        if violation <= 1e-6:
+            continue
+        members = np.flatnonzero(pi)
+        coef = np.where(complemented[members], -pi[members], pi[members])
+        rhs = rhs_z - pi[members][complemented[members]].sum()
+        # Covers often lift to the same cut: each cut once.
+        lifted = (members.tobytes(), coef.tobytes(), float(rhs))
+        if lifted in seen:
+            continue
+        seen.add(lifted)
         cuts.append((violation / np.linalg.norm(pi[members]), cols[members], coef, rhs))
     cuts.sort(key=lambda cut: -cut[0])
     return [cut[1:] for cut in cuts]
@@ -4377,6 +4635,7 @@ class CutSeparator:
         cmir_per_row=1,
         mir_cuts=True,
         threads="auto",
+        gub_covers=True,
     ):
         # The JAX device the batched searches run on (``None``: the default
         # one where the call is made).
@@ -4427,6 +4686,14 @@ class CutSeparator:
             mip.integrality if integrality is None else np.asarray(integrality, bool)
         )
         self.is_binary = self.is_int & (self.lower == 0.0) & (self.upper == 1.0)
+        # GUB cover cuts (``gub_covers``; ``gub_cover_cuts``) over the sets
+        # of binaries the rows and the conflict graph show hold at most
+        # one 1 (``None`` without any).
+        self.gub = (
+            _gub_partition(self.A, self.b, self.is_binary, conflict_graph)
+            if gub_covers
+            else None
+        )
         # Variable bounds for c-MIR (``None`` without any, as on a pure
         # integer MIP): the rows' own, then probing's.
         bounds = variable_bounds(mip)
@@ -4486,6 +4753,14 @@ class CutSeparator:
                         self.is_binary,
                     )
                 ]
+                if self.gub is not None:
+                    covers += [
+                        ("gubcover", *found)
+                        for found in gub_cover_cuts(
+                            idx, s * a, s * self.b[r], x, self.lower,
+                            self.upper, self.is_binary, self.gub,
+                        )
+                    ]
                 jobs.append((covers, self._aggregation_path(r, s, x)))
         bases = [base for _, path in jobs for base in path]
         if self.backend == "jax" and len(bases) >= self.min_batch:
@@ -4587,6 +4862,7 @@ class CutSeparator:
                 out.append((family, *cleaned))
         separate = _numba_separate().separate
         relative = _f64(self.relative)
+        gub = np.empty(0, np.int64) if self.gub is None else self.gub
 
         def run(chunk):
             return separate(
@@ -4595,6 +4871,7 @@ class CutSeparator:
                 relative, self.variable_bounds is not None, *vb,
                 int(self.max_aggregation), bool(self.aggregate_integers),
                 bool(self.flow_covers), 64, _COVER_ORDERS, _KNAPSACK_TOL, _CUT_TINY,
+                gub, self.gub is not None,
                 # None of the c-MIR cuts kept without ``mir_cuts``.
                 int(self.aggregation_width), int(self.cmir_per_row) if self.mir_cuts else 0,
             )
@@ -4607,7 +4884,7 @@ class CutSeparator:
             results = list(_separation_pool(self.threads).map(run, chunks))
         else:
             results = [run(rows)]
-        names = ("cover", "mir", "flowcover")
+        names = ("cover", "mir", "flowcover", "gubcover")
         for family, ptr, idx, coef, rhs in results:
             for k in range(family.size):
                 start, end = ptr[k], ptr[k + 1]
@@ -4824,6 +5101,25 @@ class CutSeparator:
         return merged_idx[nonzero], merged[nonzero], b + lam * self.b[r2]
 
 
+def _unique_cuts(cuts):
+    """``cuts`` (``(family, idx, coef, rhs)``) without the repeats of a cut
+    (the same columns, coefficients and right-hand side), in the order
+    given. The separators of the rows as searched and as given often agree,
+    and the selection, the pool and the efficacy passes each walk every
+    candidate."""
+    seen, out = set(), []
+    for cut in cuts:
+        key = (
+            np.asarray(cut[1], np.int64).tobytes(),
+            np.asarray(cut[2], np.float64).tobytes(),
+            float(cut[3]),
+        )
+        if key not in seen:
+            seen.add(key)
+            out.append(cut)
+    return out
+
+
 def violated_cuts(cuts, x, min_efficacy=1e-4):
     """The ``cuts`` (``(family, idx, coef, rhs)``) that ``x`` violates by an
     efficacy (distance) of at least ``min_efficacy``, in the order given:
@@ -4939,6 +5235,19 @@ def _cut_scores(
     return score
 
 
+# ``_spread_out``: the most candidates a block holds, and the share of a
+# block's cosines that may be nonzero for them to be kept sparse.
+_SPREAD_BLOCK = 2048
+_SPREAD_SPARSE_SHARE = 0.05
+
+
+def _row_max(M):
+    """The largest ``|entry|`` of each row of the sparse matrix ``M``."""
+    if M.nnz == 0:
+        return np.zeros(M.shape[0])
+    return np.asarray(abs(M).max(axis=1).todense(), np.float64).ravel()
+
+
 def _spread_out(directions, order, max_cuts, held=None):
     """The greedy pass of ``select_cuts``: the rows of ``directions`` (CSR,
     unit rows) taken in ``order``, skipping each whose |cosine| with one
@@ -4950,8 +5259,16 @@ def _spread_out(directions, order, max_cuts, held=None):
     with its block only, and a later block's with all the cuts chosen
     before it. Same cuts as one pass over all of them, without a product
     over every candidate per cut chosen (a third of a second a round on
-    bab5, with about 1,000 candidates)."""
-    block_size = max(4 * max_cuts, 256)
+    bab5, with about 1,000 candidates).
+
+    Two cuts have a cosine only where they share a column, so the products
+    stay sparse and only their stored entries are read; a block's own
+    cosines are made dense (``_gram``) only when more than
+    ``_SPREAD_SPARSE_SHARE`` of them would be stored. A block holds at most
+    ``_SPREAD_BLOCK`` candidates whatever ``max_cuts`` is: at four times
+    ``max_cuts``, as it was, 10,000 cuts a round made each block's cosines
+    a dense 40,000 by 40,000 array (12.8 GB)."""
+    block_size = min(max(4 * max_cuts, 256), _SPREAD_BLOCK)
     chosen = []
     for start in range(0, order.size, block_size):
         block = order[start : start + block_size]
@@ -4959,12 +5276,11 @@ def _spread_out(directions, order, max_cuts, held=None):
         # The largest |cosine| of each candidate with a cut chosen so far.
         nearest = np.zeros(block.size)
         if chosen:
-            nearest = np.abs((D @ directions[chosen].T).toarray()).max(axis=1)
+            nearest = _row_max(D @ directions[chosen].T)
         if held is not None and held.shape[0]:
-            np.maximum(
-                nearest, np.abs((D @ held.T).toarray()).max(axis=1), out=nearest
-            )
+            np.maximum(nearest, _row_max(D @ held.T), out=nearest)
         cosines = None  # the block's |cosines|, once a cut in it is chosen
+        sparse = False
         for j, i in enumerate(block):
             if nearest[j] > _CUT_MAX_PARALLELISM:
                 continue
@@ -4972,8 +5288,18 @@ def _spread_out(directions, order, max_cuts, held=None):
             if len(chosen) >= max_cuts:
                 return chosen
             if cosines is None:
-                cosines = np.abs(_gram(D))
-            np.maximum(nearest, cosines[j], out=nearest)
+                counts = np.bincount(D.indices, minlength=D.shape[1]).astype(np.float64)
+                sparse = counts @ counts <= _SPREAD_SPARSE_SHARE * float(block.size) ** 2
+                if sparse:
+                    cosines = abs(D @ D.T).tocsr()
+                else:
+                    cosines = np.abs(_gram(D))
+            if sparse:
+                first, last = cosines.indptr[j], cosines.indptr[j + 1]
+                near = cosines.indices[first:last]
+                nearest[near] = np.maximum(nearest[near], cosines.data[first:last])
+            else:
+                np.maximum(nearest, cosines[j], out=nearest)
     return chosen
 
 
@@ -9363,6 +9689,7 @@ class _BranchAndBound:
         flow_covers=True,
         mir_cuts=True,
         clique_cuts=True,
+        gub_cover_cuts=True,
         zero_half_cuts=True,
         cut_age=_CUT_AGE,
         max_cut_rows=None,
@@ -9385,6 +9712,9 @@ class _BranchAndBound:
         separation_threads="auto",
         node_bound_stop=True,
         dual_repair=True,
+        dual_polish=True,
+        dual_polish_sweeps=_DUAL_POLISH_SWEEPS,
+        dual_polish_children=True,
         node_lp_tolerance=None,
         heuristic_effort=0.1,
         reliability_threshold=4,
@@ -9734,6 +10064,7 @@ class _BranchAndBound:
         # Global cuts in the tree need one sparsity pattern per compiled
         # solver; the batched solver captures it, so they are serial only.
         self.use_flow_covers = bool(flow_covers)
+        self.use_gub_covers = bool(gub_cover_cuts)
         self.use_mir_cuts = bool(mir_cuts)
         # Clique cuts (``clique_cuts``): one conflict graph over the root
         # box, built at the first separation and kept for the tree rounds.
@@ -9910,6 +10241,21 @@ class _BranchAndBound:
         self.use_dual_repair = bool(dual_repair)
         self.dual_repairer = None
         self.dual_repair_stats = collections.Counter(tried=0, improved=0, seconds=0.0)
+        # Dual ascent on each device node's bound (``DualPolish``).
+        self.dual_polish_sweeps = int(dual_polish_sweeps) if dual_polish else 0
+        if self.dual_polish_sweeps < 0:
+            raise ValueError("dual_polish_sweeps must be >= 0")
+        self.dual_polisher = None
+        self.dual_polish_stats = collections.Counter(
+            tried=0, improved=0, closed=0, made_rigorous=0, gain=0.0, seconds=0.0,
+            child_tried=0, child_improved=0, child_closed=0, child_gain=0.0,
+            child_seconds=0.0,
+        )
+        # Children's bounds polished over their own boxes before their LPs
+        # (``polish_child``), from the duals behind the parent's terms.
+        self.child_polish = bool(dual_polish_children) and self.dual_polish_sweeps > 0
+        self.child_polish_sweeps = min(self.dual_polish_sweeps, _CHILD_POLISH_SWEEPS)
+        self.polished_duals = None
         self.use_tree_cuts = bool(tree_cuts)
         self.tree_cut_every = tree_cut_every
         if int(tree_pool_every) < 0:
@@ -10661,6 +11007,11 @@ class _BranchAndBound:
         if self.use_dual_repair:
             repairer = DualRepair(mip, self.is_int)
             self.dual_repairer = repairer if repairer else None
+        self.dual_polisher = None
+        if self.dual_polish_sweeps:
+            polisher = DualPolish(mip, self.is_int, self.dual_polish_sweeps)
+            self.dual_polisher = polisher if polisher else None
+        self.polished_duals = None  # (the rows changed)
         if rows_only:
             return
         # The heuristics propagate even when the search does not.
@@ -11232,34 +11583,131 @@ class _BranchAndBound:
 
     def repair_terms(self, result, terms, raw, rigorous, lower, upper):
         """A device LP's ``(terms, raw, rigorous)`` with its duals repaired
-        (``DualRepair``, ``dual_repair``) when that bounds the box higher;
-        as given otherwise, and for an exact lane result (its duals are a
-        vertex's) or a box its bound already closes."""
-        repairer = self.dual_repairer
+        (``DualRepair``, ``dual_repair``) and then polished (``DualPolish``,
+        ``dual_polish``) when that bounds the box higher; as given
+        otherwise, and for an exact lane result (its duals are a vertex's)
+        or a box its bound already closes."""
+        repairer, polisher = self.dual_repairer, self.dual_polisher
         if (
-            repairer is None
+            (repairer is None and polisher is None)
             or result.get("stop_reason") == "exact"
             or raw >= self.cutoff()
         ):
             return terms, raw, rigorous
-        started = time.perf_counter()
         solution = result["solution"]
-        y = repairer(
-            self.mip.c, self.A_T, self.duals(solution, self.m_ineq),
-            solution.primal, lower, upper,
+        y = self.duals(solution, self.m_ineq)
+        adopted = None
+        if repairer is not None:
+            started = time.perf_counter()
+            repaired = repairer(
+                self.mip.c, self.A_T, y, solution.primal, lower, upper
+            )
+            stats = self.dual_repair_stats
+            stats["tried"] += 1
+            if repaired is not None:
+                new_terms = lagrangian_terms(
+                    self.mip.c, self.mip.A, self.mip.b, self.mip.n_eq, repaired,
+                    A_T=self.A_T,
+                )
+                new_raw, new_rigorous = self.bound_over(new_terms, lower, upper)
+                # A rigorous bound only gives way to a higher rigorous one.
+                if new_raw > raw and (new_rigorous or not rigorous):
+                    stats["improved"] += 1
+                    terms, raw, rigorous = new_terms, new_raw, new_rigorous
+                    y = adopted = repaired
+            stats["seconds"] += time.perf_counter() - started
+        if polisher is not None and raw < self.cutoff():
+            started = time.perf_counter()
+            target = self.node_bound_target()
+            polished = polisher(
+                y, lower, upper, np.inf if target is None else target
+            )
+            stats = self.dual_polish_stats
+            stats["tried"] += 1
+            if polished is not None:
+                # From the duals alone, not the reduced costs the ascent
+                # updated as it went.
+                new_terms = lagrangian_terms(
+                    self.mip.c, self.mip.A, self.mip.b, self.mip.n_eq, polished,
+                    A_T=self.A_T,
+                )
+                new_raw, new_rigorous = self.bound_over(new_terms, lower, upper)
+                if new_raw > raw and (new_rigorous or not rigorous):
+                    stats["improved"] += 1
+                    stats["made_rigorous"] += bool(new_rigorous and not rigorous)
+                    if np.isfinite(raw):
+                        stats["gain"] += float(new_raw - raw)
+                    stats["closed"] += bool(
+                        self.round_bound(new_raw) >= self.cutoff()
+                    )
+                    terms, raw, rigorous = new_terms, new_raw, new_rigorous
+                    adopted = polished
+            stats["seconds"] += time.perf_counter() - started
+        if adopted is not None:
+            # The duals behind these terms, for the children's ascent.
+            self.polished_duals = (terms[1], adopted)
+        return terms, raw, rigorous
+
+    def child_polish_due(self, child_raw, bound):
+        """Whether a child's bound from its parent's duals is polished over
+        its own box before its LP (``dual_polish_children``): not one that
+        closes already, and, past the first ``_CHILD_POLISH_TRIAL`` tries,
+        only while ``_CHILD_POLISH_SHARE`` of them close their child. It
+        raises nearly every child's bound, but at about the cost of the
+        node's own polish for each child, which only the LPs it saves
+        repay: over 40 s, timtab1, pg5_34 and mas76 closed 1 or 2 of
+        2,300 to 9,300 children for 10% to 17% of the time, and
+        neos-911970 closed 18 of 628 for 4%."""
+        if self.dual_polisher is None or not self.child_polish:
+            return False
+        if max(self.round_bound(child_raw), bound) >= self.cutoff():
+            return False
+        stats = self.dual_polish_stats
+        tried = stats["child_tried"]
+        return (
+            tried < _CHILD_POLISH_TRIAL
+            or stats["child_closed"] >= _CHILD_POLISH_SHARE * tried
         )
-        stats = self.dual_repair_stats
-        stats["tried"] += 1
+
+    def polish_child(self, terms, warm, lower, upper, raw, rigorous):
+        """A child's ``(terms, raw, rigorous)`` from dual ascent over its
+        own box (``DualPolish``), before its LP is solved: the parent's
+        duals are a maximiser's neighbours for the parent's box, and the
+        child's differs by the branched bound and what propagation fixed,
+        so a pass or two re-settles them. Starts from the duals the
+        parent's terms came from (``polished_duals``), else its LP's."""
+        started = time.perf_counter()
+        stats = self.dual_polish_stats
+        stats["child_tried"] += 1
+        held = self.polished_duals
+        if held is not None and held[0] is terms[1]:
+            y = held[1]
+        elif warm is not None and warm[0] is not None:
+            y = self.duals(warm[0], self.m_ineq)
+        else:
+            y = None
+        polished = None
         if y is not None:
+            target = self.node_bound_target()
+            polished = self.dual_polisher(
+                y, lower, upper, np.inf if target is None else target,
+                sweeps=self.child_polish_sweeps,
+            )
+        if polished is not None:
             new_terms = lagrangian_terms(
-                self.mip.c, self.mip.A, self.mip.b, self.mip.n_eq, y, A_T=self.A_T
+                self.mip.c, self.mip.A, self.mip.b, self.mip.n_eq, polished,
+                A_T=self.A_T,
             )
             new_raw, new_rigorous = self.bound_over(new_terms, lower, upper)
-            # A rigorous bound only gives way to a higher rigorous one.
             if new_raw > raw and (new_rigorous or not rigorous):
-                stats["improved"] += 1
+                stats["child_improved"] += 1
+                if np.isfinite(raw):
+                    stats["child_gain"] += float(new_raw - raw)
+                stats["child_closed"] += bool(
+                    self.round_bound(new_raw) >= self.cutoff()
+                )
                 terms, raw, rigorous = new_terms, new_raw, new_rigorous
-        stats["seconds"] += time.perf_counter() - started
+        stats["child_seconds"] += time.perf_counter() - started
         return terms, raw, rigorous
 
     def reduced_cost_fix(self, terms, lower, upper):
@@ -12823,6 +13271,11 @@ class _BranchAndBound:
                 rigorous = bool(precomputed["rigorous"][side])
             else:
                 child_bound, rigorous = self.bound_over(terms, lo, up)
+            child_terms = terms
+            if self.child_polish_due(child_bound, bound):
+                child_terms, child_bound, rigorous = self.polish_child(
+                    terms, warm, lo, up, child_bound, rigorous
+                )
             # Its own bound, when rigorous, on top of the node's proven one.
             child_proven = node.proven
             if rigorous and np.isfinite(child_bound):
@@ -12844,7 +13297,7 @@ class _BranchAndBound:
                 self.branch_cutoffs[side, var] += 1
                 self.close(child_bound, rigorous, child_proven)
                 if rigorous:
-                    self.learn(terms, lo, up)
+                    self.learn(child_terms, lo, up)
                 continue
             distance = xv - math.floor(xv) if down else math.ceil(xv) - xv
             child = _Node(
@@ -13554,6 +14007,7 @@ class _BranchAndBound:
             names = (
                 ("gomory", "Gomory"),
                 ("cover", "cover"),
+                ("gubcover", "GUB cover"),
                 ("mir", "MIR"),
                 ("flowcover", "flow cover"),
                 ("clique", "clique"),
@@ -13717,6 +14171,7 @@ class _BranchAndBound:
                 for family in (
                     "gomory",
                     "cover",
+                    "gubcover",
                     "mir",
                     "flowcover",
                     "clique",
@@ -13734,6 +14189,7 @@ class _BranchAndBound:
             "objective_step": self.objective_step,
             "reduced_cost_tightenings": self.reduced_cost_tightenings,
             "dual_repairs": dict(self.dual_repair_stats),
+            "dual_polish": dict(self.dual_polish_stats),
             "children_pruned": self.children_pruned,
             "lp_repairs": self.lp_repairs,
             "lp_repairs_skipped": self.lp_repairs_skipped,
@@ -14261,6 +14717,7 @@ class _BranchAndBound:
                 separators, x, lower, upper, 2 * self.max_cuts_per_round
             )
             candidates += inout or []
+            candidates = _unique_cuts(candidates)
             found = self.select_cuts(candidates, x, n, self.max_cuts_per_round)
             found = self.new_cuts(found)  # none: the round adds nothing, so stop
             self.inout_result(found, inout)
@@ -14479,6 +14936,7 @@ class _BranchAndBound:
                 separators, x, lower, upper, 2 * self.max_cuts_per_round
             )
             candidates += inout or []
+            candidates = _unique_cuts(candidates)
             found = self.select_cuts(candidates, x, n, self.max_cuts_per_round)
             found = self.new_cuts(found, age_limit)  # none: the round adds nothing, so stop
             self.inout_result(found, inout)
@@ -15197,6 +15655,7 @@ class _BranchAndBound:
             aggregation_width=self.aggregation_width,
             cmir_per_row=self.cmir_per_row,
             flow_covers=self.use_flow_covers,
+            gub_covers=self.use_gub_covers,
             mir_cuts=self.use_mir_cuts,
             backend=self.separation_backend,
             device=self.separation_device,
@@ -15431,6 +15890,7 @@ class _BranchAndBound:
         candidates = self.node_separated(x)
         candidates += self.zero_half(x, lower, upper, 2 * per_point, mip=mip)
         candidates = [c for c in candidates if c[1].size <= self.tree_cut_max_nnz]
+        candidates = _unique_cuts(candidates)
         selected = self.select_cuts(candidates, x, mip.num_variables, per_point)
         return selected, violated_cuts(candidates, x)
 
@@ -20062,6 +20522,7 @@ def solve(
     flow_covers=True,
     mir_cuts=True,
     clique_cuts=True,
+    gub_cover_cuts=True,
     zero_half_cuts=True,
     cut_age=100,
     max_cut_rows=10000,
@@ -20078,6 +20539,9 @@ def solve(
     separation_threads="auto",
     node_bound_stop=True,
     dual_repair=True,
+    dual_polish=True,
+    dual_polish_sweeps=_DUAL_POLISH_SWEEPS,
+    dual_polish_children=True,
     node_lp_tolerance=1e-3,
     heuristic_effort=0.3,
     reliability_threshold=8,
@@ -20537,6 +21001,15 @@ def solve(
       (GPU search) a round's separation went from 1.6 s to 1.0 s, and the
       exact cut rounds fit 22 rounds (root 728.5) where they had fit 19
       (718).
+      GUB cover cuts (``gub_cover_cuts``, on by default; family
+      ``"gubcover"``; the function of the same name) are cover cuts that
+      know which of a row's binaries exclude one another: the rows and
+      conflict cliques that allow at most one 1 are cut into disjoint sets
+      (``_gub_partition``), a cover is built over the sets, one item
+      each, and every item of a set at least as heavy as its set's enters
+      the cut with it. Where a capacity row sits beside assignment rows
+      (each job once, each slot once) the plain covers count items that
+      can never be chosen together.
       Clique cuts (``clique_cuts``, on by default; family ``"clique"``)
       come from a conflict graph on the binaries (``ConflictGraph``), built
       once from the rows over the root box: two literals (``x_j`` or
@@ -20695,6 +21168,32 @@ def solve(
       about 7 ms a node, and reduced-cost fixing went from 0 tightenings to
       37,846 in 120 s (``dual_repairs`` in the result: tried, improved,
       seconds).
+      With ``dual_polish`` (on by default; ``DualPolish``, needs numba)
+      the duals are then moved uphill on the bound itself: the bound is
+      concave and piecewise linear in the duals, and along one row's dual
+      its maximiser is exact (the kink where the row's residual at the
+      reduced costs' box vertex changes sign), so ``dual_polish_sweeps``
+      passes (3) take every row in turn. That reaches integer columns and
+      equality rows, raises duals as well as lowering them, and moves
+      reduced costs off infinite bounds they point at (a bound that was
+      not rigorous can come back rigorous). Over node-like boxes of 11
+      MIPLIB instances (``benchmarks/scan_bound_gap.py``) it won back 15%
+      to 99% of the gap between the device's bound and HiGHS's LP optimum,
+      about half or more on most, in 0.1 to 10 ms a node; passes beyond
+      the third add little (``dual_polish`` in the result: tried,
+      improved, closed, made_rigorous, gain, seconds). The passes end at
+      a point no single row's dual improves; from there a line search
+      along the supergradient at the LP's primal point, duals of slack
+      rows zeroed first, other row orders and a pattern search were each
+      measured and none paid for itself, so what is left of the gap
+      needs LP work (``node_refinement``, the exact lane).
+      With ``dual_polish_children`` (on by default) each child's bound
+      from its parent's duals is polished the same way over the child's
+      own box (2 passes) when it is branched, before its LP: a higher
+      bound orders the queue better, and a child it closes needs no LP
+      (the ``child_`` counts in ``dual_polish``). It costs each child
+      about what the node's own polish costs, so past the first 200
+      children it goes on only while 1% of them close.
     * **Conflicts** (``conflicts``, on by default; ``ConflictPool``). Each
       node or child closed by its Lagrangian bound leaves a dual proof,
       ``constant + r·x <= cutoff``, which every better solution satisfies
@@ -21547,6 +22046,7 @@ def solve(
         conflict_pool_size=conflict_pool_size,
         conflict_max_nnz=conflict_max_nnz,
         flow_covers=flow_covers,
+        gub_cover_cuts=gub_cover_cuts,
         mir_cuts=mir_cuts,
         clique_cuts=clique_cuts,
         zero_half_cuts=zero_half_cuts,
@@ -21565,6 +22065,9 @@ def solve(
         separation_threads=separation_threads,
         node_bound_stop=node_bound_stop,
         dual_repair=dual_repair,
+        dual_polish=dual_polish,
+        dual_polish_sweeps=dual_polish_sweeps,
+        dual_polish_children=dual_polish_children,
         node_lp_tolerance=node_lp_tolerance,
         heuristic_effort=heuristic_effort,
         reliability_threshold=reliability_threshold,
@@ -21793,6 +22296,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "cuts": {
                 "gomory": 0,
                 "cover": 0,
+                "gubcover": 0,
                 "mir": 0,
                 "flowcover": 0,
                 "clique": 0,
@@ -21805,6 +22309,12 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "objective_step": None,
             "reduced_cost_tightenings": 0,
             "dual_repairs": {"tried": 0, "improved": 0, "seconds": 0.0},
+            "dual_polish": {
+                "tried": 0, "improved": 0, "closed": 0, "made_rigorous": 0,
+                "gain": 0.0, "seconds": 0.0, "child_tried": 0,
+                "child_improved": 0, "child_closed": 0, "child_gain": 0.0,
+                "child_seconds": 0.0,
+            },
             "children_pruned": 0,
             "lp_repairs": 0,
             "lp_repairs_skipped": 0,

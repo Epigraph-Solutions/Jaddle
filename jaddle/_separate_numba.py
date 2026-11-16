@@ -24,7 +24,7 @@ import math
 import numba as nb
 import numpy as np
 
-COVER, MIR, FLOW = 0, 1, 2  # cut families, as ``separate`` reports them
+COVER, MIR, FLOW, GUB = 0, 1, 2, 3  # cut families, as ``separate`` reports them
 vb_tie = 1e-6  # ``jaddle_mip._VB_TIE``
 cmir_flip_work, cmir_min_flips = 200_000, 16  # ``jaddle_mip._CMIR_FLIP_WORK``
 
@@ -153,11 +153,13 @@ def _knapsack(idx, a, b, x, lower, upper, is_binary, tol):
 
 
 @nb.njit(cache=True)
-def _lift_cover(cover, w, z, capacity):
+def _lift_cover(cover, w, z, capacity, floor=None):
     """``jaddle_mip._lift_cover``: ``(violated, π)``; ``π`` is the lifted
     coefficients when ``violated``."""
     rhs = cover.size - 1
     pi = np.zeros(w.size)
+    if floor is not None:
+        pi[:] = floor
     outside = np.ones(w.size, np.bool_)
     for item in cover:
         pi[item] = 1.0
@@ -190,10 +192,200 @@ def _lift_cover(cover, w, z, capacity):
             alpha = rhs - top
         if alpha <= 0:
             continue
-        pi[item] = alpha
+        pi[item] = max(float(alpha), pi[item])
         for v in range(rhs, alpha - 1, -1):
             least[v] = min(least[v], least[v - alpha] + w[item])
     return True, pi
+
+
+@nb.njit(cache=True)
+def _cut_found(out_idx, out_coef, out_rhs, idx, coef, rhs):
+    """Whether the cut is one of those found already (the same columns,
+    coefficients and right-hand side)."""
+    for k in range(len(out_idx)):
+        if (
+            out_rhs[k] == rhs
+            and out_idx[k].size == idx.size
+            and np.all(out_idx[k] == idx)
+            and np.all(out_coef[k] == coef)
+        ):
+            return True
+    return False
+
+
+@nb.njit(cache=True)
+def gub_cover_cuts(idx, a, b, x, lower, upper, is_binary, gub, tol):
+    """``jaddle_mip.gub_cover_cuts``: lists of the cuts' columns,
+    coefficients and right-hand sides, most violated first."""
+    out_idx, out_coef, out_rhs = [np.empty(0, np.int64)], [np.empty(0)], [0.0]
+    out_idx.pop()
+    out_coef.pop()
+    out_rhs.pop()
+    ok, cols, w, comp, z, capacity = _knapsack(
+        idx, a, b, x, lower, upper, is_binary, tol
+    )
+    if not ok:
+        return out_idx, out_coef, out_rhs
+    k = cols.size
+    group = np.empty(k, np.int64)
+    for p in range(k):
+        group[p] = -1 if comp[p] else gub[cols[p]]
+    label = np.empty(k, np.int64)
+    count = 0
+    previous = -1
+    for p in np.argsort(group, kind="mergesort"):
+        if group[p] < 0 or group[p] != previous:
+            count += 1
+        label[p] = count - 1
+        previous = group[p]
+    size = np.zeros(count, np.int64)
+    for p in range(k):
+        size[label[p]] += 1
+    if size.max() < 2:
+        return out_idx, out_coef, out_rhs
+    threshold = capacity + 1e-9 * (1.0 + abs(capacity))
+    integral = True
+    load = 0.0
+    for q in range(k):
+        z_int = math.floor(z[q] + 0.5)
+        if abs(z[q] - z_int) > 1e-9:
+            integral = False
+            break
+        load += w[q] * z_int
+    if integral and load <= threshold:
+        return out_idx, out_coef, out_rhs
+    rep = np.full(count, -1, np.int64)
+    for p in range(k):
+        q = rep[label[p]]
+        if q < 0 or z[p] > z[q] or (z[p] == z[q] and w[p] > w[q]):
+            rep[label[p]] = p
+    wr = w[rep]
+    heavy = np.empty(k, np.bool_)
+    mass = np.zeros(count)
+    z_total = 0.0
+    for p in range(k):
+        heavy[p] = w[p] >= wr[label[p]]
+        if heavy[p]:
+            mass[label[p]] += z[p]
+        z_total += z[p]
+    orders = [
+        np.argsort((1.0 - mass) / wr, kind="mergesort"),
+        _stable_by_two(1.0 - mass, -wr),
+        np.argsort(-wr, kind="mergesort"),
+    ]
+    seen = [np.empty(0, np.int64)]
+    seen.pop()
+    efficacies = [0.0]
+    efficacies.pop()
+    for o in range(3):
+        order = orders[o]
+        total = 0.0
+        end = -1
+        for p in range(order.size):
+            total += wr[order[p]]
+            if total > threshold:
+                end = p
+                break
+        if end < 0:
+            continue
+        chosen = order[: end + 1]
+        total = 0.0
+        for g in chosen:
+            total += wr[g]
+        keep = np.ones(chosen.size, np.bool_)
+        for position in np.argsort(mass[chosen], kind="mergesort"):
+            if total - wr[chosen[position]] > threshold:
+                total -= wr[chosen[position]]
+                keep[position] = False
+        chosen = np.sort(chosen[keep])
+        if size[chosen].max() < 2:
+            continue
+        repeated = False
+        for other in seen:
+            if other.size == chosen.size and np.all(other == chosen):
+                repeated = True
+                break
+        if repeated:
+            continue
+        seen.append(chosen)
+        rhs_z = chosen.size - 1.0
+        in_cover = 0.0
+        for g in chosen:
+            in_cover += mass[g]
+        if in_cover - rhs_z + max(rhs_z, 1.0) * (z_total - in_cover) <= 1e-6:
+            continue
+        inside = np.zeros(count, np.bool_)
+        for g in chosen:
+            inside[g] = True
+        floor = np.zeros(k)
+        for p in range(k):
+            if inside[label[p]] and heavy[p]:
+                floor[p] = 1.0
+        violated, pi = _lift_cover(np.sort(rep[chosen]), w, z, capacity, floor)
+        if not violated:
+            continue
+        violation = 0.0
+        for q in range(pi.size):
+            violation += pi[q] * z[q]
+        violation -= rhs_z
+        if violation <= 1e-6:
+            continue
+        members = np.flatnonzero(pi)
+        coef = np.empty(members.size)
+        rhs = rhs_z
+        for m in range(members.size):
+            q = members[m]
+            coef[m] = -pi[q] if comp[q] else pi[q]
+            if comp[q]:
+                rhs -= pi[q]
+        if _cut_found(out_idx, out_coef, out_rhs, cols[members], coef, rhs):
+            continue
+        efficacies.append(violation / _norm(pi[members]))
+        out_idx.append(cols[members])
+        out_coef.append(coef)
+        out_rhs.append(rhs)
+    if len(efficacies) > 1:
+        order = np.argsort(-np.array(efficacies), kind="mergesort")
+        out_idx = [out_idx[m] for m in order]
+        out_coef = [out_coef[m] for m in order]
+        out_rhs = [out_rhs[m] for m in order]
+    return out_idx, out_coef, out_rhs
+
+
+# ``jaddle_mip._COVER_CLASSES``.
+_COVER_CLASSES = 8
+
+
+@nb.njit(cache=True)
+def _class_covers(w, z, threshold, covers):
+    """``jaddle_mip._class_covers``, appended to ``covers``."""
+    by_weight = np.argsort(w, kind="mergesort")
+    masses = [0.0]
+    masses.pop()
+    found = [np.empty(0, np.int64)]
+    found.pop()
+    start = 0
+    while start < by_weight.size:
+        v = w[by_weight[start]]
+        end = start + 1
+        while end < by_weight.size and w[by_weight[end]] == v:
+            end += 1
+        need = int(math.floor(threshold / v)) + 1
+        if 2 <= need <= end - start:
+            members = by_weight[start:end]
+            cover = members[np.argsort(-z[members], kind="mergesort")[:need]]
+            mass = 0.0
+            for item in cover:
+                mass += z[item]
+            if mass > 1e-9:
+                masses.append(mass)
+                found.append(np.sort(cover))
+        start = end
+    if len(found) == 0:
+        return
+    order = np.argsort(-np.array(masses), kind="mergesort")
+    for k in range(min(order.size, _COVER_CLASSES)):
+        covers.append(found[order[k]])
 
 
 @nb.njit(cache=True)
@@ -227,10 +419,8 @@ def cover_cuts(idx, a, b, x, lower, upper, is_binary, max_covers, tol):
         heaviest,
     ]
     z_total = z.sum()  # z is in [0, 1]: its positive part is itself
-    seen = [np.empty(0, np.int64)]
-    seen.pop()
-    efficacies = [0.0]
-    efficacies.pop()
+    covers = [np.empty(0, np.int64)]
+    covers.pop()
     for o in range(min(max_covers, 3)):
         order = orders[o]
         total = 0.0
@@ -251,7 +441,14 @@ def cover_cuts(idx, a, b, x, lower, upper, is_binary, max_covers, tol):
             if total - w[cover[position]] > threshold:
                 total -= w[cover[position]]
                 keep[position] = False
-        cover = np.sort(cover[keep])
+        covers.append(np.sort(cover[keep]))
+    if max_covers >= 3:
+        _class_covers(w, z, threshold, covers)
+    seen = [np.empty(0, np.int64)]
+    seen.pop()
+    efficacies = [0.0]
+    efficacies.pop()
+    for cover in covers:
         repeated = False
         for other in seen:
             if other.size == cover.size and np.all(other == cover):
@@ -283,6 +480,8 @@ def cover_cuts(idx, a, b, x, lower, upper, is_binary, max_covers, tol):
             coef[k] = -pi[q] if comp[q] else pi[q]
             if comp[q]:
                 rhs -= pi[q]
+        if _cut_found(out_idx, out_coef, out_rhs, cols[members], coef, rhs):
+            continue
         efficacies.append(violation / _norm(pi[members]))
         out_idx.append(cols[members])
         out_coef.append(coef)
@@ -967,12 +1166,12 @@ def separate(
     A_ptr, A_idx, A_val, b_rows, is_eq, C_ptr, C_row, C_val, relative,
     has_vb, vb_ptr, vb_kind, vb_z, vb_c, vb_d,
     max_aggregation, aggregate_integers, flow_covers, max_divisors, max_covers,
-    knapsack_tol, cut_tiny, aggregation_width=1, cmir_per_row=1,
+    knapsack_tol, cut_tiny, gub, gub_covers, aggregation_width=1, cmir_per_row=1,
 ):
     """``CutSeparator._separate`` without the clique and implied-bound cuts:
     the cleaned cuts of the rows ``rows`` (already the tight ones, in
     order) as ``(family, ptr, idx, coef, rhs)``, cut ``k`` being family
-    ``family[k]`` (``COVER``, ``MIR``, ``FLOW``) over
+    ``family[k]`` (``COVER``, ``MIR``, ``FLOW``, ``GUB``) over
     ``idx[ptr[k]:ptr[k + 1]]``."""
     n = x.size
     pos = np.full(n, -1, np.int64)
@@ -1000,6 +1199,14 @@ def separate(
             for k in range(len(c_idx)):
                 _add(fams, cut_idx, cut_coef, cut_rhs, COVER, c_idx[k], c_coef[k],
                      c_rhs[k], lower, upper, cut_tiny)
+            if gub_covers:
+                g_idx, g_coef, g_rhs = gub_cover_cuts(
+                    A_idx[start:end], s * A_val[start:end], s * b_rows[r], x,
+                    lower, upper, is_binary, gub, knapsack_tol,
+                )
+                for k in range(len(g_idx)):
+                    _add(fams, cut_idx, cut_coef, cut_rhs, GUB, g_idx[k], g_coef[k],
+                         g_rhs[k], lower, upper, cut_tiny)
             p_idx, p_a, p_b = aggregation_path(
                 r, s, x, lower, upper, is_int, A_ptr, A_idx, A_val, b_rows, is_eq,
                 C_ptr, C_row, C_val, relative, max_aggregation, aggregate_integers,

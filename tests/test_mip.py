@@ -681,6 +681,169 @@ def test_dual_repair_option_keeps_the_optimum():
     assert off["dual_repairs"]["tried"] == 0
 
 
+def _lp_reference(mip):
+    """SciPy's HiGHS optimum of ``mip``'s LP relaxation and its duals in
+    Jaddle's convention."""
+    from scipy.optimize import linprog
+
+    n_eq, m = mip.n_eq, mip.A.shape[0]
+    ref = linprog(
+        mip.c,
+        A_ub=mip.A[n_eq:] if m > n_eq else None,
+        b_ub=mip.b[n_eq:] if m > n_eq else None,
+        A_eq=mip.A[:n_eq] if n_eq else None,
+        b_eq=mip.b[:n_eq] if n_eq else None,
+        bounds=list(zip(mip.lower, mip.upper)),
+        method="highs",
+    )
+    assert ref.status == 0
+    y = np.concatenate(
+        [
+            -ref.eqlin.marginals if n_eq else np.zeros(0),
+            -ref.ineqlin.marginals if m > n_eq else np.zeros(0),
+        ]
+    )
+    return ref.fun, y
+
+
+def _bound_at(mip, y, tol=1e-9):
+    return jm.lagrangian_bound(
+        mip.c, mip.A, mip.b, mip.n_eq, mip.lower, mip.upper, y,
+        reduced_cost_tolerance=tol,
+    )
+
+
+@pytest.mark.parametrize("make", [knapsack, facility_location, difference_rows])
+def test_dual_polish_raises_the_bound_and_stays_below_the_lp(make):
+    # Dual ascent from noisy duals: the bound never falls, never passes the
+    # LP's optimum, and wins back most of what the noise cost.
+    pytest.importorskip("numba")
+    mip = make()
+    optimum, y = _lp_reference(mip)
+    polish = jm.DualPolish(mip, mip.integrality)
+    assert polish
+    slack = 1e-6 * (1 + abs(optimum))
+    rng = np.random.default_rng(0)
+    lost = won = 0.0
+    for noise in (1e-3, 1e-1):
+        for _ in range(3):
+            noisy = y + noise * (1 + np.abs(y)) * rng.standard_normal(y.size)
+            noisy[mip.n_eq :] = np.maximum(noisy[mip.n_eq :], 0.0)
+            before, _ = _bound_at(mip, noisy)
+            polished = polish(noisy, mip.lower, mip.upper, sweeps=5)
+            if polished is None:
+                continue
+            assert np.all(polished[mip.n_eq :] >= 0.0)
+            after, _ = _bound_at(mip, polished)
+            assert after >= before - slack
+            assert after <= optimum + slack
+            if np.isfinite(before):
+                lost += optimum - before
+                won += after - before
+    # (Every noisy bound of a model with unbounded columns may be -inf.)
+    assert won > 0.3 * lost or lost == 0.0
+
+
+def test_dual_polish_takes_a_reduced_cost_off_an_infinite_bound():
+    # Columns with no upper bound: noisy duals leave reduced costs that
+    # point at it (the bound is -inf), and the ascent moves them off.
+    pytest.importorskip("numba")
+    mip = facility_location()
+    assert np.isinf(mip.upper).any()
+    optimum, y = _lp_reference(mip)
+    polish = jm.DualPolish(mip, mip.integrality)
+    rng = np.random.default_rng(1)
+    fixed = 0
+    for _ in range(5):
+        noisy = y + 0.05 * rng.standard_normal(y.size)
+        noisy[mip.n_eq :] = np.maximum(noisy[mip.n_eq :], 0.0)
+        before, _ = _bound_at(mip, noisy, tol=0.0)
+        if np.isfinite(before):
+            continue
+        polished = polish(noisy, mip.lower, mip.upper)
+        after, rigorous = _bound_at(mip, polished, tol=0.0)
+        fixed += bool(np.isfinite(after) and rigorous)
+        assert after <= optimum + 1e-6 * (1 + abs(optimum))
+    assert fixed > 0
+
+
+def test_dual_polish_kernel_matches_its_python_source():
+    numba_bound = pytest.importorskip("jaddle._bound_numba")
+    mip = facility_location()
+    _, y = _lp_reference(mip)
+    A = mip.A.tocsr()
+    noisy = y + 0.05 * np.random.default_rng(2).standard_normal(y.size)
+    args = (
+        mip.c, A.indptr.astype(np.int64), A.indices.astype(np.int64), A.data,
+        mip.b, mip.n_eq, noisy, mip.lower, mip.upper, mip.integrality, 3, np.inf,
+    )
+    compiled, moves = numba_bound.dual_ascent(*args)
+    source, source_moves = numba_bound.dual_ascent.py_func(*args)
+    assert moves == source_moves > 0
+    np.testing.assert_allclose(compiled, source, rtol=1e-12, atol=1e-12)
+
+
+def test_dual_polish_option_keeps_the_optimum():
+    pytest.importorskip("numba")
+    keys = {
+        "tried", "improved", "closed", "made_rigorous", "gain", "seconds",
+        "child_tried", "child_improved", "child_closed", "child_gain",
+        "child_seconds",
+    }
+    for mip in (knapsack(), facility_location(), difference_rows()):
+        on = solve(mip, dual_polish=True)
+        off = solve(mip, dual_polish=False)
+        assert on["status"] == off["status"] == "optimal"
+        assert on["objective"] == pytest.approx(off["objective"], rel=1e-6)
+        assert set(on["dual_polish"]) == keys
+        assert off["dual_polish"]["tried"] == 0
+        assert off["dual_polish"]["child_tried"] == 0
+        parents = solve(mip, dual_polish=True, dual_polish_children=False)
+        assert parents["status"] == "optimal"
+        assert parents["objective"] == pytest.approx(off["objective"], rel=1e-6)
+        assert parents["dual_polish"]["child_tried"] == 0
+
+
+def test_polish_child_bound_stays_below_the_child_lp():
+    # The parent's optimal duals over a child box (one binary fixed), then
+    # polished there: higher, and still below the child LP's optimum.
+    pytest.importorskip("numba")
+    mip = knapsack()
+    _, y = _lp_reference(mip)
+    polish = jm.DualPolish(mip, mip.integrality)
+    raised = 0
+    for var in range(mip.c.size):
+        for value in (0.0, 1.0):
+            lower, upper = mip.lower.copy(), mip.upper.copy()
+            lower[var] = upper[var] = value
+            child = jm.MIP(
+                jl.LP(
+                    c=mip.c, A_eq=mip.lp.A_eq, b_eq=mip.lp.b_eq,
+                    A_ineq=mip.lp.A_ineq, b_ineq=mip.lp.b_ineq,
+                    lower_bounds=lower, upper_bounds=upper,
+                ),
+                mip.integrality,
+            )
+            try:
+                optimum, _ = _lp_reference(child)
+            except AssertionError:
+                continue  # an infeasible child
+            before, _ = jm.lagrangian_bound(
+                mip.c, mip.A, mip.b, mip.n_eq, lower, upper, y,
+                reduced_cost_tolerance=1e-9,
+            )
+            polished = polish(y, lower, upper, sweeps=2)
+            if polished is None:
+                continue
+            after, _ = jm.lagrangian_bound(
+                mip.c, mip.A, mip.b, mip.n_eq, lower, upper, polished,
+                reduced_cost_tolerance=1e-9,
+            )
+            assert before - 1e-9 <= after <= optimum + 1e-6 * (1 + abs(optimum))
+            raised += after > before + 1e-9
+    assert raised > 0
+
+
 # %% Cutting planes
 def test_mir_cut_textbook():
     # x0 + x1 <= 1.5 with x integer in [0, 5], at (0.75, 0.75): the MIR with
@@ -824,8 +987,8 @@ def test_cuts_strengthen_the_root(monkeypatch):
     # win).
     assert with_cuts["cuts"]["mir"] + with_cuts["cuts"]["flowcover"] > 0
     assert without["cuts"] == {
-        "gomory": 0, "cover": 0, "mir": 0, "flowcover": 0, "clique": 0, "zerohalf": 0,
-        "impliedbound": 0,
+        "gomory": 0, "cover": 0, "gubcover": 0, "mir": 0, "flowcover": 0, "clique": 0,
+        "zerohalf": 0, "impliedbound": 0,
     }
     assert without["root_bound_before_cuts"] is None
     # The cuts close part of the root gap and the tree is no larger.
@@ -3158,6 +3321,171 @@ def test_lifted_cover_cuts_are_valid(seed):
     for idx, coef, rhs in cuts:
         assert np.all(feasible[:, idx[idx < n]] @ coef[idx < n] <= rhs + 1e-9)
         assert coef @ x[idx] > rhs  # each cut cuts off the LP point
+
+
+def _gub_case(rng, n=12):
+    """A knapsack row with some complemented items, disjoint sets of its
+    binaries (at most one of a set is 1) and a point inside the sets."""
+    a = rng.integers(1, 15, n).astype(float) * rng.choice([1.0, 1.0, 1.0, -1.0], n)
+    b = 0.35 * np.abs(a).sum() - np.abs(a[a < 0]).sum()
+    gub = np.full(n, -1, np.int64)
+    order, start, sets = rng.permutation(n), 0, 0
+    while start < n:
+        members = order[start : start + int(rng.integers(1, 5))]
+        start += members.size
+        if members.size >= 2:
+            gub[members] = sets
+            sets += 1
+    x = rng.uniform(0, 1, n) * (rng.random(n) < 0.7)
+    for k in range(sets):
+        if x[gub == k].sum() > 1:
+            x[gub == k] /= x[gub == k].sum()
+    return a, b, gub, sets, x
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_gub_cover_cuts_are_valid(seed):
+    # Every cut holds at every 0/1 point of the row that has at most one
+    # item of each set, and cuts off the LP point; the compiled separator
+    # gives the same cuts.
+    rng = np.random.default_rng(seed)
+    n = 12
+    a, b, gub, sets, x = _gub_case(rng, n)
+    lower, upper, is_binary = np.zeros(n), np.ones(n), np.ones(n, bool)
+    points = ((np.arange(2**n)[:, None] >> np.arange(n)) & 1).astype(float)
+    ok = points @ a <= b + 1e-9
+    for k in range(sets):
+        ok &= points[:, gub == k].sum(1) <= 1
+    feasible = points[ok]
+    idx = np.arange(n)
+    cuts = jm.gub_cover_cuts(idx, a, b, x, lower, upper, is_binary, gub)
+    for cols, coef, rhs in cuts:
+        assert np.all(feasible[:, cols] @ coef <= rhs + 1e-9)
+        assert coef @ x[cols] > rhs
+    kernel = jm._numba_separate()
+    if kernel is not None:
+        got = kernel.gub_cover_cuts(
+            idx, a, b, x, lower, upper, is_binary, gub, jm._KNAPSACK_TOL
+        )
+        assert len(got[0]) == len(cuts)
+        for (cols, coef, rhs), g_cols, g_coef, g_rhs in zip(cuts, *got):
+            assert np.array_equal(cols, g_cols)
+            np.testing.assert_allclose(coef, g_coef)
+            assert rhs == pytest.approx(g_rhs)
+
+
+def test_gub_cover_cut_uses_the_sets():
+    # 2 x1 + 2 x2 + 2 x3 + 4 x4 <= 5 with x1 + x2 <= 1 and x3 + x4 <= 1.
+    # The heavy item fits with neither x1 nor x2 (4 + 2 > 5), and those two
+    # exclude each other, so x1 + x2 + x4 <= 1; the row alone only gives
+    # x1 + x4 <= 1 and x2 + x4 <= 1, which the point (1/4, 1/4, 0, 3/4)
+    # satisfies.
+    a, b = np.array([2.0, 2.0, 2.0, 4.0]), 5.0
+    gub = np.array([0, 0, 1, 1])
+    lower, upper, is_binary = np.zeros(4), np.ones(4), np.ones(4, bool)
+    x = np.array([0.25, 0.25, 0.0, 0.75])
+    idx = np.arange(4)
+    assert jm.cover_cuts(idx, a, b, x, lower, upper, is_binary) == []
+    cuts = jm.gub_cover_cuts(idx, a, b, x, lower, upper, is_binary, gub)
+    assert len(cuts) == 1
+    cols, coef, rhs = cuts[0]
+    assert list(cols) == [0, 1, 3] and np.all(coef == 1.0) and rhs == 1.0
+    # No two items share a set: the plain covers have it.
+    none = np.full(4, -1)
+    assert jm.gub_cover_cuts(idx, a, b, x, lower, upper, is_binary, none) == []
+
+
+def test_gub_partition_takes_disjoint_parts_of_packing_rows():
+    A = sp.csr_matrix(
+        np.array([[1.0, 1, 1, 0, 0, 0], [0, 0, 1, 1, 1, 1], [3, 2, 0, 0, 5, 4.0]])
+    )
+    b = np.array([1.0, 1.0, 6.0])
+    gub = jm._gub_partition(A, b, np.ones(6, bool))
+    # The larger row first; the other keeps its two columns left over; the
+    # knapsack row (3 + 2 fits in 6) is no set.
+    assert list(gub) == [1, 1, 0, 0, 0, 0]
+    assert jm._gub_partition(A[2:], b[2:], np.ones(6, bool)) is None
+    # A column that is not binary keeps its row out.
+    binary = np.array([True, True, True, True, True, False])
+    assert list(jm._gub_partition(A, b, binary)) == [0, 0, 0, -1, -1, -1]
+
+
+def test_gub_cover_cuts_in_the_search():
+    mip = generalised_assignment()
+    ref = reference(mip)
+    on = solve(mip, gub_cover_cuts=True)
+    off = solve(mip, gub_cover_cuts=False)
+    assert on["status"] == off["status"] == "optimal"
+    assert on["objective"] == pytest.approx(ref, rel=1e-6)
+    assert off["objective"] == pytest.approx(ref, rel=1e-6)
+    assert off["cuts"]["gubcover"] == 0
+
+
+@pytest.mark.parametrize("fill, count, n", [(3, 5000, 400), (30, 700, 60)])
+def test_spread_out_over_many_blocks_matches_one_dense_pass(fill, count, n):
+    # More candidates than a block holds, sparse rows (the cosines stay
+    # sparse) and dense ones (``_gram``): the cuts one pass over a dense
+    # cosine matrix takes, with every candidate allowed.
+    rng = np.random.default_rng(fill)
+
+    def unit_rows(k):
+        idx = np.array([np.sort(rng.choice(n, fill, replace=False)) for _ in range(k)])
+        coef = rng.integers(1, 3, (k, fill)).astype(float)
+        coef /= np.linalg.norm(coef, axis=1)[:, None]
+        return sp.csr_matrix(
+            (coef.ravel(), idx.ravel(), np.arange(0, k * fill + 1, fill)), shape=(k, n)
+        )
+
+    # Half as many distinct rows as candidates: many are a repeat.
+    candidates = unit_rows(count // 2)[rng.integers(0, count // 2, count)]
+    held = candidates[rng.integers(0, count, 20)]
+    order = rng.permutation(count)
+    cosines = np.abs((candidates @ candidates.T).toarray())
+    blocked = np.abs((candidates @ held.T).toarray()).max(axis=1)
+    expected = []
+    for i in order:
+        if blocked[i] > jm._CUT_MAX_PARALLELISM:
+            continue
+        expected.append(int(i))
+        np.maximum(blocked, cosines[i], out=blocked)
+    assert count > jm._SPREAD_BLOCK or fill > 3
+    assert list(jm._spread_out(candidates, order, count, held=held)) == expected
+    assert list(jm._spread_out(candidates, order, 10, held=held)) == expected[:10]
+    assert len(expected) < count
+
+
+def test_unique_cuts_keeps_the_first_of_each():
+    a = ("cover", np.array([0, 2]), np.array([1.0, 1.0]), 1.0)
+    b = ("mir", np.array([0, 2]), np.array([1.0, 1.0]), 1.0)  # a again
+    c = ("cover", np.array([0, 2]), np.array([1.0, 1.0]), 2.0)
+    d = ("cover", np.array([0, 3]), np.array([1.0, 1.0]), 1.0)
+    out = jm._unique_cuts([a, b, c, d, a, d])
+    assert [id(cut) for cut in out] == [id(a), id(c), id(d)]
+    assert jm._unique_cuts([]) == []
+
+
+def test_cover_separators_return_each_cut_once():
+    # A bin's capacity row (weights 1 to 4, capacity 4 when open): several
+    # covers lift to "one heavy item a bin"; it comes back once, with the
+    # cut of three items of weight 2.
+    w = np.array([1.0] * 4 + [2.0] * 6 + [3.0] * 6 + [4.0] * 3 + [-4.0])
+    n = w.size
+    x = np.zeros(n)
+    x[-1], x[10], x[4], x[5] = 1.0, 2 / 3, 0.5, 0.5
+    lower, upper, is_binary = np.zeros(n), np.ones(n), np.ones(n, bool)
+    idx = np.arange(n)
+    cuts = jm.cover_cuts(idx, w, 0.0, x, lower, upper, is_binary)
+    keys = {(c.tobytes(), f.tobytes(), r) for c, f, r in cuts}
+    assert len(keys) == len(cuts) == 2
+    assert any(np.abs(f).max() == 2.0 for _, f, _ in cuts)
+    kernel = jm._numba_separate()
+    if kernel is not None:
+        got = kernel.cover_cuts(
+            idx, w, 0.0, x, lower, upper, is_binary, jm._COVER_ORDERS, jm._KNAPSACK_TOL
+        )
+        assert len(got[0]) == len(cuts)
+        for (c, f, r), g_c, g_f, g_r in zip(cuts, *got):
+            assert np.array_equal(c, g_c) and np.allclose(f, g_f) and r == g_r
 
 
 def test_cover_cuts_skip_integral_points_only_inside_the_knapsack():

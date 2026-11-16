@@ -192,17 +192,24 @@ def run_jaddle(path, args, primal_target=None):
         device=args.device,
         verbose=True,
         log_every_seconds=10,
-        batch_size=4,
-        cut_rounds=100,
+        lp_tolerance=1e-4,
+        root_crossover=True,
+        cut_round_lp="highs",
+        batch_size=8,
         cuts=True,
-        dual_repair=True,
+        dual_polish=True,
+        gub_cover_cuts=True,
         tree_cuts=True,
+        cut_rounds=100,
+        max_cuts_per_round=int(1e4),
+        cut_pool_size=int(1e5),
+        max_cut_rows=int(1e5),
         # lp_options=dict(verbose=True, log_every=10),
         # tree="lean",
         # Implied-bound cuts and probing cliques: root bound on pg5_34
         # -15,209 -> -14,367 (HiGHS's), timtab1 347k -> 476k, neos-911970
         # 23 -> 52, for at most 3 s of probing.
-        probing=True,
+        probing=False,
         # # All rounding heuristics.
         # heuristic_every=10,  # plain rounding of node LP points ("H")
         # round_repair=True,  # round and repair, at the root and in the tree ("U")
@@ -295,6 +302,12 @@ def print_details(result):
         f"Dual repair: {repairs['improved']} of {repairs['tried']} node bounds raised "
         f"in {repairs['seconds']:.1f}s; {result['reduced_cost_tightenings']} "
         f"reduced-cost tightenings"
+    )
+    polish = result["dual_polish"]
+    print(
+        f"Dual polish: {polish['improved']} of {polish['tried']} node bounds raised "
+        f"(by {polish['gain']:.6g} in all, {polish['closed']} closed, "
+        f"{polish['made_rigorous']} made rigorous) in {polish['seconds']:.1f}s"
     )
     root = result["root_exact_strong"]
     print(
