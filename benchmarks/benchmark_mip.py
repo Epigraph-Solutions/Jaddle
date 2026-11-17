@@ -173,7 +173,8 @@ def load_primal_targets(path):
 
 # %%
 def run_jaddle(path, args, primal_target=None):
-    mip = jm.load(path)
+    # Cached next to the file (``<path>.jaddle.npz``): later runs skip the MPS parse.
+    mip = jm.load(path, cache=True)
     row = {
         "n_vars": mip.num_variables,
         "n_ints": mip.num_integers,
@@ -185,11 +186,18 @@ def run_jaddle(path, args, primal_target=None):
         print(f"Primal target: {primal_target:.10g}")
     started = time.time()
     result = jm.solve(
-        path,
+        mip,  # already loaded above: passing ``path`` would parse the file again
         primal_target=primal_target,
         max_seconds=args.max_seconds,
         device=args.device,
+        precision="float64",
+        lp_tolerance=1e-4,
+        root_refinement=1e-6,
         presolve=True,
+        cut_rounds=200,
+        gub_cover_cuts=True,
+        symmetry=True,
+        objective_cuts=True,
         verbose=True,
         log_every_seconds=10,
     )

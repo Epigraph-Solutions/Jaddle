@@ -5244,7 +5244,7 @@ def test_zero_half_cuts_are_valid_on_mixed_rows(make):
 
 def test_zero_half_cuts_in_the_search():
     mip = odd_cycle(7)
-    result = solve(mip, clique_cuts=False, gomory_cuts=False)
+    result = solve(mip, clique_cuts=False, gomory_cuts=False, objective_cuts=False)
     assert_solved(result, mip, reference(mip))
     assert result["cuts"]["zerohalf"] >= 1
     assert result["root_bound_before_cuts"] == pytest.approx(-3.5, abs=1e-4)
@@ -10339,3 +10339,119 @@ def test_local_branching_radius_adapts(monkeypatch):
     finally:
         if search.exact_lane is not None:
             search.exact_lane.shutdown()
+
+
+def test_load_cache_round_trips_and_follows_the_file(tmp_path):
+    import highspy
+    import os
+
+    mip = facility_location()
+    path = str(tmp_path / "model.mps")
+    highs = highspy.Highs()
+    highs.silent()
+    highs.passModel(jm.to_highs(mip))
+    highs.writeModel(path)
+    first = jm.load(path, cache=True)
+    assert os.path.exists(path + ".jaddle.npz")
+    again = jm.load(path, cache=True)
+    assert (first.A != again.A).nnz == 0 and first.n_eq == again.n_eq
+    for name in ("b", "c", "lower", "upper", "integrality", "implied"):
+        assert np.array_equal(getattr(first, name), getattr(again, name)), name
+    assert (first.offset, first.maximise) == (again.offset, again.maximise)
+    assert_solved(jm.solve(again, batch_size=4), again, reference(first))
+    # A changed file is parsed again, not served from the stale cache.
+    highs.changeColCost(0, float(np.asarray(mip.c)[0]) + 1.0)
+    highs.writeModel(path)
+    os.utime(path, ns=(0, os.stat(path).st_mtime_ns + 10**9))
+    changed = jm.load(path, cache=True)
+    assert changed.c[0] == pytest.approx(first.c[0] + 1.0)
+
+
+def test_symmetry_is_skipped_on_large_models(monkeypatch):
+    mip = facility_location()
+    monkeypatch.setattr(jm, "_SYMMETRY_MAX_NNZ", mip.A.nnz - 1)
+    called = []
+    monkeypatch.setattr(
+        jm, "symmetry_generators", lambda *a, **k: called.append(1) or []
+    )
+    result = jm.solve(mip, batch_size=4, symmetry=True)
+    assert_solved(result, mip, reference(mip))
+    assert not called and "skipped" in result["symmetry"]
+
+
+def test_root_time_limit_keeps_the_cut_rounds_best_bound(monkeypatch):
+    # The cut rounds end on the time limit (or Ctrl+C, which takes the same
+    # path) with a last re-solve far weaker than the rounds' best: the root
+    # must close at the rounds' best, not drag the reported bound down to
+    # the last LP's (zuck_small: 8.54e8 reported as 1.23e9).
+    mip = generalised_assignment(seed=3, agents=8, jobs=40)
+    real_cut_loop = jm._BranchAndBound.cut_loop
+    real_lp_bound = jm._BranchAndBound.lp_bound
+    seen = {}
+
+    def cut_loop(self, lower, upper, result):
+        out = real_cut_loop(self, lower, upper, result)
+        seen["best"] = self.active_bound
+        seen["proven"] = self.active_proven
+        self.request_interrupt()  # out of time from here on
+        return dict(out, stop_reason="time_limit")
+
+    def lp_bound(self, solution, lower, upper, result=None, thorough=False):
+        raw, rigorous = real_lp_bound(self, solution, lower, upper, result, thorough)
+        if "best" in seen and np.isfinite(raw):
+            raw = raw - 1e3 * (1.0 + abs(raw))  # a far weaker last re-solve
+        return raw, rigorous
+
+    monkeypatch.setattr(jm._BranchAndBound, "cut_loop", cut_loop)
+    monkeypatch.setattr(jm._BranchAndBound, "lp_bound", lp_bound)
+    result = jm.solve(
+        mip, batch_size=4, cut_rounds=3, symmetry=False, feasibility_jump=False,
+        rins_seconds=0, crossover_seconds=0, proximity_seconds=0,
+        local_branching_seconds=0, first_solution_seconds=0,
+    )
+    assert "best" in seen, "the cut loop must run for this test"
+    assert result["status"] in ("interrupted", "time_limit")
+    assert np.isfinite(seen["proven"])
+    # Reported (model sense, a min here) at least the rounds' proven bound.
+    assert result["bound"] >= seen["proven"] + mip.offset - 1e-6 * (1 + abs(seen["proven"]))
+    assert result["bound"] <= reference(mip) + 1e-6
+
+
+# %% Objective bound row
+def objective_row_stub(mip, bound, step=1.0, on=True):
+    stub = types.SimpleNamespace(
+        objective_step=step, use_objective_cuts=on, mip=mip,
+        global_bound=lambda: bound,
+    )
+    stub.round_bound = lambda b: jm._BranchAndBound.round_bound(stub, b)
+    return stub
+
+
+def test_objective_bound_row_rounds_the_bound_up():
+    # max Σx around a 7-cycle: internally min −Σx with LP bound −3.5, and
+    # objective values are integers, so every solution has −Σx >= −3.
+    mip = odd_cycle(7)
+    row, rhs = jm._BranchAndBound.objective_bound_row(objective_row_stub(mip, -3.5))
+    assert np.all(row.toarray() == 1.0) and rhs == pytest.approx(3.0)
+    # It cuts off the LP point and holds at the optimum.
+    assert row @ np.full(7, 0.5) > rhs
+    assert row @ np.array([1.0, 0, 1, 0, 1, 0, 0]) <= rhs
+    # A bound a hair under an integer keeps that integer (round-off).
+    _, rhs = jm._BranchAndBound.objective_bound_row(objective_row_stub(mip, -3.0 - 1e-9))
+    assert rhs == pytest.approx(3.0)
+    for stub in (
+        objective_row_stub(mip, -3.5, step=None),
+        objective_row_stub(mip, -3.5, on=False),
+        objective_row_stub(mip, -np.inf),
+    ):
+        assert jm._BranchAndBound.objective_bound_row(stub) is None
+
+
+@pytest.mark.parametrize("make", [lambda: odd_cycle(7), general_integer])
+def test_objective_cuts_keep_the_optimum(make):
+    mip = make()
+    ref = reference(mip)
+    assert_solved(solve(mip), mip, ref)
+    off = solve(mip, objective_cuts=False)
+    assert_solved(off, mip, ref)
+    assert off["cuts"]["objective"] == 0

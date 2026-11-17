@@ -311,15 +311,97 @@ def from_highs(model, presolve=False, highs_options=None):
     return _mip_from_highs_lp(highs.getPresolvedLp(), maximise=maximise)
 
 
-def load(path, presolve=False, highs_options=None):
+# Bump when ``_save_cache``'s layout changes: older caches are rebuilt.
+_CACHE_VERSION = 1
+
+
+def _cache_path(path):
+    return path + ".jaddle.npz"
+
+
+def _cache_stamp(path):
+    """The source file's identity for a cache: format, size, mtime."""
+    stat = os.stat(path)
+    return np.array([_CACHE_VERSION, stat.st_size, stat.st_mtime_ns], np.int64)
+
+
+def _save_cache(mip, path):
+    """Write ``mip``'s host arrays next to ``path`` (``load(cache=True)``).
+    Written to a temporary name and renamed, so a reader never sees half a
+    file; a failure to write is ignored (a read-only data directory)."""
+    A = sp.csr_matrix(mip.A)
+    target = _cache_path(path)
+    temp = f"{target}.{os.getpid()}.tmp.npz"
+    try:
+        np.savez(
+            temp,
+            stamp=_cache_stamp(path),
+            n_eq=np.int64(mip.n_eq),
+            shape=np.array(A.shape, np.int64),
+            indptr=A.indptr, indices=A.indices, data=A.data,
+            b=mip.b, c=mip.c, lower=mip.lower, upper=mip.upper,
+            integrality=mip.integrality, implied=mip.implied,
+            offset=np.float64(mip.offset), maximise=np.bool_(mip.maximise),
+        )
+        os.replace(temp, target)
+    except OSError:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+
+
+def _load_cache(path):
+    """The ``MIP`` cached for ``path`` (``_save_cache``), or ``None`` when
+    there is none, or it is for another version of the file or format."""
+    target = _cache_path(path)
+    if not os.path.exists(target):
+        return None
+    try:
+        with np.load(target) as z:
+            if not np.array_equal(z["stamp"], _cache_stamp(path)):
+                return None
+            A = sp.csr_matrix(
+                (z["data"], z["indices"], z["indptr"]), shape=tuple(z["shape"])
+            )
+            n_eq, b = int(z["n_eq"]), z["b"]
+            lp = LP(
+                z["c"], A[:n_eq].tocsc(), b[:n_eq], A[n_eq:].tocsc(), b[n_eq:],
+                z["lower"], z["upper"],
+            )
+            return MIP(
+                lp, z["integrality"], offset=float(z["offset"]),
+                maximise=bool(z["maximise"]), implied=z["implied"],
+            )
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def load(path, presolve=False, highs_options=None, cache=False):
     """
     Load a MIP from a file into a ``MIP``, ready for ``solve()``.
 
     ``path`` is any file HiGHS reads (MPS, LP, gzipped or not). This is
     ``from_highs`` for files; see it for ``presolve`` and ``highs_options``.
     Raises ``ValueError`` when HiGHS cannot read the file.
+
+    ``cache=True`` keeps the loaded model's arrays next to the file
+    (``<path>.jaddle.npz``) and reads them on the next call instead of
+    parsing the file again: a large MPS file takes HiGHS's parser most of
+    the load. The cache is rebuilt when the file's size or modification
+    time changes. It holds the model as loaded without ``presolve`` or
+    ``highs_options``; with either, the file is always parsed.
     """
-    return from_highs(os.fspath(path), presolve=presolve, highs_options=highs_options)
+    path = os.fspath(path)
+    use_cache = cache and not presolve and not highs_options
+    if use_cache:
+        mip = _load_cache(path)
+        if mip is not None:
+            return mip
+    mip = from_highs(path, presolve=presolve, highs_options=highs_options)
+    if use_cache:
+        _save_cache(mip, path)
+    return mip
 
 
 def to_highs(mip):
@@ -5473,6 +5555,13 @@ def _cut_block(cuts, n, min_rows=0, min_nnz=0):
 
 # %%
 # Symmetry
+# The most nonzeros ``symmetry="auto"`` searches for symmetry: the coloured
+# graph has a vertex per column, row and distinct (row, coefficient), and
+# bliss cannot be stopped. bab5 (about 150k nonzeros) took 0.02 s; on
+# zuck_small (6.7M nonzeros, about 6M vertices) it ran for minutes.
+_SYMMETRY_MAX_NNZ = 1_000_000
+
+
 def _colours(keys):
     """Integer colours for a sequence of hashable keys, equal keys equal."""
     table = {}
@@ -9869,6 +9958,7 @@ class _BranchAndBound:
         clique_cuts=True,
         gub_cover_cuts=True,
         zero_half_cuts=True,
+        objective_cuts=True,
         cut_age=_CUT_AGE,
         max_cut_rows=None,
         gomory_candidates=None,
@@ -10260,6 +10350,9 @@ class _BranchAndBound:
         # Zero-half cuts (``zero_half_cuts``) from the LP's rows, its cuts
         # included, at each root and tree round.
         self.use_zero_half = bool(zero_half_cuts)
+        # The rounded objective bound as a row for zero-half cuts and as a
+        # cut itself (``objective_bound_row``).
+        self.use_objective_cuts = bool(objective_cuts)
         # Implied-bound cuts (``implied_bound_cuts``) from what probing learnt.
         self.use_implied_bound_cuts = bool(implied_bound_cuts)
         # Conflicts from probing in the conflict graph (``probing_cliques``):
@@ -14368,6 +14461,7 @@ class _BranchAndBound:
                 ("flowcover", "flow cover"),
                 ("clique", "clique"),
                 ("zerohalf", "zero-half"),
+                ("objective", "objective bound"),
                 ("impliedbound", "implied bound"),
             )
             counts = ", ".join(
@@ -14534,6 +14628,7 @@ class _BranchAndBound:
                     "flowcover",
                     "clique",
                     "zerohalf",
+                    "objective",
                     "impliedbound",
                 )
             },
@@ -15912,9 +16007,44 @@ class _BranchAndBound:
         if not self.use_zero_half:
             return []
         mip = self.mip if mip is None else mip  # a worker passes the rows it took
-        return zero_half_cuts(
-            mip.A, mip.b, mip.n_eq, x, lower, upper, self.cut_int, max_cuts=max_cuts
+        A, b = mip.A, mip.b
+        objective = self.objective_bound_row()
+        if objective is not None:
+            A = sp.vstack([sp.csr_matrix(A), objective[0]], format="csr")
+            b = np.append(b, objective[1])
+        cuts = zero_half_cuts(
+            A, b, mip.n_eq, x, lower, upper, self.cut_int, max_cuts=max_cuts
         )
+        if objective is not None:
+            row, rhs = objective
+            if float((row @ np.asarray(x, np.float64))[0]) > rhs + 1e-6:
+                cuts.append(("objective", row.indices.copy(), row.data.copy(), rhs))
+        return cuts
+
+    def objective_bound_row(self):
+        """The objective bound as a row ``-(c/g)·x <= -⌈bound/g⌉`` (a 1×n
+        CSR matrix and its right-hand side), or ``None``: with an objective
+        step ``g`` (``objective_step``) every solution has ``c·x`` a multiple
+        of ``g``, so the global bound rounds up (``round_bound``) and holds
+        as a row with integer coefficients. Combined with the model's rows
+        by the zero-half separator it gives Chvátal–Gomory cuts no single
+        row aggregation does: on a set covering instance like
+        neos-5052403-cygnet (unit costs, LP 180.24, optimum 182) the
+        rounded bound is 181 and the last unit can only come from rank-1
+        cuts with the objective in their support."""
+        step = self.objective_step
+        if step is None or not self.use_objective_cuts:
+            return None
+        bound = self.round_bound(self.global_bound())
+        if not np.isfinite(bound):
+            return None
+        coef = np.round(np.asarray(self.mip.c, np.float64) / step)
+        idx = np.flatnonzero(coef)
+        if idx.size == 0:
+            return None
+        n = coef.size
+        row = sp.csr_matrix((-coef[idx], idx, [0, idx.size]), shape=(1, n))
+        return row, -float(round(bound / step))
 
     def inout_candidates(self, separators, x, lower, upper, max_cuts):
         """
@@ -19937,9 +20067,18 @@ class _BranchAndBound:
         feasible point keeps its objective value, so the search stays
         exact. Returns the box with the fixings, propagated, or ``None``
         when it is empty. With ``symmetry="auto"`` and no igraph, nothing
-        happens.
+        happens; nor over ``_SYMMETRY_MAX_NNZ`` nonzeros, as bliss has no
+        time limit (raise it to search larger models).
         """
         started = time.time()
+        if mip.A.nnz > _SYMMETRY_MAX_NNZ:
+            self.symmetry_stats = {"skipped": f"{mip.A.nnz} nonzeros > {_SYMMETRY_MAX_NNZ}"}
+            if self.verbose:
+                print(
+                    f"Symmetry: skipped ({mip.A.nnz:,} nonzeros, over"
+                    f" _SYMMETRY_MAX_NNZ = {_SYMMETRY_MAX_NNZ:,})"
+                )
+            return lower, upper
         try:
             generators = symmetry_generators(mip, lower, upper)
         except ImportError:
@@ -20325,6 +20464,12 @@ class _BranchAndBound:
         if result["stop_reason"] == "time_limit" or self.out_of_time():
             bound, rigorous = self.lp_bound(result["solution"], lower, upper, result)
             self.raise_root_proven(bound, rigorous)
+            # Close at the rounds' best bound (``active_bound``), not the last
+            # re-solve's: a truncated re-solve after a cut round can be far
+            # weaker, and ``close`` takes the lesser of ``bound`` and
+            # ``proven``, so it dragged the reported bound down with it (on
+            # zuck_small, a maximisation, from 8.54e8 to 1.23e9).
+            bound = max(self.round_bound(bound), self.active_bound)
             self.close(bound, rigorous, proven=self.active_proven)
             return self.result("time_limit")
         # Every round's bound holds for the root box (the cuts are valid,
@@ -21185,6 +21330,7 @@ def solve(
     clique_cuts=True,
     gub_cover_cuts=True,
     zero_half_cuts=True,
+    objective_cuts=True,
     cut_age=100,
     max_cut_rows=10000,
     cut_pool_size=_CUT_POOL_SIZE,
@@ -21696,6 +21842,9 @@ def solve(
       other families. With ``implied_variable_bounds`` (on by default) the
       ones on continuous columns also join the rows' variable bounds for
       c-MIR and flow cover cuts.
+      With integral objective values (``objective_step``) the global bound,
+      rounded up, joins those rows as ``c·x >= ⌈bound⌉`` and is a cut
+      itself (``objective_cuts``, on by default; family ``"objective"``).
       Zero-half cuts (``zero_half_cuts``, on by default; family
       ``"zerohalf"``) are {0, ½}-Chvátal–Gomory cuts: half the sum of a set
       of rows with integer coefficients, rounded down
@@ -22774,6 +22923,7 @@ def solve(
         mir_cuts=mir_cuts,
         clique_cuts=clique_cuts,
         zero_half_cuts=zero_half_cuts,
+        objective_cuts=objective_cuts,
         cut_age=cut_age,
         max_cut_rows=max_cut_rows,
         cut_pool_size=cut_pool_size,
@@ -23031,6 +23181,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
                 "flowcover": 0,
                 "clique": 0,
                 "zerohalf": 0,
+                "objective": 0,
                 "impliedbound": 0,
             },
             "root_bound_before_cuts": None,
