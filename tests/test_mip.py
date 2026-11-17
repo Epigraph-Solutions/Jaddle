@@ -1,5 +1,6 @@
 """Tests for the branch-and-bound MIP solver, jaddle.jaddle_mip."""
 
+import heapq
 import threading
 import time
 import types
@@ -7460,7 +7461,7 @@ def test_band_overflow_in_the_search():
     ref = reference(mip)
     options = dict(
         max_seconds=300, batch_size=4, exact_nodes=1, exact_band=0.5,
-        rins_seconds=0, crossover_seconds=0, proximity_seconds=0,
+        rins_seconds=0, crossover_seconds=0, proximity_seconds=0, local_branching_seconds=0,
     )
     result = jm.solve(mip, exact_overflow_share=0.5, **options)
     assert result["bound"] <= ref + 1e-6
@@ -7587,7 +7588,7 @@ def test_highs_rins_and_crossover_in_the_search(make):
     assert result["crossover_finds"] <= result["crossover_calls"]
     off = jm.solve(
         mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
-        proximity_seconds=0,
+        proximity_seconds=0, local_branching_seconds=0,
     )
     assert off["rins_calls"] == off["crossover_calls"] == off["submip_lane_seconds"] == 0
 
@@ -7652,7 +7653,7 @@ def test_proximity_in_the_search():
     assert result["proximity_empty"] <= result["proximity_calls"]
     off = jm.solve(
         mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
-        proximity_seconds=0,
+        proximity_seconds=0, local_branching_seconds=0,
     )
     assert off["proximity_calls"] == off["submip_lane_seconds"] == 0
 
@@ -8974,7 +8975,7 @@ def test_lane_serviced_during_batches_keeps_the_optimum():
     ref = reference(mip)
     result = jm.solve(
         mip, max_seconds=300, batch_size=4, exact_nodes=2, exact_band=0.5,
-        rins_seconds=0, crossover_seconds=0, proximity_seconds=0,
+        rins_seconds=0, crossover_seconds=0, proximity_seconds=0, local_branching_seconds=0,
     )
     assert result["bound"] <= ref + 1e-6
     if result["status"] == "optimal":
@@ -9656,7 +9657,7 @@ def test_dual_fixing_in_the_search(make):
     mip = make()
     result = jm.solve(
         mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
-        proximity_seconds=0, dual_fix_seconds=5,
+        proximity_seconds=0, local_branching_seconds=0, dual_fix_seconds=5,
     )
     assert_solved(result, mip, reference(mip))
     assert result["dual_fix_calls"] > 0
@@ -9664,7 +9665,7 @@ def test_dual_fixing_in_the_search(make):
     assert 0.1 <= result["dual_fix_rate"] <= 0.95
     off = jm.solve(
         mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
-        proximity_seconds=0,
+        proximity_seconds=0, local_branching_seconds=0,
     )
     assert off["dual_fix_calls"] == 0
 
@@ -10208,3 +10209,133 @@ def test_numba_clean_cut_drops_roundoff_cuts():
     )
     assert ok and idx.tolist() == [0, 1]
 
+
+
+def test_packed_warm_blank_keeps_shapes_and_frees_bytes():
+    primal = np.zeros(1000)
+    primal[:400] = 1.5
+    warm = (jm.SaddleState(primal=primal, dual_ineq=np.ones(50), dual_eq=np.zeros(0)), None)
+    packed = jm._PackedWarm(warm)
+    assert packed.nbytes() > 0
+    blank = packed.blank()
+    assert blank.nbytes() == 0
+    solution, _ = blank.unpack()
+    assert solution.primal.shape == (1000,) and not solution.primal.any()
+    assert solution.dual_ineq.shape == (50,) and not solution.dual_ineq.any()
+
+
+def test_warm_start_budget_trims_worst_nodes_and_still_solves(monkeypatch):
+    search = search_for(facility_location(), monkeypatch, batch_size=4)
+    try:
+        n = search.mip.num_variables
+        search.warm_start_memory = 3 * 8 * n  # about three dense starts
+        search.warm_rescan_at = search.warm_start_memory
+        for k in range(10):
+            sol = jm.SaddleState(
+                primal=np.full(n, 0.5 + k), dual_ineq=np.zeros(0), dual_eq=np.zeros(0)
+            )
+            search.push(jm._Node(float(k), 1, None, (sol, None), None))
+        assert search.warm_trims > 0
+        held = {id(e[2]._warm): e[2]._warm.nbytes() for e in search.open}
+        assert sum(held.values()) <= search.warm_start_memory
+        # The best bounds keep their starts; the worst were blanked.
+        best = min(search.open, key=lambda e: e[2].bound)[2]
+        assert best.warm[0].primal.any()
+        assert search.memory_pressure or search.warm_bytes <= search.warm_start_memory
+    finally:
+        if search.exact_lane is not None:
+            search.exact_lane.shutdown()
+
+
+def test_tight_memory_budgets_still_solve_to_optimality():
+    mip = facility_location()
+    ref = reference(mip)
+    assert_solved(solve(mip, batch_size=4, warm_start_memory=1e3), mip, ref)
+    assert_solved(solve(mip, batch_size=4, memory_limit=1e4, max_open_nodes=4), mip, ref)
+
+
+def test_open_node_cap_switches_to_depth_first(monkeypatch):
+    search = search_for(facility_location(), monkeypatch, batch_size=4)
+    try:
+        search.max_open_nodes = 4
+        for k in range(6):
+            search.push(jm._Node(float(k), 1, None, None, None))
+        assert search.memory_pressure
+        newest = search.open[0][2]
+        assert newest.bound == 5.0  # depth first: the last pushed comes first
+        while len(search.open) > 1:
+            heapq.heappop(search.open)
+        search.push(jm._Node(9.0, 1, None, None, None))
+        assert not search.memory_pressure
+    finally:
+        if search.exact_lane is not None:
+            search.exact_lane.shutdown()
+
+
+@pytest.mark.parametrize("make", [facility_location, generalised_assignment])
+def test_local_branching_stays_in_the_ball_and_walks_down(make):
+    # Each point is within k of its centre over the binaries and under the
+    # cutoff; recentred on each, the walk never gets worse, and a ball
+    # around the optimum holds nothing better.
+    mip = make()
+    is_int = np.asarray(mip.integrality, bool)
+    held = jm._highs_local_branching(mip, is_int)
+    binaries = held[1]
+    assert binaries.size > 0
+    plain = jm._highs_submip(mip, is_int)
+    x = jm._submip_job(plain, mip, mip.lower, mip.upper, np.inf, 0.05)
+    if x is None:  # no point within the tiny limit: any feasible one
+        x = jm._submip_job(plain, mip, mip.lower, mip.upper, np.inf, 30.0)
+    k, values = 4, []
+    for _ in range(30):
+        value = float(mip.c @ x)
+        values.append(value)
+        cutoff = value - 1e-6 * (1.0 + abs(value))
+        y, empty = jm._local_branching_job(
+            held, mip, x, mip.lower, mip.upper, k, cutoff, 30.0
+        )
+        if y is None:
+            break
+        assert mip.is_feasible(y)
+        assert float(mip.c @ y) < cutoff
+        flips = np.abs(np.round(y[binaries]) - np.round(x[binaries])).sum()
+        assert flips <= k
+        x = y
+    assert all(a > b for a, b in zip(values, values[1:]))
+    assert empty or y is None
+
+
+def test_local_branching_in_the_search():
+    mip = generalised_assignment()
+    off_others = dict(
+        max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
+        proximity_seconds=0, dual_fix_seconds=0,
+    )
+    result = jm.solve(mip, local_branching_seconds=5, **off_others)
+    assert_solved(result, mip, reference(mip))
+    assert result["local_branching_calls"] > 0
+    assert result["local_branching_finds"] <= result["local_branching_calls"]
+    assert result["local_branching_empty"] <= result["local_branching_calls"]
+    off = jm.solve(mip, local_branching_seconds=0, **off_others)
+    assert off["local_branching_calls"] == 0
+
+
+def test_local_branching_radius_adapts(monkeypatch):
+    search = search_for(facility_location(), monkeypatch, batch_size=4)
+    try:
+        search.submip_budget = 10.0
+        k0 = search.local_branching_k
+        search.adapt_local_branching(False, True, 9.0)  # shown empty: wider
+        assert search.local_branching_k > k0
+        wide = search.local_branching_k
+        search.adapt_local_branching(False, False, 10.0)  # timed out: narrower
+        assert search.local_branching_k < wide
+        for _ in range(20):
+            search.adapt_local_branching(False, False, 10.0)
+        assert search.local_branching_k == jm._LOCAL_BRANCHING_MIN_K
+        held = search.local_branching_k
+        search.adapt_local_branching(True, False, 1.0)  # a find keeps it
+        assert search.local_branching_k == held
+    finally:
+        if search.exact_lane is not None:
+            search.exact_lane.shutdown()

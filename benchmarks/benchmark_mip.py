@@ -186,26 +186,12 @@ def run_jaddle(path, args, primal_target=None):
     started = time.time()
     result = jm.solve(
         path,
-        presolve=True,
-        max_seconds=args.max_seconds,
         primal_target=primal_target,
+        max_seconds=args.max_seconds,
         device=args.device,
+        presolve=True,
         verbose=True,
         log_every_seconds=10,
-        batch_size=4,
-        dual_polish=True,
-        dual_repair=True,
-        gub_cover_cuts=False,
-        cut_rounds=100,
-        max_cuts_per_round=int(1e4),
-        cut_pool_size=int(1e5),
-        max_cut_rows=int(1e5),
-        probing=True,
-        support_gate=True,
-        support_gate_dives=True,
-        fix_and_propagate=True,
-        bulk_rounding=True,
-        dive_every=10,
     )
     row.update(
         {

@@ -7794,6 +7794,7 @@ _LOG_SOURCES = (
     ("Z", "Trivial"),
     ("C", "Crossover"),
     ("X", "Proximity"),
+    ("V", "Local branching"),
     ("Q", "Presolved restart"),
     ("W", "HiGHS first solution"),
     ("1", "1-opt"),
@@ -7904,6 +7905,40 @@ class _PackedWarm:
 
     def has_solution(self):
         return self.treedef.num_leaves > 0
+
+    def nbytes(self):
+        """The host bytes its packed leaves take (device arrays and a
+        solution kept as it is count only their host arrays)."""
+        leaves = self.leaves
+        if leaves is None:
+            leaves = jax.tree.leaves(self.solution)
+        total = 0
+        for leaf in leaves:
+            if isinstance(leaf, _SparseLeaf):
+                total += leaf.index.nbytes + leaf.values.nbytes
+            elif isinstance(leaf, np.ndarray):
+                total += leaf.nbytes
+        return total
+
+    def blank(self):
+        """The same warm start with its solution all zeros (a cold start of
+        the same shapes, kept as empty ``_SparseLeaf``s), for
+        ``warm_start_memory``; ``opt_state`` is kept."""
+        leaves = self.leaves
+        if leaves is None:
+            leaves = jax.tree.leaves(self.solution)
+        out = object.__new__(_PackedWarm)
+        out.treedef, out.opt_state, out.solution = self.treedef, self.opt_state, None
+        out.leaves = [
+            _SparseLeaf(
+                tuple(np.shape(leaf)), np.dtype(leaf.dtype),
+                np.zeros(0, np.int32), np.zeros(0, leaf.dtype),
+            )
+            if hasattr(leaf, "dtype") and np.dtype(leaf.dtype).kind == "f"
+            else leaf
+            for leaf in leaves
+        ]
+        return out
 
     def unpack(self):
         if self.leaves is None:
@@ -8437,6 +8472,64 @@ def _proximity_job(highs, mip, is_int, center, lower, upper, cutoff, seconds):
     return x, False
 
 
+def _highs_local_branching(mip, is_int):
+    """``_highs_submip``'s MIP with one more row over the binaries
+    (``_local_branching_job`` sets its coefficients), the local branching
+    row. Returns ``(highs, binaries, signs)``: ``signs`` are the row's
+    current coefficients (all ``+1``: no centre yet)."""
+    highs = _highs_submip(mip, is_int)
+    binaries = np.flatnonzero(
+        np.asarray(is_int, bool)
+        & (np.asarray(mip.lower, np.float64) == 0.0)
+        & (np.asarray(mip.upper, np.float64) == 1.0)
+    ).astype(np.int32)
+    signs = np.ones(binaries.size)
+    highs.addRow(-np.inf, np.inf, binaries.size, binaries, signs)
+    return highs, binaries, signs
+
+
+def _local_branching_job(held, mip, center, lower, upper, k, cutoff, seconds):
+    """
+    Local branching (Fischetti & Lodi, 2003) in ``held``
+    (``_highs_local_branching``): over ``[lower, upper]``, pruned at
+    ``cutoff``, among the points within Hamming distance ``k`` of
+    ``center`` over the binaries,
+    ``Σ_{center=1} (1 − x) + Σ_{center=0} x ≤ k``. No integer is fixed, so
+    any ``k`` binaries may flip, unlike RINS's fixings. Returns ``(x,
+    empty)``: HiGHS's best point (``None``: none) and whether it showed the
+    ball holds nothing under the cutoff.
+    """
+    import highspy
+
+    highs, binaries, signs = held
+    n = lower.size
+    row = highs.getNumRow() - 1
+    ones = np.asarray(center, np.float64)[binaries] >= 0.5
+    want = np.where(ones, -1.0, 1.0)
+    for j in np.flatnonzero(want != signs).tolist():
+        highs.changeCoeff(row, int(binaries[j]), float(want[j]))
+    signs[:] = want
+    highs.changeRowBounds(row, -np.inf, float(k) - float(ones.sum()))
+    highs.changeColsBounds(n, np.arange(n, dtype=np.int32), lower, upper)
+    highs.setOptionValue("objective_bound", float(cutoff))
+    highs.setOptionValue("time_limit", highs.getRunTime() + float(seconds))
+    highs.run()
+    status = highs.getModelStatus()
+    if highs.getInfo().primal_solution_status != 2:  # kSolutionStatusFeasible
+        return None, status == highspy.HighsModelStatus.kInfeasible
+    x = np.array(highs.getSolution().col_value, np.float64)
+    if float(np.asarray(mip.c, np.float64) @ x) >= cutoff:
+        return None, False
+    return x, False
+
+
+# Local branching's ball radius (``_BranchAndBound.local_branching``): its
+# start, floor, and the factor it moves by (up when the ball was shown
+# empty or searched fast, down when the search ran out of time).
+_LOCAL_BRANCHING_K = 10
+_LOCAL_BRANCHING_MIN_K = 2
+_LOCAL_BRANCHING_STEP = 1.5
+
 # The solutions crossover draws from (``_BranchAndBound.solution_pool``).
 _SOLUTION_POOL_SIZE = 10
 
@@ -8477,6 +8570,8 @@ class _SubMipLane:
         self.held = None  # (mip, Highs), used on the lane's thread only
         # Proximity search's own copy, with the objective row added.
         self.held_proximity = None
+        # Local branching's, with its distance row.
+        self.held_local = None
         self.job = None  # (future, kind)
 
     def busy(self):
@@ -8524,6 +8619,24 @@ class _SubMipLane:
 
         self.job = (self.pool.submit(job), "proximity")
 
+    def submit_local_branching(self, mip, is_int, center, lower, upper, k, cutoff, seconds):
+        """Queue local branching within ``k`` of ``center``
+        (``_local_branching_job``)."""
+        lower, upper = np.array(lower, np.float64), np.array(upper, np.float64)
+        is_int = np.array(is_int, bool)
+        center = np.array(center, np.float64)
+
+        def job():
+            started = time.time()
+            if self.held_local is None or self.held_local[0] is not mip:
+                self.held_local = (mip, _highs_local_branching(mip, is_int))
+            x, empty = _local_branching_job(
+                self.held_local[1], mip, center, lower, upper, k, cutoff, seconds
+            )
+            return x, empty, time.time() - started
+
+        self.job = (self.pool.submit(job), "local")
+
     def finished(self):
         """The finished job as ``(kind, x, empty, seconds)`` (``x`` ``None``
         when it found nothing or raised; ``empty``: HiGHS showed the box
@@ -8544,10 +8657,11 @@ class _SubMipLane:
         if self.job is not None:
             self.job[0].cancel()
             self.job = None
-        for held in (self.held, self.held_proximity):
+        for held in (self.held, self.held_proximity, self.held_local):
             if held is not None:
                 try:
-                    held[1].cancelSolve()
+                    highs = held[1][0] if isinstance(held[1], tuple) else held[1]
+                    highs.cancelSolve()
                 except Exception:
                     pass
         self.pool.shutdown(wait=False, cancel_futures=True)
@@ -9845,6 +9959,8 @@ class _BranchAndBound:
         exact_overflow_share=0.5,
         exact_overflow_epochs=None,
         exact_basis_memory=2e9,
+        warm_start_memory=1e9,
+        max_open_nodes=None,
         exact_strong_lookahead=None,
         exact_strong_cutoff=False,
         exact_direct=True,
@@ -9888,6 +10004,7 @@ class _BranchAndBound:
         crossover_min_fixed=0.5,
         proximity_seconds=10.0,
         proximity_gap_share=0.0,
+        local_branching_seconds=10.0,
         jump_gap_share=0.0,
         first_solution_seconds=0.0,
         dual_fix_seconds=0.0,
@@ -10390,6 +10507,26 @@ class _BranchAndBound:
         # byte a column and row each): key -> [shape, basis, holders],
         # oldest first; the oldest go when it is full.
         self.exact_basis_memory = float(exact_basis_memory or 0)
+        # The host bytes the open nodes' packed warm starts may take
+        # (``warm_start_memory``; ``None``: no cap): past it the worst-bound
+        # open nodes' starts are blanked to zeros (``trim_warm``).
+        self.warm_start_memory = (
+            None if warm_start_memory is None else float(warm_start_memory)
+        )
+        self.warm_bytes = 0  # an upper estimate since the last trim
+        self.warm_rescan_at = self.warm_start_memory  # next measurement
+        self.warm_trims = 0
+        # The lean tree's open nodes' HiGHS bases (``_Node.lean_basis``) share
+        # ``exact_basis_memory``: past it the worst-bound nodes drop theirs.
+        self.lean_basis_bytes = 0
+        # Depth-first while the frontier is over ``max_open_nodes`` or its
+        # warm starts cannot be trimmed to ``warm_start_memory``, until it is
+        # back under half of either (``update_memory_pressure``).
+        self.max_open_nodes = None if max_open_nodes is None else int(max_open_nodes)
+        self.memory_pressure = False
+        self.pressure_switches = 0
+        self.pressure_pushes = 0
+        self.lean_rescan_at = self.exact_basis_memory
         self.basis_store = collections.OrderedDict()
         self.basis_keys = itertools.count()
         self.exact_pivots = 0
@@ -10583,6 +10720,14 @@ class _BranchAndBound:
         self.crossover_solutions = int(crossover_solutions)
         self.crossover_min_fixed = float(crossover_min_fixed)
         self.proximity_seconds = float(proximity_seconds or 0.0)
+        # Local branching on the sub-MIP lane (``local_branching``): its
+        # seconds a call and ball radius (adapted), calls, finds and balls
+        # shown empty.
+        self.local_branching_seconds = float(local_branching_seconds or 0.0)
+        self.local_branching_k = _LOCAL_BRANCHING_K
+        self.local_branching_calls = 0
+        self.local_branching_finds = 0
+        self.local_branching_empty = 0
         # Aggressive targets (``gap_target``): the share of the gap a new
         # point must close, for proximity search and the improving jumps;
         # the setting and the share in use (``adapt_gap_share``).
@@ -10621,6 +10766,7 @@ class _BranchAndBound:
                 rins_seconds
                 or self.crossover_seconds
                 or self.proximity_seconds
+                or self.local_branching_seconds
                 or first_solution_seconds
                 or self.dual_fix_seconds
             )
@@ -11419,7 +11565,7 @@ class _BranchAndBound:
         )
 
     def key(self, node, order):
-        if self.diving():
+        if self.diving() or self.memory_pressure:
             return (-order,)
         # Equal bounds (common with an objective step, which rounds them:
         # on CMS750_4 hundreds of open nodes sit at each level) go by the
@@ -11432,6 +11578,112 @@ class _BranchAndBound:
             node.cut_version = self.cut_version
         order = next(self.counter)
         heapq.heappush(self.open, (self.key(node, order), order, node))
+        if self.warm_start_memory is not None:
+            packed = node._warm
+            if isinstance(packed, _PackedWarm):
+                self.warm_bytes += packed.nbytes()
+                if self.warm_bytes > self.warm_rescan_at:
+                    self.trim_warm()
+        self.update_memory_pressure()
+        if node.lean_basis is not None and self.exact_basis_memory > 0:
+            self.lean_basis_bytes += self.mip.num_variables + (node.lean_rows or 0)
+            if self.lean_basis_bytes > self.lean_rescan_at:
+                self.trim_lean_bases()
+
+    def update_memory_pressure(self):
+        """Switch node selection to depth-first (``key``) under memory
+        pressure, and back once it eases; the heap is rekeyed on a switch."""
+        count, limit = len(self.open), self.max_open_nodes
+        budget = self.warm_start_memory
+        if self.memory_pressure and budget is not None:
+            # ``warm_bytes`` only grows between measurements: measure again
+            # now and then, so pressure from it can ease.
+            self.pressure_pushes += 1
+            if self.pressure_pushes % 1024 == 0:
+                self.trim_warm()
+        over = (limit is not None and count > limit) or (
+            budget is not None and self.warm_bytes > budget
+        )
+        eased = (limit is None or count <= limit // 2) and (
+            budget is None or self.warm_bytes <= 0.5 * budget
+        )
+        if over and not self.memory_pressure:
+            self.memory_pressure = True
+        elif eased and self.memory_pressure:
+            self.memory_pressure = False
+        else:
+            return
+        self.pressure_switches += 1
+        self.rekey()
+
+    def trim_lean_bases(self):
+        """Hold the open nodes' lean bases (one byte a column and row each,
+        shared ones once) to ``exact_basis_memory``, dropping the
+        worst-bound nodes' to three quarters of it: such a node's LP starts
+        from its thread's last basis instead."""
+        holders, size = {}, {}
+        n = self.mip.num_variables
+        for _, _, node in self.open:
+            if node.lean_basis is not None:
+                key = id(node.lean_basis)
+                size.setdefault(key, n + (node.lean_rows or 0))
+                holders[key] = holders.get(key, 0) + 1
+        total = sum(size.values())
+        budget = self.exact_basis_memory
+        if total > budget:
+            worst = sorted(self.open, key=lambda entry: -entry[2].bound)
+            for _, _, node in worst:
+                if total <= 0.75 * budget:
+                    break
+                if node.lean_basis is None:
+                    continue
+                key = id(node.lean_basis)
+                node.lean_basis, node.lean_rows = None, None
+                holders[key] -= 1
+                if holders[key] == 0:
+                    total -= size[key]
+        self.lean_basis_bytes = total
+        self.lean_rescan_at = max(budget, total + 0.25 * budget)
+
+    def trim_warm(self):
+        """Hold the open heap's packed warm starts to ``warm_start_memory``:
+        measure them (children share their parent's packing, counted once)
+        and, when over, blank the worst-bound nodes' starts (``blank``) to
+        three quarters of it. Nodes whose start is a point the exact lane
+        relies on (``exact_known``, ``screened``) keep theirs."""
+        holders, size = {}, {}
+        for _, _, node in self.open:
+            packed = node._warm
+            if isinstance(packed, _PackedWarm):
+                key = id(packed)
+                if key not in size:
+                    size[key] = packed.nbytes()
+                holders[key] = holders.get(key, 0) + 1
+        total = sum(size.values())
+        budget = self.warm_start_memory
+        if total > budget:
+            target = 0.75 * budget
+            worst = sorted(self.open, key=lambda entry: -entry[2].bound)
+            for _, _, node in worst:
+                if total <= target:
+                    break
+                packed = node._warm
+                if (
+                    not isinstance(packed, _PackedWarm)
+                    or node.exact_known
+                    or node.screened
+                    or size.get(id(packed), 0) == 0
+                ):
+                    continue
+                key = id(packed)
+                node._warm = packed.blank()
+                holders[key] -= 1
+                if holders[key] == 0:
+                    total -= size[key]
+            self.warm_trims += 1
+        self.warm_bytes = total
+        # Measure again after a quarter budget's growth, and never below it.
+        self.warm_rescan_at = max(budget, total + 0.25 * budget)
 
     def rekey(self):
         self.open = [(self.key(n, o), o, n) for _, o, n in self.open]
@@ -13996,6 +14248,7 @@ class _BranchAndBound:
             "U": self.use_round_repair,
             "C": bool(self.crossover_seconds and self.submip_lane is not None),
             "X": bool(self.proximity_seconds and self.submip_lane is not None),
+            "V": bool(self.local_branching_seconds and self.submip_lane is not None),
             "Q": self.restart_presolve and self.max_restarts > 0,
             "W": bool(self.first_solution_seconds and self.submip_lane is not None),
             "L": self.level_lane is not None,
@@ -14263,6 +14516,8 @@ class _BranchAndBound:
             "tree_cut_skipped": self.tree_cut_skipped,
             "tree_cut_families": dict(self.tree_cut_families),
             "cut_pool": len(self.cut_pool),
+            "warm_trims": self.warm_trims,
+            "pressure_switches": self.pressure_switches,
             "global_redcost_fixed": self.global_redcost_fixed,
             "cut_pool_rows": len(self.cut_archive),
             "lp_epochs": self.lp_epochs,
@@ -14330,6 +14585,9 @@ class _BranchAndBound:
             "proximity_calls": self.proximity_calls,
             "proximity_finds": self.proximity_finds,
             "proximity_empty": self.proximity_empty,
+            "local_branching_calls": self.local_branching_calls,
+            "local_branching_finds": self.local_branching_finds,
+            "local_branching_empty": self.local_branching_empty,
             "submip_lane_seconds": self.submip_lane_seconds,
             "objective_levels": self.level_stats(),
             "exact_cut_rounds": self.exact_cut_stats,
@@ -16700,6 +16958,49 @@ class _BranchAndBound:
         self.proximity_calls += 1
         return True
 
+    def local_branching(self):
+        """Local branching on the sub-MIP lane (``_local_branching_job``,
+        Fischetti & Lodi): the base box under the cutoff, within Hamming
+        distance ``local_branching_k`` of the incumbent over the binaries.
+        Once an incumbent, radius and cutoff. Returns whether a job went
+        in."""
+        seconds = self.submip_seconds_left(self.local_branching_seconds)
+        if seconds <= 0:
+            return False
+        base, ints = self.base, self.is_int
+        binaries = ints & (base.lower == 0.0) & (base.upper == 1.0)
+        count = int(binaries.sum())
+        if count <= _LOCAL_BRANCHING_MIN_K:
+            return False
+        k = min(int(self.local_branching_k), count // 2)
+        center, cutoff = self.incumbent[1], self.cutoff()
+        key = ("local", center[ints].tobytes(), k, cutoff)
+        if key in self.rins_seen:
+            return False
+        self.rins_seen.add(key)
+        self.submip_lane.submit_local_branching(
+            base, ints, center, base.lower, base.upper, k, cutoff, seconds
+        )
+        self.submip_last = "local"
+        self.submip_budget = float(seconds)
+        self.submip_calls += 1
+        self.local_branching_calls += 1
+        return True
+
+    def adapt_local_branching(self, improved, empty, seconds):
+        """Widen the ball when it was shown empty, or searched without a
+        point in well under its time; narrow it when the search timed out
+        empty-handed. A find keeps the radius (the next ball is around the
+        new incumbent)."""
+        k = self.local_branching_k
+        if improved:
+            return
+        if empty or seconds < _RINS_EARLY_SHARE * max(self.submip_budget, 1e-9):
+            k = k * _LOCAL_BRANCHING_STEP
+        else:
+            k = k / _LOCAL_BRANCHING_STEP
+        self.local_branching_k = max(_LOCAL_BRANCHING_MIN_K, int(round(k)))
+
     def feed_submip(self):
         """Keep the sub-MIP lane busy between node solves: the root's RENS
         when it is waiting; while there is no incumbent, HiGHS on the whole
@@ -16721,7 +17022,7 @@ class _BranchAndBound:
             if getattr(self, "root_lower", None) is not None and self.tree_started:
                 self.feed_first_solution()
             return
-        order = ("rins", "proximity", "crossover", "dualfix")
+        order = ("rins", "proximity", "local", "crossover", "dualfix")
         start = order.index(self.submip_last) + 1 if self.submip_last in order else 0
         for kind in order[start:] + order[:start]:
             if kind == "rins":
@@ -16731,6 +17032,9 @@ class _BranchAndBound:
                         return
             elif kind == "proximity":
                 if self.proximity_seconds and self.proximity():
+                    return
+            elif kind == "local":
+                if self.local_branching_seconds and self.local_branching():
                     return
             elif kind == "crossover":
                 if self.crossover_seconds and self.crossover():
@@ -16759,11 +17063,16 @@ class _BranchAndBound:
                 self.proximity_gap_share = self.adapt_gap_share(
                     self.proximity_gap_share, self.proximity_gap_max, False
                 )
-            self.proximity_empty += empty
+            if kind == "local":
+                self.adapt_local_branching(False, empty, seconds)
+                self.local_branching_empty += empty
+            else:
+                self.proximity_empty += empty
             return
         before = None if self.incumbent is None else self.incumbent[0]
         source = {
-            "rins": "N", "proximity": "X", "rens": "E", "first": "W", "dualfix": "G"
+            "rins": "N", "proximity": "X", "rens": "E", "first": "W", "dualfix": "G",
+            "local": "V",
         }.get(kind, "C")
         self.try_incumbent(x, source, None)
         improved = self.incumbent is not None and (
@@ -16777,6 +17086,9 @@ class _BranchAndBound:
             self.proximity_gap_share = self.adapt_gap_share(
                 self.proximity_gap_share, self.proximity_gap_max, improved
             )
+        elif kind == "local":
+            self.local_branching_finds += improved
+            self.adapt_local_branching(improved, False, seconds)
         elif kind == "rens":
             self.rens_finds += improved
         elif kind == "first":
@@ -17201,6 +17513,7 @@ class _BranchAndBound:
             rens_seconds=0.0,
             crossover_seconds=0.0,
             proximity_seconds=0.0,
+            local_branching_seconds=0.0,
             first_solution_seconds=0.0,
             dual_fix_seconds=0.0,
             projected_pdhg=False,
@@ -20994,6 +21307,9 @@ def solve(
     exact_overflow_share=0.0,
     exact_overflow_epochs=None,
     exact_basis_memory=2e9,
+    warm_start_memory=1e9,
+    max_open_nodes=None,
+    memory_limit=None,
     exact_strong_lookahead=4,
     exact_strong_cutoff=False,
     exact_direct=True,
@@ -21037,6 +21353,7 @@ def solve(
     crossover_min_fixed=0.5,
     proximity_seconds=20,
     proximity_gap_share=0.0,
+    local_branching_seconds=10,
     jump_gap_share=0.0,
     first_solution_seconds=40,
     dual_fix_seconds=20,
@@ -21842,6 +22159,18 @@ def solve(
       interior points cost it nothing. RINS and crossover take turns on the
       lane. Results: ``rins_calls``, ``rins_finds``, ``crossover_calls``,
       ``crossover_finds`` and ``submip_lane_seconds``.
+    * **Local branching** (``local_branching_seconds``, default 10 s a
+      call; ``0``: off; needs ``submip_solver="highs"``), as Fischetti and
+      Lodi's. HiGHS searches the whole base box under the cutoff with one
+      more row, the incumbent's Hamming ball over the binaries
+      (``Σ_{x̄=1} (1 − x) + Σ_{x̄=0} x ≤ k``), so any ``k`` binaries may
+      flip, where RINS and crossover fix integers; marked ``"V"``. ``k``
+      starts at 10, grows by 1.5x when a ball is shown empty or searched
+      in under half its time, and shrinks when a search times out. One
+      call per incumbent, radius and cutoff; it takes turns on the lane
+      with RINS, proximity search and crossover. Results:
+      ``local_branching_calls``, ``local_branching_finds`` and
+      ``local_branching_empty``.
     * **Proximity search** (``proximity_seconds``, default 20 s a call;
       ``0``: off; needs ``submip_solver="highs"``), as Fischetti and
       Monaci's. HiGHS searches the whole base box with the objective as a
@@ -22090,6 +22419,18 @@ def solve(
       from a kept one (``warm_bases`` stays 0); with the earlier band, on
       presolved map06, a child took 870–3,100 pivots (0.5–1.6 s) from its
       parent's basis against 3,400–5,200 (1.8–2.9 s) from another node's.
+      The lean tree's open nodes' bases share the same cap; past it the
+      worst-bound nodes drop theirs.
+
+      Tree memory: the open nodes' packed PDHG warm starts take at most
+      ``warm_start_memory`` host bytes (default 1e9; ``None``: no cap);
+      past it the worst-bound nodes' starts are zeroed (a cold start).
+      ``max_open_nodes`` (default ``None``: no cap) and a warm start
+      budget that trimming cannot meet switch node selection to depth
+      first until the frontier is back under half of them.
+      ``memory_limit`` (bytes, default ``None``) caps both byte budgets
+      together: at most half of it for warm starts and a quarter for
+      bases (``exact_basis_memory``).
       The root is not a lane node, so it gets exact strong branching of its
       own (``exact_root_candidates``, default 128; ``None``: every
       fractional integer; ``0``: off, and the PDHG root sweep,
@@ -22322,6 +22663,10 @@ def solve(
     """
     start = time.time()
     deadline = None if max_seconds is None else start + max_seconds
+    if memory_limit is not None:
+        share = 0.5 * float(memory_limit)
+        warm_start_memory = share if warm_start_memory is None else min(warm_start_memory, share)
+        exact_basis_memory = min(exact_basis_memory or 0, 0.25 * float(memory_limit))
     if node_lp_options is None:
         # Node LPs check convergence every 64 iterations (jl.solve: 256),
         # unless lp_options sets it for every LP.
@@ -22479,6 +22824,8 @@ def solve(
         exact_overflow_share=exact_overflow_share,
         exact_overflow_epochs=exact_overflow_epochs,
         exact_basis_memory=exact_basis_memory,
+        warm_start_memory=warm_start_memory,
+        max_open_nodes=max_open_nodes,
         exact_strong_lookahead=exact_strong_lookahead,
         exact_strong_cutoff=exact_strong_cutoff,
         exact_direct=exact_direct,
@@ -22522,6 +22869,7 @@ def solve(
         crossover_min_fixed=crossover_min_fixed,
         proximity_seconds=proximity_seconds,
         proximity_gap_share=proximity_gap_share,
+        local_branching_seconds=local_branching_seconds,
         jump_gap_share=jump_gap_share,
         first_solution_seconds=first_solution_seconds,
         dual_fix_seconds=dual_fix_seconds,
@@ -22733,6 +23081,9 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "proximity_calls": 0,
             "proximity_finds": 0,
             "proximity_empty": 0,
+            "local_branching_calls": 0,
+            "local_branching_finds": 0,
+            "local_branching_empty": 0,
             "submip_lane_seconds": 0.0,
             "cutoff_probing": None,
             "restart_presolve": [],
