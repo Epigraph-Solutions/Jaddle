@@ -10180,6 +10180,52 @@ def test_primal_target_maximisation_with_presolve(tmp_path):
     assert loose["objective"] >= 1.5
 
 
+@pytest.mark.parametrize("make", [knapsack, facility_location])
+def test_feed_highs_matches_reference(make):
+    mip = make()
+    ref = reference(mip)
+    result = solve(mip, feed_highs=True)
+    assert_solved(result, mip, ref)
+    feed = result["highs_feed"]
+    assert feed is not None
+    # HiGHS's bound is a valid bound on the optimum.
+    assert feed["bound"] <= ref + 1e-6 * (1 + abs(ref))
+
+
+def test_feed_highs_maximisation_bound_sign(tmp_path):
+    # Model sense and offset: HiGHS's bound of a maximisation is above it.
+    base = facility_location()
+    mip = jm.MIP(base.lp, base.integrality, offset=3.0, maximise=True)
+    path = tmp_path / "facility.mps"
+    write_mps(mip, path)
+    loaded = jm.load(path)
+    ref = reference(mip)
+    result = solve(loaded, feed_highs=True)
+    assert_solved(result, loaded, ref)
+    bound = result["highs_feed"]["bound"]
+    if np.isfinite(bound):
+        assert bound >= ref - 1e-6 * (1 + abs(ref))
+
+
+def test_highs_feed_passes_offered_point():
+    # The point offered before the run reaches HiGHS's user-solution callback.
+    mip = knapsack(seed=3, n=60)
+    x = np.zeros(mip.num_variables)  # feasible: nothing packed
+    feed = jm._HighsFeed(mip, 1e-4, 1e-6, verbose=False, time_limit=30.0)
+    feed.offer(x, float(mip.c @ x))
+    feed.offer(x, float(mip.c @ x))  # not better: ignored
+    feed.start()
+    feed.join(60.0)
+    assert feed.done() and feed.status == "Optimal"
+    ref = reference(mip)
+    assert feed.stats()["bound"] == pytest.approx(ref, rel=1e-4, abs=1e-6)
+    assert feed.solutions_fed <= 1
+
+
+def test_feed_highs_off_by_default():
+    assert solve(knapsack())["highs_feed"] is None
+
+
 def test_clean_cut_drops_roundoff_cuts():
     # app1-1: MIR left ``6.2e-9·x <= 1e-9`` on a binary (a cancelled
     # ``0 <= 0``); propagation divided by it and fixed x = 0, cutting off

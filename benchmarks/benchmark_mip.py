@@ -95,6 +95,18 @@ def parse_args():
         "--no-highs", action="store_true", help="skip the HiGHS comparison solve"
     )
     p.add_argument(
+        "--lean",
+        action="store_true",
+        help='use tree="lean" and lean_cuts=True (default: tree="jaddle", '
+        "lean_cuts=False)",
+    )
+    p.add_argument(
+        "--feed-highs",
+        action="store_true",
+        help="run HiGHS alongside Jaddle's search, fed its incumbents "
+        "(jm.solve(feed_highs=True))",
+    )
+    p.add_argument(
         "--primal-targets",
         default=None,
         help="CSV with instance,best_obj columns: stop Jaddle once its "
@@ -174,7 +186,7 @@ def load_primal_targets(path):
 # %%
 def run_jaddle(path, args, primal_target=None):
     # Cached next to the file (``<path>.jaddle.npz``): later runs skip the MPS parse.
-    mip = jm.load(path, cache=True)
+    mip = jm.load(path)
     row = {
         "n_vars": mip.num_variables,
         "n_ints": mip.num_integers,
@@ -187,21 +199,27 @@ def run_jaddle(path, args, primal_target=None):
     started = time.time()
     result = jm.solve(
         mip,  # already loaded above: passing ``path`` would parse the file again
-        primal_target=primal_target,
-        max_seconds=args.max_seconds,
         device=args.device,
+        verbose=True,
+        log_every_seconds=10,
+        presolve=True,
+        primal_target=primal_target,
+        feed_highs=args.feed_highs,
+        max_seconds=args.max_seconds,
+        root_lp="highs" if args.lean else "jaddle",
+        cut_round_lp="highs" if args.lean else "jaddle",
         # precision="float64",
         # lp_tolerance=1e-4,
         # root_refinement=1e-6,
         # root_crossover=True,
         # cut_round_lp="highs",
-        presolve=True,
-        cut_rounds=200,
-        gub_cover_cuts=True,
-        symmetry=True,
+        cut_rounds=3,
         objective_cuts=True,
-        verbose=True,
-        log_every_seconds=10,
+        batch_size=8,
+        tree="lean" if args.lean else "jaddle",
+        lean_cuts=args.lean,
+        symmetry=False,
+        support_gate=False,
     )
     row.update(
         {
@@ -335,8 +353,6 @@ def print_details(result):
 def run_highs(path, args):
     highs = highspy.Highs()
     highs.setOptionValue("output_flag", True)
-    highs.setOptionValue("parallel", "on")
-    highs.setOptionValue("threads", 12)
     limit = args.max_seconds if args.max_seconds is not None else HIGHS_DEFAULT_SECONDS
     highs.setOptionValue("time_limit", float(limit))
     highs.readModel(path)

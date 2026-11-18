@@ -7430,6 +7430,152 @@ class _HighsHolder:
                     pass
 
 
+class _HighsFeed:
+    """HiGHS's MIP solver on the search's MIP, in a background thread, fed
+    the search's incumbents (``solve(feed_highs=True)``). Jaddle tends to
+    find good points early and HiGHS to close the bound: each incumbent
+    offered (``offer``) is passed to HiGHS at its next user-solution
+    callback, so it prunes on it, and HiGHS's dual bound (``bound``) and
+    improving points (``poll``) come back to the search. Values here are
+    min-form without the offset, as the search's; HiGHS's are the model's
+    (``sign * (min-form + offset)``)."""
+
+    def __init__(self, mip, rel_gap, abs_gap, verbose, time_limit=None, options=None):
+        import highspy
+
+        self.cb = highspy.cb
+        self.mip = mip
+        self.highs = _highs_mip(to_highs(mip))
+        settings = {
+            # Silent: the search's log shows HiGHS's bound and points (``M``).
+            "output_flag": False,
+            "mip_rel_gap": float(rel_gap),
+            "mip_abs_gap": float(abs_gap),
+            "threads": 1,
+        }
+        if time_limit is not None:
+            settings["time_limit"] = max(float(time_limit), 0.0)
+        settings.update(options or {})
+        for name, value in settings.items():
+            self.highs.setOptionValue(name, value)
+        self.lock = threading.Lock()
+        self.pending = None  # (min-form value, x) not yet passed to HiGHS
+        self.offered_value = np.inf
+        self.received = []  # HiGHS's improving points, not yet polled
+        self.dual_bound = -np.inf  # min form, without the offset
+        self.cancelled = False
+        self.solutions_fed = 0
+        self.solutions_received = 0
+        self.status = None  # HiGHS's model status name once it returns
+        self.thread = None
+        self.highs.setCallback(self._callback, None)
+        CT = highspy.cb.HighsCallbackType
+        for kind in (
+            CT.kCallbackMipUserSolution,
+            CT.kCallbackMipImprovingSolution,
+            CT.kCallbackMipInterrupt,
+        ):
+            self.highs.startCallback(kind)
+
+    def min_form(self, model_value):
+        return self.mip.sign * float(model_value) - self.mip.offset
+
+    def _callback(self, kind, message, out, data_in, user_data):
+        CT = self.cb.HighsCallbackType
+        try:
+            bound = float(out.mip_dual_bound)
+        except Exception:
+            bound = np.nan
+        if np.isfinite(bound):
+            # Min form: a maximisation's upper bound is a lower one here.
+            value = self.min_form(bound)
+            with self.lock:
+                self.dual_bound = max(self.dual_bound, value)
+        if kind == CT.kCallbackMipUserSolution:
+            with self.lock:
+                pending, self.pending = self.pending, None
+            if pending is not None:
+                data_in.setSolution(np.asarray(pending[1], np.float64))
+                data_in.user_has_solution = True
+                self.solutions_fed += 1
+        elif kind == CT.kCallbackMipImprovingSolution:
+            x = np.array(out.mip_solution, np.float64)
+            if x.shape[0] == self.mip.num_variables:
+                with self.lock:
+                    self.received.append(x)
+        elif kind == CT.kCallbackMipInterrupt:
+            if self.cancelled:
+                data_in.user_interrupt = True
+
+    def offer(self, x, value):
+        """Pass the point ``x`` (min-form ``value``) to HiGHS when it is
+        better than every point offered before."""
+        with self.lock:
+            if value >= self.offered_value:
+                return
+            self.offered_value = value
+            self.pending = (value, np.array(x, np.float64))
+
+    def poll(self):
+        """HiGHS's improving points since the last poll."""
+        with self.lock:
+            points, self.received = self.received, []
+        self.solutions_received += len(points)
+        return points
+
+    def bound(self):
+        """HiGHS's dual bound so far (min form, without the offset)."""
+        with self.lock:
+            return self.dual_bound
+
+    def start(self):
+        def run():
+            try:
+                self.highs.run()
+                self.status = self.highs.modelStatusToString(
+                    self.highs.getModelStatus()
+                )
+                if self.status == "Optimal":
+                    info = self.highs.getInfo()
+                    value = self.min_form(info.mip_dual_bound)
+                    if np.isfinite(value):
+                        with self.lock:
+                            self.dual_bound = max(self.dual_bound, value)
+            except Exception as error:  # HiGHS failing leaves the search on
+                self.status = f"error: {error}"
+
+        self.thread = threading.Thread(target=run, name="jaddle-highs-feed", daemon=True)
+        self.thread.start()
+
+    def done(self):
+        return self.thread is not None and not self.thread.is_alive()
+
+    def infeasible(self):
+        return self.done() and self.status == "Infeasible"
+
+    def optimal(self):
+        return self.done() and self.status == "Optimal"
+
+    def cancel(self):
+        self.cancelled = True
+        try:
+            self.highs.cancelSolve()
+        except Exception:
+            pass
+
+    def join(self, timeout=10.0):
+        if self.thread is not None:
+            self.thread.join(timeout)
+
+    def stats(self):
+        return {
+            "status": self.status,
+            "bound": self.mip.sign * (self.bound() + self.mip.offset),
+            "solutions_fed": self.solutions_fed,
+            "solutions_received": self.solutions_received,
+        }
+
+
 def _block_highs(mip, cols, rows, lower, upper, gap, relax=False):
     """A silent one-thread ``highspy.Highs`` holding the block of ``mip``
     on the columns ``cols`` and rows ``rows`` (``linking_blocks``), with
@@ -7886,6 +8032,7 @@ _LOG_SOURCES = (
     ("V", "Local branching"),
     ("Q", "Presolved restart"),
     ("W", "HiGHS first solution"),
+    ("M", "HiGHS MIP feed"),
     ("1", "1-opt"),
 )
 
@@ -10110,6 +10257,8 @@ class _BranchAndBound:
         lean_threads="auto",
         lean_cuts=False,
         primal_target=None,
+        feed_highs=False,
+        highs_feed_options=None,
         interrupt=None,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
@@ -10127,6 +10276,12 @@ class _BranchAndBound:
         # along the interrupt's path, with status ``"primal_target"``.
         self.primal_target = None if primal_target is None else float(primal_target)
         self.target_reached = False
+        # HiGHS on the same MIP alongside (``feed_highs``), outermost search
+        # only: started by ``run``.
+        self.feed_highs = bool(feed_highs) and interrupt is None
+        self.highs_feed_options = highs_feed_options
+        self.highs_feed = None
+        self.highs_closed = False
         self.rins_nodes = rins_nodes
         if symmetry not in ("auto", True, False):
             raise ValueError(
@@ -11505,7 +11660,48 @@ class _BranchAndBound:
         in flight back in the queue, so the bound reported stays valid."""
         if self.interrupt.is_set():
             return True
+        if self.highs_feed is not None and self.highs_feed_closed():
+            self.highs_closed = True
+            self.request_interrupt()
+            return True
         return self.deadline is not None and time.time() >= self.deadline
+
+    def highs_feed_closed(self):
+        """Whether HiGHS (``feed_highs``) has finished the search: it
+        proved optimality or infeasibility, or its bound reached the cutoff
+        of the search's incumbent."""
+        feed = self.highs_feed
+        if feed.optimal() or feed.infeasible():
+            return True
+        return self.incumbent is not None and self.highs_floor() >= self.cutoff()
+
+    def start_highs_feed(self):
+        """Start HiGHS alongside the search (``feed_highs``)."""
+        limit = None if self.deadline is None else self.deadline - time.time()
+        try:
+            feed = _HighsFeed(
+                self.original,
+                self.rel_gap,
+                self.abs_gap,
+                self.verbose,
+                time_limit=limit,
+                options=self.highs_feed_options,
+            )
+        except Exception as error:
+            if self.verbose:
+                print(f"HiGHS feed not started: {error}")
+            return
+        if self.incumbent is not None:
+            feed.offer(self.incumbent[1], self.incumbent[0])
+        feed.start()
+        self.highs_feed = feed
+
+    def collect_highs_feed(self):
+        """HiGHS's improving points (``feed_highs``) as incumbents (``M``)."""
+        if self.highs_feed is None:
+            return
+        for x in self.highs_feed.poll():
+            self.try_incumbent(x, "M", None)
 
     def request_interrupt(self):
         """Stop the search as a time limit would, with the best point so
@@ -11581,9 +11777,16 @@ class _BranchAndBound:
         # Every solution is in an objective level not yet shown empty
         # (``objective_levels``).
         bound = max(bound, self.level_floor())
+        bound = max(bound, self.highs_floor())
         if self.incumbent is not None:
             bound = min(bound, self.incumbent[0])
         return bound
+
+    def highs_floor(self):
+        """HiGHS's dual bound (``feed_highs``), rounded as the search's."""
+        if self.highs_feed is None:
+            return -np.inf
+        return self.round_bound(self.highs_feed.bound())
 
     def close(self, bound, rigorous=True, proven=None):
         """Close a region at ``bound``. ``proven``: the rigorous bound the
@@ -11619,6 +11822,7 @@ class _BranchAndBound:
         bound = max(bound, self.proven_floor)
         # Objective levels are shown empty by HiGHS.
         bound = max(bound, self.level_floor())
+        bound = max(bound, self.highs_floor())
         if self.incumbent is not None:
             bound = min(bound, self.incumbent[0])
         return bound
@@ -12755,6 +12959,8 @@ class _BranchAndBound:
             return True
         switch = self.incumbent is None
         self.incumbent = (value, candidate)
+        if self.highs_feed is not None and source != "M":
+            self.highs_feed.offer(candidate, value)
         if self.early_jump is not None:
             self.early_jump.set()  # the early root jumps stop
         if source != "N":
@@ -14348,6 +14554,7 @@ class _BranchAndBound:
             "1": self.use_one_opt,
             "K": self.linking_blocks is not None,
             "Z": self.use_trivial,
+            "M": self.feed_highs,
         }
         return {mark for mark, enabled in on.items() if enabled}
 
@@ -14539,6 +14746,13 @@ class _BranchAndBound:
     def result(self, status):
         # Background points that are in already (the rest are dropped).
         self.collect_heuristics(schedule=False)
+        self.collect_highs_feed()
+        if self.highs_feed is not None and status in ("time_limit", "interrupted"):
+            # HiGHS may have closed the search just as the time ran out.
+            if self.highs_feed_closed():
+                self.highs_closed = True
+        if self.highs_closed and status in ("time_limit", "interrupted"):
+            status = "optimal_highs"  # settled below, after the bounds
         if status == "time_limit" and self.interrupt.is_set():
             status = "interrupted"  # it took the time-limit path
         if self.target_reached and status in ("time_limit", "interrupted"):
@@ -14555,6 +14769,9 @@ class _BranchAndBound:
                     status = "infeasible"
             elif self.unresolved_floor < self.cutoff():
                 status = "unresolved"
+        elif status == "optimal_highs":
+            # HiGHS's proof (``feed_highs``) covers the whole MIP.
+            status = "optimal" if self.incumbent is not None else "infeasible"
         x = None if self.incumbent is None else self.incumbent[1]
         objective = None if x is None else self.model_value(self.incumbent[0])
         if self.verbose:
@@ -14578,6 +14795,7 @@ class _BranchAndBound:
                 or bound >= search_bound - 1e-9 * (1.0 + abs(search_bound))
             ),
             "nodes": self.nodes,
+            "highs_feed": None if self.highs_feed is None else self.highs_feed.stats(),
             "infeasible_nodes": self.infeasible_nodes,
             "unresolved_nodes": self.unresolved_nodes,
             "lean_tree": self.lean_stats,
@@ -17579,6 +17797,7 @@ class _BranchAndBound:
         the first incumbent, during the root's cut rounds. On eil33-2 the
         rounds ran past 100 s with only the jump's points (1,773 against
         an optimum of 934, which HiGHS finds within 60 s)."""
+        self.collect_highs_feed()
         self.service_levels()
         self.service_probing()
         self.collect_submip()
@@ -17736,6 +17955,37 @@ class _BranchAndBound:
                 "every solution needs columns that LP leaves at a whole number"
             )
         return empty
+
+    def root_rens(self, lower, upper, result, root_x, warm):
+        """RENS at the root (``rens``) from an exact vertex, as HiGHS's
+        RENS works from its simplex root: far more of it is integral than
+        of a PDHG point. The cut loop keeps its last one; otherwise cross
+        over now (``root_crossover``), and fall back to ``root_x``."""
+        vertex = self.root_vertex_x
+        if vertex is None:
+            vertex = self.current_root_vertex()  # round and repair's
+        if vertex is None and self.root_crossover is not False:
+            vertex, _ = self.root_vertex(lower, upper, result["solution"])
+        if vertex is not None:
+            self.rens(vertex, lower, upper, warm, min_fixed=0.3)
+        else:
+            self.rens(root_x, lower, upper, warm)
+
+    def early_submips(self, lower, upper, result):
+        """RENS and RINS on the first root LP, before the cut rounds, for
+        the sub-MIP lane: HiGHS searches them on its thread while the
+        rounds run (``collect_heuristics`` collects them). Without this the
+        lane sat idle through the rounds, which on eilA101-2 took the whole
+        time limit with only the jump's points. RINS's centre is the root
+        point (``recent_points``), its neighbourhood the incumbent's."""
+        root_x = np.asarray(result["solution"].primal, np.float64)
+        warm = (result["solution"], result["opt_state"])
+        if self.rens_seconds:
+            self.root_rens(lower, upper, result, root_x, warm)
+        if self.rins_seconds and self.incumbent is not None:
+            self.recent_points.append(root_x)
+            self.rins_pending = True
+        self.feed_submip()
 
     def rens(self, x, lower, upper, warm, min_fixed=0.5):
         """
@@ -20147,6 +20397,8 @@ class _BranchAndBound:
                 daemon=True,
             )
             heartbeat.start()
+        if self.feed_highs:
+            self.start_highs_feed()
         try:
             if self.device is None:
                 return self._run()
@@ -20158,6 +20410,9 @@ class _BranchAndBound:
                 heartbeat.join(timeout=5.0)
             if installed:
                 signal.signal(signal.SIGINT, previous or signal.default_int_handler)
+            if self.highs_feed is not None:
+                self.highs_feed.cancel()
+                self.highs_feed.join()
             if self.workers is not None:
                 self.workers.shutdown()
             if self.exact_lane is not None:
@@ -20422,6 +20677,9 @@ class _BranchAndBound:
             if not self.background_root_heuristics(lower, upper, result):
                 self.root_heuristics(lower, upper, result, improve=False)
             self.root_phase("heuristics before the cut rounds")
+        if cut_loop_due and self.submip_lane is not None and not self.out_of_time():
+            self.early_submips(lower, upper, result)
+            self.root_phase("sub-MIPs before the cut rounds")
         if cut_loop_due and self.dual_fix_seconds and not self.out_of_time():
             # The sub-MIP lane is idle through the cut rounds: dual-guided
             # fixing needs only these duals (not rigorous ones), and the
@@ -20518,19 +20776,7 @@ class _BranchAndBound:
         root_x = np.asarray(result["solution"].primal, np.float64)
         root_warm = (result["solution"], result["opt_state"])
         if self.rens_seconds and not self.out_of_time():
-            # From an exact vertex, as HiGHS's RENS works from its simplex
-            # root: far more of it is integral than of a PDHG point. The cut
-            # loop keeps its last one; otherwise cross over now
-            # (``root_crossover``).
-            vertex = self.root_vertex_x
-            if vertex is None:
-                vertex = self.current_root_vertex()  # round and repair's
-            if vertex is None and self.root_crossover is not False:
-                vertex, _ = self.root_vertex(lower, upper, result["solution"])
-            if vertex is not None:
-                self.rens(vertex, lower, upper, root_warm, min_fixed=0.3)
-            else:
-                self.rens(root_x, lower, upper, root_warm)
+            self.root_rens(lower, upper, result, root_x, root_warm)
         self.root_phase("RENS")
         if self.dive_every and not self.out_of_time():
             # The root dives share one heuristic budget.
@@ -21515,6 +21761,8 @@ def solve(
     lean_threads="auto",
     lean_cuts=False,
     primal_target=None,
+    feed_highs=False,
+    highs_feed_options=None,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -22717,6 +22965,16 @@ def solve(
     ``jl.solve_with_presolve``: it is timed on its own
     (``"presolve_seconds"``).
 
+    ``feed_highs=True`` runs HiGHS's MIP solver on the same MIP in a
+    background thread (one HiGHS thread; ``highs_feed_options``, a dict of
+    HiGHS options, overrides that and the rest). Each new incumbent of the
+    search is passed to HiGHS (its user-solution callback), HiGHS's improving
+    points come back as incumbents (source ``"H"``), and its dual bound
+    raises the search's: the search stops once either side closes the gap.
+    HiGHS runs silent; the search's log has one bound and one incumbent,
+    each the better of the two sides (HiGHS's points marked ``M``). The result's ``"highs_feed"`` has HiGHS's status,
+    bound (model sense), and the counts of points fed and received.
+
     Returns a dict:
 
     * ``"x"``: the best solution found (NumPy, float64), or ``None``.
@@ -23035,6 +23293,8 @@ def solve(
         lean_threads=lean_threads,
         lean_cuts=lean_cuts,
         primal_target=primal_target,
+        feed_highs=feed_highs,
+        highs_feed_options=highs_feed_options,
     )
     return _solve_model(
         model, presolve, precision, highs_options, feasibility_tolerance, settings
