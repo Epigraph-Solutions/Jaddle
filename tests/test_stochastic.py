@@ -243,7 +243,10 @@ def _captured_constant_warnings(fn):
             fn()
     finally:
         jax.config.update("jax_captured_constants_warn_bytes", old)
-    return [w for w in caught if "constants were captured" in str(w.message)]
+    # JAX < 0.12.1 reports "constants were captured"; later versions (with
+    # simplified jaxpr constants) report each one as "Closed-over constant".
+    markers = ("constants were captured", "Closed-over constant")
+    return [w for w in caught if any(m in str(w.message) for m in markers)]
 
 
 def test_data_is_passed_to_the_compiled_programs():

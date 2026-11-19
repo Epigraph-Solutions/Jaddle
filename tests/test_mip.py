@@ -3097,7 +3097,8 @@ def test_reduced_cost_tightening_keeps_better_solutions(make):
 
 @pytest.mark.parametrize("batch_size", [1, 4])
 def test_bounds_from_duals_in_the_search(batch_size):
-    mip = generalised_assignment(1)
+    # Seed 2: since JAX 0.12.1 seed 1's root closes the gap (no tree).
+    mip = generalised_assignment(2)
     # Without the root's strongest cuts there is a tree to fix bounds in.
     result = solve(
         mip, batch_size=batch_size, gomory_cuts=False, aggregate_integers=False
@@ -6251,7 +6252,24 @@ def test_stale_cut_duals_are_zeroed_for_a_batch_solved_before_a_refresh(monkeypa
             zeroed.append(all(duals[base_m + i] == 0.0 for i in stale))
         return out
 
+    # Whether a real refresh lands while a batch is in flight depends on
+    # timing (JAX version, warm compilation caches), so one is simulated:
+    # the first batch read back once the cut block has slots finds slot 0
+    # given a new cut since it was dispatched. Zeroing a cut's dual is
+    # always valid, so the search stays correct.
+    real_read = jm._BranchAndBound.read_batch
+    simulated = []
+
+    def read_batch(self, handle, service=False):
+        results = real_read(self, handle, service=service)
+        if not simulated and self.slot_version:
+            self.cut_version += 1
+            self.slot_version[0] = self.cut_version
+            simulated.append(True)
+        return results
+
     monkeypatch.setattr(jm._BranchAndBound, "stale_free", stale_free)
+    monkeypatch.setattr(jm._BranchAndBound, "read_batch", read_batch)
     mip = generalised_assignment(2)
     result = solve(
         mip, batch_size=4, tree_cuts=True, tree_cut_every=1, max_nodes=80,
