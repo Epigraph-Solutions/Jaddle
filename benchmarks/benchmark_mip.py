@@ -220,6 +220,17 @@ def run_jaddle(path, args, primal_target=None):
         lean_cuts=args.lean,
         symmetry=False,
         support_gate=False,
+        first_solution_seconds=0,
+        # Keep Jaddle's own CPU threads to a minimum so the HiGHS feed
+        # (feed_highs) gets the cores.
+        separation_threads=1,
+        tree_cut_async=False,
+        parallel_heuristics=False,
+        parallel_rounding=False,
+        jump_threads=1,
+        cutoff_probing_threads=0,
+        lean_threads=1,
+        highs_feed_options=dict(threads=8),
     )
     row.update(
         {

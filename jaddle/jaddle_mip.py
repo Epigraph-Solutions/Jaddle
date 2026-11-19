@@ -8204,6 +8204,24 @@ def _pack_warm(warm):
     return packed
 
 
+def _batched_node_lp_keys():
+    """The ``jaddle_linear.solve_many`` options batched node LPs pass on
+    (the search sets the rest itself)."""
+    import inspect
+
+    return set(inspect.signature(jl.solve_many).parameters) - {
+        "lp",
+        "lower_bounds",
+        "upper_bounds",
+        "initial_solutions",
+        "initial_opt_states",
+        "max_epochs",
+        "bound_target",
+        "device",
+        "precision",
+    }
+
+
 class _Node:
     """An open node: its bound, depth, bound changes against the root (as
     ``(index, lower, upper)``), the parent's warm start, the branching
@@ -11335,6 +11353,15 @@ class _BranchAndBound:
             )
         )
         self.node_lp_options = node_lp_options
+        if self.batch_size > 1:
+            # Checked here, not at the first batch: a root that closes the
+            # model would otherwise accept any option.
+            unknown = sorted(set(node_lp_options) - _batched_node_lp_keys())
+            if unknown:
+                raise ValueError(
+                    f"node_lp_options {', '.join(unknown)} cannot be used by batched "
+                    "node LPs (jaddle_linear.solve_many)"
+                )
         self.node_lp_kwargs.update(node_lp_options)
         if self.node_precision is not None:
             self.node_lp_kwargs["precision"] = self.node_precision
@@ -11759,18 +11786,32 @@ class _BranchAndBound:
         return self.incumbent is not None and self.global_bound() >= self.cutoff()
 
     def global_bound(self):
-        bound = min((node.bound for node in self.open_nodes()), default=np.inf)
+        # A node's rigorous bound (``proven``) can pass its pruning bound
+        # (a strong-branching or exact LP proved more than its own LP did):
+        # both hold, so the larger one counts, and ``proven_bound`` never
+        # passes this one.
+        def node_bound(node):
+            return max(node.bound, node.proven)
+
+        bound = min((node_bound(node) for node in self.open_nodes()), default=np.inf)
         # Nodes a batch has evaluated but not yet split are in no list.
         bound = min(
-            bound, min((d["bound"] for d in self.deferred_branches), default=np.inf)
+            bound,
+            min(
+                (max(d["bound"], d["node"].proven) for d in self.deferred_branches),
+                default=np.inf,
+            ),
         )
         bound = min(
-            bound, min((node.bound for node in self.batch_waiting), default=np.inf)
+            bound, min((node_bound(node) for node in self.batch_waiting), default=np.inf)
         )
         bound = min(
-            bound, min((node.bound for node in self.pipeline_nodes()), default=np.inf)
+            bound,
+            min((node_bound(node) for node in self.pipeline_nodes()), default=np.inf),
         )
-        bound = min(bound, self.closed_floor, self.active_bound)
+        bound = min(
+            bound, self.closed_floor, max(self.active_bound, self.active_proven)
+        )
         # The rounds before a restart bounded every solution below the
         # cutoff, and the restarted root box keeps all of them.
         bound = max(bound, self.bound_floor)
@@ -12835,6 +12876,9 @@ class _BranchAndBound:
                 kept = trial
         kept = np.array(kept)
         self.bump_conflict(lower, upper, cols=kept)
+        # The root box may hold reduced-cost fixings, which keep only the
+        # solutions better than the cutoff: so does the no-good.
+        self.conflicts.set_cutoff(self.proof_cutoff())
         self.conflicts.add_nogood(kept[lower[kept] == 1.0], kept[lower[kept] == 0.0])
 
     def conflict_propagate(self, lower, upper):
@@ -13914,7 +13958,10 @@ class _BranchAndBound:
                 self.conflict_pruned += 1
                 self.branch_cutoffs[side, var] += 1
                 self.bump_conflict(lo, up)
-                self.close(max(bound, self.cutoff_bound()), proven=self.cutoff_bound())
+                self.close(
+                    max(bound, self.cutoff_bound()),
+                    proven=max(node.proven, self.cutoff_bound()),
+                )
                 continue
             inferences = int(np.count_nonzero((lo != split_lo) | (up != split_up)))
             self.inference_sum[side, var] += inferences
@@ -18914,25 +18961,7 @@ class _BranchAndBound:
         if max_epochs is None:
             max_epochs = self.node_max_epochs
         if self._node_batch_settings is None:
-            import inspect
-
-            accepted = set(inspect.signature(jl.solve_many).parameters) - {
-                "lp",
-                "lower_bounds",
-                "upper_bounds",
-                "initial_solutions",
-                "initial_opt_states",
-                "max_epochs",
-                "bound_target",
-                "device",
-                "precision",
-            }
-            unknown = sorted(set(self.node_lp_options) - accepted)
-            if unknown:
-                raise ValueError(
-                    f"node_lp_options {', '.join(unknown)} cannot be used by batched "
-                    "node LPs (jaddle_linear.solve_many)"
-                )
+            accepted = _batched_node_lp_keys()
             # Node LPs: ``lp_options`` (what solve_many takes), then the
             # node layer (``node_lp_tolerance``, ``node_lp_options``).
             self._node_batch_settings = {
@@ -20903,6 +20932,12 @@ class _BranchAndBound:
                     break
                 if self.batch_size > 1:
                     self.batch_step()
+                    continue
+                if not self.open and (
+                    self.plunge_node is None or self.exact_plunges_on()
+                ):
+                    # The steps above (a new incumbent's pruning, the lanes'
+                    # results) can empty the heap: check the loop again.
                     continue
                 node = self.next_node()
                 if node.bound >= self.cutoff():
@@ -23477,7 +23512,7 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
             "first_solution_finds": 0,
             "dual_fix_calls": 0,
             "dual_fix_finds": 0,
-            "dual_fix_rate": float(dual_fix_rate),
+            "dual_fix_rate": float(settings["dual_fix_rate"]),
             "projected_pdhg_calls": 0,
             "projected_pdhg_finds": 0,
             "rins_fixing_rate": 1.0,

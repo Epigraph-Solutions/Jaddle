@@ -243,12 +243,33 @@ print(f"Swarm: {n_binaries} binaries, {len(problem.constraints)} constraints")
 # %%
 problem.solve(
     solver=JaddleSolver(),
-    max_seconds=180,
     device="cpu",
     verbose=True,
-    log_every_seconds=10,   
-    tree="lean",
-    lean_cuts=True,
+    log_every_seconds=10,
+    presolve=True,
+    feed_highs=True,
+    max_seconds=180,
+    # precision="float64",
+    # lp_tolerance=1e-4,
+    # root_refinement=1e-6,
+    # root_crossover=True,
+    # cut_round_lp="highs",
+    cut_rounds=3,
+    objective_cuts=True,
+    batch_size=8,
+    symmetry=False,
+    support_gate=False,
+    first_solution_seconds=0,
+    # Keep Jaddle's own CPU threads to a minimum so the HiGHS feed
+    # (feed_highs) gets the cores.
+    separation_threads=1,
+    tree_cut_async=False,
+    parallel_heuristics=False,
+    parallel_rounding=False,
+    jump_threads=1,
+    cutoff_probing_threads=0,
+    highs_feed_options=dict(threads=4),
+    exact_nodes=0,
 )
 stats = problem.solver_stats.extra_stats
 if p[0].value is None:

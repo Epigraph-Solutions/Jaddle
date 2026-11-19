@@ -1103,7 +1103,7 @@ def test_cuts_strengthen_the_root(monkeypatch):
     assert with_cuts["cuts"]["mir"] + with_cuts["cuts"]["flowcover"] > 0
     assert without["cuts"] == {
         "gomory": 0, "cover": 0, "gubcover": 0, "mir": 0, "flowcover": 0, "clique": 0,
-        "zerohalf": 0, "impliedbound": 0,
+        "zerohalf": 0, "impliedbound": 0, "objective": 0,
     }
     assert without["root_bound_before_cuts"] is None
     # The cuts close part of the root gap and the tree is no larger.
@@ -1652,7 +1652,8 @@ def test_global_redcost_fixing_holds_for_every_better_solution(monkeypatch):
 
     monkeypatch.setattr(jm._BranchAndBound, "global_fix", global_fix)
     mip = general_integer()
-    result = solve(mip, batch_size=1, global_redcost_fixing=True)
+    # Without MIR cuts, which close general_integer at the root.
+    result = solve(mip, batch_size=1, global_redcost_fixing=True, mir_cuts=False)
     assert_solved(result, mip, reference(mip))
     assert result["global_redcost_fixed"] > 0
     assert _check_root_boxes(mip, records[-5:]) > 0
@@ -1980,7 +1981,9 @@ def record_conflicts(monkeypatch):
 def test_conflicts_are_valid(make, monkeypatch):
     mip = make()
     rows = record_conflicts(monkeypatch)
-    result = solve(mip, conflicts=True)
+    # Without cuts: they close general_integer at the root, or leave no
+    # node for a conflict to prune.
+    result = solve(mip, conflicts=True, cuts=False)
     assert_solved(result, mip, reference(mip))
     for idx, coef, rhs, cutoff, _, box in rows:
         bound = None if not np.isfinite(cutoff) else cutoff
@@ -2614,7 +2617,8 @@ def test_node_crossover_turns_a_face_point_into_an_integral_vertex():
 @pytest.mark.parametrize("batch_size", [1, 4])
 def test_node_crossover_in_the_search(batch_size):
     mip = general_integer()
-    result = solve(mip, node_crossover=True, batch_size=batch_size)
+    # Without MIR cuts, which close general_integer at the root.
+    result = solve(mip, node_crossover=True, batch_size=batch_size, mir_cuts=False)
     assert_solved(result, mip, reference(mip))
     assert 0 < result["node_crossover_vertices"] <= result["node_crossovers"]
     assert result["node_crossover_seconds"] > 0
@@ -2831,10 +2835,11 @@ def test_repair_gives_up_when_the_neighbourhood_is_infeasible():
 
 def test_heuristic_effort_zero_turns_rins_off():
     mip = general_integer()
-    result = solve(mip, heuristic_effort=0.0)
+    # Without MIR cuts, which close general_integer at the root.
+    result = solve(mip, heuristic_effort=0.0, mir_cuts=False)
     assert_solved(result, mip, reference(mip))
     assert result["rins_calls"] == 0
-    assert solve(mip)["rins_calls"] > 0  # on by default
+    assert solve(mip, mir_cuts=False)["rins_calls"] > 0  # on by default
 
 
 def test_rins_node_limit_adapts(monkeypatch):
@@ -2907,7 +2912,7 @@ def test_batched_search_matches_reference(make):
     mip = make()
     # Without heuristics: with an incumbent from them, root reduced-cost
     # fixing can close the search before it branches.
-    result = solve(mip, batch_size=4, gomory_cuts=False, **no_heuristics())
+    result = solve(mip, batch_size=4, gomory_cuts=False, mir_cuts=False, **no_heuristics())
     assert_solved(result, mip, reference(mip))
     assert result["batches"] > 0
 
@@ -2916,7 +2921,7 @@ def test_batch_larger_than_the_tree():
     # Far more slots than open nodes: every batch is padded.
     mip = facility_location()
     # Without heuristics, so root reduced-cost fixing cannot end it at the root.
-    result = solve(mip, batch_size=64, gomory_cuts=False, **no_heuristics())
+    result = solve(mip, batch_size=64, gomory_cuts=False, mir_cuts=False, **no_heuristics())
     assert_solved(result, mip, reference(mip))
     assert 0 < result["batches"] <= result["nodes"]
 
@@ -3172,7 +3177,8 @@ def test_node_points_are_rounded_in_the_background(monkeypatch):
     monkeypatch.setattr(jm._BranchAndBound, "_evaluate", _evaluate)
     mip = generalised_assignment(2)
     ref = reference(mip)
-    options = dict(parallel_heuristics=True, jump_backend="numba", max_nodes=60)
+    # Without cuts, which close the model at the root.
+    options = dict(parallel_heuristics=True, jump_backend="numba", max_nodes=60, cuts=False)
     result = solve(mip, fix_and_propagate=False, **options)
     assert result["status"] in ("optimal", "node_limit")
     assert result["background_roundings"] == len(in_tree) > 0
@@ -3730,8 +3736,8 @@ def test_tree_cuts_are_added_without_recompiling(monkeypatch):
         return real(self, problem)
 
     monkeypatch.setattr(jl._SolvePrograms, "_device", counted)
-    # Without Gomory cuts the root leaves a tree to cut in.
-    options = dict(tree_cuts=True, tree_cut_every=1, max_nodes=40, gomory_cuts=False)
+    # Without Gomory or MIR cuts the root leaves a tree to cut in.
+    options = dict(tree_cuts=True, tree_cut_every=1, max_nodes=40, gomory_cuts=False, mir_cuts=False)
     solve(mip, **options)  # compile
     traces.clear()
     result = solve(mip, **options)
@@ -3744,7 +3750,7 @@ def test_tree_cuts_per_round_follow_the_option(per_round, monkeypatch):
     mip = generalised_assignment(1)
     search = search_for(
         mip, monkeypatch, tree_cuts=True, tree_cut_every=1, max_nodes=40,
-        gomory_cuts=False, max_tree_cuts_per_round=per_round,
+        gomory_cuts=False, mir_cuts=False, max_tree_cuts_per_round=per_round,
     )
     monkeypatch.undo()
     added = []
@@ -3822,7 +3828,7 @@ def test_worker_cuts_are_dropped_after_a_restart(monkeypatch):
 def test_tree_cut_pool_size_follows_the_options(monkeypatch):
     mip = generalised_assignment(2)
     options = dict(
-        tree_cuts=True, tree_cut_every=1, max_nodes=200, gomory_cuts=False,
+        tree_cuts=True, tree_cut_every=1, max_nodes=200, gomory_cuts=False, mir_cuts=False,
         max_tree_cuts_per_round=40,
     )
     small = solve(mip, **options)
@@ -3897,7 +3903,8 @@ def test_tree_cuts_refresh_from_the_pool_and_requeue(batch_size):
     # batches: pooled cuts come back, and members a new cut cuts off are
     # solved again before they branch.
     mip = general_integer()
-    result = solve(mip, batch_size=batch_size, tree_cut_every=1)
+    # Without MIR cuts, which close general_integer at the root.
+    result = solve(mip, mir_cuts=False, batch_size=batch_size, tree_cut_every=1)
     assert_solved(result, mip, reference(mip))
     assert result["tree_cut_refreshes"] > 0 and result["tree_cuts_added"] > 0
     assert result["tree_cut_pool_hits"] > 0
@@ -3923,7 +3930,8 @@ def test_tree_cut_bounds_hold_for_every_better_solution(batch_size, monkeypatch)
         return real(self, node, lower, upper, lp, result)
 
     monkeypatch.setattr(jm._BranchAndBound, "_evaluate", evaluate)
-    result = solve(mip, batch_size=batch_size, tree_cut_every=1)
+    # Without MIR cuts, which close general_integer at the root.
+    result = solve(mip, mir_cuts=False, batch_size=batch_size, tree_cut_every=1)
     assert_solved(result, mip, reference(mip))
     assert result["tree_cut_refreshes"] > 0
     checked = 0
@@ -3982,7 +3990,8 @@ def test_tree_cut_refreshes_keep_the_compiled_node_solver(monkeypatch):
     monkeypatch.setattr(jl._SolvePrograms, "_device", counted)
     monkeypatch.setattr(jm._BranchAndBound, "refresh_cuts", refresh)
     mip = general_integer()
-    result = solve(mip, batch_size=4, tree_cut_every=1)
+    # Without MIR cuts, which close general_integer at the root.
+    result = solve(mip, mir_cuts=False, batch_size=4, tree_cut_every=1)
     assert_solved(result, mip, reference(mip))
     assert len(at_refresh) >= 3
     # After the first refreshes nothing new compiles.
@@ -4344,7 +4353,8 @@ def test_node_lp_tolerance_applies_to_node_solves_only(monkeypatch):
 
     monkeypatch.setattr(jm._BranchAndBound, "solve_lp", solve_lp)
     # No feasibility pump: it also solves LPs with the node budget.
-    result = solve(mip, node_lp_tolerance=3e-4, feasibility_pump=False)
+    # Without MIR cuts, which close general_integer at the root.
+    result = solve(mip, mir_cuts=False, node_lp_tolerance=3e-4, feasibility_pump=False)
     assert_solved(result, mip, reference(mip))
     nodes = [tol for epochs, tol in calls if epochs == 200]  # node_max_epochs
     assert nodes and all(tol == 3e-4 for tol in nodes)
@@ -5242,9 +5252,12 @@ def test_zero_half_cuts_are_valid_on_mixed_rows(make):
         assert max_over_mip(mip, idx, coef) <= rhs + 1e-7 * (1 + abs(rhs))
 
 
-def test_zero_half_cuts_in_the_search():
+def test_zero_half_cuts_in_the_search(monkeypatch):
     mip = odd_cycle(7)
-    result = solve(mip, clique_cuts=False, gomory_cuts=False, objective_cuts=False)
+    # The objective is integral, so rounding the root's -3.5 up to -3 would
+    # close the gap with no cut: without the rounding, a cut must.
+    monkeypatch.setattr(jm, "objective_step", lambda c, integrality: None)
+    result = solve(mip, clique_cuts=False, gomory_cuts=False, mir_cuts=False, objective_cuts=False)
     assert_solved(result, mip, reference(mip))
     assert result["cuts"]["zerohalf"] >= 1
     assert result["root_bound_before_cuts"] == pytest.approx(-3.5, abs=1e-4)
@@ -5375,7 +5388,8 @@ def test_node_precision(monkeypatch, options):
 
     monkeypatch.setattr(jm._BranchAndBound, "solve_lp", spy_solve_lp)
     mip = general_integer()
-    result = solve(mip, precision="float64", node_precision="float32", **options)
+    # Without MIR cuts, which close general_integer at the root.
+    result = solve(mip, mir_cuts=False, precision="float64", node_precision="float32", **options)
     assert_solved(result, mip, reference(mip))
     assert seen["root"] == {"float64"}
     if options.get("batch_size", 1) == 1:  # serial node LPs go through solve_lp
@@ -5531,7 +5545,8 @@ def test_strong_branching_bounds_stay_valid():
 def test_strong_branching_with_tree_cuts():
     # Tree cuts change the LP's shape, so the children are solved one by one.
     mip = general_integer()
-    result = solve(mip, branching="reliability", tree_cuts=True, tree_cut_every=1)
+    # Without MIR cuts, which close general_integer at the root.
+    result = solve(mip, mir_cuts=False, branching="reliability", tree_cuts=True, tree_cut_every=1)
     assert_solved(result, mip, reference(mip))
     assert result["strong_branch_lps"] > 0
 
@@ -5764,9 +5779,10 @@ def test_round_repair_is_off_in_sub_searches(monkeypatch):
         real(self, mip, **settings)
 
     monkeypatch.setattr(jm._BranchAndBound, "__init__", recording)
-    mip = facility_location()
+    # facility_location now closes at the root, before any sub-search.
+    mip = generalised_assignment(2)
     solve(mip, rens_seconds=2.0)
-    assert seen[0] is True and len(seen) > 1  # RENS ran a sub-search
+    assert seen[0] is True and len(seen) > 1  # a sub-MIP heuristic ran a sub-search
     assert all(flag is False for flag in seen[1:])
 
 
@@ -6673,7 +6689,7 @@ def jm_settings():
         if value.default is not inspect.Parameter.empty
     }
     defaults.update(PINNED)
-    for key in ("max_seconds", "presolve", "highs_options", "precision"):
+    for key in ("max_seconds", "presolve", "highs_options", "precision", "memory_limit"):
         defaults.pop(key, None)
     defaults.update(deadline=None, start=time.time())
     return defaults
@@ -7395,11 +7411,13 @@ def test_exact_node_lp_duals_bound_the_lp(make):
         status, x, y_eq, y_ineq = jm._exact_node_lp(highs, mip, lower, upper, 10.0)
         assert status == "optimal"
         value = mip.c @ x
-        # The duals' Lagrangian bound is the LP's optimum, and rigorous.
-        terms = jm.lagrangian_terms(
-            mip.c, mip.A, mip.b, mip.n_eq, np.concatenate([y_eq, y_ineq])
+        # The duals' Lagrangian bound, as the search takes it from exact
+        # duals (round-off reduced costs at infinite bounds zeroed: raw,
+        # facility_location's -4e-16 at an unbounded column gives -inf), is
+        # the LP's optimum, and rigorous.
+        bound, rigorous = jm._exact_side_bound(
+            mip, None, y_eq, y_ineq, lower, upper, mip.integrality.astype(bool), 0.0
         )
-        bound, rigorous = jm.box_bound(*terms, lower, upper)
         assert rigorous
         assert bound <= value + 1e-7 * (1 + abs(value))
         assert bound == pytest.approx(value, rel=1e-6, abs=1e-6)
@@ -7417,12 +7435,16 @@ def test_exact_node_lp_proves_an_empty_box_infeasible():
 
 @pytest.mark.parametrize("make", [knapsack, facility_location])
 def test_default_settings_solve_to_the_optimum(make):
-    # jm.solve itself, not the PINNED helper: float32 LPs, no cuts or
-    # probing, the jump as the only heuristic, and the exact lane.
+    # jm.solve itself, not the PINNED helper.
     mip = make()
+    ref = reference(mip)
     result = jm.solve(mip, max_seconds=120)
-    assert_solved(result, mip, reference(mip))
-    assert result["exact_nodes"]["solved"] > 0
+    assert_solved(result, mip, ref)
+    # The exact lane runs in batched search only, and with the default cuts
+    # these models close at the root, leaving it no node.
+    batched = jm.solve(mip, max_seconds=120, batch_size=4, cuts=False)
+    assert_solved(batched, mip, ref)
+    assert batched["exact_nodes"]["solved"] > 0
 
 
 @pytest.mark.parametrize("share", [0.5, 0.0])
@@ -7462,6 +7484,7 @@ def test_band_overflow_in_the_search():
     options = dict(
         max_seconds=300, batch_size=4, exact_nodes=1, exact_band=0.5,
         rins_seconds=0, crossover_seconds=0, proximity_seconds=0, local_branching_seconds=0,
+        cuts=False,  # with cuts the model closes at the root
     )
     result = jm.solve(mip, exact_overflow_share=0.5, **options)
     assert result["bound"] <= ref + 1e-6
@@ -7579,8 +7602,13 @@ def test_crossover_fixes_where_the_points_agree(monkeypatch):
 )
 def test_highs_rins_and_crossover_in_the_search(make):
     mip = make()
+    # Without cuts, which close coverage_chains at the root before RINS,
+    # and without the other sub-MIP heuristics, which share its lane and on
+    # this small tree could take its only turn.
     result = jm.solve(
-        mip, max_seconds=120, batch_size=4, rins_seconds=5, crossover_seconds=5
+        mip, max_seconds=120, batch_size=4, rins_seconds=5, crossover_seconds=5,
+        cuts=False, first_solution_seconds=0, dual_fix_seconds=0,
+        proximity_seconds=0, local_branching_seconds=0,
     )
     assert_solved(result, mip, reference(mip))
     assert result["rins_calls"] > 0
@@ -7588,7 +7616,8 @@ def test_highs_rins_and_crossover_in_the_search(make):
     assert result["crossover_finds"] <= result["crossover_calls"]
     off = jm.solve(
         mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
-        proximity_seconds=0, local_branching_seconds=0,
+        proximity_seconds=0, local_branching_seconds=0, dual_fix_seconds=0,
+        first_solution_seconds=0,
     )
     assert off["rins_calls"] == off["crossover_calls"] == off["submip_lane_seconds"] == 0
 
@@ -7653,7 +7682,8 @@ def test_proximity_in_the_search():
     assert result["proximity_empty"] <= result["proximity_calls"]
     off = jm.solve(
         mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
-        proximity_seconds=0, local_branching_seconds=0,
+        proximity_seconds=0, local_branching_seconds=0, dual_fix_seconds=0,
+        first_solution_seconds=0,
     )
     assert off["proximity_calls"] == off["submip_lane_seconds"] == 0
 
@@ -7924,7 +7954,7 @@ def test_finished_lane_nodes_count_in_the_bound_until_evaluated(monkeypatch):
         monkeypatch.setattr(search, "exact_strong_children", lambda *args: None)
         seen = []
 
-        def evaluate_exact(node, box, solution, strong=None, known=None):
+        def evaluate_exact(node, box, solution, strong=None, known=None, lp_seconds=None):
             search.active_bound = node.bound  # as ``_evaluate`` sets it
             seen.append((node, search.global_bound(), search.explored()))
 
@@ -9310,22 +9340,19 @@ def test_exact_cut_rounds_solve(make, monkeypatch):
 
     def exact_cut_loop(self, lower, upper, result):
         held.clear()
-        self.exact_rows_at_end = []  # stays empty when no cut is kept
+        self.exact_cut_stats = None
         out = real_loop(self, lower, upper, result)
-        # Rows in step with the cut list: the searched rows, then one per cut.
-        rows = self.base.A.shape[0] + len(self.exact_rows_at_end)
+        if self.exact_cut_stats is None:
+            return out  # HiGHS could not solve the root LP
+        # Rows in step with the cut list as the rounds left it: the searched
+        # rows, then one per cut (``compact_cuts`` later trims the PDHG
+        # copy only, and is skipped when the re-solve stops early).
+        rows = self.base.A.shape[0] + self.exact_cut_stats["cuts"]
         assert held[0].getNumRow() == rows
         return out
 
-    real_compact = jm._BranchAndBound.compact_cuts
-
-    def compact_cuts(self, lower, upper, result, duals=None):
-        self.exact_rows_at_end = list(self.cut_list)
-        return real_compact(self, lower, upper, result, duals)
-
     monkeypatch.setattr(jm, "_highs_rows", highs_rows)
     monkeypatch.setattr(jm._BranchAndBound, "exact_cut_loop", exact_cut_loop)
-    monkeypatch.setattr(jm._BranchAndBound, "compact_cuts", compact_cuts)
     result = solve(mip, cut_round_lp="highs")
     assert_solved(result, mip, ref)
     stats = result["exact_cut_rounds"]
@@ -9445,22 +9472,18 @@ def test_device_kernels_count_their_padded_entries(monkeypatch):
             search.exact_lane.shutdown()
 
 
-def test_exact_cut_rounds_strengthen_the_root(monkeypatch):
+def test_exact_cut_rounds_strengthen_the_root():
     mip = facility_location()
-    after_cuts = []
-    real_loop = jm._BranchAndBound.cut_loop
-
-    def cut_loop(self, lower, upper, result):
-        result = real_loop(self, lower, upper, result)
-        after_cuts.append(self.model_value(self.lp_bound(result["solution"], lower, upper)[0]))
-        return result
-
-    monkeypatch.setattr(jm._BranchAndBound, "cut_loop", cut_loop)
     result = solve(mip, cut_round_lp="highs")
     root = result["root_bound_before_cuts"]
     ref = reference(mip)
-    assert result["exact_cut_rounds"]["rounds"] >= 1
-    assert after_cuts[0] > root + 1e-3 * abs(ref - root)
+    stats = result["exact_cut_rounds"]
+    assert stats["rounds"] >= 1
+    # The rounds' own LP bound: when they close the root (here they reach
+    # the optimum), the loop hands back the LP from before the cuts, so
+    # that LP's bound would not show their gain.
+    assert stats["lp_bound"] > root + 1e-3 * abs(ref - root)
+    assert stats["lp_bound"] <= ref + 1e-6 * (1 + abs(ref))
 
 
 def test_exact_cut_rounds_fall_back_to_pdhg(monkeypatch):
@@ -9665,7 +9688,7 @@ def test_dual_fixing_in_the_search(make):
     assert 0.1 <= result["dual_fix_rate"] <= 0.95
     off = jm.solve(
         mip, max_seconds=120, batch_size=4, rins_seconds=0, crossover_seconds=0,
-        proximity_seconds=0, local_branching_seconds=0,
+        proximity_seconds=0, local_branching_seconds=0, dual_fix_seconds=0,
     )
     assert off["dual_fix_calls"] == 0
 
