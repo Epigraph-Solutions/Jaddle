@@ -1,9 +1,66 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 ### Added
 
+- Local branching on the sub-MIP lane (`local_branching_seconds`, default
+  10 s a call; `0`: off; needs `submip_solver="highs"`; Fischetti and
+  Lodi). HiGHS searches the whole base box below the cutoff with one more
+  row, the incumbent's Hamming ball over the binaries, so any `k` binaries
+  may flip where RINS and crossover fix integers (marked `"V"`). `k`
+  starts at 10, grows 1.5x when a ball is shown empty or searched in under
+  half its time, and shrinks when a search times out. It takes turns with
+  RINS, proximity search and crossover. New result keys:
+  `local_branching_calls`, `local_branching_finds`,
+  `local_branching_empty`.
+- HiGHS alongside the search (`feed_highs`, off by default;
+  `highs_feed_options`). HiGHS's MIP solver runs on the same MIP in a
+  background thread. Each new incumbent is passed to it, its improving
+  points come back as incumbents (marked `M`), and its dual bound raises
+  the search's. The search stops once either side closes the gap. New
+  result key: `highs_feed` (status, bound, points fed and received).
+- Objective cuts (`objective_cuts`, on by default; family `"objective"`).
+  With integral objective values the rounded-up global bound,
+  `c·x >= ⌈bound⌉`, joins the rows for c-MIR and is a cut itself.
+- GUB cover cuts (`gub_cover_cuts`, on by default; family `"gubcover"`;
+  `jm.gub_cover_cuts`): cover cuts over a partition of a row's binaries
+  into sets that allow at most one 1 (from rows and conflict cliques), so
+  a capacity row beside assignment rows gets covers that respect them.
+- Dual polish of node bounds (`dual_polish`, on by default; needs numba;
+  `jm.DualPolish`, `dual_polish_sweeps`, `dual_polish_children`). After
+  dual repair, each row's dual is moved to the exact maximiser of the
+  bound along it, `dual_polish_sweeps` (3) passes over the rows. This
+  reaches integer columns and equality rows, and can make a non-rigorous
+  bound rigorous. Over node boxes of 11 MIPLIB instances it won back 15%
+  to 99% of the gap to HiGHS's LP optimum, in 0.1 to 10 ms a node. New
+  result key: `dual_polish`.
+- Primal target (`primal_target`): the search stops, with status
+  `"primal_target"`, as soon as an incumbent is at least as good as the
+  given value (in the model's own sense).
+- The lean tree (`tree="lean"`, `lean_threads`, `lean_cuts`): a
+  best-bound tree whose node LPs are all HiGHS's dual simplex, warm from
+  the parent's basis, with reliability branching on HiGHS and rigorous
+  dual bounds. For small MIPs, whose device LPs cost far more than
+  HiGHS's: on pk1 it ran about 2,000 nodes a second against about 160.
+  New result key: `lean_tree`.
+- The support gate (`support_gate`, `support_gate_dives`, on by default).
+  At the root, the LP point's near-integral integers are fixed and the
+  rows propagated; when that is infeasible, every solution needs columns
+  the LP does not use. RENS skips a neighbourhood that fails the same
+  test, and LP dives from such a point are skipped. New result keys:
+  `support_gate`, `dives_skipped`.
+- Tree memory caps: `warm_start_memory` (default 1e9 bytes) for the open
+  nodes' PDHG warm starts, `max_open_nodes` (default no cap), and
+  `memory_limit`, which caps both byte budgets together (half for warm
+  starts, a quarter for exact bases). Past a cap the worst-bound nodes
+  lose their warm starts, and node selection goes depth first until the
+  frontier is back under half of it.
+- A load cache (`jm.load(path, cache=True)`): the loaded model's arrays
+  are kept next to the file (`<path>.jaddle.npz`) and read instead of
+  parsing the file again. The cache is rebuilt when the file's size or
+  modification time changes, and is not used with `presolve` or
+  `highs_options`.
 - Aggressive proximity search and improving jumps (`proximity_gap_share`,
   `jump_gap_share`, default 0: any improvement). The next point must close
   that share of the gap between the incumbent and the search's bound, as
@@ -20,7 +77,7 @@
   `rens_fixing_rate` (default 1) fixes only that share of the integral
   integers. The rest get their whole box: `[floor, ceil]` of a whole
   number would fix them anyway.
-- Dual-guided fixing (`dual_fix_seconds`, default 0: off; needs
+- Dual-guided fixing (`dual_fix_seconds`, default 20 s a call; `0`: off; needs
   `submip_solver="highs"`). The root LP's reduced costs rank the free
   integers of the root box. The share `dual_fix_rate` (default 0.7) with
   the largest `|r_j|` is fixed at the bound each one's sign prefers, and
@@ -72,7 +129,7 @@
   separation backend is in use (it was on only for MIPs with at most
   10,000 nonzeros).
 
-- Proximity search on the sub-MIP lane (`proximity_seconds`, default 10 s
+- Proximity search on the sub-MIP lane (`proximity_seconds`, default 20 s
   a call, marked `"X"`; Fischetti & Monaci). HiGHS keeps the objective as
   a row under the cutoff and searches the whole box for the feasible point
   nearest the incumbent, then re-solves the continuous variables for the
@@ -162,6 +219,12 @@
   rounds lacked was exact points and rounds, not cut strength.
 
 ### Changed
+
+- More sub-MIP heuristics run by default: dual-guided fixing
+  (`dual_fix_seconds=20`, was off), local branching
+  (`local_branching_seconds=10`) and HiGHS's first solution
+  (`first_solution_seconds=40`). Proximity search's default rose from
+  10 s a call to 20 s. Pass `0` to turn any of them off.
 
 - The tree starts with the root cuts that carry the bound. When the cut
   rounds end, `compact_cuts` keeps only the cuts with a nonzero dual when
@@ -323,6 +386,26 @@
   30n20b8's node points (2.3–4.5 s a call to 0.6–1.1 s).
 
 ### Fixed
+
+- `solve(..., presolve=True)` raised `NameError` when HiGHS's presolve
+  found the model infeasible.
+- The serial tree could pop an empty node heap (`IndexError`) when a new
+  incumbent or the lanes' results emptied it between the loop's check and
+  the next node.
+- The reported bound could pass the search's bound. A node's rigorous
+  bound (`proven`, from strong branching or an exact LP) can exceed the
+  bound it prunes on, and `global_bound` used only the latter. It now
+  takes the larger of the two, which also prunes such nodes sooner.
+- A child that conflict propagation emptied kept only the cutoff as its
+  proven bound, dropping its parent's, so `bound_rigorous` came back
+  `False` on searches whose every bound was rigorous.
+- No-goods are learned against the root box, which reduced-cost fixing
+  tightens using the incumbent, so they hold only below the cutoff. The
+  conflict pool now records that cutoff with them, as it already did for
+  its other rows.
+- Unknown `node_lp_options` for batched search were accepted when the
+  root closed the model before the first batch. They are now checked when
+  the search is built.
 
 - With a large tree cut pool (`tree_cut_rows`) the device kernels for a
   batch's children and for strong branching ran out of memory.
