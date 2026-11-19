@@ -31,7 +31,7 @@ def has(module):
         ("mip/facility_location.py", []),
         ("mip/cvxpy_facility_location.py", ["cvxpy"]),
         ("mip/cvxpy_drone_swarm.py", ["cvxpy", "matplotlib"]),
-        ("cp/isotonic_regression.py", ["matplotlib"]),
+        ("cp/isotonic_regression.py", ["matplotlib", "sklearn"]),
         ("cp/linear_regression.py", ["matplotlib", "sklearn"]),
         ("cp/cvxpy_lasso.py", ["cvxpy"]),
         ("cp/cvxpy_channel_capacity.py", ["cvxpy"]),
