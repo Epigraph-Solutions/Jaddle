@@ -50,6 +50,10 @@ PINNED = dict(
     # Tree cuts separated on a worker land a refresh later, at a time that
     # depends on the thread; the async tests turn it on.
     tree_cut_async=False,
+    # Cutoff probing runs on CPU threads, racing the root cut rounds: when
+    # it closes the root first no cut is separated, so cut and node counts
+    # depend on the thread. Tests of cutoff probing turn it on.
+    cutoff_probing=False,
     dive_every=0,
     tree_heuristics=False,
     tree_heuristic_every=20,
