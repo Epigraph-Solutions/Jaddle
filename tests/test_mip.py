@@ -6254,7 +6254,7 @@ def test_stale_cut_duals_are_zeroed_for_a_batch_solved_before_a_refresh(monkeypa
 
     # Whether a real refresh lands while a batch is in flight depends on
     # timing (JAX version, warm compilation caches), so one is simulated:
-    # the first batch read back once the cut block has slots finds slot 0
+    # the first dispatched batch read back once the cut block has slots finds slot 0
     # given a new cut since it was dispatched. Zeroing a cut's dual is
     # always valid, so the search stays correct.
     real_read = jm._BranchAndBound.read_batch
@@ -6262,7 +6262,9 @@ def test_stale_cut_duals_are_zeroed_for_a_batch_solved_before_a_refresh(monkeypa
 
     def read_batch(self, handle, service=False):
         results = real_read(self, handle, service=service)
-        if not simulated and self.slot_version:
+        # Only a dispatched batch (``process_batch``, the one caller with
+        # ``service``) checks its version; ``solve_batch`` waits in place.
+        if service and not simulated and self.slot_version:
             self.cut_version += 1
             self.slot_version[0] = self.cut_version
             simulated.append(True)
