@@ -1360,7 +1360,6 @@ Laptop GPU.
 | Outcome | Instances |
 |---|---|
 | Certified optimal on the HiGHS-presolved LP | **382 / 383** (one settled by presolve itself) |
-| Certified optimal on the original LP, after HiGHS postsolve | **297 / 383** |
 | Time limit reached | 1 (hgms62) |
 
 The two certificates differ because postsolve can enlarge a first-order
@@ -1377,9 +1376,8 @@ counted at the 3600-second limit, as in the PDLP papers):
 
 | Time measured | SGM10 |
 |---|---|
-| Iteration loop, including the first-epoch compile (`solve_seconds`) | 6.86 s |
-| Iteration loop with the compile amortised out (`corrected_seconds`) | 4.72 s |
-| Wall clock, including presolve, scaling and setup | 9.56 s |
+| Iteration loop, including the first-epoch compile (`solve_seconds`) | 4.06 s |
+| Iteration loop with the compile amortised out (`corrected_seconds`) | 2.82 s |
 
 The benchmark harnesses, instance diagnostics and instructions for reproducing
 these results are described in [`benchmarks/README.md`](https://github.com/BrendanVR/Jaddle/blob/main/benchmarks/README.md).
