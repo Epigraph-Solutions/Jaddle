@@ -690,6 +690,112 @@ def test_quadratic_program_rejects_asymmetric_Q():
         jc.quadratic_program(Q=np.array([[1.0, 1.0], [0.0, 1.0]]), c=np.zeros(2))
 
 
+def factor_model_qp(n=60, k=3, seed=0):
+    """A portfolio-style QP with Q = diag(q) + F Fᵀ: a budget row, a few
+    exposure limits and long-only bounds."""
+    rng = np.random.default_rng(seed)
+    q = rng.uniform(0.05, 0.2, n)
+    F = rng.standard_normal((n, k))
+    qp = dict(
+        c=-rng.uniform(0.0, 1.0, n),
+        A_eq=np.ones((1, n)),
+        b_eq=np.ones(1),
+        A_ineq=F.T,
+        b_ineq=0.5 * np.ones(k),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    return qp, q, F
+
+
+def test_low_rank_matvec_and_scaling():
+    rng = np.random.default_rng(0)
+    q, F, v, d = rng.uniform(size=7), rng.standard_normal((7, 2)), *rng.uniform(size=(2, 7))
+    Q = jc.LowRankPSD(q, F)
+    dense = Q.toarray()
+    np.testing.assert_allclose(Q @ v, dense @ v)
+    np.testing.assert_allclose(Q.diagonal(), np.diag(dense))
+    np.testing.assert_allclose(Q.scaled(d).toarray(), np.diag(d) @ dense @ np.diag(d))
+    np.testing.assert_allclose(
+        jc._matvec(jc.LowRankPSD(jnp.asarray(q), jnp.asarray(F)), jnp.asarray(v)),
+        dense @ v,
+        rtol=1e-5,
+    )
+
+
+def test_low_rank_equilibration_bounds_the_formed_matrix():
+    # The bounded row reductions are never below the formed matrix's, so
+    # the scaled KKT matrix has no entry above 1 after a Ruiz sweep.
+    import scipy.sparse as sp
+
+    qp, q, F = factor_model_qp(n=20)
+    A = sp.vstack([sp.csr_matrix(qp["A_eq"]), sp.csr_matrix(qp["A_ineq"])])
+    Q = jc.LowRankPSD(q, F)
+    d, e = jc._equilibrate_kkt(Q, A, 1, 0)
+    s = np.concatenate([d, e])
+    kkt = sp.bmat([[Q.toarray(), A.T], [A, None]]).toarray()
+    assert np.abs(s[:, None] * kkt * s[None, :]).max() <= 1 + 1e-12
+
+
+@pytest.mark.parametrize("given", ["factors", "matrix"])
+def test_quadratic_program_factor_Q_matches_matrix(given):
+    qp, q, F = factor_model_qp()
+    if given == "matrix":
+        # A rank-k Q given as a matrix: factor_Q finds the factor itself.
+        q = np.zeros_like(q)
+    Q = jc.LowRankPSD(q, F)
+    reference = solve_qp(dict(qp, Q=Q.toarray()))
+    factored = solve_qp(
+        dict(qp, Q=Q if given == "factors" else Q.toarray()), factor_Q=True
+    )
+    assert_qp_certified(reference)
+    assert_qp_certified(factored)
+    for a, b in zip(factored["solution"], reference["solution"]):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-5)
+
+
+def test_factor_Q_device_storage(monkeypatch):
+    import scipy.sparse as sp
+
+    qp, q, F = factor_model_qp()
+    A = qp["A_eq"]
+    # A rank-k matrix is factored; a full-rank one is cheaper as a matrix.
+    factored = jc._scale_qp(F @ F.T, 60, A, None, None, None, 0, 0, True)[-1][0]
+    assert isinstance(factored, jc.LowRankPSD) and factored.F.shape == (60, 3)
+    full = jc._scale_qp(np.diag(q) + F @ F.T, 60, A, None, None, None, 0, 0, True)
+    assert isinstance(full[-1][0], jax.Array)
+    # Given factors are used as given; without factor_Q they are formed.
+    given = jc._scale_qp(jc.LowRankPSD(q, F), 60, A, None, None, None, 0, 0, True)
+    assert isinstance(given[-1][0], jc.LowRankPSD)
+    formed = jc._scale_qp(jc.LowRankPSD(q, F), 60, A, None, None, None, 0, 0)
+    assert sp.issparse(formed[0]) and isinstance(formed[-1][0], jax.Array)
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        jc._scale_qp(-F @ F.T, 60, A, None, None, None, 0, 0, True)
+    with pytest.raises(ValueError, match="q >= 0"):
+        jc._scale_qp(jc.LowRankPSD(-q, F), 60, A, None, None, None, 0, 0, True)
+
+
+def test_make_qp_solver_factor_Q_vmap_batch():
+    qp, q, F = factor_model_qp(seed=1)
+    matrices = {k: qp[k] for k in ("A_eq", "A_ineq", "lower_bounds", "upper_bounds")}
+    rng = np.random.default_rng(1)
+    c = -rng.uniform(0.0, 1.0, (4, q.shape[0]))
+    b_eq, b_ineq = np.ones((4, 1)), np.full((4, F.shape[1]), 0.5)
+    solve_fn = jc.make_qp_solver(
+        jc.LowRankPSD(q, F), **matrices, factor_Q=True, **QP_SOLVER_SETTINGS
+    )
+    result = jax.jit(jax.vmap(solve_fn))(c, b_eq, b_ineq)
+    assert np.asarray(result.converged).all()
+    for i in range(4):
+        reference = jc.quadratic_program(
+            Q=np.diag(q) + F @ F.T, c=c[i], b_eq=b_eq[i], b_ineq=b_ineq[i],
+            **matrices, **QP_SOLVER_SETTINGS,
+        )
+        np.testing.assert_allclose(
+            result.solution.primal[i], reference["solution"].primal, atol=1e-5
+        )
+
+
 def test_diverged_solve_does_not_certify():
     # Free columns without curvature (the epigraph form of sum((x - a)^2)):
     # the fixed-step alternating scheme diverges to NaN from k = 0.1 without

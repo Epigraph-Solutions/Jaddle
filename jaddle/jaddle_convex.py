@@ -2543,27 +2543,113 @@ def make_solution(build_cp, active_tol=1e-6, gmres_tol=1e-10, **settings):
 
 
 # %%
+class LowRankPSD(NamedTuple):
+    """``Q = diag(q) + F Fᵀ`` with ``q >= 0`` and ``F`` of shape ``(n, k)``,
+    never formed: a product with it costs ``O(nk)``. A pytree, so it passes
+    through ``jit`` and ``vmap`` like the matrices it stands in for. Pass it
+    as ``Q`` to ``quadratic_program`` or ``make_qp_solver`` with
+    ``factor_Q=True`` (without, it is formed and solved as a matrix)."""
+
+    q: Any
+    F: Any
+
+    @property
+    def shape(self):
+        n = self.q.shape[0]
+        return (n, n)
+
+    def __matmul__(self, v):
+        return self.q * v + self.F @ (self.F.T @ v)
+
+    def diagonal(self):
+        return self.q + (self.F * self.F).sum(axis=1)
+
+    def scaled(self, d):
+        """``D Q D = diag(d² q) + (D F)(D F)ᵀ``."""
+        return LowRankPSD(d * d * self.q, d[:, None] * self.F)
+
+    def toarray(self):
+        return np.diag(self.q) + self.F @ self.F.T
+
+
+# Eigenvalues below this fraction of the largest are dropped when a matrix Q
+# is factored: Q ≈ V_k Λ_k V_kᵀ.
+_FACTOR_RANK_TOL = 1e-10
+
+
+def _factor_Q(Q):
+    """``Q`` (scipy, symmetric) as a ``LowRankPSD`` from its eigendecomposition,
+    or ``None`` if the factor would not be cheaper to multiply by than ``Q``
+    itself (``n + 2nk`` against its stored entries). The eigendecomposition
+    is dense, ``O(n³)``, once on the host."""
+    n = Q.shape[0]
+    if n == 0:
+        return None
+    lam, V = np.linalg.eigh(Q.toarray())
+    top = max(lam[-1], 0.0)
+    if lam[0] < -1e-8 * max(top, 1.0):
+        raise ValueError("Q must be positive semidefinite")
+    keep = lam > _FACTOR_RANK_TOL * top
+    k = int(keep.sum())
+    stored = Q.nnz if _device_size(Q) is None else n * n
+    if n + 2 * n * k >= stored:
+        return None
+    return LowRankPSD(np.zeros(n), V[:, keep] * np.sqrt(lam[keep]))
+
+
+def _device_size(A):
+    """``None`` if ``_device_matrix`` would store ``A`` sparse, else its size."""
+    size = A.shape[0] * A.shape[1]
+    if size > 0 and (size <= _DENSE_SIZE or A.nnz >= _DENSE_DENSITY * size):
+        return size
+    return None
+
+
 def _equilibrate_kkt(Q, A, ruiz_iterations, pc_iterations):
     """Variable scales ``d`` and constraint scales ``e`` that equilibrate the
     KKT matrix ``[[Q, Aᵀ], [A, 0]]`` symmetrically: Ruiz sweeps (each row's
     largest entry to 1), then Pock-Chambolle sweeps (each row's absolute sum
     to 1). One scale per row of the KKT matrix keeps ``D Q D`` symmetric, so
     the scaling is a change of variables ``x = D x̃``. An empty row keeps
-    scale 1."""
+    scale 1.
+
+    A ``LowRankPSD`` Q is never formed; its rows' reductions are bounded
+    instead. Ruiz: Q is PSD, so ``|Q_ij| <= √(Q_ii Q_jj)``, and row i of
+    ``|SQS|`` peaks below ``s_i√Q_ii · max_j s_j√Q_jj`` (exact on the
+    diagonal). Pock-Chambolle: row i of ``|SQS|`` sums below
+    ``s_i²|q_i| + s_i (|F| |F|ᵀ s)_i`` (exact for ``F >= 0``)."""
     import scipy.sparse as sp
 
     n = Q.shape[0]
-    kkt = abs(sp.bmat([[Q, A.T], [A, None]], format="csr"))
+    low_rank = isinstance(Q, LowRankPSD)
+    Q_block = sp.csr_matrix((n, n)) if low_rank else Q
+    kkt = abs(sp.bmat([[Q_block, A.T], [A, None]], format="csr"))
     scale = np.ones(kkt.shape[0])
+    if low_rank:
+        root_diag = np.sqrt(np.maximum(Q.diagonal(), 0.0))
+        abs_q, abs_F = np.abs(Q.q), np.abs(Q.F)
 
-    def sweep(reduce):
-        norms = scale * np.asarray(reduce(kkt @ sp.diags(scale))).ravel()
+    def q_rows(s, kind):
+        if kind == "max":
+            r = s * root_diag
+            return r * (r.max() if n else 0.0)
+        return s * s * abs_q + s * (abs_F @ (abs_F.T @ s))
+
+    def sweep(kind):
+        scaled = kkt @ sp.diags(scale)
+        reduced = scaled.max(axis=1).toarray() if kind == "max" else scaled.sum(axis=1)
+        norms = scale * np.asarray(reduced).ravel()
+        if low_rank:
+            rows = q_rows(scale[:n], kind)
+            norms[:n] = (
+                np.maximum(norms[:n], rows) if kind == "max" else norms[:n] + rows
+            )
         return scale / np.sqrt(np.where(norms > 0, norms, 1.0))
 
     for _ in range(ruiz_iterations):
-        scale = sweep(lambda m: m.max(axis=1).toarray())
+        scale = sweep("max")
     for _ in range(pc_iterations):
-        scale = sweep(lambda m: m.sum(axis=1))
+        scale = sweep("sum")
     return scale[:n], scale[n:]
 
 
@@ -2583,8 +2669,7 @@ def _device_matrix(A, dtype):
     of them are nonzero, else a BCOO."""
     from jaddle.jaddle_basic_types import scipy_to_bcoo
 
-    size = A.shape[0] * A.shape[1]
-    if size > 0 and (size <= _DENSE_SIZE or A.nnz >= _DENSE_DENSITY * size):
+    if _device_size(A) is not None:
         return jax.device_put(A.toarray().astype(jnp.dtype(dtype)))
     return scipy_to_bcoo(A, dtype)
 
@@ -2640,6 +2725,10 @@ def _matvec(M, v):
     """``M @ v`` at full precision for a dense ``M``. Under ``vmap`` a product
     with a shared matrix becomes a matrix-matrix product, which the float32
     profile would run in TF32 (about 3 significant digits)."""
+    if isinstance(M, LowRankPSD):
+        # O(nk). Under vmap F stays shared, so each product is one GEMM.
+        Ftv = jnp.matmul(M.F.T, v, precision="highest")
+        return M.q * v + jnp.matmul(M.F, Ftv, precision="highest")
     if isinstance(M, jax.Array):
         return jnp.matmul(M, v, precision="highest")
     return M @ v
@@ -2720,20 +2809,56 @@ def _scaled_qp_cp(matrices, c_s, b_eq_s, b_ineq_s, c_norm, b_norm):
     )
 
 
+def _check_low_rank(Q, n):
+    q = np.asarray(Q.q, dtype=np.float64)
+    F = np.asarray(Q.F, dtype=np.float64)
+    if q.shape != (n,) or F.ndim != 2 or F.shape[0] != n:
+        raise ValueError(
+            f"LowRankPSD needs q of shape ({n},) and F of shape ({n}, k), "
+            f"got {q.shape} and {F.shape}"
+        )
+    if (q < 0).any():
+        raise ValueError("LowRankPSD needs q >= 0 for Q to be PSD")
+    return LowRankPSD(q, F)
+
+
 def _scale_qp(
-    Q, n, A_eq, A_ineq, lower_bounds, upper_bounds, ruiz_iterations, pc_iterations
+    Q,
+    n,
+    A_eq,
+    A_ineq,
+    lower_bounds,
+    upper_bounds,
+    ruiz_iterations,
+    pc_iterations,
+    factor_Q=False,
 ):
     """Check a QP's matrices and KKT-scale them. Returns the matrices as
-    scipy CSR (``None`` blocks as empty ones), the bounds as float arrays,
-    the variable scales ``d`` and row scales ``e`` (eq rows first), and the
-    scaled device data ``_scaled_qp_cp`` takes as ``matrices``."""
+    scipy CSR (``None`` blocks as empty ones; Q as a ``LowRankPSD`` if given
+    as one with ``factor_Q``), the bounds as float arrays, the variable
+    scales ``d`` and row scales ``e`` (eq rows first), and the scaled device
+    data ``_scaled_qp_cp`` takes as ``matrices``.
+
+    With ``factor_Q`` the device Q is a ``LowRankPSD``: ``Q`` itself if it is
+    one, else ``Q``'s eigendecomposition truncated to its numerical rank, if
+    that is cheaper to multiply by (else Q stays a matrix)."""
     import scipy.sparse as sp
 
-    Q = sp.csr_matrix(Q, dtype=np.float64)
-    if Q.shape != (n, n):
-        raise ValueError(f"Q has shape {Q.shape}, expected {(n, n)}")
-    if abs(Q - Q.T).max() > 1e-12 * max(abs(Q).max(), 1.0):
-        raise ValueError("Q must be symmetric")
+    factor = None
+    if isinstance(Q, LowRankPSD):
+        Q = _check_low_rank(Q, n)
+        if factor_Q:
+            factor = Q
+        else:
+            Q = Q.toarray()
+    if factor is None:
+        Q = sp.csr_matrix(Q, dtype=np.float64)
+        if Q.shape != (n, n):
+            raise ValueError(f"Q has shape {Q.shape}, expected {(n, n)}")
+        if abs(Q - Q.T).max() > 1e-12 * max(abs(Q).max(), 1.0):
+            raise ValueError("Q must be symmetric")
+        if factor_Q:
+            factor = _factor_Q(Q)
 
     def block(A):
         if A is None:
@@ -2750,7 +2875,10 @@ def _scale_qp(
     )
 
     d, e = _equilibrate_kkt(
-        Q, sp.vstack([A_eq, A_ineq]), ruiz_iterations, pc_iterations
+        Q if factor is None else factor,
+        sp.vstack([A_eq, A_ineq]),
+        ruiz_iterations,
+        pc_iterations,
     )
     D = sp.diags(d)
     # Under the float16 profile only the matrices are stored in half
@@ -2760,7 +2888,13 @@ def _scale_qp(
     A_eq_scipy = sp.diags(e[:m_eq]) @ A_eq @ D
     A_ineq_scipy = sp.diags(e[m_eq:]) @ A_ineq @ D
     matrices = (
-        _device_matrix(D @ Q @ D, matrix_dtype),
+        (
+            _device_matrix(D @ Q @ D, matrix_dtype)
+            if factor is None
+            else LowRankPSD(
+                *(jnp.asarray(a, dtype=matrix_dtype) for a in factor.scaled(d))
+            )
+        ),
         _device_matrix(A_eq_scipy, matrix_dtype),
         _device_matrix(A_eq_scipy.T, matrix_dtype),
         _device_matrix(A_ineq_scipy, matrix_dtype),
@@ -2789,6 +2923,7 @@ def quadratic_program(
     dual_gap_tolerance=1e-3,
     ruiz_iterations=10,
     pc_iterations=1,
+    factor_Q=False,
     initial_solution=None,
     device=None,
     precision=None,
@@ -2849,6 +2984,13 @@ def quadratic_program(
     ``device`` and ``precision`` are as in ``solve()``, and also cover the
     scaled matrices built here (stored in half precision under
     ``"float16"``).
+
+    ``factor_Q=True`` multiplies by Q as ``diag(q) + F Fᵀ``, at ``O(nk)`` a
+    product. ``Q`` may then be a ``LowRankPSD(q, F)``, which is never formed;
+    a matrix Q is eigendecomposed once on the host (dense, ``O(n³)``) and
+    truncated to its numerical rank k, and kept as a matrix if ``n + 2nk``
+    is not below its stored entries. Without it a ``LowRankPSD`` is formed
+    and solved as a matrix.
     """
     c = np.asarray(c, dtype=np.float64)
     Q, A_eq, A_ineq, lower, upper, d, e, matrices = _scale_qp(
@@ -2860,6 +3002,7 @@ def quadratic_program(
         upper_bounds,
         ruiz_iterations,
         pc_iterations,
+        factor_Q,
     )
     m_eq = A_eq.shape[0]
     b_eq = np.asarray(b_eq, dtype=np.float64) if m_eq else np.zeros(0)
@@ -2932,6 +3075,7 @@ def make_qp_solver(
     dual_gap_tolerance=1e-3,
     ruiz_iterations=10,
     pc_iterations=1,
+    factor_Q=False,
     **settings,
 ):
     """
@@ -2963,7 +3107,8 @@ def make_qp_solver(
     ``quadratic_program``. The termination test is ``quadratic_program``'s
     (relative, in the problem's own units). Other keyword arguments go to
     ``make_solver``; ``gradient_scaling`` defaults to ``False``, since the
-    KKT scaling already equilibrates the rows.
+    KKT scaling already equilibrates the rows. ``factor_Q`` is as in
+    ``quadratic_program``.
     """
     n = Q.shape[0]
     _, A_eq, A_ineq, _, _, d, e, matrices = _scale_qp(
@@ -2975,6 +3120,7 @@ def make_qp_solver(
         upper_bounds,
         ruiz_iterations,
         pc_iterations,
+        factor_Q,
     )
     m_eq, m_ineq = A_eq.shape[0], A_ineq.shape[0]
     dtype = _wide(jo.jaddle_dtype())  # iterates at least float32
