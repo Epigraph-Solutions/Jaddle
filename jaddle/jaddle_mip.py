@@ -12963,7 +12963,7 @@ class _BranchAndBound:
             )
         return lower, upper
 
-    def push_resumed(self, root):
+    def push_resumed(self, root, warm=None):
         """The checkpoint's open nodes in place of the root's children: each
         box within the root box (one left empty holds no solution below the
         cutoff), bounded by the larger of its own bound and the root's, both
@@ -12984,7 +12984,10 @@ class _BranchAndBound:
                 max(float(state["node_bound"][k]), root.bound),
                 int(state["node_depth"][k]),
                 self.compress(lower, upper),
-                None,
+                # The checkpoint keeps no warm starts: each resumed node
+                # starts from the root's LP point, as the batched node path
+                # (``launch_next``) needs one for every member.
+                warm if warm is not None else root.warm,
                 None,
                 proven=max(float(state["node_proven"][k]), root.proven),
             )
@@ -21379,7 +21382,7 @@ class _BranchAndBound:
         if self.resume is not None and self.resume.get("node_ptr") is not None:
             # The checkpoint's open nodes (``resume_from``) in place of the
             # root's children; they hold the bound from the queue.
-            self.push_resumed(root)
+            self.push_resumed(root, root_warm)
             self.active_bound = self.active_proven = np.inf
             self.tree_started = True
             self.log(" ", None, force=True)
