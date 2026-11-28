@@ -7467,6 +7467,95 @@ class IncumbentQueue:
         }
 
 
+# The settings ``SettingsQueue`` can change: name -> (attribute of
+# ``_BranchAndBound``, type, least value, may be None).
+_LIVE_SETTINGS = {
+    "mip_rel_gap": ("rel_gap", float, 0, False),
+    "mip_abs_gap": ("abs_gap", float, 0, False),
+    "max_nodes": ("max_nodes", int, 0, True),
+    "max_seconds": ("deadline", float, 0, True),
+    "verbose": ("verbose", bool, None, False),
+    "heuristic_effort": ("heuristic_effort", float, 0, False),
+    "rins_every": ("rins_every", int, 0, False),
+    "rins_seconds": ("rins_seconds", float, 0, False),
+    "dive_every": ("dive_every", int, 0, False),
+    "round_repair_every": ("round_repair_every", int, 0, False),
+    "tree_cut_every": ("tree_cut_every", int, 1, False),
+    "reliability_threshold": ("reliability_threshold", int, 0, False),
+    "strong_candidates": ("strong_candidates", int, 0, False),
+    "strong_epochs": ("strong_epochs", int, 1, False),
+    "cut_age": ("cut_age", int, 1, False),
+}
+
+
+class SettingsQueue:
+    """Settings changed while ``solve`` runs (``solve(settings_queue=...)``).
+    Any thread may call ``put`` while the search runs; the search applies
+    the changes at its next poll, between batches, as it takes an
+    ``IncumbentQueue``'s points. Only the settings in ``LIVE`` can change:
+
+    * limits: ``mip_rel_gap``, ``mip_abs_gap``, ``max_nodes`` and
+      ``max_seconds`` (``None``: no limit; counted from the start of the
+      solve, as in ``solve``), ``verbose``;
+    * heuristics: ``heuristic_effort``, ``rins_every``, ``rins_seconds``,
+      ``dive_every``, ``round_repair_every`` (0 turns one off);
+    * branching: ``reliability_threshold``, ``strong_candidates`` (at most
+      the solve's ``strong_screen``), ``strong_epochs``;
+    * cuts: ``cut_age``, ``tree_cut_every`` (at least 1, and only when tree
+      cuts were on at the start).
+
+    ``put`` checks names and values at once and raises ``ValueError``. A
+    change the running search cannot take is skipped at the poll and listed
+    in ``skipped`` as ``(name, value, reason)``. Each applied change is in
+    ``applied`` and ``result["settings_changes"]`` as ``(seconds, name,
+    old, new)``. Sub-searches (RINS, RENS) and HiGHS alongside
+    (``feed_highs``) keep the settings they started with."""
+
+    LIVE = tuple(_LIVE_SETTINGS)
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending = []
+        self.applied = []
+        self.skipped = []
+
+    @staticmethod
+    def check(name, value):
+        if name not in _LIVE_SETTINGS:
+            raise ValueError(
+                f"{name!r} cannot change during a solve; "
+                f"live settings: {', '.join(_LIVE_SETTINGS)}"
+            )
+        _, kind, least, nullable = _LIVE_SETTINGS[name]
+        if kind is bool:
+            return bool(value)
+        if value is None:
+            if nullable:
+                return None
+            raise ValueError(f"{name} cannot be None")
+        if kind is int:
+            if isinstance(value, bool) or int(value) != value:
+                raise ValueError(f"{name} must be an integer, not {value!r}")
+            value = int(value)
+        else:
+            value = float(value)
+        if not value >= least:
+            raise ValueError(f"{name} must be at least {least}, not {value!r}")
+        return value
+
+    def put(self, **settings):
+        """Change ``settings`` (names as in ``solve``) in the running
+        search. Thread-safe and non-blocking."""
+        checked = [(name, self.check(name, value)) for name, value in settings.items()]
+        with self.lock:
+            self.pending.extend(checked)
+
+    def poll(self):
+        with self.lock:
+            changes, self.pending = self.pending, []
+        return changes
+
+
 class _HighsFeed:
     """HiGHS's MIP solver on the search's MIP, in a background thread, fed
     the search's incumbents (``solve(feed_highs=True)``). Jaddle tends to
@@ -10317,6 +10406,7 @@ class _BranchAndBound:
         highs_feed_options=None,
         incumbent_queue=None,
         incumbent_callback=None,
+        settings_queue=None,
         interrupt=None,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
@@ -10343,6 +10433,9 @@ class _BranchAndBound:
         # Points the user sends during the run (``incumbent_queue``),
         # outermost search only.
         self.incumbent_queue = incumbent_queue if interrupt is None else None
+        # Settings the user changes during the run (``settings_queue``),
+        # outermost search only.
+        self.settings_queue = settings_queue if interrupt is None else None
         # Called with each new incumbent (``incumbent_callback``), outermost
         # search only: a sub-search's points reach it through the parent's.
         self.incumbent_callback = incumbent_callback if interrupt is None else None
@@ -11771,7 +11864,9 @@ class _BranchAndBound:
 
     def collect_highs_feed(self):
         """HiGHS's improving points (``feed_highs``) as incumbents (``M``),
-        and the user's (``incumbent_queue``, ``A``)."""
+        and the user's (``incumbent_queue``, ``A``); the user's setting
+        changes (``settings_queue``)."""
+        self.apply_settings_queue()
         if self.highs_feed is not None:
             for x in self.highs_feed.poll():
                 self.try_incumbent(x, "M", None)
@@ -11796,6 +11891,35 @@ class _BranchAndBound:
                 before is None or self.incumbent[0] < before
             ):
                 queue.accepted += 1
+
+    def apply_settings_queue(self):
+        """The changes sent to ``settings_queue`` since the last poll."""
+        queue = self.settings_queue
+        if queue is None:
+            return
+        for name, value in queue.poll():
+            reason = None
+            if name == "strong_candidates" and value > self.strong_screen:
+                reason = f"above strong_screen ({self.strong_screen})"
+            elif name == "tree_cut_every" and not (
+                self.use_tree_cuts and self.tree_cut_every
+            ):
+                reason = "tree cuts were off at the start"
+            if reason is not None:
+                queue.skipped.append((name, value, reason))
+                if self.verbose:
+                    print(f"settings_queue: {name}={value!r} skipped: {reason}")
+                continue
+            attribute = _LIVE_SETTINGS[name][0]
+            if name == "max_seconds":
+                old = None if self.deadline is None else self.deadline - self.start
+                self.deadline = None if value is None else self.start + value
+            else:
+                old = getattr(self, attribute)
+                setattr(self, attribute, value)
+            queue.applied.append((time.time() - self.start, name, old, value))
+            if self.verbose:
+                print(f"settings_queue: {name} {old!r} -> {value!r}")
 
     def request_interrupt(self):
         """Stop the search as a time limit would, with the best point so
@@ -14917,6 +15041,12 @@ class _BranchAndBound:
             ),
             "nodes": self.nodes,
             "highs_feed": None if self.highs_feed is None else self.highs_feed.stats(),
+            "settings_changes": (
+                None if self.settings_queue is None else list(self.settings_queue.applied)
+            ),
+            "settings_skipped": (
+                None if self.settings_queue is None else list(self.settings_queue.skipped)
+            ),
             "incumbent_queue": (
                 None if self.incumbent_queue is None else self.incumbent_queue.stats()
             ),
@@ -21877,6 +22007,7 @@ def solve(
     highs_feed_options=None,
     incumbent_queue=None,
     incumbent_callback=None,
+    settings_queue=None,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -23089,6 +23220,13 @@ def solve(
     each the better of the two sides (HiGHS's points marked ``M``). The result's ``"highs_feed"`` has HiGHS's status,
     bound (model sense), and the counts of points fed and received.
 
+    ``settings_queue`` (a ``SettingsQueue``) lets another thread change
+    the gaps, limits, heuristic frequencies and effort, and some branching
+    and cut settings (``SettingsQueue.LIVE``) while the search runs:
+    ``queue.put(mip_rel_gap=0.01)``.
+    The search applies them between batches; the result's
+    ``"settings_changes"`` lists them. Works with ``presolve=True``.
+
     ``incumbent_queue`` (an ``IncumbentQueue``) lets another thread send
     points while the search runs: ``queue.put(x)``, with ``x`` one entry
     per column of the model (NaN allowed for continuous ones). The search
@@ -23430,6 +23568,7 @@ def solve(
         highs_feed_options=highs_feed_options,
         incumbent_queue=incumbent_queue,
         incumbent_callback=incumbent_callback,
+        settings_queue=settings_queue,
     )
     return _solve_model(
         model, presolve, precision, highs_options, feasibility_tolerance, settings

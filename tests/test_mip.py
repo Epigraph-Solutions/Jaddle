@@ -10636,3 +10636,88 @@ def test_incumbent_callback_needs_no_presolve(tmp_path):
     write_mps(knapsack(), path)
     with pytest.raises(ValueError, match="incumbent_callback"):
         solve(path, presolve=True, incumbent_callback=print)
+
+
+def test_settings_queue_checks_names_and_values():
+    queue = jm.SettingsQueue()
+    with pytest.raises(ValueError, match="cannot change"):
+        queue.put(batch_size=4)
+    with pytest.raises(ValueError, match="at least 0"):
+        queue.put(mip_rel_gap=-1)
+    with pytest.raises(ValueError, match="integer"):
+        queue.put(max_nodes=2.5)
+    queue.put(max_nodes=None, verbose=0)
+    assert queue.poll() == [("max_nodes", None), ("verbose", False)]
+
+
+def test_settings_queue_applies_before_the_search():
+    # Changes queued before the run are applied at the first poll.
+    mip = knapsack(seed=3, n=60)
+    queue = jm.SettingsQueue()
+    queue.put(mip_rel_gap=0.5, max_nodes=1)
+    result = solve(mip, mip_rel_gap=0.0, settings_queue=queue)
+    names = [name for _, name, _, _ in result["settings_changes"]]
+    assert names == ["mip_rel_gap", "max_nodes"]
+    assert result["settings_changes"][0][2:] == (0.0, 0.5)
+    assert result["nodes"] <= 2
+
+
+def test_settings_queue_shortens_time_from_another_thread():
+    mip = knapsack(seed=3, n=60)
+    queue = jm.SettingsQueue()
+    sender = threading.Thread(target=lambda: (time.sleep(0.05), queue.put(max_seconds=0)))
+    sender.start()
+    result = solve(mip, mip_rel_gap=0.0, max_seconds=600, settings_queue=queue)
+    sender.join()
+    assert result["seconds"] < 600
+    if result["settings_changes"]:
+        assert result["settings_changes"][0][1:] == ("max_seconds", 600.0, 0.0)
+        assert result["status"] in ("time_limit", "optimal")
+
+
+def test_settings_queue_off_by_default():
+    assert solve(knapsack())["settings_changes"] is None
+
+
+def test_settings_queue_checks_tier_two_values():
+    queue = jm.SettingsQueue()
+    with pytest.raises(ValueError, match="at least 1"):
+        queue.put(tree_cut_every=0)
+    with pytest.raises(ValueError, match="at least 1"):
+        queue.put(strong_epochs=0)
+    with pytest.raises(ValueError, match="None"):
+        queue.put(rins_every=None)
+    queue.put(heuristic_effort=0.5, dive_every=3)
+    assert queue.poll() == [("heuristic_effort", 0.5), ("dive_every", 3)]
+
+
+def test_settings_queue_applies_tier_two_settings():
+    mip = knapsack(seed=3, n=60)
+    ref = reference(mip)
+    queue = jm.SettingsQueue()
+    queue.put(
+        heuristic_effort=0.0,
+        rins_every=0,
+        dive_every=0,
+        round_repair_every=0,
+        reliability_threshold=2,
+        strong_candidates=2,
+        strong_epochs=10,
+        cut_age=5,
+    )
+    result = solve(mip, settings_queue=queue)
+    assert_solved(result, mip, ref)
+    changes = {name: new for _, name, _, new in result["settings_changes"]}
+    assert changes["strong_candidates"] == 2 and changes["cut_age"] == 5
+    assert result["settings_skipped"] == []
+
+
+def test_settings_queue_skips_what_the_search_cannot_take():
+    mip = knapsack(seed=3, n=60)
+    queue = jm.SettingsQueue()
+    queue.put(strong_candidates=10_000, tree_cut_every=5)
+    result = solve(mip, strong_screen=16, tree_cuts=False, settings_queue=queue)
+    assert_solved(result, mip, reference(mip))
+    skipped = {name for name, _, _ in result["settings_skipped"]}
+    assert skipped == {"strong_candidates", "tree_cut_every"}
+    assert result["settings_changes"] == []
