@@ -10721,3 +10721,88 @@ def test_settings_queue_skips_what_the_search_cannot_take():
     skipped = {name for name, _, _ in result["settings_skipped"]}
     assert skipped == {"strong_candidates", "tree_cut_every"}
     assert result["settings_changes"] == []
+
+
+# -- checkpoint / resume_from ---------------------------------------------------
+
+
+def _checkpointed(mip, path, **options):
+    """A search stopped by ``max_nodes`` with a checkpoint, or ``None`` when
+    it ended at the root (no tree to save)."""
+    result = solve(mip, max_nodes=4, checkpoint=path, heuristic_effort=0, rins_every=0, **options)
+    return result if path.exists() else None
+
+
+def test_checkpoint_resume_finds_optimum(tmp_path):
+    mip = general_integer(seed=4, n=20, m_eq=3, m_ineq=14)
+    ref = reference(mip)
+    path = tmp_path / "tree.npz"
+    first = _checkpointed(mip, path)
+    assert first is not None and first["status"] == "node_limit"
+    assert first["checkpoint"]["written"] >= 1
+    state = jm.load_checkpoint(path)
+    assert state["node_bound"].size == first["checkpoint"]["open_nodes"] > 0
+    # Every saved node box sits in the saved root box.
+    assert np.all(state["node_lower"] >= state["root_lower"][state["node_idx"]])
+    assert np.all(state["node_upper"] <= state["root_upper"][state["node_idx"]])
+    resumed = solve(mip, resume_from=path)
+    assert_solved(resumed, mip, ref)
+    stats = resumed["resumed"]
+    assert stats["nodes_in_checkpoint"] == state["node_bound"].size
+    assert stats["nodes_pushed"] + stats["nodes_emptied"] == stats["nodes_in_checkpoint"]
+    # The resumed bound starts from the checkpoint's: never below it.
+    assert resumed["bound"] >= float(first["bound"]) - 1e-6 * (1 + abs(ref))
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: facility_location(seed=5, n_fac=8, n_cust=20),
+        lambda: knapsack(seed=11, n=80),
+    ],
+    ids=["facility_location", "knapsack"],
+)
+def test_checkpoint_resume_other_models(tmp_path, make):
+    mip = make()
+    path = tmp_path / "tree.npz"
+    if _checkpointed(mip, path) is None:
+        pytest.skip("solved at the root")
+    resumed = solve(mip, resume_from=path)
+    ref = reference(mip)
+    if resumed["status"] == "unresolved":
+        # A node closed unresolved (an integral LP point the check refused):
+        # the bound must still hold the optimum.
+        sign = -1 if mip.maximise else 1
+        assert sign * resumed["bound"] <= sign * ref + 1e-4 * (1 + abs(ref))
+    else:
+        assert_solved(resumed, mip, ref)
+
+
+def test_checkpoint_rejects_another_model(tmp_path):
+    path = tmp_path / "tree.npz"
+    if _checkpointed(general_integer(seed=4, n=20, m_eq=3, m_ineq=14), path) is None:
+        pytest.skip("solved at the root")
+    with pytest.raises(ValueError, match="another MIP"):
+        solve(general_integer(seed=5, n=20, m_eq=3, m_ineq=14), resume_from=path)
+
+
+def test_checkpoint_needs_jaddle_tree(tmp_path):
+    with pytest.raises(ValueError, match="tree='jaddle'"):
+        solve(knapsack(), checkpoint=tmp_path / "tree.npz", tree="lean")
+
+
+def test_checkpoint_keeps_unresolved_floor(tmp_path):
+    # A node closed unresolved holds the bound and the status; no open box
+    # holds its region, so the checkpoint carries its floor.
+    mip = general_integer(seed=4, n=20, m_eq=3, m_ineq=14)
+    path = tmp_path / "tree.npz"
+    if _checkpointed(mip, path) is None:
+        pytest.skip("solved at the root")
+    state = dict(jm.load_checkpoint(path))
+    state["unresolved_floor"] = np.float64(-1e9)
+    state["unresolved_nodes"] = np.int64(1)
+    state["fingerprint"] = np.str_(state["fingerprint"])
+    np.savez(path, **state)
+    resumed = solve(mip, resume_from=path)
+    assert resumed["status"] == "unresolved"
+    assert resumed["unresolved_nodes"] >= 1

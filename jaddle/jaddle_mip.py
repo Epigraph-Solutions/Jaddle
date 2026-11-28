@@ -7066,6 +7066,78 @@ def _complete_start(mip, x, tol, max_seconds):
     return repaired if mip.is_feasible(repaired, tol) else None
 
 
+# The version of the file ``solve(checkpoint=...)`` writes.
+_CHECKPOINT_VERSION = 1
+
+
+def mip_fingerprint(mip):
+    """A SHA-256 hex digest of ``mip``'s rows, objective, bounds and
+    integrality: a checkpoint (``solve(checkpoint=...)``) resumes only on
+    the MIP it was written for."""
+    import hashlib
+
+    A = sp.csr_matrix(mip.A)
+    A.sort_indices()
+    digest = hashlib.sha256()
+    for part in (
+        np.asarray(A.shape, np.int64),
+        np.asarray([mip.n_eq], np.int64),
+        np.asarray(A.indptr, np.int64),
+        np.asarray(A.indices, np.int64),
+        np.asarray(A.data, np.float64),
+        np.asarray(mip.b, np.float64),
+        np.asarray(mip.c, np.float64),
+        np.asarray(mip.lower, np.float64),
+        np.asarray(mip.upper, np.float64),
+        np.asarray(mip.integrality, np.bool_),
+        np.asarray([mip.offset, float(bool(mip.maximise))], np.float64),
+    ):
+        digest.update(np.ascontiguousarray(part).tobytes())
+    return digest.hexdigest()
+
+
+def _extra_rows(mip, original):
+    """The rows of ``mip`` (the searched MIP: ``original`` with tightened
+    coefficients, symmetry rows and cuts) that ``original`` lacks, as
+    ``(A_rows, b_rows)`` for ``with_rows`` (``A_rows x <= b_rows``). Rows
+    keep their place when coefficients are tightened and new rows come
+    after the original ones, so the comparison is row by row; a changed
+    equality row becomes two inequalities."""
+    A = sp.csr_matrix(mip.A, dtype=np.float64)
+    A0 = sp.csr_matrix(original.A, dtype=np.float64)
+    b = np.asarray(mip.b, np.float64)
+    b0 = np.asarray(original.b, np.float64)
+    n0, n_eq = A0.shape[0], original.n_eq
+    if mip.n_eq != n_eq or A.shape[0] < n0 or A.shape[1] != A0.shape[1]:
+        raise ValueError("the searched MIP does not extend the original's rows")
+    diff = (A[:n0] - A0).tocsr()
+    diff.eliminate_zeros()
+    changed = np.flatnonzero((np.diff(diff.indptr) > 0) | (b[:n0] != b0))
+    eq = changed[changed < n_eq]
+    ineq = np.concatenate([changed[changed >= n_eq], np.arange(n0, A.shape[0])])
+    blocks = [A[ineq]]
+    rhs = [b[ineq]]
+    if eq.size:
+        blocks += [A[eq], -A[eq]]
+        rhs += [b[eq], -b[eq]]
+    return sp.vstack(blocks, format="csr"), np.concatenate(rhs)
+
+
+def load_checkpoint(path):
+    """The search state ``solve(checkpoint=path)`` wrote, as a dict of
+    arrays (``solve(resume_from=...)`` takes the path itself)."""
+    with np.load(path, allow_pickle=False) as data:
+        state = {key: data[key] for key in data.files}
+    version = int(state.get("version", -1))
+    if version != _CHECKPOINT_VERSION:
+        raise ValueError(
+            f"checkpoint {path!r} has version {version}, "
+            f"expected {_CHECKPOINT_VERSION}"
+        )
+    state["fingerprint"] = str(state["fingerprint"])
+    return state
+
+
 def check_mip_start(x, mip):
     """A user's starting point for ``mip`` (``solve(mip_start=...)``) as a
     float64 array, or ``None``. It has one entry per column; continuous
@@ -10407,6 +10479,9 @@ class _BranchAndBound:
         incumbent_queue=None,
         incumbent_callback=None,
         settings_queue=None,
+        checkpoint=None,
+        checkpoint_every=60.0,
+        resume_from=None,
         interrupt=None,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
@@ -10439,6 +10514,24 @@ class _BranchAndBound:
         # Called with each new incumbent (``incumbent_callback``), outermost
         # search only: a sub-search's points reach it through the parent's.
         self.incumbent_callback = incumbent_callback if interrupt is None else None
+        # The tree's state written to ``checkpoint`` every ``checkpoint_every``
+        # seconds and when the search ends (``write_checkpoint``), and the
+        # state a search resumes from (``resume_from``, ``apply_resume``):
+        # outermost search only.
+        self.checkpoint_path = None if interrupt is not None else checkpoint
+        if checkpoint_every is None or not float(checkpoint_every) > 0:
+            raise ValueError(f"checkpoint_every must be positive, not {checkpoint_every!r}")
+        self.checkpoint_every = float(checkpoint_every)
+        self.checkpoint_due = None  # when the next periodic checkpoint is due
+        self.checkpoints_written = 0
+        self.checkpoint_nodes = None  # open nodes in the last checkpoint
+        self.resume = None
+        if resume_from is not None and interrupt is None:
+            self.resume = load_checkpoint(resume_from)
+            self.resume["path"] = str(resume_from)
+        self.resume_stats = None
+        if (checkpoint is not None or resume_from is not None) and tree == "lean":
+            raise ValueError("checkpoint and resume_from need tree='jaddle', not 'lean'")
         self.rins_nodes = rins_nodes
         if symmetry not in ("auto", True, False):
             raise ValueError(
@@ -12688,6 +12781,219 @@ class _BranchAndBound:
             and self.fixed_share() >= share
             and not self.root_closed()
         )
+
+    def checkpoint_nodes_now(self):
+        """Every node whose box still holds solutions below the cutoff, with
+        the bound and proven bound ``global_bound`` and ``proven_bound``
+        count for it: the open queue, the plunge, the exact lane's, and those
+        batches and the pipeline hold outside it. Their boxes cover every
+        solution below the cutoff in the root box."""
+        nodes = [(node, node.bound) for node in self.open_nodes()]
+        nodes += [(d["node"], max(d["bound"], d["node"].bound)) for d in self.deferred_branches]
+        nodes += [(node, node.bound) for node in self.batch_waiting]
+        nodes += [(node, node.bound) for node in self.pipeline_nodes()]
+        seen, unique = set(), []
+        for node, bound in nodes:
+            if id(node) not in seen:
+                seen.add(id(node))
+                unique.append((node, bound))
+        return unique
+
+    def maybe_checkpoint(self, force=False):
+        """Write the checkpoint (``write_checkpoint``) when one is due, or at
+        once with ``force``."""
+        if self.checkpoint_path is None or not self.tree_started:
+            return
+        now = time.time()
+        if self.checkpoint_due is None:
+            self.checkpoint_due = now + self.checkpoint_every
+        if not force and now < self.checkpoint_due:
+            return
+        self.write_checkpoint(self.checkpoint_path)
+        self.checkpoint_due = time.time() + self.checkpoint_every
+
+    def write_checkpoint(self, path):
+        """
+        The search's state, to resume from (``solve(resume_from=path)``), in
+        the searched MIP's columns (the presolved MIP's with ``presolve``):
+        the fingerprint of the MIP as given (``mip_fingerprint``); the root
+        box that reduced-cost fixing has left; the open nodes as boxes
+        within it (``checkpoint_nodes_now``), with their bounds and proven
+        bounds; the rows the searched MIP adds to the given one (tightened
+        coefficients, symmetry rows, the cut pool and tree cuts, which hold
+        for every node: ``_extra_rows``); the incumbent and the pseudocosts.
+        The boxes hold every solution below the incumbent's value that the
+        rows allow, so a search that resumes with the rows, the root box and
+        the incumbent and searches the boxes misses none of them. Written to
+        a temporary file and renamed, so an interrupted write leaves the
+        last checkpoint whole.
+        """
+        started = time.time()
+        root_lower = np.asarray(self.root_lower, np.float64)
+        root_upper = np.asarray(self.root_upper, np.float64)
+        ptr, idx, lo, up, bound, proven, depth = [0], [], [], [], [], [], []
+        nodes = self.checkpoint_nodes_now()
+        for node, node_bound in nodes:
+            lower, upper = self.expand(node.changes)
+            at = np.flatnonzero((lower != root_lower) | (upper != root_upper))
+            idx.append(at.astype(np.int64))
+            lo.append(lower[at].astype(np.float64))
+            up.append(upper[at].astype(np.float64))
+            ptr.append(ptr[-1] + at.size)
+            bound.append(float(node_bound))
+            proven.append(float(node.proven))
+            depth.append(int(node.depth))
+        A_rows, b_rows = _extra_rows(self.mip, self.original)
+        A_rows = sp.csr_matrix(A_rows)
+        if self.incumbent is not None:
+            value, x = self.incumbent[0], np.asarray(self.incumbent[1], np.float64)
+        else:
+            value, x = np.inf, np.zeros(0)
+        concat = lambda parts, dtype: (
+            np.concatenate(parts).astype(dtype) if parts else np.zeros(0, dtype)
+        )
+        state = dict(
+            version=np.int64(_CHECKPOINT_VERSION),
+            fingerprint=np.str_(mip_fingerprint(self.original)),
+            seconds=np.float64(time.time() - self.start),
+            nodes_done=np.int64(self.nodes + self.resumed_nodes_done()),
+            bound=np.float64(self.global_bound()),
+            proven_bound=np.float64(self.proven_bound()),
+            root_lower=root_lower,
+            root_upper=root_upper,
+            node_ptr=np.asarray(ptr, np.int64),
+            node_idx=concat(idx, np.int64),
+            node_lower=concat(lo, np.float64),
+            node_upper=concat(up, np.float64),
+            node_bound=np.asarray(bound, np.float64),
+            node_proven=np.asarray(proven, np.float64),
+            node_depth=np.asarray(depth, np.int64),
+            rows_indptr=np.asarray(A_rows.indptr, np.int64),
+            rows_indices=np.asarray(A_rows.indices, np.int64),
+            rows_data=np.asarray(A_rows.data, np.float64),
+            rows_b=np.asarray(b_rows, np.float64),
+            incumbent_value=np.float64(value),
+            incumbent_x=x,
+            pc_sum=np.asarray(self.pc_sum, np.float64),
+            pc_count=np.asarray(self.pc_count, np.float64),
+            # The regions closed without a solution (``close``): nodes closed
+            # unresolved (every integer fixed, LP point not accepted) hold the
+            # bound and the status down, and no open box holds them.
+            closed_floor=np.float64(self.closed_floor),
+            proven_closed=np.float64(self.proven_closed),
+            unresolved_floor=np.float64(self.unresolved_floor),
+            unresolved_nodes=np.int64(self.unresolved_nodes),
+            bound_rigorous=np.bool_(self.bound_rigorous),
+        )
+        path = os.fspath(path)
+        temporary = f"{path}.tmp-{os.getpid()}"
+        with open(temporary, "wb") as handle:
+            np.savez_compressed(handle, **state)
+        os.replace(temporary, path)
+        self.checkpoints_written += 1
+        self.checkpoint_nodes = len(nodes)
+        if self.verbose:
+            print(
+                f"Checkpoint: {len(nodes)} open nodes, {A_rows.shape[0]} rows, "
+                f"bound {self.model_value(self.proven_bound())}, to {path} "
+                f"({time.time() - started:.1f}s)"
+            )
+
+    def resumed_nodes_done(self):
+        """Nodes the checkpoint resumed from had already searched."""
+        return 0 if self.resume is None else int(self.resume["nodes_done"])
+
+    def apply_resume(self, lower, upper):
+        """The checkpoint's state (``resume_from``) before the first root:
+        its rows join the searched MIP, symmetry breaking is off (its rows
+        are among them, and new ones could keep other orbit members than the
+        open boxes do), its incumbent becomes the start, its pseudocosts
+        replace the empty ones, and the root box is cut to its own. Returns
+        the root box."""
+        state = self.resume
+        fingerprint = mip_fingerprint(self.original)
+        if state["fingerprint"] != fingerprint:
+            raise ValueError(
+                f"checkpoint {state['path']!r} is for another MIP (fingerprint "
+                f"{state['fingerprint'][:12]}…, this one {fingerprint[:12]}…): "
+                "the model and presolve must be the same as when it was written"
+            )
+        n = self.original.num_variables
+        if state["root_lower"].size != n or state["pc_sum"].shape != (2, n):
+            raise ValueError(f"checkpoint {state['path']!r} has the wrong number of columns")
+        rows = sp.csr_matrix(
+            (state["rows_data"], state["rows_indices"], state["rows_indptr"]),
+            shape=(state["rows_b"].size, n),
+        )
+        if rows.shape[0]:
+            self.base = self.base.with_rows(rows, state["rows_b"])
+            self.set_mip(self.base)
+        self.symmetry = False
+        # The closed regions' floors: an unresolved node's region is in no
+        # open box, so the bound and the status must still count it.
+        self.closed_floor = min(self.closed_floor, float(state["closed_floor"]))
+        self.proven_closed = min(self.proven_closed, float(state["proven_closed"]))
+        self.unresolved_floor = min(self.unresolved_floor, float(state["unresolved_floor"]))
+        self.unresolved_nodes += int(state["unresolved_nodes"])
+        self.bound_rigorous &= bool(state["bound_rigorous"])
+        self.pc_sum = np.array(state["pc_sum"], np.float64)
+        self.pc_count = np.array(state["pc_count"], np.float64)
+        x = state["incumbent_x"]
+        if x.size:
+            start = check_mip_start(x, self.mip)
+            if self.mip_start is None or (
+                float(self.mip.c @ start) < float(self.mip.c @ np.nan_to_num(self.mip_start))
+            ):
+                self.mip_start = start
+                self.has_mip_start = True
+        lower = np.maximum(lower, state["root_lower"])
+        upper = np.minimum(upper, state["root_upper"])
+        self.resume_stats = {
+            "path": state["path"],
+            "nodes_in_checkpoint": int(state["node_bound"].size),
+            "rows": int(rows.shape[0]),
+            "nodes_done_before": int(state["nodes_done"]),
+            "bound_before": self.model_value(float(state["proven_bound"])),
+        }
+        if self.verbose:
+            print(
+                f"Resuming from {state['path']}: {state['node_bound'].size} open nodes, "
+                f"{rows.shape[0]} rows, {int(state['nodes_done'])} nodes searched, "
+                f"bound {self.model_value(float(state['proven_bound']))}"
+            )
+        return lower, upper
+
+    def push_resumed(self, root):
+        """The checkpoint's open nodes in place of the root's children: each
+        box within the root box (one left empty holds no solution below the
+        cutoff), bounded by the larger of its own bound and the root's, both
+        of which hold for it."""
+        state = self.resume
+        ptr = state["node_ptr"]
+        pushed = emptied = 0
+        for k in range(state["node_bound"].size):
+            at = slice(ptr[k], ptr[k + 1])
+            idx = state["node_idx"][at]
+            lower, upper = self.expand(
+                (idx, state["node_lower"][at], state["node_upper"][at])
+            )
+            if np.any(lower > upper):
+                emptied += 1
+                continue
+            node = _Node(
+                max(float(state["node_bound"][k]), root.bound),
+                int(state["node_depth"][k]),
+                self.compress(lower, upper),
+                None,
+                None,
+                proven=max(float(state["node_proven"][k]), root.proven),
+            )
+            self.push(node)
+            pushed += 1
+        self.resume_stats.update(nodes_pushed=pushed, nodes_emptied=emptied)
+        self.resume = dict(state, node_ptr=None)  # pushed once; ``nodes_done`` stays
+        if self.verbose:
+            print(f"Resumed {pushed} open nodes ({emptied} empty in the root box)")
 
     def restart(self):
         """
@@ -15044,6 +15350,16 @@ class _BranchAndBound:
             "settings_changes": (
                 None if self.settings_queue is None else list(self.settings_queue.applied)
             ),
+            "checkpoint": (
+                None
+                if self.checkpoint_path is None
+                else {
+                    "path": os.fspath(self.checkpoint_path),
+                    "written": self.checkpoints_written,
+                    "open_nodes": self.checkpoint_nodes,
+                }
+            ),
+            "resumed": self.resume_stats,
             "settings_skipped": (
                 None if self.settings_queue is None else list(self.settings_queue.skipped)
             ),
@@ -20672,6 +20988,10 @@ class _BranchAndBound:
         lower, upper = self.mip.lower.copy(), self.mip.upper.copy()
         if np.any(lower > upper):
             return self.result("infeasible")
+        if self.resume is not None:
+            lower, upper = self.apply_resume(lower, upper)
+            if np.any(lower > upper):
+                return self.result("infeasible")
         first = True
         while True:
             box = self._prepare(lower, upper, first)
@@ -21056,6 +21376,14 @@ class _BranchAndBound:
         if np.isfinite(self.active_bound):
             root.bound = max(root.bound, self.active_bound)
         root.proven = max(root.proven, self.active_proven)
+        if self.resume is not None and self.resume.get("node_ptr") is not None:
+            # The checkpoint's open nodes (``resume_from``) in place of the
+            # root's children; they hold the bound from the queue.
+            self.push_resumed(root)
+            self.active_bound = self.active_proven = np.inf
+            self.tree_started = True
+            self.log(" ", None, force=True)
+            return None
         if self.tree == "lean":
             # The lean tree solves the root's LP itself, over the root box
             # (``changes`` ``None``), with the cuts as rows.
@@ -21092,6 +21420,7 @@ class _BranchAndBound:
             ):
                 # Every node taken last iteration is in a list by now.
                 self.in_transit = []
+                self.maybe_checkpoint()
                 self.collect_heuristics()
                 collecting = time.perf_counter()
                 self.collect_exact()
@@ -21198,6 +21527,9 @@ class _BranchAndBound:
             self.tree_seconds += time.time() - started
             self.tree_strong_seconds += self.strong_branch_seconds - strong_before
             self.tree_clock = None
+        if status != "restart":
+            # Every node is back in the queue: the state to resume from.
+            self.maybe_checkpoint(force=True)
         return status
 
     # -- the lean tree (``tree="lean"``) -------------------------------------
@@ -22008,6 +22340,9 @@ def solve(
     incumbent_queue=None,
     incumbent_callback=None,
     settings_queue=None,
+    checkpoint=None,
+    checkpoint_every=60.0,
+    resume_from=None,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -23227,6 +23562,22 @@ def solve(
     The search applies them between batches; the result's
     ``"settings_changes"`` lists them. Works with ``presolve=True``.
 
+    ``checkpoint`` (a path) saves the search's tree every
+    ``checkpoint_every`` seconds and when the search ends: the open nodes'
+    boxes and bounds, the root box, the rows the search added (tightened
+    coefficients, symmetry rows, cuts), the incumbent and the pseudocosts,
+    as a NumPy ``.npz`` file (``load_checkpoint`` reads it). Each write
+    replaces the last whole. ``resume_from`` (such a path) starts a search
+    from it: its rows join the MIP, its incumbent is the start (a better
+    ``mip_start`` wins), the root box is cut to its own, and after the
+    root's LP and cut rounds its open nodes replace the root's children, so
+    the bound starts at the checkpoint's. Settings may differ between the
+    runs (threads, ``feed_highs`` options, cut rounds, heuristics), but the
+    model and ``presolve`` must give the same searched MIP (its
+    ``mip_fingerprint`` is checked), and symmetry breaking is off when
+    resuming. Not with ``tree="lean"``. The result's ``"checkpoint"`` and
+    ``"resumed"`` report them.
+
     ``incumbent_queue`` (an ``IncumbentQueue``) lets another thread send
     points while the search runs: ``queue.put(x)``, with ``x`` one entry
     per column of the model (NaN allowed for continuous ones). The search
@@ -23569,6 +23920,9 @@ def solve(
         incumbent_queue=incumbent_queue,
         incumbent_callback=incumbent_callback,
         settings_queue=settings_queue,
+        checkpoint=checkpoint,
+        checkpoint_every=checkpoint_every,
+        resume_from=resume_from,
     )
     return _solve_model(
         model, presolve, precision, highs_options, feasibility_tolerance, settings
