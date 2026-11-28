@@ -10548,3 +10548,91 @@ def test_objective_cuts_keep_the_optimum(make):
     off = solve(mip, objective_cuts=False)
     assert_solved(off, mip, ref)
     assert off["cuts"]["objective"] == 0
+
+
+def _reference_x(mip):
+    result = milp(
+        mip.c,
+        constraints=LinearConstraint(mip.A.toarray(), mip.row_lower, mip.row_upper),
+        integrality=mip.integrality.astype(int),
+        bounds=Bounds(mip.lower, mip.upper),
+    )
+    assert result.success
+    return result.x
+
+
+@pytest.mark.parametrize("make", [knapsack, facility_location])
+def test_incumbent_queue_takes_optimum(make):
+    # A point queued before the run is taken at the first poll (source "A").
+    mip = make()
+    ref = reference(mip)
+    queue = jm.IncumbentQueue()
+    queue.put(_reference_x(mip))
+    result = solve(mip, incumbent_queue=queue)
+    assert_solved(result, mip, ref)
+    stats = result["incumbent_queue"]
+    assert stats["received"] == 1 and stats["rejected"] == 0
+    if stats["accepted"]:
+        assert "A" in {h["source"] for h in result["history"]}
+
+
+def test_incumbent_queue_rejects_bad_points():
+    mip = knapsack()
+    queue = jm.IncumbentQueue()
+    queue.put(np.ones(mip.num_variables))  # over the weight limit
+    queue.put(np.zeros(mip.num_variables + 1))  # wrong shape
+    result = solve(mip, incumbent_queue=queue)
+    assert_solved(result, mip, reference(mip))
+    assert result["incumbent_queue"] == {"received": 2, "accepted": 0, "rejected": 2}
+
+
+def test_incumbent_queue_from_another_thread():
+    mip = knapsack(seed=3, n=60)
+    queue = jm.IncumbentQueue()
+    x = _reference_x(mip)
+    sender = threading.Thread(target=lambda: (time.sleep(0.05), queue.put(x)))
+    sender.start()
+    result = solve(mip, incumbent_queue=queue)
+    sender.join()
+    assert_solved(result, mip, reference(mip))
+
+
+def test_incumbent_queue_needs_no_presolve(tmp_path):
+    path = tmp_path / "knapsack.mps"
+    write_mps(knapsack(), path)
+    with pytest.raises(ValueError, match="incumbent_queue"):
+        solve(path, presolve=True, incumbent_queue=jm.IncumbentQueue())
+
+
+def test_incumbent_queue_off_by_default():
+    assert solve(knapsack())["incumbent_queue"] is None
+
+
+@pytest.mark.parametrize("make", [knapsack, facility_location])
+def test_incumbent_callback_sees_every_incumbent(make):
+    mip = make()
+    seen = []
+    result = solve(mip, incumbent_callback=seen.append)
+    assert_solved(result, mip, reference(mip))
+    assert len(seen) == len(result["history"])
+    for entry, record in zip(seen, result["history"]):
+        assert entry["source"] == record["source"]
+        assert entry["objective"] == record["objective"]
+        assert mip.is_feasible(entry["x"], 1e-6)
+    assert np.array_equal(seen[-1]["x"], result["x"])
+
+
+def test_incumbent_callback_errors_do_not_stop_search():
+    mip = knapsack()
+
+    def broken(entry):
+        raise RuntimeError("boom")
+
+    assert_solved(solve(mip, incumbent_callback=broken), mip, reference(mip))
+
+
+def test_incumbent_callback_needs_no_presolve(tmp_path):
+    path = tmp_path / "knapsack.mps"
+    write_mps(knapsack(), path)
+    with pytest.raises(ValueError, match="incumbent_callback"):
+        solve(path, presolve=True, incumbent_callback=print)

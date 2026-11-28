@@ -7430,6 +7430,43 @@ class _HighsHolder:
                     pass
 
 
+class IncumbentQueue:
+    """Points sent to a running search (``solve(incumbent_queue=...)``).
+    Any thread may call ``put`` while ``solve`` runs. The search takes the
+    points at its next poll, between batches, like HiGHS's
+    (``feed_highs``). Each point is checked as a ``mip_start`` is: one entry
+    per column, NaN allowed for continuous ones. Its integers are rounded
+    and its continuous part is repaired by an LP if needed. A point that is
+    infeasible or no better than the incumbent is dropped. Source ``"A"``
+    in the log and ``result["history"]``."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending = []
+        self.received = 0  # points taken by the search
+        self.accepted = 0  # of those, new incumbents
+        self.rejected = 0  # wrong shape, or not feasible
+
+    def put(self, x):
+        """Send ``x`` to the search. Thread-safe and non-blocking."""
+        x = np.array(x, dtype=np.float64).reshape(-1)
+        with self.lock:
+            self.pending.append(x)
+
+    def poll(self):
+        with self.lock:
+            points, self.pending = self.pending, []
+        self.received += len(points)
+        return points
+
+    def stats(self):
+        return {
+            "received": self.received,
+            "accepted": self.accepted,
+            "rejected": self.rejected,
+        }
+
+
 class _HighsFeed:
     """HiGHS's MIP solver on the search's MIP, in a background thread, fed
     the search's incumbents (``solve(feed_highs=True)``). Jaddle tends to
@@ -8033,6 +8070,7 @@ _LOG_SOURCES = (
     ("Q", "Presolved restart"),
     ("W", "HiGHS first solution"),
     ("M", "HiGHS MIP feed"),
+    ("A", "User incumbent"),
     ("1", "1-opt"),
 )
 
@@ -10277,6 +10315,8 @@ class _BranchAndBound:
         primal_target=None,
         feed_highs=False,
         highs_feed_options=None,
+        incumbent_queue=None,
+        incumbent_callback=None,
         interrupt=None,
     ):
         # Every setting, for sub-searches (``jaddle_rins``).
@@ -10300,6 +10340,12 @@ class _BranchAndBound:
         self.highs_feed_options = highs_feed_options
         self.highs_feed = None
         self.highs_closed = False
+        # Points the user sends during the run (``incumbent_queue``),
+        # outermost search only.
+        self.incumbent_queue = incumbent_queue if interrupt is None else None
+        # Called with each new incumbent (``incumbent_callback``), outermost
+        # search only: a sub-search's points reach it through the parent's.
+        self.incumbent_callback = incumbent_callback if interrupt is None else None
         self.rins_nodes = rins_nodes
         if symmetry not in ("auto", True, False):
             raise ValueError(
@@ -11724,11 +11770,32 @@ class _BranchAndBound:
         self.highs_feed = feed
 
     def collect_highs_feed(self):
-        """HiGHS's improving points (``feed_highs``) as incumbents (``M``)."""
-        if self.highs_feed is None:
+        """HiGHS's improving points (``feed_highs``) as incumbents (``M``),
+        and the user's (``incumbent_queue``, ``A``)."""
+        if self.highs_feed is not None:
+            for x in self.highs_feed.poll():
+                self.try_incumbent(x, "M", None)
+        queue = self.incumbent_queue
+        if queue is None:
             return
-        for x in self.highs_feed.poll():
-            self.try_incumbent(x, "M", None)
+        for x in queue.poll():
+            try:
+                x = check_mip_start(x, self.original)
+            except ValueError as error:
+                queue.rejected += 1
+                if self.verbose:
+                    print(f"incumbent_queue: {error}, ignored")
+                continue
+            before = None if self.incumbent is None else self.incumbent[0]
+            x = _fill_start(x, self.original.lower, self.original.upper)
+            if not self.try_incumbent(x, "A", None):
+                queue.rejected += 1
+                if self.verbose:
+                    print("incumbent_queue: not feasible, ignored")
+            elif self.incumbent is not None and (
+                before is None or self.incumbent[0] < before
+            ):
+                queue.accepted += 1
 
     def request_interrupt(self):
         """Stop the search as a time limit would, with the best point so
@@ -13020,6 +13087,12 @@ class _BranchAndBound:
             )
         )
         self.log(source, bound, force=True)
+        if self.incumbent_callback is not None:
+            entry = dict(self.history[-1], x=candidate.copy())
+            try:
+                self.incumbent_callback(entry)
+            except Exception as error:  # the user's code must not stop the search
+                print(f"incumbent_callback: {error!r}, ignored")
         if not self.target_reached and self.reaches_target(value):
             # As Ctrl-C does: the search stops with this point.
             self.target_reached = True
@@ -14602,6 +14675,7 @@ class _BranchAndBound:
             "K": self.linking_blocks is not None,
             "Z": self.use_trivial,
             "M": self.feed_highs,
+            "A": self.incumbent_queue is not None,
         }
         return {mark for mark, enabled in on.items() if enabled}
 
@@ -14843,6 +14917,9 @@ class _BranchAndBound:
             ),
             "nodes": self.nodes,
             "highs_feed": None if self.highs_feed is None else self.highs_feed.stats(),
+            "incumbent_queue": (
+                None if self.incumbent_queue is None else self.incumbent_queue.stats()
+            ),
             "infeasible_nodes": self.infeasible_nodes,
             "unresolved_nodes": self.unresolved_nodes,
             "lean_tree": self.lean_stats,
@@ -21798,6 +21875,8 @@ def solve(
     primal_target=None,
     feed_highs=False,
     highs_feed_options=None,
+    incumbent_queue=None,
+    incumbent_callback=None,
 ):
     """
     Solve a mixed-integer LP by branch and bound, with ``jaddle_linear.solve``
@@ -23010,6 +23089,25 @@ def solve(
     each the better of the two sides (HiGHS's points marked ``M``). The result's ``"highs_feed"`` has HiGHS's status,
     bound (model sense), and the counts of points fed and received.
 
+    ``incumbent_queue`` (an ``IncumbentQueue``) lets another thread send
+    points while the search runs: ``queue.put(x)``, with ``x`` one entry
+    per column of the model (NaN allowed for continuous ones). The search
+    takes the points between batches, as it takes HiGHS's, and each
+    feasible point better than the incumbent becomes the incumbent (source
+    ``"A"``). It is passed on to HiGHS too when ``feed_highs=True``. A
+    point that is infeasible or has the wrong shape is dropped. The result's
+    ``"incumbent_queue"`` has the counts received, accepted and rejected.
+    Not available with ``presolve=True``: points cannot be mapped into
+    HiGHS's reduced MIP.
+
+    ``incumbent_callback`` is called with each new incumbent, from the
+    search's thread, as a dict with the ``"history"`` entry's keys
+    (``"seconds"``, ``"nodes"``, ``"objective"``, ``"bound"``, ``"source"``)
+    and ``"x"``, a copy of the point (one entry per column of the model).
+    It should return quickly: the search waits for it. An exception it
+    raises is printed and ignored. Not available with ``presolve=True``:
+    the search's points are in HiGHS's reduced MIP.
+
     Returns a dict:
 
     * ``"x"``: the best solution found (NumPy, float64), or ``None``.
@@ -23330,6 +23428,8 @@ def solve(
         primal_target=primal_target,
         feed_highs=feed_highs,
         highs_feed_options=highs_feed_options,
+        incumbent_queue=incumbent_queue,
+        incumbent_callback=incumbent_callback,
     )
     return _solve_model(
         model, presolve, precision, highs_options, feasibility_tolerance, settings
@@ -23366,6 +23466,16 @@ def _solve_with_presolve(model, highs_options, feasibility_tolerance, settings):
     reduced MIP, HiGHS postsolve of the incumbent."""
     import highspy
 
+    if settings.get("incumbent_queue") is not None:
+        raise ValueError(
+            "incumbent_queue needs presolve=False: points cannot be mapped "
+            "into HiGHS's presolved MIP"
+        )
+    if settings.get("incumbent_callback") is not None:
+        raise ValueError(
+            "incumbent_callback needs presolve=False: the search's points are "
+            "in HiGHS's presolved MIP"
+        )
     start = settings["start"]
     highs = _highs_mip(model, highs_options)
     original = _mip_from_highs_lp(highs.getLp())
